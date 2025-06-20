@@ -1,6 +1,42 @@
 [package]
 name = "catalyst-dfs"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "Distributed File System for Catalyst Network based on IPFS"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
+catalyst-core = { path = "../catalyst-core" }
+catalyst-crypto = { path = "../catalyst-crypto" }
+
+# IPFS implementation
+libipld = { version = "0.16", features = ["dag-cbor", "dag-json"] }
+libp2p = { version = "0.53", features = ["kad", "request-response"] }
+libp2p-bitswap = "0.25"  # Separate bitswap implementation
+cid = "0.10"
+multihash = "0.19"
+
+# Async support
+tokio = { version = "1.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Storage
+rocksdb = "0.21"
+
+# Utilities
+log = "0.4"
+uuid = { version = "1.0", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.0"
+tokio-test = "0.4"

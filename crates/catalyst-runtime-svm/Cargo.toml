@@ -1,6 +1,56 @@
 [package]
 name = "catalyst-runtime-svm"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+authors = ["Catalyst Network Team"]
+description = "Solana Virtual Machine runtime for Catalyst Network"
+license = "MIT"
 
 [dependencies]
+# Core Catalyst dependencies
+catalyst-core = { path = "../catalyst-core" }
+catalyst-crypto = { path = "../catalyst-crypto" }
+
+# Phase 1: Standalone BPF for full control
+rbpf = "0.3"
+
+# WASM support for native runtime
+wasmtime = "15.0"
+
+# Basic VM components
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Utilities
+bytes = "1.0"
+hex = "0.4"
+uuid = { version = "1.0", features = ["v4"] }
+
+# Logging
+tracing = "0.1"
+
+# Phase 2: Solana compatibility dependencies (commented out for Phase 1)
+# solana_rbpf = { version = "0.2", optional = true }
+# solana-runtime = { version = "1.16", optional = true }
+# solana-sdk = { version = "1.16", optional = true }
+# solana-program = { version = "1.16", optional = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[features]
+default = ["native-runtime"]
+native-runtime = []
+
+# Phase 2: Solana compatibility features (disabled for Phase 1)
+# solana-compat = ["solana-rbpf", "solana-runtime", "solana-sdk", "solana-program"]
+# full = ["native-runtime", "solana-compat"]
