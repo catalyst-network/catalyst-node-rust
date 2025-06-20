@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::str::FromStr;
 
 // Module declarations - comment out missing modules for Phase 1
 // pub mod encoding;     // TODO: Create for Phase 2

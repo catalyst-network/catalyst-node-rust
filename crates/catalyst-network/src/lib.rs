@@ -411,7 +411,7 @@ mod tests {
         let peer_info = PeerInfo::new(node_id, peer_id, addresses.clone());
         
         assert_eq!(peer_info.id, node_id);
-        assert_eq!(peer_info.peer_id, peer_id);
+        assert_eq!(peer_info.peer_id(), Ok(peer_id));
         assert_eq!(peer_info.addresses, addresses);
         assert!(matches!(peer_info.connection_status, ConnectionStatus::Disconnected));
     }
