@@ -1,295 +1,252 @@
 use async_trait::async_trait;
-use futures::Stream;
-use std::pin::Pin;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
 use crate::{
-    Block, Transaction, NetworkMessage, Event, CatalystResult, 
-    NodeId, BlockHash, Address, TokenAmount, LedgerCycle,
-    ResourceProof, ConsensusMessage,
+    NodeId, Address, TokenAmount, LedgerCycle,
+    ConsensusMessage, Transaction, ExecutionResult,
 };
 
-/// Core trait for all Catalyst modules
+/// Core consensus protocol trait
 #[async_trait]
-pub trait CatalystModule: Send + Sync {
-    /// Module name for identification
-    fn name(&self) -> &'static str;
-    
-    /// Module version
-    fn version(&self) -> &'static str;
-    
-    /// Initialize the module
-    async fn initialize(&mut self) -> CatalystResult<()>;
-    
-    /// Start the module (begin processing)
-    async fn start(&mut self) -> CatalystResult<()>;
-    
-    /// Stop the module gracefully
-    async fn stop(&mut self) -> CatalystResult<()>;
-    
-    /// Check if module is healthy
-    async fn health_check(&self) -> CatalystResult<bool>;
-}
+pub trait ConsensusProtocol: Send + Sync {
+    type Block;
+    type Proposal;
+    type Vote;
 
-/// Network module for P2P communication
-#[async_trait]
-pub trait NetworkModule: CatalystModule {
-    /// Broadcast a message to the network
-    async fn broadcast(&self, message: NetworkMessage) -> CatalystResult<()>;
-    
-    /// Send a message to a specific peer
-    async fn send_to_peer(&self, peer_id: NodeId, message: NetworkMessage) -> CatalystResult<()>;
-    
-    /// Subscribe to network events
-    async fn subscribe(&self) -> CatalystResult<Pin<Box<dyn Stream<Item = NetworkMessage> + Send>>>;
-    
-    /// Get connected peers
-    async fn get_peers(&self) -> CatalystResult<Vec<NodeId>>;
-    
-    /// Connect to a peer
-    async fn connect_peer(&self, address: &str) -> CatalystResult<NodeId>;
-    
-    /// Disconnect from a peer
-    async fn disconnect_peer(&self, peer_id: NodeId) -> CatalystResult<()>;
-}
+    /// Propose a new block
+    async fn propose_block(&mut self, transactions: Vec<Transaction>) -> Result<Self::Proposal, ConsensusError>;
 
-/// Storage module for data persistence
-#[async_trait]
-pub trait StorageModule: CatalystModule {
-    /// Store a key-value pair
-    async fn put(&self, key: &[u8], value: &[u8]) -> CatalystResult<()>;
-    
-    /// Retrieve a value by key
-    async fn get(&self, key: &[u8]) -> CatalystResult<Option<Vec<u8>>>;
-    
-    /// Delete a key-value pair
-    async fn delete(&self, key: &[u8]) -> CatalystResult<()>;
-    
-    /// Check if a key exists
-    async fn exists(&self, key: &[u8]) -> CatalystResult<bool>;
-    
-    /// Iterate over keys with a prefix
-    async fn iter_prefix(&self, prefix: &[u8]) -> CatalystResult<Pin<Box<dyn Stream<Item = (Vec<u8>, Vec<u8>)> + Send>>>;
-    
-    /// Get storage statistics
-    async fn stats(&self) -> CatalystResult<StorageStats>;
-}
-
-/// Storage statistics
-#[derive(Debug, Clone)]
-pub struct StorageStats {
-    pub total_keys: u64,
-    pub total_size_bytes: u64,
-    pub free_space_bytes: u64,
-}
-
-/// Consensus module implementing the collaborative consensus protocol
-#[async_trait]
-pub trait ConsensusModule: CatalystModule {
-    /// Start a new ledger cycle as a producer
-    async fn start_cycle(&self, cycle: LedgerCycle) -> CatalystResult<()>;
-    
-    /// Process consensus messages
-    async fn process_consensus_message(&self, message: ConsensusMessage) -> CatalystResult<()>;
-    
-    /// Get current cycle information
-    async fn current_cycle(&self) -> CatalystResult<Option<LedgerCycle>>;
-    
-    /// Check if this node is a producer for the current cycle
-    async fn is_producer(&self) -> CatalystResult<bool>;
-    
     /// Validate a proposed block
-    async fn validate_block(&self, block: &Block) -> CatalystResult<bool>;
-    
-    /// Finalize a block (add to ledger)
-    async fn finalize_block(&self, block: Block) -> CatalystResult<()>;
-    
-    /// Get the latest finalized block
-    async fn latest_block(&self) -> CatalystResult<Option<Block>>;
+    async fn validate_proposal(&self, proposal: &Self::Proposal) -> Result<bool, ConsensusError>;
+
+    /// Submit a vote for a proposal
+    async fn vote(&mut self, proposal_id: &[u8], vote: Self::Vote) -> Result<(), ConsensusError>;
+
+    /// Process consensus messages
+    async fn process_message(&mut self, message: ConsensusMessage) -> Result<(), ConsensusError>;
+
+    /// Get the current consensus state
+    async fn get_state(&self) -> Result<ConsensusState, ConsensusError>;
 }
 
-/// Runtime module for executing smart contracts
+/// State management interface
 #[async_trait]
-pub trait RuntimeModule: CatalystModule {
-    /// Execute a transaction against this runtime
-    async fn execute_transaction(&self, tx: &Transaction) -> CatalystResult<ExecutionResult>;
-    
-    /// Deploy a smart contract
-    async fn deploy_contract(&self, code: &[u8], constructor_args: &[u8]) -> CatalystResult<Address>;
-    
-    /// Call a smart contract function
-    async fn call_contract(
-        &self, 
-        address: &Address, 
-        function_data: &[u8],
-        caller: &Address,
-        value: TokenAmount,
-        gas_limit: u64,
-    ) -> CatalystResult<ExecutionResult>;
-    
-    /// Get contract code
-    async fn get_contract_code(&self, address: &Address) -> CatalystResult<Option<Vec<u8>>>;
-    
-    /// Get contract storage
-    async fn get_storage(&self, address: &Address, key: &[u8]) -> CatalystResult<Option<Vec<u8>>>;
-    
-    /// Estimate gas for a transaction
-    async fn estimate_gas(&self, tx: &Transaction) -> CatalystResult<u64>;
-    
-    /// Get supported runtime type
-    fn runtime_type(&self) -> RuntimeType;
+pub trait StateManager: Send + Sync {
+    /// Get account state
+    async fn get_account(&self, address: &Address) -> Result<Option<Vec<u8>>, StateError>;
+
+    /// Update account state
+    async fn set_account(&mut self, address: &Address, data: Vec<u8>) -> Result<(), StateError>;
+
+    /// Get storage value
+    async fn get_storage(&self, address: &Address, key: &[u8]) -> Result<Option<Vec<u8>>, StateError>;
+
+    /// Set storage value
+    async fn set_storage(&mut self, address: &Address, key: Vec<u8>, value: Vec<u8>) -> Result<(), StateError>;
+
+    /// Create a state snapshot
+    async fn create_snapshot(&self) -> Result<StateSnapshot, StateError>;
+
+    /// Restore from a snapshot
+    async fn restore_snapshot(&mut self, snapshot: StateSnapshot) -> Result<(), StateError>;
+
+    /// Get state root hash
+    async fn get_state_root(&self) -> Result<[u8; 32], StateError>;
 }
 
-/// Execution result from runtime
-#[derive(Debug, Clone)]
-pub struct ExecutionResult {
-    pub success: bool,
-    pub gas_used: u64,
-    pub return_data: Vec<u8>,
-    pub logs: Vec<ExecutionLog>,
-    pub state_changes: Vec<StateChange>,
-}
-
-/// Execution log entry
-#[derive(Debug, Clone)]
-pub struct ExecutionLog {
-    pub address: Address,
-    pub topics: Vec<[u8; 32]>,
-    pub data: Vec<u8>,
-}
-
-/// State change record
-#[derive(Debug, Clone)]
-pub struct StateChange {
-    pub address: Address,
-    pub storage_key: Vec<u8>,
-    pub old_value: Option<Vec<u8>>,
-    pub new_value: Option<Vec<u8>>,
-}
-
-/// Runtime type enumeration
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RuntimeType {
-    EVM,
-    SVM,
-    WASM,
-    Native,
-}
-
-/// Service bus module for Web2 integration
+/// Network interface for peer-to-peer communication
 #[async_trait]
-pub trait ServiceBusModule: CatalystModule {
-    /// Publish an event to subscribers
-    async fn publish_event(&self, event: Event) -> CatalystResult<()>;
-    
-    /// Subscribe to events matching a filter
-    async fn subscribe_events(&self, filter: EventFilter) -> CatalystResult<Pin<Box<dyn Stream<Item = Event> + Send>>>;
-    
-    /// Register a webhook endpoint
-    async fn register_webhook(&self, endpoint: WebhookEndpoint) -> CatalystResult<String>;
-    
-    /// Unregister a webhook
-    async fn unregister_webhook(&self, webhook_id: &str) -> CatalystResult<()>;
-    
-    /// Get active subscriptions
-    async fn get_subscriptions(&self) -> CatalystResult<Vec<EventSubscription>>;
+pub trait NetworkInterface: Send + Sync {
+    /// Broadcast a message to all peers
+    async fn broadcast(&self, message: Vec<u8>) -> Result<(), NetworkError>;
+
+    /// Send a message to a specific peer
+    async fn send_to_peer(&self, peer_id: &NodeId, message: Vec<u8>) -> Result<(), NetworkError>;
+
+    /// Get list of connected peers
+    async fn get_peers(&self) -> Result<Vec<NodeId>, NetworkError>;
+
+    /// Subscribe to network events
+    async fn subscribe_events(&self) -> Result<NetworkEventReceiver, NetworkError>;
 }
 
-/// Event filter for service bus subscriptions
-#[derive(Debug, Clone)]
-pub struct EventFilter {
-    pub event_types: Option<Vec<String>>,
-    pub addresses: Option<Vec<Address>>,
-    pub topics: Option<Vec<[u8; 32]>>,
-    pub from_block: Option<u64>,
-    pub to_block: Option<u64>,
+/// Event subscription interface
+pub trait EventSubscription: Send + Sync {
+    type Event;
+    type Filter;
+
+    /// Subscribe to events matching the filter
+    fn subscribe(&mut self, filter: Self::Filter) -> Result<EventReceiver<Self::Event>, EventError>;
+
+    /// Unsubscribe from events
+    fn unsubscribe(&mut self, subscription_id: u64) -> Result<(), EventError>;
+
+    /// Publish an event
+    fn publish(&mut self, event: Self::Event) -> Result<(), EventError>;
 }
 
-/// Webhook endpoint configuration
-#[derive(Debug, Clone)]
-pub struct WebhookEndpoint {
-    pub url: String,
-    pub filter: EventFilter,
-    pub retry_policy: RetryPolicy,
-    pub authentication: Option<WebhookAuth>,
+/// Event filter interface
+pub trait EventFilter: Send + Sync + Clone {
+    type Event;
+
+    /// Check if an event matches this filter
+    fn matches(&self, event: &Self::Event) -> bool;
+
+    /// Combine with another filter using AND logic
+    fn and(self, other: Self) -> AndFilter<Self> where Self: Sized {
+        AndFilter { left: self, right: other }
+    }
+
+    /// Combine with another filter using OR logic  
+    fn or(self, other: Self) -> OrFilter<Self> where Self: Sized {
+        OrFilter { left: self, right: other }
+    }
 }
 
-/// Retry policy for webhook delivery
-#[derive(Debug, Clone)]
-pub struct RetryPolicy {
-    pub max_retries: u32,
-    pub initial_delay_ms: u64,
-    pub max_delay_ms: u64,
-    pub backoff_multiplier: f64,
+// Filter combinators
+#[derive(Clone)]
+pub struct AndFilter<F> {
+    left: F,
+    right: F,
 }
 
-/// Webhook authentication
-#[derive(Debug, Clone)]
-pub enum WebhookAuth {
-    None,
-    Bearer { token: String },
-    Basic { username: String, password: String },
-    Custom { headers: Vec<(String, String)> },
+impl<F: EventFilter> EventFilter for AndFilter<F> {
+    type Event = F::Event;
+
+    fn matches(&self, event: &Self::Event) -> bool {
+        self.left.matches(event) && self.right.matches(event)
+    }
 }
 
-/// Event subscription information
-#[derive(Debug, Clone)]
-pub struct EventSubscription {
-    pub id: String,
-    pub filter: EventFilter,
-    pub created_at: u64,
-    pub events_delivered: u64,
+#[derive(Clone)]
+pub struct OrFilter<F> {
+    left: F,
+    right: F,
 }
 
-/// Distributed File System module
-#[async_trait]
-pub trait DfsModule: CatalystModule {
-    /// Store a file and return its content hash
-    async fn store_file(&self, data: &[u8]) -> CatalystResult<String>;
-    
-    /// Retrieve a file by its content hash
-    async fn get_file(&self, hash: &str) -> CatalystResult<Option<Vec<u8>>>;
-    
-    /// Check if a file exists
-    async fn file_exists(&self, hash: &str) -> CatalystResult<bool>;
-    
-    /// Pin a file (ensure it stays available)
-    async fn pin_file(&self, hash: &str) -> CatalystResult<()>;
-    
-    /// Unpin a file
-    async fn unpin_file(&self, hash: &str) -> CatalystResult<()>;
-    
-    /// List pinned files
-    async fn list_pinned(&self) -> CatalystResult<Vec<String>>;
-    
-    /// Get file metadata
-    async fn file_metadata(&self, hash: &str) -> CatalystResult<Option<FileMetadata>>;
-    
-    /// Provide storage space to the network
-    async fn provide_storage(&self, capacity_bytes: u64) -> CatalystResult<()>;
+impl<F: EventFilter> EventFilter for OrFilter<F> {
+    type Event = F::Event;
+
+    fn matches(&self, event: &Self::Event) -> bool {
+        self.left.matches(event) || self.right.matches(event)
+    }
 }
 
-/// File metadata
-#[derive(Debug, Clone)]
-pub struct FileMetadata {
-    pub hash: String,
-    pub size_bytes: u64,
-    pub created_at: u64,
-    pub pin_count: u32,
-    pub availability_score: f64,
+// Type aliases for event handling
+pub type EventReceiver<T> = tokio::sync::mpsc::Receiver<T>;
+pub type NetworkEventReceiver = EventReceiver<NetworkEvent>;
+
+// Supporting types
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsensusState {
+    pub current_height: u64,
+    pub current_round: u32,
+    pub leader: Option<NodeId>,
+    pub locked_block: Option<[u8; 32]>,
+    pub votes: HashMap<[u8; 32], u32>, // block_hash -> vote_count
 }
 
-/// Configuration module for managing node settings
-pub trait ConfigModule: Send + Sync {
-    /// Get a configuration value
-    fn get<T>(&self, key: &str) -> CatalystResult<Option<T>> 
-    where T: serde::de::DeserializeOwned;
-    
-    /// Set a configuration value
-    fn set<T>(&mut self, key: &str, value: T) -> CatalystResult<()>
-    where T: serde::Serialize;
-    
-    /// Save configuration to disk
-    fn save(&self) -> CatalystResult<()>;
-    
-    /// Reload configuration from disk
-    fn reload(&mut self) -> CatalystResult<()>;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateSnapshot {
+    pub root_hash: [u8; 32],
+    pub height: u64,
+    pub timestamp: u64,
+    pub metadata: HashMap<String, Vec<u8>>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum NetworkEvent {
+    PeerConnected(NodeId),
+    PeerDisconnected(NodeId),
+    MessageReceived { from: NodeId, data: Vec<u8> },
+    NetworkError(String),
+}
+
+// Error types
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConsensusError {
+    InvalidProposal(String),
+    InvalidVote(String),
+    NetworkError(String),
+    StateError(String),
+    Timeout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StateError {
+    AccountNotFound,
+    InvalidAddress,
+    SerializationError(String),
+    StorageError(String),
+    SnapshotError(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NetworkError {
+    PeerNotFound,
+    ConnectionFailed(String),
+    SendFailed(String),
+    ReceiveFailed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EventError {
+    SubscriptionFailed(String),
+    PublishFailed(String),
+    FilterError(String),
+}
+
+// Implement std::error::Error for all error types
+impl std::fmt::Display for ConsensusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConsensusError::InvalidProposal(msg) => write!(f, "Invalid proposal: {}", msg),
+            ConsensusError::InvalidVote(msg) => write!(f, "Invalid vote: {}", msg),
+            ConsensusError::NetworkError(msg) => write!(f, "Network error: {}", msg),
+            ConsensusError::StateError(msg) => write!(f, "State error: {}", msg),
+            ConsensusError::Timeout => write!(f, "Consensus timeout"),
+        }
+    }
+}
+
+impl std::error::Error for ConsensusError {}
+
+impl std::fmt::Display for StateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StateError::AccountNotFound => write!(f, "Account not found"),
+            StateError::InvalidAddress => write!(f, "Invalid address"),
+            StateError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
+            StateError::StorageError(msg) => write!(f, "Storage error: {}", msg),
+            StateError::SnapshotError(msg) => write!(f, "Snapshot error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for StateError {}
+
+impl std::fmt::Display for NetworkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NetworkError::PeerNotFound => write!(f, "Peer not found"),
+            NetworkError::ConnectionFailed(msg) => write!(f, "Connection failed: {}", msg),
+            NetworkError::SendFailed(msg) => write!(f, "Send failed: {}", msg),
+            NetworkError::ReceiveFailed(msg) => write!(f, "Receive failed: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for NetworkError {}
+
+impl std::fmt::Display for EventError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventError::SubscriptionFailed(msg) => write!(f, "Subscription failed: {}", msg),
+            EventError::PublishFailed(msg) => write!(f, "Publish failed: {}", msg),
+            EventError::FilterError(msg) => write!(f, "Filter error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for EventError {}

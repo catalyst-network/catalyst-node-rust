@@ -1,6 +1,37 @@
 [package]
 name = "catalyst-consensus"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "4-Phase Collaborative Consensus for Catalyst Network"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
+catalyst-core = { path = "../catalyst-core" }
+catalyst-crypto = { path = "../catalyst-crypto" }
+catalyst-network = { path = "../catalyst-network" }
+catalyst-utils = { path = "../catalyst-utils" }
+
+# Async support
+tokio = { version = "1.0", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Utilities
+tracing = "0.1"
+uuid = { version = "1.0", features = ["v4"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[features]
+default = []
+testing = []
+full-consensus = []  # For future advanced features

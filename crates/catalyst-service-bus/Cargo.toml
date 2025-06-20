@@ -1,6 +1,46 @@
 [package]
 name = "catalyst-service-bus"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "Web2 integration service bus for Catalyst Network"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
+catalyst-core = { path = "../catalyst-core" }
+catalyst-storage = { path = "../catalyst-storage" }
+
+# Web server and WebSocket support
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+hyper = "1.0"
+
+# WebSocket handling
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Utilities
+log = "0.4"
+uuid = { version = "1.0", features = ["v4"] }
+dashmap = "5.0"
+
+# Metrics and observability
+metrics = "0.21"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.0"

@@ -1,83 +1,109 @@
+use crate::{Address, TxHash, BlockHash, TokenAmount, Timestamp, NodeId, NodeRole};
 use serde::{Deserialize, Serialize};
-use crate::{Address, TxHash, BlockHash, TokenAmount, Timestamp, NodeId};
+use std::collections::HashMap;
+use tokio::sync::mpsc;
 
-/// System-wide events that can be subscribed to
+/// Event system for the Catalyst network
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SystemEvent {
-    /// Blockchain events
-    Blockchain(BlockchainEvent),
-    /// Network events
-    Network(NetworkEvent),
+pub enum Event {
+    /// Transaction events
+    Transaction(TransactionEvent),
+    /// Block events
+    Block(BlockEvent),
     /// Consensus events
     Consensus(ConsensusEvent),
+    /// Network events
+    Network(NetworkEvent),
     /// Storage events
     Storage(StorageEvent),
-    /// Module lifecycle events
-    Module(ModuleEvent),
+    /// Custom application events
+    Custom {
+        event_type: String,
+        data: Vec<u8>,
+    },
 }
 
-/// Blockchain-related events
+/// Transaction-related events
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum BlockchainEvent {
-    /// New block added to chain
-    NewBlock {
-        block_hash: BlockHash,
-        block_height: u64,
-        timestamp: Timestamp,
-        tx_count: u32,
-        producer_id: NodeId,
-    },
-    /// New transaction in mempool
-    NewTransaction {
+pub enum TransactionEvent {
+    /// Transaction submitted to mempool
+    Submitted {
         tx_hash: TxHash,
-        from_address: Option<Address>,
-        to_address: Option<Address>,
-        amount: Option<TokenAmount>,
+        from: Address,
         timestamp: Timestamp,
     },
-    /// Transaction confirmed in block
-    TransactionConfirmed {
+    /// Transaction included in block
+    Included {
         tx_hash: TxHash,
         block_hash: BlockHash,
         block_height: u64,
-        gas_used: u64,
+    },
+    /// Transaction execution completed
+    Executed {
+        tx_hash: TxHash,
         success: bool,
-    },
-    /// Token transfer event
-    TokenTransfer {
-        from_address: Address,
-        to_address: Address,
-        amount: TokenAmount,
-        tx_hash: TxHash,
-        block_height: u64,
-    },
-    /// Contract deployed
-    ContractDeployed {
-        contract_address: Address,
-        deployer_address: Address,
-        tx_hash: TxHash,
-        block_height: u64,
-        runtime_type: String,
-    },
-    /// Contract function called
-    ContractCall {
-        contract_address: Address,
-        caller_address: Address,
-        function_data: Vec<u8>,
-        tx_hash: TxHash,
-        block_height: u64,
         gas_used: u64,
-        success: bool,
+        return_data: Vec<u8>,
     },
-    /// Custom contract event
-    ContractEvent {
-        contract_address: Address,
-        event_name: String,
-        topics: Vec<[u8; 32]>,
-        data: Vec<u8>,
+    /// Transaction failed
+    Failed {
         tx_hash: TxHash,
-        block_height: u64,
+        error: String,
+        gas_used: u64,
     },
+}
+
+/// Block-related events
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BlockEvent {
+    /// New block proposed
+    Proposed {
+        block_hash: BlockHash,
+        height: u64,
+        producer: NodeId,
+        timestamp: Timestamp,
+    },
+    /// Block finalized
+    Finalized {
+        block_hash: BlockHash,
+        height: u64,
+        transaction_count: u32,
+    },
+    /// Block reorganization
+    Reorganization {
+        old_chain: Vec<BlockHash>,
+        new_chain: Vec<BlockHash>,
+        fork_point: u64,
+    },
+}
+
+/// Consensus-related events
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ConsensusEvent {
+    /// New consensus round started
+    RoundStarted {
+        height: u64,
+        round: u32,
+        leader: NodeId,
+    },
+    /// Vote cast in consensus
+    VoteCast {
+        voter: NodeId,
+        block_hash: BlockHash,
+        vote_type: VoteType,
+    },
+    /// Consensus reached
+    ConsensusReached {
+        block_hash: BlockHash,
+        height: u64,
+        votes: u32,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum VoteType {
+    Prevote,
+    Precommit,
 }
 
 /// Network-related events
@@ -86,262 +112,207 @@ pub enum NetworkEvent {
     /// Peer connected
     PeerConnected {
         peer_id: NodeId,
+        role: NodeRole,
         address: String,
-        role: crate::NodeRole,
     },
     /// Peer disconnected
     PeerDisconnected {
         peer_id: NodeId,
         reason: String,
     },
-    /// Message received from peer
+    /// Message received
     MessageReceived {
-        peer_id: NodeId,
+        from: NodeId,
         message_type: String,
-        size_bytes: u32,
+        size: usize,
     },
-    /// Network partition detected
-    NetworkPartition {
-        partition_size: u32,
-        connected_peers: Vec<NodeId>,
-    },
-    /// Network healing (partition resolved)
-    NetworkHealed {
-        total_peers: u32,
-        healing_duration_ms: u64,
-    },
-}
-
-/// Consensus-related events
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ConsensusEvent {
-    /// New ledger cycle started
-    CycleStarted {
-        cycle_id: u64,
-        producer_count: u32,
-        partition_id: u32,
-        start_time: Timestamp,
-    },
-    /// Ledger cycle completed
-    CycleCompleted {
-        cycle_id: u64,
-        block_hash: BlockHash,
-        participant_count: u32,
-        duration_ms: u64,
-    },
-    /// Node selected as producer
-    SelectedAsProducer {
-        cycle_id: u64,
-        partition_id: u32,
-        selection_time: Timestamp,
-    },
-    /// Consensus phase transition
-    PhaseTransition {
-        cycle_id: u64,
-        from_phase: ConsensusPhase,
-        to_phase: ConsensusPhase,
-        timestamp: Timestamp,
-    },
-    /// Consensus failure/timeout
-    ConsensusFailed {
-        cycle_id: u64,
-        phase: ConsensusPhase,
-        reason: String,
-        participant_count: u32,
-    },
-}
-
-/// Consensus phases from the protocol
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ConsensusPhase {
-    Construction,
-    Campaigning,
-    Voting,
-    Synchronization,
 }
 
 /// Storage-related events
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StorageEvent {
-    /// File stored in DFS
+    /// File stored
     FileStored {
         file_hash: String,
-        size_bytes: u64,
-        storage_node: NodeId,
-        timestamp: Timestamp,
+        size: u64,
+        storage_nodes: Vec<NodeId>,
     },
-    /// File retrieved from DFS
+    /// File retrieved
     FileRetrieved {
         file_hash: String,
-        requester_node: NodeId,
-        timestamp: Timestamp,
-    },
-    /// File pinned
-    FilePinned {
-        file_hash: String,
-        pin_count: u32,
-        timestamp: Timestamp,
+        requester: NodeId,
     },
     /// Storage capacity changed
-    StorageCapacityChanged {
+    CapacityChanged {
         node_id: NodeId,
         old_capacity: u64,
         new_capacity: u64,
-        timestamp: Timestamp,
-    },
-    /// Storage node joined network
-    StorageNodeJoined {
-        node_id: NodeId,
-        capacity_bytes: u64,
-        location: Option<String>,
-    },
-    /// Storage node left network
-    StorageNodeLeft {
-        node_id: NodeId,
-        reason: String,
     },
 }
 
-/// Module lifecycle events
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ModuleEvent {
-    /// Module initialized
-    ModuleInitialized {
-        module_name: String,
-        version: String,
-        timestamp: Timestamp,
-    },
-    /// Module started
-    ModuleStarted {
-        module_name: String,
-        timestamp: Timestamp,
-    },
-    /// Module stopped
-    ModuleStopped {
-        module_name: String,
-        reason: String,
-        timestamp: Timestamp,
-    },
-    /// Module failed
-    ModuleFailed {
-        module_name: String,
-        error: String,
-        timestamp: Timestamp,
-    },
-    /// Module health check failed
-    HealthCheckFailed {
-        module_name: String,
-        error: String,
-        timestamp: Timestamp,
-    },
+/// Event subscription interface
+pub trait EventSubscription: Send + Sync {
+    type Event;
+    type Filter;
+
+    /// Subscribe to events matching the filter
+    fn subscribe(&mut self, filter: Self::Filter) -> Result<EventReceiver<Self::Event>, EventError>;
+
+    /// Unsubscribe from events
+    fn unsubscribe(&mut self, subscription_id: u64) -> Result<(), EventError>;
+
+    /// Publish an event
+    fn publish(&mut self, event: Self::Event) -> Result<(), EventError>;
 }
 
-/// Event subscription configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventSubscription {
-    /// Unique subscription ID
-    pub id: String,
-    /// Event filter
-    pub filter: EventFilter,
-    /// Delivery method
-    pub delivery: DeliveryMethod,
-    /// Created timestamp
-    pub created_at: Timestamp,
-    /// Statistics
-    pub stats: SubscriptionStats,
+/// Event filter interface
+pub trait EventFilter: Send + Sync + Clone {
+    type Event;
+
+    /// Check if an event matches this filter
+    fn matches(&self, event: &Self::Event) -> bool;
 }
 
-/// Event filter for subscriptions
+/// Event filter implementations
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventFilter {
-    /// System event types to include
-    pub event_types: Option<Vec<String>>,
-    /// Contract addresses to filter by
-    pub contract_addresses: Option<Vec<Address>>,
-    /// Transaction addresses to filter by
-    pub addresses: Option<Vec<Address>>,
-    /// Event topics to filter by
-    pub topics: Option<Vec<[u8; 32]>>,
-    /// Block height range
-    pub block_range: Option<BlockRange>,
-    /// Only include successful events
-    pub success_only: bool,
+pub enum CatalystEventFilter {
+    /// Match all events
+    All,
+    /// Match events by type
+    ByType(String),
+    /// Match transaction events for specific address
+    ByAddress(Address),
+    /// Match events by node
+    ByNode(NodeId),
+    /// Match events in block range
+    ByBlockRange { from: u64, to: u64 },
+    /// Combined filters
+    And(Box<CatalystEventFilter>, Box<CatalystEventFilter>),
+    Or(Box<CatalystEventFilter>, Box<CatalystEventFilter>),
 }
 
-/// Block range for filtering
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlockRange {
-    pub from_block: Option<u64>,
-    pub to_block: Option<u64>,
+impl EventFilter for CatalystEventFilter {
+    type Event = Event;
+
+    fn matches(&self, event: &Self::Event) -> bool {
+        match self {
+            CatalystEventFilter::All => true,
+            CatalystEventFilter::ByType(event_type) => {
+                match event {
+                    Event::Transaction(_) => event_type == "transaction",
+                    Event::Block(_) => event_type == "block",
+                    Event::Consensus(_) => event_type == "consensus",
+                    Event::Network(_) => event_type == "network",
+                    Event::Storage(_) => event_type == "storage",
+                    Event::Custom { event_type: et, .. } => event_type == et,
+                }
+            },
+            CatalystEventFilter::ByAddress(address) => {
+                match event {
+                    Event::Transaction(TransactionEvent::Submitted { from, .. }) => from == address,
+                    Event::Transaction(TransactionEvent::Executed { .. }) => false, // Would need tx details
+                    _ => false,
+                }
+            },
+            CatalystEventFilter::ByNode(node_id) => {
+                match event {
+                    Event::Block(BlockEvent::Proposed { producer, .. }) => producer == node_id,
+                    Event::Consensus(ConsensusEvent::VoteCast { voter, .. }) => voter == node_id,
+                    Event::Network(NetworkEvent::PeerConnected { peer_id, .. }) => peer_id == node_id,
+                    Event::Network(NetworkEvent::PeerDisconnected { peer_id, .. }) => peer_id == node_id,
+                    _ => false,
+                }
+            },
+            CatalystEventFilter::ByBlockRange { from, to } => {
+                match event {
+                    Event::Block(BlockEvent::Proposed { height, .. }) => height >= from && height <= to,
+                    Event::Block(BlockEvent::Finalized { height, .. }) => height >= from && height <= to,
+                    _ => false,
+                }
+            },
+            CatalystEventFilter::And(left, right) => {
+                left.matches(event) && right.matches(event)
+            },
+            CatalystEventFilter::Or(left, right) => {
+                left.matches(event) || right.matches(event)
+            },
+        }
+    }
 }
 
-/// Event delivery methods
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DeliveryMethod {
-    /// WebSocket stream
-    WebSocket {
-        connection_id: String,
-    },
-    /// HTTP webhook
-    Webhook {
-        url: String,
-        retry_policy: crate::traits::RetryPolicy,
-        authentication: Option<crate::traits::WebhookAuth>,
-    },
-    /// Internal channel (for module-to-module communication)
-    Internal {
-        channel_id: String,
-    },
+/// Event receiver type
+pub type EventReceiver<T> = mpsc::Receiver<T>;
+
+/// Event error types
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EventError {
+    SubscriptionFailed(String),
+    PublishFailed(String),
+    FilterError(String),
+    ChannelClosed,
 }
 
-/// Subscription statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubscriptionStats {
-    /// Total events delivered
-    pub events_delivered: u64,
-    /// Failed delivery attempts
-    pub delivery_failures: u64,
-    /// Last successful delivery
-    pub last_delivery: Option<Timestamp>,
-    /// Last delivery failure
-    pub last_failure: Option<Timestamp>,
-    /// Average delivery latency (ms)
-    pub avg_latency_ms: f64,
+impl std::fmt::Display for EventError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EventError::SubscriptionFailed(msg) => write!(f, "Subscription failed: {}", msg),
+            EventError::PublishFailed(msg) => write!(f, "Publish failed: {}", msg),
+            EventError::FilterError(msg) => write!(f, "Filter error: {}", msg),
+            EventError::ChannelClosed => write!(f, "Event channel closed"),
+        }
+    }
 }
 
-/// Event batch for efficient delivery
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventBatch {
-    /// Batch ID
-    pub batch_id: String,
-    /// Events in this batch
-    pub events: Vec<SystemEvent>,
-    /// Batch timestamp
-    pub timestamp: Timestamp,
-    /// Sequence number
-    pub sequence: u64,
+impl std::error::Error for EventError {}
+
+/// Event manager for handling subscriptions and publishing
+pub struct EventManager {
+    subscribers: HashMap<u64, mpsc::Sender<Event>>,
+    next_id: u64,
 }
 
-/// Event delivery confirmation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeliveryConfirmation {
-    /// Event or batch ID
-    pub id: String,
-    /// Delivery status
-    pub status: DeliveryStatus,
-    /// Delivery timestamp
-    pub delivered_at: Timestamp,
-    /// Response time in milliseconds
-    pub response_time_ms: u64,
-    /// Error message if failed
-    pub error: Option<String>,
+impl EventManager {
+    pub fn new() -> Self {
+        Self {
+            subscribers: HashMap::new(),
+            next_id: 0,
+        }
+    }
+
+    pub fn subscribe(&mut self, filter: CatalystEventFilter) -> (u64, EventReceiver<Event>) {
+        let (tx, rx) = mpsc::channel(1000);
+        let id = self.next_id;
+        self.next_id += 1;
+        
+        self.subscribers.insert(id, tx);
+        (id, rx)
+    }
+
+    pub fn unsubscribe(&mut self, subscription_id: u64) -> Result<(), EventError> {
+        self.subscribers.remove(&subscription_id);
+        Ok(())
+    }
+
+    pub async fn publish(&mut self, event: Event) -> Result<(), EventError> {
+        let mut failed_subscribers = Vec::new();
+        
+        for (id, sender) in &self.subscribers {
+            if sender.send(event.clone()).await.is_err() {
+                failed_subscribers.push(*id);
+            }
+        }
+        
+        // Remove failed subscribers
+        for id in failed_subscribers {
+            self.subscribers.remove(&id);
+        }
+        
+        Ok(())
+    }
 }
 
-/// Event delivery status
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DeliveryStatus {
-    Success,
-    Failed,
-    Retrying,
-    Abandoned,
+impl Default for EventManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
