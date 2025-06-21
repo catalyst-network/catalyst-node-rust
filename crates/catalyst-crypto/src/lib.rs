@@ -9,19 +9,19 @@ pub mod merkle;
 pub mod proofs;
 pub mod signature;
 
-// Re-exports - fix naming conflicts
+// Re‑exports – resolve naming nicely
 pub use keys::*;
 pub use commitment::*;
 pub use hash::*;
-pub use merkle::{MerkleTree}; // Only export MerkleTree, not MerkleProof
-pub use proofs::*; // This exports the MerkleProof from proofs
+pub use merkle::MerkleTree; // Only export MerkleTree (not MerkleProof)
+pub use proofs::*; // This exports MerkleProof from proofs
 pub use signature::*;
 
 // Type aliases
 pub type Bytes32 = [u8; 32];
 pub type Bytes64 = [u8; 64];
 
-// Custom Hash type (not std::hash::Hash)
+/// Canonical 32‑byte hash wrapper (not std::hash::Hash)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hash(pub Bytes32);
 
@@ -29,7 +29,7 @@ impl Hash {
     pub fn new(bytes: Bytes32) -> Self {
         Self(bytes)
     }
-    
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -50,11 +50,29 @@ pub enum CryptoError {
     HashError,
 }
 
-// Trait for hashable types
+// Trait for hashable data structures
 pub trait Hashable {
     fn crypto_hash(&self) -> Hash;
 }
 
+// ────────────────────────────────────────────────────────────────────────────────
+// Blanket impl so *any* fixed‑size byte array works with `Hashable`.
+// This lets you call `[u8; N]::crypto_hash()` directly in tests & code without
+// first slicing, e.g. `b"hello".crypto_hash()`.
+//
+// We simply coerce the array to a slice and delegate to the existing slice impl,
+// so there’s no duplicated hashing logic.
+//
+// `as_slice()` on arrays has been stable since Rust 1.55.
+// ────────────────────────────────────────────────────────────────────────────────
+impl<const N: usize> Hashable for [u8; N] {
+    #[inline]
+    fn crypto_hash(&self) -> Hash {
+        self.as_slice().crypto_hash()
+    }
+}
+
+// Constants
 pub mod constants {
     pub const HASH_SIZE: usize = 32;
     pub const SIGNATURE_SIZE: usize = 64;

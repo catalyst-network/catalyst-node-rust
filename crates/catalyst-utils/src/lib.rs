@@ -1,19 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// Module declarations - comment out missing modules for Phase 1
-// pub mod encoding;     // TODO: Create for Phase 2
-// pub mod metrics;      // TODO: Create for Phase 2  
-// pub mod time;         // TODO: Create for Phase 2
-// pub mod async_utils;  // TODO: Create for Phase 2
-// pub mod math;         // TODO: Create for Phase 2
+// Add this at the top
+pub mod error;
 
-// Re-exports - comment out for now
-// pub use encoding::*;
-// pub use metrics::*;
-// pub use time::*;
-// pub use async_utils::*;
-// pub use math::*;
+// Add these re-exports at the top
+pub use error::{CatalystError, CatalystResult};
 
 /// System information utilities
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +42,8 @@ impl Default for SystemInfo {
 pub mod utils {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    // ... rest of your utils code stays the same
+    
     /// Get current timestamp in seconds
     pub fn current_timestamp() -> u64 {
         SystemTime::now()
@@ -177,9 +171,9 @@ pub mod errors {
     pub type UtilResult<T> = Result<T, UtilError>;
 
     /// Common utility errors
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub enum UtilError {
-        Io(std::io::Error),
+        Io(String),
         Parse(String),
         Timeout,
         RateLimited,
@@ -202,7 +196,7 @@ pub mod errors {
 
     impl From<std::io::Error> for UtilError {
         fn from(err: std::io::Error) -> Self {
-            UtilError::Io(err)
+            UtilError::Io(err.to_string())
         }
     }
 }
@@ -240,9 +234,11 @@ pub mod network {
     }
 }
 
+// Keep all your existing tests...
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr; // Add this import for the tests
 
     #[test]
     fn test_system_info() {
@@ -296,5 +292,48 @@ mod tests {
         
         let local_ip = std::net::IpAddr::from_str("127.0.0.1").unwrap();
         assert!(network::is_local_ip(&local_ip));
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+    
+    #[test]
+    fn test_error_creation_macros() {
+        let crypto_err = crypto_error!("Invalid key length");
+        match crypto_err {
+            CatalystError::Crypto(msg) => assert_eq!(msg, "Invalid key length"),
+            _ => panic!("Wrong error type"),
+        }
+        
+        let consensus_err = consensus_error!("voting", "Failed to reach threshold");
+        match consensus_err {
+            CatalystError::Consensus { phase, message } => {
+                assert_eq!(phase, "voting");
+                assert_eq!(message, "Failed to reach threshold");
+            },
+            _ => panic!("Wrong error type"),
+        }
+        
+        let timeout_err = timeout_error!(5000, "block proposal");
+        match timeout_err {
+            CatalystError::Timeout { duration_ms, operation } => {
+                assert_eq!(duration_ms, 5000);
+                assert_eq!(operation, "block proposal");
+            },
+            _ => panic!("Wrong error type"),
+        }
+    }
+    
+    #[test]
+    fn test_error_conversion() {
+        let util_err = errors::UtilError::Timeout;
+        let catalyst_err: CatalystError = util_err.into();
+        
+        match catalyst_err {
+            CatalystError::Util(_) => (),
+            _ => panic!("Conversion failed"),
+        }
     }
 }
