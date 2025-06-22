@@ -1,11 +1,30 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// Add this at the top
+// Add ALL module declarations - THIS IS CRITICAL
 pub mod error;
+pub mod logging;
+pub mod metrics;
+pub mod serialization;
+pub mod state;
+pub mod network;
 
-// Add these re-exports at the top
+// Re-export core types that other crates will use
 pub use error::{CatalystError, CatalystResult};
+
+// Re-export important traits that other crates need
+pub use serialization::{CatalystSerialize, CatalystDeserialize, CatalystCodec};
+pub use state::StateManager;
+pub use network::{NetworkMessage, MessageType, MessageEnvelope};
+
+// Common type aliases used across the Catalyst ecosystem
+pub type Hash = [u8; 32];
+pub type Address = [u8; 21];
+pub type PublicKey = [u8; 32];
+pub type Signature = [u8; 64];
+
+// Re-export async_trait since many of our traits use it
+pub use async_trait::async_trait;
 
 /// System information utilities
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,8 +61,6 @@ impl Default for SystemInfo {
 pub mod utils {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    // ... rest of your utils code stays the same
-    
     /// Get current timestamp in seconds
     pub fn current_timestamp() -> u64 {
         SystemTime::now()
@@ -139,31 +156,7 @@ pub mod utils {
     }
 }
 
-/// Logging utilities
-pub mod logging {
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-    /// Initialize logging with default configuration
-    pub fn init_logging() {
-        tracing_subscriber::registry()
-            .with(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "info".into()),
-            )
-            .with(tracing_subscriber::fmt::layer())
-            .init();
-    }
-
-    /// Initialize logging with custom level
-    pub fn init_logging_with_level(level: &str) {
-        tracing_subscriber::registry()
-            .with(tracing_subscriber::EnvFilter::new(level))
-            .with(tracing_subscriber::fmt::layer())
-            .init();
-    }
-}
-
-/// Error handling utilities
+/// Error handling utilities (keeping the existing module)
 pub mod errors {
     use std::fmt;
 
@@ -201,44 +194,11 @@ pub mod errors {
     }
 }
 
-/// Network utilities
-pub mod network {
-    use std::net::{IpAddr, SocketAddr};
-    use std::str::FromStr;
-
-    /// Parse a network address string
-    pub fn parse_address(addr: &str) -> Result<SocketAddr, crate::errors::UtilError> {
-        SocketAddr::from_str(addr)
-            .map_err(|e| crate::errors::UtilError::Parse(e.to_string()))
-    }
-
-    /// Check if an IP address is local
-    pub fn is_local_ip(ip: &IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(ipv4) => {
-                ipv4.is_loopback() || ipv4.is_private() || ipv4.is_link_local()
-            }
-            IpAddr::V6(ipv6) => {
-                ipv6.is_loopback() || ipv6.is_unspecified()
-            }
-        }
-    }
-
-    /// Get local IP addresses
-    pub fn get_local_interfaces() -> Vec<IpAddr> {
-        // Simplified implementation - in production you might use a crate like `local-ip-address`
-        vec![
-            IpAddr::from_str("127.0.0.1").unwrap(),
-            IpAddr::from_str("::1").unwrap(),
-        ]
-    }
-}
-
 // Keep all your existing tests...
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr; // Add this import for the tests
+    use std::str::FromStr;
 
     #[test]
     fn test_system_info() {
@@ -283,15 +243,6 @@ mod tests {
         
         // Should fail when out of tokens
         assert!(!limiter.try_acquire(1));
-    }
-
-    #[test]
-    fn test_network_utils() {
-        let addr = network::parse_address("127.0.0.1:8000").unwrap();
-        assert_eq!(addr.port(), 8000);
-        
-        let local_ip = std::net::IpAddr::from_str("127.0.0.1").unwrap();
-        assert!(network::is_local_ip(&local_ip));
     }
 }
 
