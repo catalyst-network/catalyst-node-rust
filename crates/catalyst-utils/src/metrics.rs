@@ -1,12 +1,11 @@
 // catalyst-utils/src/metrics.rs
 
 use crate::error::{CatalystResult, CatalystError};
-use crate::logging::{LogCategory, LogLevel, get_logger};
+use crate::logging::{LogCategory, LogLevel, get_logger, LogValue};
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::thread;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Types of metrics supported by Catalyst
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -263,7 +262,7 @@ impl Metric {
                 self.updated_at = SystemTime::now();
                 Ok(())
             }
-            _ => Err(CatalystError::InvalidInput(
+            _ => Err(CatalystError::Invalid(
                 "Cannot increment non-counter metric".to_string(),
             )),
         }
@@ -276,7 +275,7 @@ impl Metric {
                 self.updated_at = SystemTime::now();
                 Ok(())
             }
-            _ => Err(CatalystError::InvalidInput(
+            _ => Err(CatalystError::Invalid(
                 "Cannot set gauge on non-gauge metric".to_string(),
             )),
         }
@@ -294,7 +293,7 @@ impl Metric {
                 self.updated_at = SystemTime::now();
                 Ok(())
             }
-            _ => Err(CatalystError::InvalidInput(
+            _ => Err(CatalystError::Invalid(
                 "Cannot observe non-histogram metric".to_string(),
             )),
         }
@@ -307,7 +306,7 @@ impl Metric {
                 self.updated_at = SystemTime::now();
                 Ok(())
             }
-            _ => Err(CatalystError::InvalidInput(
+            _ => Err(CatalystError::Invalid(
                 "Cannot mark rate on non-rate metric".to_string(),
             )),
         }
@@ -380,7 +379,7 @@ impl MetricsRegistry {
     /// Register a new metric
     pub fn register_metric(&mut self, metric: Metric) -> CatalystResult<()> {
         if self.metrics.contains_key(&metric.name) {
-            return Err(CatalystError::InvalidInput(
+            return Err(CatalystError::Invalid(
                 format!("Metric '{}' already registered", metric.name),
             ));
         }
@@ -453,50 +452,52 @@ impl MetricsRegistry {
 
         if let Some(logger) = get_logger() {
             for (name, metric) in &self.metrics {
-                let mut fields = HashMap::new();
-                fields.insert("metric_name".to_string(), name.clone().into());
-                fields.insert("metric_type".to_string(), format!("{:?}", metric.metric_type).into());
-                fields.insert("category".to_string(), metric.category.to_string().into());
+                let mut fields = vec![
+                    ("metric_name", LogValue::String(name.clone())),
+                    ("metric_type", LogValue::String(format!("{:?}", metric.metric_type))),
+                    ("category", LogValue::String(metric.category.to_string())),
+                ];
 
                 // Add node ID if available
                 if let Some(ref node_id) = self.node_id {
-                    fields.insert("node_id".to_string(), node_id.clone().into());
+                    fields.push(("node_id", LogValue::String(node_id.clone())));
                 }
 
                 // Add metric-specific values
                 match &metric.value {
                     MetricValue::Counter(value) => {
-                        fields.insert("value".to_string(), (*value as i64).into());
+                        fields.push(("value", LogValue::Integer(*value as i64)));
                     }
                     MetricValue::Gauge(value) => {
-                        fields.insert("value".to_string(), (*value).into());
+                        fields.push(("value", LogValue::Float(*value)));
                     }
                     MetricValue::Histogram(hist) => {
-                        fields.insert("count".to_string(), (hist.count as i64).into());
-                        fields.insert("sum".to_string(), hist.sum.into());
-                        fields.insert("mean".to_string(), hist.mean().into());
+                        fields.push(("count", LogValue::Integer(hist.count as i64)));
+                        fields.push(("sum", LogValue::Float(hist.sum)));
+                        fields.push(("mean", LogValue::Float(hist.mean())));
                         if let Some(p99) = hist.percentile(99.0) {
-                            fields.insert("p99".to_string(), p99.into());
+                            fields.push(("p99", LogValue::Float(p99)));
                         }
                     }
                     MetricValue::Timer(timer) => {
-                        fields.insert("count".to_string(), (timer.count as i64).into());
-                        fields.insert("mean_duration".to_string(), timer.mean().into());
+                        fields.push(("count", LogValue::Integer(timer.count as i64)));
+                        fields.push(("mean_duration", LogValue::Float(timer.mean())));
                         if let Some(p99) = timer.percentile(99.0) {
-                            fields.insert("p99_duration".to_string(), p99.into());
+                            fields.push(("p99_duration", LogValue::Float(p99)));
                         }
                     }
-                    MetricValue::Rate(rate) => {
+                    MetricValue::Rate(_rate) => {
                         // Note: We need mutable access to get rate, but this is read-only export
-                        fields.insert("rate_info".to_string(), "rate_metric".into());
+                        fields.push(("rate_info", LogValue::String("rate_metric".to_string())));
                     }
                 }
 
+                let field_refs: Vec<(&str, LogValue)> = fields.into_iter().collect();
                 let _ = logger.log_with_fields(
                     LogLevel::Info,
                     LogCategory::Metrics,
                     &format!("Metric export: {}", name),
-                    &fields.into_iter().map(|(k, v)| (k.as_str(), v)).collect::<Vec<_>>(),
+                    &field_refs,
                 );
             }
         }
@@ -507,22 +508,24 @@ impl MetricsRegistry {
 }
 
 /// Global metrics registry
-static mut GLOBAL_METRICS: Option<Arc<Mutex<MetricsRegistry>>> = None;
-static METRICS_INIT: std::sync::Once = std::sync::Once::new();
+static GLOBAL_METRICS: std::sync::Mutex<Option<Arc<Mutex<MetricsRegistry>>>> = std::sync::Mutex::new(None);
 
 /// Initialize the global metrics registry
 pub fn init_metrics() -> CatalystResult<()> {
-    METRICS_INIT.call_once(|| {
-        unsafe {
-            GLOBAL_METRICS = Some(Arc::new(Mutex::new(MetricsRegistry::new())));
-        }
-    });
+    let mut registry = GLOBAL_METRICS.lock()
+        .map_err(|_| CatalystError::Runtime("Failed to acquire metrics lock".to_string()))?;
+    
+    if registry.is_some() {
+        return Err(CatalystError::Runtime("Metrics registry already initialized".to_string()));
+    }
+    
+    *registry = Some(Arc::new(Mutex::new(MetricsRegistry::new())));
     Ok(())
 }
 
 /// Get reference to global metrics registry
 pub fn get_metrics_registry() -> Option<Arc<Mutex<MetricsRegistry>>> {
-    unsafe { GLOBAL_METRICS.clone() }
+    GLOBAL_METRICS.lock().ok()?.clone()
 }
 
 /// Catalyst-specific metric definitions

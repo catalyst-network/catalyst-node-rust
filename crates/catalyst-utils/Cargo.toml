@@ -6,8 +6,11 @@ description = "Utility functions for Catalyst Network"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# Error handling - ADD THIS
+# Error handling
 thiserror = "1.0"
+
+# Async support - REQUIRED for your traits
+async-trait = "0.1"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
