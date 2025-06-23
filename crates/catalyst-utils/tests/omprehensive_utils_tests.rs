@@ -2,7 +2,6 @@
 
 use catalyst_utils::*;
 use catalyst_utils::utils;
-use std::collections::HashMap;
 
 // Test SystemInfo functionality comprehensively
 mod system_info_tests {

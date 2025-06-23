@@ -97,6 +97,16 @@ pub struct Histogram {
 }
 
 impl Histogram {
+
+    // Add these public methods
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    pub fn sum(&self) -> f64 {
+        self.sum
+    }
+    
     pub fn new(config: HistogramConfig) -> Self {
         let mut buckets = HashMap::new();
         for bucket in &config.buckets {
