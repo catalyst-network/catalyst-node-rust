@@ -47,13 +47,43 @@ pub enum CatalystError {
     #[error("Internal error: {0}")]
     Internal(String),
     
-    /// Utility-specific errors (integrate your existing UtilError)
+    /// Utility-specific errors
     #[error("Utility error: {0}")]
-    Util(#[from] crate::errors::UtilError),
+    Util(#[from] UtilError),
 }
 
 /// Standard Result type used across Catalyst
 pub type CatalystResult<T> = Result<T, CatalystError>;
+
+/// Common utility errors (moved from lib.rs to avoid circular dependency)
+#[derive(Debug, Clone)]
+pub enum UtilError {
+    Io(String),
+    Parse(String),
+    Timeout,
+    RateLimited,
+    InvalidInput(String),
+}
+
+impl std::fmt::Display for UtilError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UtilError::Io(err) => write!(f, "IO error: {}", err),
+            UtilError::Parse(msg) => write!(f, "Parse error: {}", msg),
+            UtilError::Timeout => write!(f, "Operation timed out"),
+            UtilError::RateLimited => write!(f, "Rate limited"),
+            UtilError::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for UtilError {}
+
+impl From<std::io::Error> for UtilError {
+    fn from(err: std::io::Error) -> Self {
+        UtilError::Io(err.to_string())
+    }
+}
 
 /// Convenience macros for creating errors
 #[macro_export]

@@ -20,10 +20,18 @@ serde_json = "1.0"
 hex = "0.4"
 rand = "0.8"
 
-# Logging
+# Logging (you're using both tracing and custom logging)
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Network and async runtime
+tokio = { version = "1.0", features = ["full"], optional = true }
+
+# Additional dependencies used in your code
+libp2p = { version = "0.54", optional = true }
+
 [features]
 default = []
-full = []
+full = ["tokio", "libp2p"]
+async = ["tokio"]
+network = ["libp2p"]

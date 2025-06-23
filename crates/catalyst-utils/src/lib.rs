@@ -10,7 +10,7 @@ pub mod state;
 pub mod network;
 
 // Re-export core types that other crates will use
-pub use error::{CatalystError, CatalystResult};
+pub use error::{CatalystError, CatalystResult, UtilError};
 
 // Re-export important traits that other crates need
 pub use serialization::{CatalystSerialize, CatalystDeserialize, CatalystCodec};
@@ -156,44 +156,6 @@ pub mod utils {
     }
 }
 
-/// Error handling utilities (keeping the existing module)
-pub mod errors {
-    use std::fmt;
-
-    /// Generic result type for utilities
-    pub type UtilResult<T> = Result<T, UtilError>;
-
-    /// Common utility errors
-    #[derive(Debug, Clone)]
-    pub enum UtilError {
-        Io(String),
-        Parse(String),
-        Timeout,
-        RateLimited,
-        InvalidInput(String),
-    }
-
-    impl fmt::Display for UtilError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match self {
-                UtilError::Io(err) => write!(f, "IO error: {}", err),
-                UtilError::Parse(msg) => write!(f, "Parse error: {}", msg),
-                UtilError::Timeout => write!(f, "Operation timed out"),
-                UtilError::RateLimited => write!(f, "Rate limited"),
-                UtilError::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
-            }
-        }
-    }
-
-    impl std::error::Error for UtilError {}
-
-    impl From<std::io::Error> for UtilError {
-        fn from(err: std::io::Error) -> Self {
-            UtilError::Io(err.to_string())
-        }
-    }
-}
-
 // Keep all your existing tests...
 #[cfg(test)]
 mod tests {
@@ -279,7 +241,7 @@ mod error_tests {
     
     #[test]
     fn test_error_conversion() {
-        let util_err = errors::UtilError::Timeout;
+        let util_err = UtilError::Timeout;
         let catalyst_err: CatalystError = util_err.into();
         
         match catalyst_err {
