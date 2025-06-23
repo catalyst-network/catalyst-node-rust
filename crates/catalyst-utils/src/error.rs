@@ -85,6 +85,18 @@ impl From<std::io::Error> for UtilError {
     }
 }
 
+impl From<hex::FromHexError> for UtilError {
+    fn from(err: hex::FromHexError) -> Self {
+        UtilError::Parse(format!("Hex decode error: {}", err))
+    }
+}
+
+impl From<hex::FromHexError> for CatalystError {
+    fn from(err: hex::FromHexError) -> Self {
+        CatalystError::Util(UtilError::from(err))
+    }
+}
+
 /// Convenience macros for creating errors
 #[macro_export]
 macro_rules! crypto_error {

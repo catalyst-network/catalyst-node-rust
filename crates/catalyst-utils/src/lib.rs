@@ -13,7 +13,7 @@ pub mod network;
 pub use error::{CatalystError, CatalystResult, UtilError};
 
 // Re-export important traits that other crates need
-pub use serialization::{CatalystSerialize, CatalystDeserialize, CatalystCodec};
+pub use serialization::{CatalystSerialize, CatalystDeserialize, CatalystCodec, SerializationContext, CatalystSerializeWithContext};
 pub use state::StateManager;
 pub use network::{NetworkMessage, MessageType, MessageEnvelope};
 
@@ -160,7 +160,6 @@ pub mod utils {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
 
     #[test]
     fn test_system_info() {

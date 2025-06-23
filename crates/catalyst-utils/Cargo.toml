@@ -24,14 +24,16 @@ rand = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Network and async runtime
-tokio = { version = "1.0", features = ["full"], optional = true }
+# Network and async runtime - make tokio non-optional for examples
+tokio = { version = "1.0", features = ["full"] }
 
 # Additional dependencies used in your code
 libp2p = { version = "0.54", optional = true }
 
+[dev-dependencies]
+tokio-test = "0.4"
+
 [features]
 default = []
-full = ["tokio", "libp2p"]
-async = ["tokio"]
+full = ["libp2p"]
 network = ["libp2p"]
