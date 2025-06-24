@@ -1,8 +1,7 @@
 // examples/serialization_example.rs
 
 use catalyst_utils::*;
-use catalyst_utils::serialization::{self, *};
-use serde::{Serialize, Deserialize};
+use catalyst_utils::serialization::{self};
 
 fn main() -> CatalystResult<()> {
     println!("=== Catalyst Serialization System Example ===\n");
@@ -167,8 +166,8 @@ fn main() -> CatalystResult<()> {
     println!("     V1 format: {} bytes", v1_bytes.len());
     println!("     V2 format: {} bytes", v2_bytes.len());
     
-    let recovered_v1 = ProtocolMessage::deserialize_with_context(&v1_bytes, &ctx_v1)?;
-    let recovered_v2 = ProtocolMessage::deserialize_with_context(&v2_bytes, &ctx_v2)?;
+    let _recovered_v1 = ProtocolMessage::deserialize_with_context(&v1_bytes, &ctx_v1)?;
+    let _recovered_v2 = ProtocolMessage::deserialize_with_context(&v2_bytes, &ctx_v2)?;
     
     println!("     ✓ Context-aware serialization successful");
     println!();
@@ -311,9 +310,7 @@ fn main() -> CatalystResult<()> {
 
     // 7. Utility function usage
     println!("7. Utility function usage:");
-    
-    use std::io::Cursor;
-    
+        
     // Manual serialization using utilities
     let mut buffer = Vec::new();
     serialization::utils::serialize_string(&mut buffer, "Catalyst")?;

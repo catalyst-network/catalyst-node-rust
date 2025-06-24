@@ -12,7 +12,7 @@ use catalyst_core::{
     types::Block,
     traits::{ConsensusProtocol, ConsensusState, ConsensusError},
 };
-use catalyst_crypto::{KeyPair, CryptoSignature, Hash};
+use catalyst_crypto::{KeyPair, Signature, Hash256, blake2b_hash};
 use catalyst_network::{Network, NetworkEvent};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -54,7 +54,7 @@ pub struct CatalystConsensus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProducerInfo {
     pub node_id: NodeId,
-    pub hash_value: Hash,
+    pub hash_value: Hash256,
     pub timestamp: u64,
     pub phase: ConsensusPhase,
 }
@@ -244,10 +244,10 @@ impl CatalystConsensus {
         info!("Executing Construction Phase for cycle {}", cycle.cycle_id);
         
         // Create producer quantity message
-        let hash_value = catalyst_crypto::hash::sha256(&node_id);
+        let hash_value = blake2b_hash(&node_id);
         let message = ConsensusMessage::ProducerQuantity {
             producer_id: node_id,
-            hash_value: hash_value.0,
+            hash_value: *hash_value.as_bytes(),
             cycle_id: cycle.cycle_id,
         };
         
@@ -267,12 +267,12 @@ impl CatalystConsensus {
         info!("Executing Campaigning Phase for cycle {}", cycle.cycle_id);
         
         // Create producer candidate message
-        let candidate_hash = catalyst_crypto::hash::sha256(&[&node_id[..], &cycle.cycle_id.to_le_bytes()].concat());
+        let candidate_hash = blake2b_hash(&[&node_id[..], &cycle.cycle_id.to_le_bytes()].concat());
         let producer_list_hash = [0u8; 32]; // TODO: Calculate actual producer list hash
         
         let message = ConsensusMessage::ProducerCandidate {
             producer_id: node_id,
-            candidate_hash: candidate_hash.0,
+            candidate_hash: *candidate_hash.as_bytes(),
             producer_list_hash,
             cycle_id: cycle.cycle_id,
         };
@@ -293,12 +293,12 @@ impl CatalystConsensus {
         info!("Executing Voting Phase for cycle {}", cycle.cycle_id);
         
         // Create producer vote message
-        let ledger_update_hash = catalyst_crypto::hash::sha256(&cycle.cycle_id.to_le_bytes());
+        let ledger_update_hash = blake2b_hash(&cycle.cycle_id.to_le_bytes());
         let voter_list_hash = [0u8; 32]; // TODO: Calculate actual voter list hash
         
         let message = ConsensusMessage::ProducerVote {
             producer_id: node_id,
-            ledger_update_hash: ledger_update_hash.0,
+            ledger_update_hash: *ledger_update_hash.as_bytes(),
             voter_list_hash,
             cycle_id: cycle.cycle_id,
         };
@@ -348,7 +348,7 @@ impl CatalystConsensus {
                 
                 let producer_info = ProducerInfo {
                     node_id: producer_id,
-                    hash_value: Hash::new(hash_value),
+                    hash_value: Hash256::new(hash_value),
                     timestamp: catalyst_utils::utils::current_timestamp(),
                     phase: ConsensusPhase::Construction,
                 };
@@ -397,7 +397,7 @@ impl CatalystConsensus {
 impl ConsensusProtocol for CatalystConsensus {
     type Block = Block;
     type Proposal = Block;
-    type Vote = CryptoSignature;
+    type Vote = Signature;
 
     async fn propose_block(&mut self, transactions: Vec<Transaction>) -> Result<Self::Proposal, ConsensusError> {
         let state = self.state.read().await;
@@ -453,10 +453,12 @@ impl ConsensusProtocol for CatalystConsensus {
 mod tests {
     use super::*;
     use catalyst_network::MockNetwork;
-
+    use rand::thread_rng;
+    
     #[tokio::test]
     async fn test_consensus_creation() {
-        let keypair = catalyst_crypto::KeyPair::generate();
+        let mut rng = thread_rng();
+        let keypair = catalyst_crypto::KeyPair::generate(&mut rng);
         let node_id = [1u8; 32];
         let network_config = catalyst_network::NetworkConfig::default();
         let network = Arc::new(MockNetwork::new(network_config));

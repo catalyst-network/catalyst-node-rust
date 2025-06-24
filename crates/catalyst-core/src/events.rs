@@ -1,4 +1,4 @@
-use crate::{Address, TxHash, BlockHash, TokenAmount, Timestamp, NodeId, NodeRole};
+use crate::{Address, TxHash, BlockHash, Timestamp, NodeId, NodeRole};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
@@ -279,7 +279,7 @@ impl EventManager {
         }
     }
 
-    pub fn subscribe(&mut self, filter: CatalystEventFilter) -> (u64, EventReceiver<Event>) {
+    pub fn subscribe(&mut self, _filter: CatalystEventFilter) -> (u64, EventReceiver<Event>) {
         let (tx, rx) = mpsc::channel(1000);
         let id = self.next_id;
         self.next_id += 1;

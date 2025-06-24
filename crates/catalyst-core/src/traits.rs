@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::{
-    NodeId, Address, TokenAmount, LedgerCycle,
-    ConsensusMessage, Transaction, ExecutionResult,
+    NodeId, Address,
+    ConsensusMessage, Transaction
 };
 
 /// Core consensus protocol trait

@@ -1,230 +1,133 @@
-use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, Verifier};
-use crate::{CryptoError, Bytes32, Bytes64};
+use crate::{CryptoError, CryptoResult, blake2b_hash};
+use curve25519_dalek::{
+    scalar::Scalar,
+    ristretto::{RistrettoPoint, CompressedRistretto},
+    constants::RISTRETTO_BASEPOINT_POINT,
+};
+use rand::{RngCore, CryptoRng};
+use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
-#[derive(Debug, Clone)]
+pub const PRIVATE_KEY_SIZE: usize = 32;
+pub const PUBLIC_KEY_SIZE: usize = 32;
+
+/// Private key for Curve25519 operations
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct PrivateKey {
-    inner: SigningKey,
-}
-
-// Custom serialization for PrivateKey
-impl serde::Serialize for PrivateKey {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let bytes = self.inner.to_bytes();
-        bytes.to_vec().serialize(serializer)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for PrivateKey {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let bytes: Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
-        if bytes.len() != 32 {
-            return Err(serde::de::Error::custom("Invalid private key length"));
-        }
-        let mut key_bytes = [0u8; 32];
-        key_bytes.copy_from_slice(&bytes);
-        let inner = SigningKey::from_bytes(&key_bytes);
-        Ok(Self { inner })
-    }
+    scalar: Scalar,
+    #[serde(skip)]
+    bytes: [u8; PRIVATE_KEY_SIZE],
 }
 
 impl PrivateKey {
-    pub fn generate() -> Self {
-        let inner = SigningKey::generate(&mut rand::thread_rng());
-        Self { inner }
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
-        if bytes.len() != 32 {
-            return Err(CryptoError::InvalidKey);
-        }
+    /// Generate a new random private key
+    pub fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
+        let mut bytes = [0u8; PRIVATE_KEY_SIZE];
+        rng.fill_bytes(&mut bytes);
         
-        let mut key_bytes = [0u8; 32];
-        key_bytes.copy_from_slice(bytes);
-        
-        let inner = SigningKey::from_bytes(&key_bytes);
-        Ok(Self { inner })
+        let scalar = Scalar::from_bytes_mod_order(bytes);
+        Self { scalar, bytes }
     }
-
-    pub fn to_bytes(&self) -> Bytes32 {
-        self.inner.to_bytes()
+    
+    /// Create from existing bytes
+    pub fn from_bytes(bytes: [u8; PRIVATE_KEY_SIZE]) -> Self {
+        let scalar = Scalar::from_bytes_mod_order(bytes);
+        Self { scalar, bytes }
     }
-
+    
+    /// Get the scalar representation
+    pub fn scalar(&self) -> &Scalar {
+        &self.scalar
+    }
+    
+    /// Convert to bytes (use carefully - exposes private key)
+    pub fn to_bytes(&self) -> [u8; PRIVATE_KEY_SIZE] {
+        self.bytes
+    }
+    
+    /// Derive public key from this private key
     pub fn public_key(&self) -> PublicKey {
-        PublicKey {
-            inner: self.inner.verifying_key(),
-        }
-    }
-
-    pub fn sign(&self, message: &[u8]) -> CryptoSignature {
-        CryptoSignature {
-            inner: self.inner.sign(message),
-        }
+        let point = &self.scalar * &RISTRETTO_BASEPOINT_POINT;
+        PublicKey { point }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl std::fmt::Debug for PrivateKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PrivateKey([REDACTED])")
+    }
+}
+
+/// Public key for Curve25519 operations
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicKey {
-    inner: VerifyingKey,
-}
-
-// Custom serialization for PublicKey
-impl serde::Serialize for PublicKey {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let bytes = self.inner.to_bytes();
-        bytes.to_vec().serialize(serializer)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for PublicKey {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let bytes: Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
-        if bytes.len() != 32 {
-            return Err(serde::de::Error::custom("Invalid public key length"));
-        }
-        let mut key_bytes = [0u8; 32];
-        key_bytes.copy_from_slice(&bytes);
-        match VerifyingKey::from_bytes(&key_bytes) {
-            Ok(inner) => Ok(Self { inner }),
-            Err(_) => Err(serde::de::Error::custom("Invalid public key bytes")),
-        }
-    }
+    point: RistrettoPoint,
 }
 
 impl PublicKey {
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
-        if bytes.len() != 32 {
-            return Err(CryptoError::InvalidKey);
-        }
-        
-        let mut key_bytes = [0u8; 32];
-        key_bytes.copy_from_slice(bytes);
-        
-        match VerifyingKey::from_bytes(&key_bytes) {
-            Ok(inner) => Ok(Self { inner }),
-            Err(_) => Err(CryptoError::InvalidKey),
-        }
+    /// Create from RistrettoPoint
+    pub fn from_point(point: RistrettoPoint) -> Self {
+        Self { point }
     }
-
-    pub fn to_bytes(&self) -> Bytes32 {
-        self.inner.to_bytes()
+    
+    /// Create from compressed bytes
+    pub fn from_bytes(bytes: [u8; PUBLIC_KEY_SIZE]) -> CryptoResult<Self> {
+        let compressed = CompressedRistretto(bytes);
+        let point = compressed.decompress()
+            .ok_or(CryptoError::InvalidKey("Invalid public key encoding".to_string()))?;
+        Ok(Self { point })
     }
-
-    pub fn verify(&self, message: &[u8], signature: &CryptoSignature) -> Result<(), CryptoError> {
-        self.inner
-            .verify(message, &signature.inner)
-            .map_err(|_| CryptoError::SignatureVerificationFailed)
+    
+    /// Get the point representation
+    pub fn point(&self) -> &RistrettoPoint {
+        &self.point
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CryptoSignature {
-    inner: Signature,
-}
-
-// Custom serialization for CryptoSignature
-impl serde::Serialize for CryptoSignature {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let bytes = self.inner.to_bytes();
-        bytes.to_vec().serialize(serializer)
+    
+    /// Convert to compressed bytes
+    pub fn to_bytes(&self) -> [u8; PUBLIC_KEY_SIZE] {
+        self.point.compress().0
+    }
+    
+    /// Generate address from public key (20 bytes from hash)
+    pub fn to_address(&self) -> [u8; 20] {
+        let hash = blake2b_hash(&self.to_bytes());
+        let mut address = [0u8; 20];
+        address.copy_from_slice(&hash.as_bytes()[..20]);
+        address
     }
 }
 
-impl<'de> serde::Deserialize<'de> for CryptoSignature {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let bytes: Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
-        if bytes.len() != 64 {
-            return Err(serde::de::Error::custom("Invalid signature length"));
-        }
-        let mut sig_bytes = [0u8; 64];
-        sig_bytes.copy_from_slice(&bytes);
-        let inner = Signature::from_bytes(&sig_bytes);
-        Ok(Self { inner })
-    }
-}
-
-impl CryptoSignature {
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
-        if bytes.len() != 64 {
-            return Err(CryptoError::InvalidSignature);
-        }
-        
-        let mut sig_bytes = [0u8; 64];
-        sig_bytes.copy_from_slice(bytes);
-        
-        let inner = Signature::from_bytes(&sig_bytes);
-        Ok(Self { inner })
-    }
-
-    pub fn to_bytes(&self) -> Bytes64 {
-        self.inner.to_bytes()
-    }
-}
-
-// Key pair for convenience
+/// Key pair combining private and public keys
 #[derive(Debug, Clone)]
 pub struct KeyPair {
-    pub private_key: PrivateKey,
-    pub public_key: PublicKey,
+    private_key: PrivateKey,
+    public_key: PublicKey,
 }
 
 impl KeyPair {
-    pub fn generate() -> Self {
-        let private_key = PrivateKey::generate();
+    /// Generate a new random key pair
+    pub fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
+        let private_key = PrivateKey::generate(rng);
         let public_key = private_key.public_key();
-        
-        Self {
-            private_key,
-            public_key,
-        }
+        Self { private_key, public_key }
     }
     
-    pub fn sign(&self, message: &[u8]) -> CryptoSignature {
-        self.private_key.sign(message)
+    /// Create from existing private key
+    pub fn from_private_key(private_key: PrivateKey) -> Self {
+        let public_key = private_key.public_key();
+        Self { private_key, public_key }
+    }
+    
+    /// Get the private key
+    pub fn private_key(&self) -> &PrivateKey {
+        &self.private_key
+    }
+    
+    /// Get the public key
+    pub fn public_key(&self) -> &PublicKey {
+        &self.public_key
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_key_generation() {
-        let keypair = KeyPair::generate();
-        let message = b"test message";
-        
-        let signature = keypair.sign(message);
-        assert!(keypair.public_key.verify(message, &signature).is_ok());
-    }
-
-    #[test]
-    fn test_key_serialization() {
-        let keypair = KeyPair::generate();
-        
-        let private_bytes = keypair.private_key.to_bytes();
-        let public_bytes = keypair.public_key.to_bytes();
-        
-        let restored_private = PrivateKey::from_bytes(&private_bytes).unwrap();
-        let restored_public = PublicKey::from_bytes(&public_bytes).unwrap();
-        
-        assert_eq!(keypair.public_key.to_bytes(), restored_public.to_bytes());
-        assert_eq!(restored_private.public_key().to_bytes(), restored_public.to_bytes());
-    }
-}
+/// Curve25519 key pair implementation as specified
+pub type Curve25519KeyPair = KeyPair;
