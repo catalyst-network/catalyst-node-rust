@@ -10,6 +10,7 @@ catalyst-core = { path = "../catalyst-core" }
 catalyst-crypto = { path = "../catalyst-crypto" }
 catalyst-network = { path = "../catalyst-network" }
 catalyst-utils = { path = "../catalyst-utils" }
+rand = "0.8"
 
 # Async support
 tokio = { version = "1.0", features = ["full"] }

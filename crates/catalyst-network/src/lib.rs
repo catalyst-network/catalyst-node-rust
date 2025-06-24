@@ -256,6 +256,7 @@ impl Default for NetworkConfig {
 pub struct MockNetwork {
     config: NetworkConfig,
     peers: HashMap<NodeId, PeerInfo>,
+    #[allow(dead_code)]
     event_sender: Option<mpsc::Sender<NetworkEvent>>,
     is_started: bool,
 }

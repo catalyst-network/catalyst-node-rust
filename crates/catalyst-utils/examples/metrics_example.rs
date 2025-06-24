@@ -60,7 +60,7 @@ fn main() -> CatalystResult<()> {
     
     // Manual timing
     {
-        let mut reg = registry.lock().unwrap();
+        let reg = registry.lock().unwrap();
         let timer = reg.start_timer("consensus_phase_duration", registry.clone());
         
         // Simulate consensus phase work
