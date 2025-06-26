@@ -1,0 +1,309 @@
+# Catalyst Network Development Configuration
+
+[network]
+name = "devnet"
+p2p_port = 7000
+api_port = 8080
+max_peers = 20
+min_peers = 3
+connection_timeout_ms = 5000
+heartbeat_interval_ms = 30000
+max_message_size = 1048576  # 1MB
+ipv6_enabled = true
+bootstrap_peers = [
+    "127.0.0.1:7001",
+    "127.0.0.1:7002"
+]
+
+[network.discovery]
+enabled = true
+discovery_interval_ms = 10000
+max_discovery_peers = 5
+discovery_timeout_ms = 3000
+
+[network.bandwidth]
+enabled = false
+max_upload_bps = null
+max_download_bps = null
+burst_allowance = 1048576  # 1MB
+
+[consensus]
+cycle_duration_ms = 15000  # 15 seconds for fast development
+construction_phase_ms = 3750
+campaigning_phase_ms = 3750
+voting_phase_ms = 3750
+synchronization_phase_ms = 3750
+producer_count = 5
+supermajority_threshold = 0.67
+statistical_confidence = 0.99
+min_producers = 3
+max_transaction_batch_size = 100
+
+[consensus.worker_pool]
+max_worker_pool_size = 20
+min_worker_score = 0.5
+worker_pass_duration_ms = 3600000  # 1 hour
+resource_proof_required = false
+
+[consensus.worker_pool.scoring]
+uptime_weight = 0.3
+resource_weight = 0.3
+participation_weight = 0.4
+history_decay_factor = 0.95
+
+[consensus.producer_selection]
+use_pseudo_random_selection = true
+rotation_strategy = "WeightedRandom"
+min_selection_interval_ms = 60000  # 1 minute
+geographic_distribution_enabled = false
+
+[consensus.security]
+max_byzantine_ratio = 0.33
+strict_validation = false
+producer_quantity_timeout_ms = 2000
+candidate_timeout_ms = 2000
+vote_timeout_ms = 2000
+max_clock_drift_ms = 1000
+anti_spam_enabled = false
+
+[crypto]
+curve = "Curve25519"
+hash_algorithm = "Blake2b256"
+signature_scheme = "MuSig"
+
+[crypto.key_derivation]
+key_size_bits = 256
+deterministic = false
+kdf = "Pbkdf2"
+iterations = 1000  # Lower for development
+salt_size = 32
+
+[crypto.signature_aggregation]
+enabled = true
+max_signatures_per_aggregation = 100
+aggregation_timeout_ms = 1000
+batch_aggregation = true
+parallel_verification = true
+
+[crypto.confidential_transactions]
+enabled = false  # Disabled for development simplicity
+range_proof_system = "Bulletproofs"
+blinding_factor_size = 32
+optimize_proof_size = false
+batch_verification = false
+
+[crypto.random_generation]
+rng_type = "SystemRng"
+entropy_source = "System"
+seed_size = 32
+use_hardware_rng = false
+
+[crypto.security]
+constant_time_operations = false  # Relaxed for development
+secure_memory_cleanup = false
+side_channel_resistance = false
+key_refresh_interval_ms = null
+max_key_usage_count = null
+additional_checks = false
+
+[storage]
+[storage.database]
+db_type = "RocksDb"
+data_directory = "./data/devnet"
+max_db_size_bytes = 1073741824  # 1GB
+write_buffer_size = 67108864  # 64MB
+block_cache_size = 134217728  # 128MB
+background_threads = 2
+compression_enabled = false
+compression_type = "None"
+
+[storage.database.rocksdb]
+wal_enabled = true
+wal_size_limit = 67108864  # 64MB
+max_write_buffer_number = 3
+target_file_size_base = 67108864  # 64MB
+bloom_filter_enabled = false
+bloom_filter_bits_per_key = 10
+level_compaction_dynamic_level_bytes = false
+
+[storage.state_management]
+[storage.state_management.ledger_structure]
+cls_memory_size = 10485760  # 10MB
+recent_updates_count = 100
+historical_threshold_cycles = 1000
+snapshot_interval_cycles = 100
+
+[storage.state_management.partitioning]
+account_type_partitioning = true
+non_confidential_partition_size = 1000
+confidential_partition_size = 1000
+contract_partition_size = 1000
+geographic_partitioning = false
+
+[storage.dfs]
+enabled = false  # Disabled for development simplicity
+dfs_type = "Local"
+cache_directory = "./data/devnet/dfs"
+max_cache_size_bytes = 104857600  # 100MB
+replication_factor = 1
+
+[storage.cache]
+enabled = true
+cache_type = "Memory"
+max_cache_size_bytes = 52428800  # 50MB
+eviction_policy = "Lru"
+ttl_seconds = 3600
+
+[storage.backup]
+enabled = false
+backup_interval_seconds = 3600
+backup_directory = "./backups/devnet"
+retention_count = 5
+compression_enabled = false
+encryption_enabled = false
+
+[service_bus]
+enabled = true
+
+[service_bus.websocket]
+port = 9090
+bind_address = "127.0.0.1"
+max_connections = 100
+connection_timeout_ms = 30000
+heartbeat_interval_ms = 30000
+max_message_size = 1048576  # 1MB
+
+[service_bus.websocket.compression]
+enabled = false
+algorithm = "Gzip"
+level = 6
+min_size_bytes = 1024
+
+[service_bus.rest_api]
+port = 8081
+bind_address = "127.0.0.1"
+max_request_size = 1048576  # 1MB
+request_timeout_ms = 10000
+cors_enabled = true
+cors_origins = ["*"]
+
+[service_bus.rest_api.versioning]
+default_version = "v1"
+supported_versions = ["v1"]
+version_header = "X-API-Version"
+version_in_path = true
+
+[service_bus.event_processing]
+[service_bus.event_processing.buffer]
+size = 1000
+buffer_type = "RingBuffer"
+overflow_behavior = "DropOldest"
+flush_interval_ms = 1000
+max_batch_size = 100
+
+[service_bus.auth]
+enabled = false
+methods = ["ApiKey"]
+
+[service_bus.auth.jwt]
+secret_key = "dev_secret_key_change_in_production"
+expiration_seconds = 3600
+issuer = "catalyst-devnet"
+audience = "catalyst-clients"
+algorithm = "HS256"
+
+[service_bus.rate_limiting]
+enabled = false
+
+[logging]
+level = "Debug"
+format = "Text"
+
+[[logging.outputs]]
+output_type = { Console = { use_stderr = false } }
+min_level = "Debug"
+
+[[logging.outputs]]
+output_type = { File = { path = "./logs/devnet/catalyst.log", append = true } }
+min_level = "Info"
+format_override = "Json"
+buffer_size = 8192
+flush_interval_ms = 1000
+
+[logging.structured]
+enabled = true
+
+[logging.structured.node_identification]
+include_node_id = true
+include_network_name = true
+include_node_type = true
+include_version = true
+
+[logging.rotation]
+enabled = true
+strategy = "Size"
+max_file_size_bytes = 104857600  # 100MB
+max_archived_files = 5
+compress_archived = false
+
+[logging.performance]
+async_logging = true
+async_worker_threads = 2
+async_queue_size = 10000
+
+[logging.performance.buffering]
+enabled = true
+buffer_size_bytes = 8192
+flush_interval_ms = 1000
+flush_on_critical = true
+
+[metrics]
+enabled = true
+
+[metrics.server]
+port = 9091
+bind_address = "127.0.0.1"
+endpoint_path = "/metrics"
+auth_enabled = false
+request_timeout_ms = 10000
+compression_enabled = false
+
+[metrics.collection]
+collection_interval_seconds = 15
+high_frequency_enabled = false
+categories = ["Consensus", "Network", "Transaction", "System"]
+
+[metrics.collection.node_metrics]
+include_node_id = true
+include_network_name = true
+include_node_type = true
+track_uptime = true
+include_version_info = true
+
+[metrics.collection.system_metrics]
+cpu_enabled = true
+memory_enabled = true
+disk_io_enabled = true
+network_io_enabled = true
+system_load_enabled = true
+
+[metrics.collection.application_metrics.catalyst_metrics]
+consensus_cycles = true
+producer_selection = true
+transaction_throughput = true
+network_peers = true
+worker_pool = true
+ledger_state = true
+
+[metrics.storage]
+backend = "Memory"
+[metrics.storage.retention]
+default_retention_seconds = 86400  # 1 day
+
+[metrics.export]
+enabled = false
+format = "Prometheus"
+interval_seconds = 60
+
+[metrics.alerting]
+enabled = false

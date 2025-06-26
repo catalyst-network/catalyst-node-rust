@@ -1,0 +1,16 @@
+[network]
+name = "mainnet"
+p2p_port = 7000
+api_port = 8080
+max_peers = 200
+
+[consensus]
+cycle_duration_ms = 60000  # 60 seconds
+construction_phase_ms = 15000
+campaigning_phase_ms = 15000
+voting_phase_ms = 15000
+synchronization_phase_ms = 15000
+producer_count = 200  # Production size
+supermajority_threshold = 0.67
+
+# ... etc

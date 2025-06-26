@@ -1,0 +1,759 @@
+# Catalyst Network Configuration Template
+# This file demonstrates all available configuration options
+# Copy and modify for your specific network setup
+
+# =============================================================================
+# NETWORK CONFIGURATION
+# =============================================================================
+[network]
+# Network identifier (devnet, testnet, mainnet)
+name = "example"
+
+# P2P networking configuration
+p2p_port = 7000
+api_port = 8080
+max_peers = 50
+min_peers = 5
+connection_timeout_ms = 10000
+heartbeat_interval_ms = 30000
+max_message_size = 2097152  # 2MB
+ipv6_enabled = true
+
+# Bootstrap peer addresses for initial network connection
+bootstrap_peers = [
+    "seed1.catalyst.network:7000",
+    "seed2.catalyst.network:7000",
+    "127.0.0.1:7001"  # Local peer for development
+]
+
+# Peer discovery configuration
+[network.discovery]
+enabled = true
+discovery_interval_ms = 15000
+max_discovery_peers = 10
+discovery_timeout_ms = 5000
+
+# Bandwidth management
+[network.bandwidth]
+enabled = true
+max_upload_bps = 52428800      # 50 MB/s
+max_download_bps = 104857600   # 100 MB/s
+burst_allowance = 10485760     # 10MB burst
+
+# =============================================================================
+# CONSENSUS CONFIGURATION
+# =============================================================================
+[consensus]
+# 4-phase collaborative consensus timing
+cycle_duration_ms = 30000      # Total cycle: 30 seconds
+construction_phase_ms = 7500   # Phase 1: Construction
+campaigning_phase_ms = 7500    # Phase 2: Campaigning
+voting_phase_ms = 7500         # Phase 3: Voting
+synchronization_phase_ms = 7500 # Phase 4: Synchronization
+
+# Producer and worker configuration
+producer_count = 50
+supermajority_threshold = 0.67
+statistical_confidence = 0.999
+min_producers = 10
+max_transaction_batch_size = 1000
+
+# Worker pool management
+[consensus.worker_pool]
+max_worker_pool_size = 200
+min_worker_score = 0.7
+worker_pass_duration_ms = 7200000  # 2 hours
+resource_proof_required = true
+
+# Scoring algorithm for worker selection
+[consensus.worker_pool.scoring]
+uptime_weight = 0.3
+resource_weight = 0.3
+participation_weight = 0.4
+history_decay_factor = 0.98
+
+# Producer selection configuration
+[consensus.producer_selection]
+use_pseudo_random_selection = true
+rotation_strategy = "WeightedRandom"
+min_selection_interval_ms = 300000  # 5 minutes
+geographic_distribution_enabled = true
+
+# Security settings for consensus
+[consensus.security]
+max_byzantine_ratio = 0.33
+strict_validation = true
+producer_quantity_timeout_ms = 5000
+candidate_timeout_ms = 5000
+vote_timeout_ms = 5000
+max_clock_drift_ms = 500
+anti_spam_enabled = true
+
+# =============================================================================
+# CRYPTOGRAPHIC CONFIGURATION
+# =============================================================================
+[crypto]
+# Core cryptographic algorithms (as per Catalyst specification)
+curve = "Curve25519"
+hash_algorithm = "Blake2b256"
+signature_scheme = "MuSig"
+
+# Key derivation settings
+[crypto.key_derivation]
+key_size_bits = 256
+deterministic = false
+kdf = "Argon2"
+iterations = 50000
+salt_size = 32
+
+# MuSig signature aggregation
+[crypto.signature_aggregation]
+enabled = true
+max_signatures_per_aggregation = 500
+aggregation_timeout_ms = 2000
+batch_aggregation = true
+parallel_verification = true
+
+# Confidential transactions using Pedersen Commitments
+[crypto.confidential_transactions]
+enabled = true
+range_proof_system = "Bulletproofs"
+blinding_factor_size = 32
+optimize_proof_size = true
+batch_verification = true
+
+# Random number generation
+[crypto.random_generation]
+rng_type = "ChaCha20"
+entropy_source = "Combined"
+seed_size = 32
+use_hardware_rng = true
+
+# Security hardening
+[crypto.security]
+constant_time_operations = true
+secure_memory_cleanup = true
+side_channel_resistance = true
+key_refresh_interval_ms = 3600000  # 1 hour
+max_key_usage_count = 10000
+additional_checks = true
+
+# =============================================================================
+# STORAGE CONFIGURATION
+# =============================================================================
+[storage]
+# Database configuration
+[storage.database]
+db_type = "RocksDb"
+data_directory = "./data/catalyst"
+max_db_size_bytes = 10737418240  # 10GB
+write_buffer_size = 134217728    # 128MB
+block_cache_size = 268435456     # 256MB
+background_threads = 4
+compression_enabled = true
+compression_type = "Snappy"
+
+# RocksDB specific settings
+[storage.database.rocksdb]
+wal_enabled = true
+wal_size_limit = 134217728       # 128MB
+max_write_buffer_number = 4
+target_file_size_base = 67108864 # 64MB
+bloom_filter_enabled = true
+bloom_filter_bits_per_key = 10
+level_compaction_dynamic_level_bytes = true
+
+# Three-level ledger structure
+[storage.state_management]
+[storage.state_management.ledger_structure]
+cls_memory_size = 20971520       # 20MB
+recent_updates_count = 1000
+historical_threshold_cycles = 5000
+snapshot_interval_cycles = 500
+
+# Account type partitioning
+[storage.state_management.partitioning]
+account_type_partitioning = true
+non_confidential_partition_size = 10000
+confidential_partition_size = 5000
+contract_partition_size = 2000
+geographic_partitioning = true
+
+# State synchronization
+[storage.state_management.synchronization]
+sync_batch_size = 500
+max_concurrent_syncs = 10
+sync_timeout_ms = 30000
+incremental_sync = true
+diff_compression = true
+
+# Merkle tree configuration
+[storage.state_management.merkle_tree]
+branching_factor = 16
+cache_size = 5000
+pruning_enabled = true
+pruning_threshold_cycles = 10000
+
+# Distributed File System (DFS)
+[storage.dfs]
+enabled = true
+dfs_type = "Ipfs"
+cache_directory = "./data/catalyst/dfs"
+max_cache_size_bytes = 2147483648  # 2GB
+replication_factor = 3
+
+# IPFS configuration
+[storage.dfs.ipfs]
+api_endpoint = "http://127.0.0.1:5001"
+gateway_endpoint = "http://127.0.0.1:8080"
+clustering_enabled = true
+swarm_key = null  # Set for private networks
+pin_important_content = true
+
+[storage.dfs.ipfs.gc_settings]
+auto_gc_enabled = true
+gc_interval_seconds = 3600
+storage_threshold_percent = 85.0
+
+# Content addressing
+[storage.dfs.content_addressing]
+hash_function = "blake2b-256"
+chunk_size = 262144  # 256KB
+deduplication_enabled = true
+encryption_enabled = false
+
+# Caching configuration
+[storage.cache]
+enabled = true
+cache_type = "Hybrid"
+max_cache_size_bytes = 536870912  # 512MB
+eviction_policy = "Lru"
+ttl_seconds = 3600
+
+[storage.cache.layers]
+l1_size_bytes = 134217728   # 128MB (hot data)
+l2_size_bytes = 268435456   # 256MB (warm data)
+l3_size_bytes = 134217728   # 128MB (cold data)
+promotion_threshold = 0.8
+
+# Backup configuration
+[storage.backup]
+enabled = true
+backup_interval_seconds = 86400  # Daily
+backup_directory = "./backups/catalyst"
+retention_count = 7
+compression_enabled = true
+encryption_enabled = true
+
+# Security settings
+[storage.security]
+encryption_at_rest = true
+encryption_algorithm = "AES-256-GCM"
+key_rotation_interval_seconds = 86400  # Daily
+integrity_checks = true
+secure_deletion = true
+
+[storage.security.access_control]
+enabled = true
+file_permissions = 0o600
+directory_permissions = 0o700
+
+# =============================================================================
+# SERVICE BUS CONFIGURATION (Web2 Integration)
+# =============================================================================
+[service_bus]
+enabled = true
+
+# WebSocket server for real-time events
+[service_bus.websocket]
+port = 9090
+bind_address = "0.0.0.0"
+max_connections = 1000
+connection_timeout_ms = 30000
+heartbeat_interval_ms = 30000
+max_message_size = 1048576  # 1MB
+
+[service_bus.websocket.compression]
+enabled = true
+algorithm = "Gzip"
+level = 6
+min_size_bytes = 1024
+
+# REST API server
+[service_bus.rest_api]
+port = 8081
+bind_address = "0.0.0.0"
+max_request_size = 2097152  # 2MB
+request_timeout_ms = 30000
+cors_enabled = true
+cors_origins = ["*"]
+
+[service_bus.rest_api.versioning]
+default_version = "v1"
+supported_versions = ["v1", "v2"]
+version_header = "X-API-Version"
+version_in_path = true
+
+# Event processing pipeline
+[service_bus.event_processing]
+[service_bus.event_processing.buffer]
+size = 10000
+buffer_type = "RingBuffer"
+overflow_behavior = "DropOldest"
+flush_interval_ms = 1000
+max_batch_size = 500
+
+[service_bus.event_processing.filtering]
+enabled = true
+default_filters = []
+max_filters_per_client = 20
+
+[service_bus.event_processing.filtering.complexity_limits]
+max_conditions = 20
+max_nesting_depth = 5
+max_execution_time_us = 5000
+
+[service_bus.event_processing.transformation]
+enabled = true
+available_transformations = ["JsonTransform", "FieldMapping"]
+max_transformations_per_event = 5
+transformation_timeout_ms = 1000
+
+[service_bus.event_processing.replay]
+enabled = true
+max_replay_duration_hours = 24
+max_events_per_replay = 10000
+replay_rate_limit = 1000
+caching_enabled = true
+
+[service_bus.event_processing.persistence]
+enabled = true
+retention_hours = 168  # 7 days
+storage_backend = "Database"
+compression_enabled = true
+persistence_batch_size = 1000
+
+# Authentication and authorization
+[service_bus.auth]
+enabled = true
+methods = ["JWT", "ApiKey"]
+
+[service_bus.auth.jwt]
+secret_key = "your-secret-key-change-in-production"
+expiration_seconds = 3600
+issuer = "catalyst-network"
+audience = "catalyst-clients"
+algorithm = "HS256"
+
+[service_bus.auth.api_keys]
+key_length = 32
+expiration_seconds = null  # No expiration
+rotation_enabled = false
+storage_backend = "database"
+
+[service_bus.auth.sessions]
+timeout_seconds = 3600
+storage = "Redis"
+secure_cookies = true
+same_site_policy = "Strict"
+
+# Rate limiting
+[service_bus.rate_limiting]
+enabled = true
+
+[service_bus.rate_limiting.global_limits]
+requests_per_second = 5000
+burst_allowance = 1000
+connections_per_second = 100
+events_per_second = 10000
+
+[service_bus.rate_limiting.per_client_limits]
+requests_per_minute = 1000
+events_per_minute = 5000
+max_concurrent_connections = 10
+data_transfer_per_minute = 10485760  # 10MB
+
+# =============================================================================
+# LOGGING CONFIGURATION
+# =============================================================================
+[logging]
+level = "Info"
+format = "Json"
+
+# Multiple output destinations
+[[logging.outputs]]
+output_type = { Console = { use_stderr = false } }
+min_level = "Info"
+format_override = "Text"
+
+[[logging.outputs]]
+output_type = { File = { path = "./logs/catalyst.log", append = true } }
+min_level = "Debug"
+format_override = "Json"
+buffer_size = 16384
+flush_interval_ms = 5000
+
+[[logging.outputs]]
+output_type = { Syslog = { facility = "daemon", hostname = null } }
+min_level = "Error"
+
+# Category-specific log levels
+[[logging.category_levels]]
+category = "catalyst_consensus"
+level = "Debug"
+enabled = true
+
+[[logging.category_levels]]
+category = "catalyst_network"
+level = "Info"
+enabled = true
+
+[[logging.category_levels]]
+category = "catalyst_crypto"
+level = "Warn"
+enabled = true
+
+# Structured logging
+[logging.structured]
+enabled = true
+
+# Default fields included in all log entries
+[[logging.structured.default_fields]]
+name = "timestamp"
+source = { System = "Timestamp" }
+required = true
+
+[[logging.structured.default_fields]]
+name = "node_id"
+source = { Node = "NodeId" }
+required = true
+
+[[logging.structured.default_fields]]
+name = "network"
+source = { Node = "NetworkName" }
+required = true
+
+# Node identification in logs
+[logging.structured.node_identification]
+include_node_id = true
+include_network_name = true
+include_node_type = true
+include_version = true
+
+# Context tracking for debugging
+[logging.structured.context_tracking]
+enabled = true
+track_consensus_cycles = true
+track_transaction_flows = true
+track_network_events = true
+max_context_depth = 15
+context_retention_seconds = 7200
+
+# Sensitive data filtering
+[logging.structured.sensitive_data]
+filtering_enabled = true
+redacted_fields = ["private_key", "secret", "password", "token"]
+redacted_patterns = [
+    "sk[a-fA-F0-9]{64}",  # Private keys
+    "\\b(?:[0-9]{1,3}\\.){3}[0-9]{1,3}\\b"  # IP addresses
+]
+redaction_text = "[REDACTED]"
+anonymize_ip_addresses = true
+
+# Log rotation
+[logging.rotation]
+enabled = true
+strategy = "SizeAndTime"
+max_file_size_bytes = 104857600  # 100MB
+max_archived_files = 10
+compress_archived = true
+
+[logging.rotation.schedule]
+frequency = "Daily"
+daily_hour = 2  # 2 AM
+weekly_day = null
+monthly_day = null
+
+# Performance optimization
+[logging.performance]
+async_logging = true
+async_worker_threads = 4
+async_queue_size = 50000
+
+[logging.performance.batching]
+enabled = true
+max_batch_size = 1000
+max_wait_time_ms = 100
+compression_enabled = true
+
+[logging.performance.buffering]
+enabled = true
+buffer_size_bytes = 16384
+flush_interval_ms = 1000
+flush_on_critical = true
+
+[logging.performance.sampling]
+enabled = true
+default_rate = 1.0
+
+[[logging.performance.sampling.rules]]
+category_pattern = "catalyst_network::gossip"
+level = "Debug"
+rate = 0.1  # Sample 10% of debug network gossip logs
+burst_allowance = 10
+
+# =============================================================================
+# METRICS CONFIGURATION
+# =============================================================================
+[metrics]
+enabled = true
+
+# Metrics server (Prometheus-compatible)
+[metrics.server]
+port = 9091
+bind_address = "0.0.0.0"
+endpoint_path = "/metrics"
+auth_enabled = true
+auth_token = "metrics-secret-token"
+request_timeout_ms = 30000
+compression_enabled = true
+
+# Collection settings
+[metrics.collection]
+collection_interval_seconds = 30
+high_frequency_enabled = true
+high_frequency_interval_ms = 1000
+categories = [
+    "Consensus",
+    "Network", 
+    "Transaction",
+    "Storage",
+    "Crypto",
+    "Runtime",
+    "ServiceBus",
+    "System"
+]
+
+# Node identification in metrics
+[metrics.collection.node_metrics]
+include_node_id = true
+include_network_name = true
+include_node_type = true
+include_geographic_info = true
+track_uptime = true
+include_version_info = true
+
+# System resource metrics
+[metrics.collection.system_metrics]
+cpu_enabled = true
+memory_enabled = true
+disk_io_enabled = true
+network_io_enabled = true
+file_descriptors_enabled = true
+system_load_enabled = true
+
+[metrics.collection.system_metrics.process_metrics]
+cpu_usage = true
+memory_usage = true
+thread_count = true
+fd_count = true
+start_time = true
+
+# Application-specific metrics
+[metrics.collection.application_metrics.catalyst_metrics]
+consensus_cycles = true
+producer_selection = true
+transaction_throughput = true
+network_peers = true
+dfs_storage = true
+worker_pool = true
+ledger_state = true
+
+[metrics.collection.application_metrics.performance_metrics]
+response_times = true
+throughput = true
+queue_depths = true
+cache_metrics = true
+database_performance = true
+gc_metrics = true
+
+[metrics.collection.application_metrics.health_metrics]
+error_rates = true
+availability = true
+health_checks = true
+alerts = true
+sla_compliance = true
+
+# Storage configuration
+[metrics.storage]
+backend = { TimeSeries = "Prometheus" }
+
+[metrics.storage.local]
+directory = "./data/metrics"
+max_size_bytes = 1073741824  # 1GB
+file_format = "Json"
+compression_enabled = true
+
+[metrics.storage.tsdb]
+url = "http://prometheus:9090"
+database = "catalyst_metrics"
+username = "catalyst"
+password = "metrics-password"
+connection_timeout_ms = 10000
+query_timeout_ms = 60000
+max_connections = 20
+batch_size = 5000
+flush_interval_seconds = 10
+
+# Retention policies
+[metrics.storage.retention]
+default_retention_seconds = 2592000  # 30 days
+high_frequency_retention_seconds = 86400  # 1 day
+aggregated_retention_seconds = 31536000  # 1 year
+
+[[metrics.storage.retention.category_policies]]
+category = "System"
+retention_seconds = 604800  # 1 week
+
+[[metrics.storage.retention.category_policies.aggregation]]
+interval_seconds = 300  # 5 minutes
+functions = ["Average", "Max"]
+keep_raw_data = false
+
+# Export targets
+[metrics.export]
+enabled = true
+format = "Prometheus"
+interval_seconds = 60
+
+[[metrics.export.targets]]
+name = "prometheus_push"
+enabled = true
+target_type = { Prometheus = { gateway_url = "http://pushgateway:9091", job = "catalyst" } }
+
+[[metrics.export.targets]]
+name = "influxdb"
+enabled = true
+target_type = { InfluxDb = { url = "http://influxdb:8086", database = "catalyst", token = "influx-token" } }
+
+[metrics.export.targets.filter]
+include_metrics = ["catalyst_*"]
+exclude_metrics = ["catalyst_debug_*"]
+
+[metrics.export.batch_config]
+enabled = true
+max_batch_size = 5000
+max_wait_time_ms = 10000
+compression_enabled = true
+
+# Alerting configuration
+[metrics.alerting]
+enabled = true
+
+[[metrics.alerting.rules]]
+name = "high_error_rate"
+description = "Error rate is too high"
+metric = "catalyst_error_rate"
+evaluation_interval_seconds = 60
+severity = "Warning"
+channels = ["slack", "email"]
+labels = [["team", "infrastructure"]]
+
+[metrics.alerting.rules.condition]
+Threshold = { operator = "GreaterThan", value = 0.05 }
+
+[[metrics.alerting.rules]]
+name = "consensus_failure"
+description = "Consensus cycle has failed"
+metric = "catalyst_consensus_failures_total"
+evaluation_interval_seconds = 30
+severity = "Critical"
+channels = ["pagerduty"]
+
+[metrics.alerting.rules.condition]
+RateOfChange = { operator = "GreaterThan", value = 0.1, duration_seconds = 300 }
+
+# Alert channels
+[[metrics.alerting.channels]]
+name = "slack"
+channel_type = "Slack"
+enabled = true
+
+[metrics.alerting.channels.config]
+settings = { webhook_url = "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK", channel = "#alerts" }
+message_template = "🚨 Alert: {{ .AlertName }} - {{ .Description }}"
+
+[metrics.alerting.channels.config.retry]
+max_attempts = 3
+delay_ms = 1000
+backoff_multiplier = 2.0
+
+[[metrics.alerting.channels]]
+name = "pagerduty"
+channel_type = "PagerDuty"
+enabled = true
+
+[metrics.alerting.channels.config]
+settings = { integration_key = "your-pagerduty-integration-key" }
+
+# Performance optimization
+[metrics.performance]
+optimization_enabled = true
+
+[metrics.performance.sampling]
+enabled = true
+default_rate = 1.0
+
+[[metrics.performance.sampling.rules]]
+metric_pattern = "catalyst_network_*"
+rate = 0.5
+burst_allowance = 100
+
+[metrics.performance.aggregation]
+enabled = true
+window_seconds = 60
+functions = ["Average", "Sum", "Max"]
+keep_raw = false
+
+[metrics.performance.memory_management]
+max_memory_bytes = 268435456  # 256MB
+cleanup_interval_seconds = 300
+pressure_threshold = 0.8
+pooling_enabled = true
+
+[metrics.performance.concurrency]
+worker_threads = 8
+queue_size = 50000
+lock_free_enabled = true
+batch_size = 1000
+
+# Custom metrics
+[metrics.custom_metrics]
+enabled = true
+
+[[metrics.custom_metrics.definitions]]
+name = "custom_business_metric"
+description = "Custom business KPI"
+metric_type = "Gauge"
+labels = ["region", "service"]
+source = { Http = { url = "http://internal-api/metrics" } }
+
+[metrics.custom_metrics.dynamic_creation]
+enabled = true
+max_dynamic_metrics = 10000
+metric_lifetime_seconds = 3600
+gc_enabled = true
+
+# =============================================================================
+# EXAMPLE ENVIRONMENT VARIABLE OVERRIDES
+# =============================================================================
+# You can override any configuration value using environment variables:
+#
+# CATALYST_NETWORK=testnet
+# CATALYST_NETWORK_P2P_PORT=7001
+# CATALYST_CONSENSUS_PRODUCER_COUNT=25
+# CATALYST_STORAGE_DATA_DIRECTORY=/var/lib/catalyst
+# CATALYST_METRICS_ENABLED=true
+# CATALYST_LOG_LEVEL=debug
+#
+# See the documentation for the complete list of environment variables.
