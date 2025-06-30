@@ -6,7 +6,6 @@
 //! 3. Voting Phase - Producer votes
 //! 4. Synchronization Phase - Final output
 
-// Add all necessary imports
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -165,8 +164,8 @@ impl Default for ConsensusConfig {
     }
 }
 
-// Placeholder for current_timestamp function
-fn current_timestamp() -> u64 {
+/// Get current timestamp in seconds
+pub fn current_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -538,5 +537,33 @@ mod tests {
         assert_eq!(config.phase_duration_ms, 10_000);
         assert_eq!(config.min_producers, 3);
         assert_eq!(config.max_producers, 100);
+    }
+
+    #[test]
+    fn test_current_timestamp() {
+        let ts1 = current_timestamp();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let ts2 = current_timestamp();
+        assert!(ts2 >= ts1);
+    }
+
+    #[test]
+    fn test_consensus_message_types() {
+        let node_id = [1u8; 32];
+        let hash_value = [2u8; 32];
+        
+        let quantity = ConsensusMessage::ProducerQuantity {
+            producer_id: node_id,
+            hash_value,
+            cycle_id: 1,
+        };
+        
+        match quantity {
+            ConsensusMessage::ProducerQuantity { producer_id, cycle_id, .. } => {
+                assert_eq!(producer_id, node_id);
+                assert_eq!(cycle_id, 1);
+            }
+            _ => panic!("Wrong message type"),
+        }
     }
 }
