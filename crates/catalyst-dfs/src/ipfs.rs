@@ -22,11 +22,8 @@ pub mod ipfs;
 
 pub use storage::LocalDfsStorage;
 pub use swarm::{DfsSwarm, SwarmConfig, NetworkEvent, NetworkStats};
-pub use provider::{
-    DfsContentProvider, DhtContentProvider, ContentReplicator, 
-    ProviderStats, ReplicationStatus, ReplicationLevel
-};
-pub use ipfs::{NetworkedDfs, IpfsFactory};
+pub use provider::{DfsContentProvider, DhtContentProvider, ContentReplicator, ProviderStats, ReplicationStatus, ReplicationLevel};
+pub use ipfs::NetworkedDfs;
 
 #[derive(Error, Debug)]
 pub enum DfsError {

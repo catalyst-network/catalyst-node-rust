@@ -4,19 +4,32 @@ version = "0.1.0"
 edition = "2021"
 description = "Distributed File System for Catalyst Network based on IPFS"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/catalyst-network/catalyst-dfs"
+documentation = "https://docs.rs/catalyst-dfs"
+keywords = ["blockchain", "ipfs", "distributed", "storage", "p2p"]
+categories = ["network-programming", "filesystem", "cryptography"]
 
 [dependencies]
+# Core Catalyst dependencies
 catalyst-core = { path = "../catalyst-core" }
-catalyst-crypto = { path = "../catalyst-crypto" }
 
-# IPFS implementation
-libipld = { version = "0.16", features = ["dag-cbor", "dag-json"] }
-libp2p = { version = "0.53", features = ["kad", "request-response"] }
-libp2p-bitswap = "0.25"  # Separate bitswap implementation
+# IPFS and content addressing
 cid = "0.10"
 multihash = "0.19"
 
-# Async support
+# Networking with libp2p
+libp2p = { version = "0.53", features = [
+    "kad", 
+    "request-response", 
+    "gossipsub", 
+    "identify", 
+    "noise", 
+    "tcp", 
+    "yamux",
+    "async-std"
+] }
+
+# Async runtime
 tokio = { version = "1.0", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"
@@ -26,12 +39,15 @@ async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
+# Database and storage
+rocksdb = "0.21"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
 # Error handling
 thiserror = "1.0"
 anyhow = "1.0"
-
-# Storage
-rocksdb = "0.21"
 
 # Utilities
 log = "0.4"
@@ -40,3 +56,25 @@ uuid = { version = "1.0", features = ["v4"] }
 [dev-dependencies]
 tempfile = "3.0"
 tokio-test = "0.4"
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+futures = "0.3"
+
+[features]
+default = ["full"]
+full = ["networking", "storage", "provider"]
+networking = []
+storage = []
+provider = []
+
+[[bench]]
+name = "dfs_benchmarks"
+harness = false
+path = "benches/dfs_benchmarks.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+debug = true
