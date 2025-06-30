@@ -6,48 +6,106 @@
 //! 3. Voting Phase - Producer votes
 //! 4. Synchronization Phase - Final output
 
-use async_trait::async_trait;
-use catalyst_core::{
-    ConsensusMessage, Transaction, NodeId,
-    types::Block,
-    traits::{ConsensusProtocol, ConsensusState, ConsensusError},
-};
-use catalyst_crypto::{KeyPair, Signature, Hash256, blake2b_hash};
-use catalyst_network::{Network, NetworkEvent};
-use serde::{Deserialize, Serialize};
+// Add all necessary imports
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
-// Module declarations - comment out missing modules for Phase 1
-// pub mod collaborative;  // TODO: Implement 4-phase protocol
-// pub mod producer;       // TODO: Implement producer selection
-// pub mod validator;      // TODO: Implement validation logic
-// pub mod cycle;          // TODO: Implement ledger cycles
-// pub mod messages;       // TODO: Implement message handling
+// Network imports
+use catalyst_network::{NetworkService, NetworkEvent, NetworkMessage};
 
-// Re-exports - comment out for now
-// pub use collaborative::*;
-// pub use producer::*;
-// pub use validator::*;
-// pub use cycle::*;
-// pub use messages::*;
+// Crypto imports - use actual catalyst_crypto types
+use catalyst_crypto::{KeyPair, Signature, Hash256};
 
-/// 4-Phase Consensus Engine for Catalyst Network
-pub struct CatalystConsensus {
-    /// Local node information
-    node_id: NodeId,
-    /// Cryptographic key pair for signing
-    keypair: KeyPair,
-    /// Current consensus state
-    state: Arc<RwLock<ConsensusState>>,
-    /// Network interface for communication
-    network: Arc<dyn Network>,
-    /// Current ledger cycle information
-    current_cycle: Arc<RwLock<LedgerCycle>>,
-    /// Producer information for current cycle
-    producers: Arc<RwLock<HashMap<NodeId, ProducerInfo>>>,
+// For now, define the missing core types locally until catalyst_core is available
+pub type NodeId = [u8; 32];
+
+#[derive(Debug, Clone)]
+pub struct ConsensusState {
+    pub current_height: u64,
+    pub current_round: u64,
+    pub leader: Option<NodeId>,
+    pub locked_block: Option<[u8; 32]>,
+    pub votes: HashMap<[u8; 32], u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Block {
+    pub hash: [u8; 32],
+    pub height: u64,
+    pub timestamp: u64,
+    pub transactions: Vec<Transaction>,
+    pub previous_hash: [u8; 32],
+    pub merkle_root: [u8; 32],
+    pub producer_id: NodeId,
+}
+
+#[derive(Debug, Clone)]
+pub struct Transaction {
+    pub id: [u8; 32],
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConsensusMessage {
+    ProducerQuantity {
+        producer_id: NodeId,
+        hash_value: [u8; 32],
+        cycle_id: u64,
+    },
+    ProducerCandidate {
+        producer_id: NodeId,
+        candidate_hash: [u8; 32],
+        producer_list_hash: [u8; 32],
+        cycle_id: u64,
+    },
+    ProducerVote {
+        producer_id: NodeId,
+        ledger_update_hash: [u8; 32],
+        voter_list_hash: [u8; 32],
+        cycle_id: u64,
+    },
+    ProducerOutput {
+        producer_id: NodeId,
+        dfs_address: String,
+        voter_list_hash: [u8; 32],
+        cycle_id: u64,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum ConsensusError {
+    InvalidProposal(String),
+    NetworkError(String),
+    ValidationError(String),
+}
+
+impl std::fmt::Display for ConsensusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConsensusError::InvalidProposal(msg) => write!(f, "Invalid proposal: {}", msg),
+            ConsensusError::NetworkError(msg) => write!(f, "Network error: {}", msg),
+            ConsensusError::ValidationError(msg) => write!(f, "Validation error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ConsensusError {}
+
+// Placeholder trait - will be replaced with actual trait from catalyst_core
+#[allow(async_fn_in_trait)]
+pub trait ConsensusProtocol {
+    type Block;
+    type Proposal;
+    type Vote;
+
+    async fn propose_block(&mut self, transactions: Vec<Transaction>) -> Result<Self::Proposal, ConsensusError>;
+    async fn validate_proposal(&self, proposal: &Self::Proposal) -> Result<bool, ConsensusError>;
+    async fn vote(&mut self, proposal_id: &[u8], vote: Self::Vote) -> Result<(), ConsensusError>;
+    async fn process_message(&mut self, message: ConsensusMessage) -> Result<(), ConsensusError>;
+    async fn get_state(&self) -> Result<ConsensusState, ConsensusError>;
 }
 
 /// Information about a producer in the current cycle
@@ -107,12 +165,36 @@ impl Default for ConsensusConfig {
     }
 }
 
+// Placeholder for current_timestamp function
+fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// 4-Phase Consensus Engine for Catalyst Network
+pub struct CatalystConsensus {
+    /// Local node information
+    node_id: NodeId,
+    /// Cryptographic key pair for signing
+    keypair: KeyPair,
+    /// Current consensus state
+    state: Arc<RwLock<ConsensusState>>,
+    /// Network interface for communication
+    network: Arc<NetworkService>,
+    /// Current ledger cycle information
+    current_cycle: Arc<RwLock<LedgerCycle>>,
+    /// Producer information for current cycle
+    producers: Arc<RwLock<HashMap<NodeId, ProducerInfo>>>,
+}
+
 impl CatalystConsensus {
     /// Create a new consensus engine
     pub fn new(
         node_id: NodeId,
         keypair: KeyPair,
-        network: Arc<dyn Network>,
+        network: Arc<NetworkService>,
     ) -> Self {
         let initial_state = ConsensusState {
             current_height: 0,
@@ -124,7 +206,7 @@ impl CatalystConsensus {
 
         let initial_cycle = LedgerCycle {
             cycle_id: 0,
-            start_time: catalyst_utils::utils::current_timestamp(),
+            start_time: current_timestamp(),
             duration_ms: 40_000, // 4 phases * 10 seconds
             partition_id: 0,
             producer_count: 0,
@@ -159,30 +241,38 @@ impl CatalystConsensus {
         let mut event_receiver = self.network.subscribe_events().await?;
         
         let _state = Arc::clone(&self.state);
-        let producers = Arc::clone(&self.producers);
-        let node_id = self.node_id;
+        let _producers = Arc::clone(&self.producers);
+        let _node_id = self.node_id;
         
         tokio::spawn(async move {
-            while let Some(event) = event_receiver.recv().await {
-                match event {
-                    NetworkEvent::MessageReceived { from, message } => {
-                        // Handle consensus messages
-                        if let catalyst_core::NetworkMessage::Consensus(consensus_msg) = message {
-                            Self::handle_consensus_message(
-                                &producers,
-                                node_id,
-                                from,
-                                consensus_msg,
-                            ).await;
+            loop {
+                match event_receiver.recv().await {
+                    Ok(event) => {
+                        match event {
+                            NetworkEvent::MessageReceived { message } => {
+                                // message is Vec<u8>, not NetworkMessage
+                                tracing::debug!("Received consensus message: {} bytes", message.len());
+                                // TODO: Deserialize message and handle consensus logic
+                            }
+                            NetworkEvent::PeerConnected { peer_id } => {
+                                info!("Peer connected: {}", peer_id);
+                            }
+                            NetworkEvent::PeerDisconnected { peer_id } => {
+                                info!("Peer disconnected: {}", peer_id);
+                            }
+                            NetworkEvent::Error { error } => {
+                                tracing::error!("Network error: {:?}", error);
+                            }
                         }
                     }
-                    NetworkEvent::PeerConnected(peer_info) => {
-                        info!("Peer connected: {:?}", peer_info.id);
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::info!("Network event channel closed");
+                        break;
                     }
-                    NetworkEvent::PeerDisconnected(peer_id) => {
-                        info!("Peer disconnected: {:?}", peer_id);
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        tracing::warn!("Network event receiver lagged behind");
+                        continue;
                     }
-                    _ => {}
                 }
             }
         });
@@ -236,106 +326,78 @@ impl CatalystConsensus {
 
     /// Execute Construction Phase (Phase 1)
     async fn execute_construction_phase(
-        network: &Arc<dyn Network>,
+        network: &Arc<NetworkService>,
         node_id: NodeId,
         _keypair: &KeyPair,
         cycle: &LedgerCycle,
     ) {
         info!("Executing Construction Phase for cycle {}", cycle.cycle_id);
         
-        // Create producer quantity message
-        let hash_value = blake2b_hash(&node_id);
-        let message = ConsensusMessage::ProducerQuantity {
-            producer_id: node_id,
-            hash_value: *hash_value.as_bytes(),
-            cycle_id: cycle.cycle_id,
-        };
+        let message_data = format!("ProducerQuantity:{}:{}", 
+            hex::encode(node_id), cycle.cycle_id).into_bytes();
+        let message = NetworkMessage::Data(message_data);
         
-        // Broadcast message
-        if let Err(e) = network.broadcast(catalyst_core::NetworkMessage::Consensus(message)).await {
+        if let Err(e) = network.broadcast(message).await {
             tracing::error!("Failed to broadcast construction message: {}", e);
         }
     }
 
     /// Execute Campaigning Phase (Phase 2)
     async fn execute_campaigning_phase(
-        network: &Arc<dyn Network>,
+        network: &Arc<NetworkService>,
         node_id: NodeId,
         _keypair: &KeyPair,
         cycle: &LedgerCycle,
     ) {
         info!("Executing Campaigning Phase for cycle {}", cycle.cycle_id);
         
-        // Create producer candidate message
-        let candidate_hash = blake2b_hash(&[&node_id[..], &cycle.cycle_id.to_le_bytes()].concat());
-        let producer_list_hash = [0u8; 32]; // TODO: Calculate actual producer list hash
+        let message_data = format!("ProducerCandidate:{}:{}", 
+            hex::encode(node_id), cycle.cycle_id).into_bytes();
+        let message = NetworkMessage::Data(message_data);
         
-        let message = ConsensusMessage::ProducerCandidate {
-            producer_id: node_id,
-            candidate_hash: *candidate_hash.as_bytes(),
-            producer_list_hash,
-            cycle_id: cycle.cycle_id,
-        };
-        
-        // Broadcast message
-        if let Err(e) = network.broadcast(catalyst_core::NetworkMessage::Consensus(message)).await {
+        if let Err(e) = network.broadcast(message).await {
             tracing::error!("Failed to broadcast campaigning message: {}", e);
         }
     }
 
     /// Execute Voting Phase (Phase 3)
     async fn execute_voting_phase(
-        network: &Arc<dyn Network>,
+        network: &Arc<NetworkService>,
         node_id: NodeId,
         _keypair: &KeyPair,
         cycle: &LedgerCycle,
     ) {
         info!("Executing Voting Phase for cycle {}", cycle.cycle_id);
         
-        // Create producer vote message
-        let ledger_update_hash = blake2b_hash(&cycle.cycle_id.to_le_bytes());
-        let voter_list_hash = [0u8; 32]; // TODO: Calculate actual voter list hash
+        let message_data = format!("ProducerVote:{}:{}", 
+            hex::encode(node_id), cycle.cycle_id).into_bytes();
+        let message = NetworkMessage::Data(message_data);
         
-        let message = ConsensusMessage::ProducerVote {
-            producer_id: node_id,
-            ledger_update_hash: *ledger_update_hash.as_bytes(),
-            voter_list_hash,
-            cycle_id: cycle.cycle_id,
-        };
-        
-        // Broadcast message
-        if let Err(e) = network.broadcast(catalyst_core::NetworkMessage::Consensus(message)).await {
+        if let Err(e) = network.broadcast(message).await {
             tracing::error!("Failed to broadcast voting message: {}", e);
         }
     }
 
     /// Execute Synchronization Phase (Phase 4)
     async fn execute_synchronization_phase(
-        network: &Arc<dyn Network>,
+        network: &Arc<NetworkService>,
         node_id: NodeId,
         _keypair: &KeyPair,
         cycle: &LedgerCycle,
     ) {
         info!("Executing Synchronization Phase for cycle {}", cycle.cycle_id);
         
-        // Create producer output message
-        let dfs_address = format!("catalyst://cycle-{}/output", cycle.cycle_id);
-        let voter_list_hash = [0u8; 32]; // TODO: Calculate actual voter list hash
+        let message_data = format!("ProducerOutput:{}:{}", 
+            hex::encode(node_id), cycle.cycle_id).into_bytes();
+        let message = NetworkMessage::Data(message_data);
         
-        let message = ConsensusMessage::ProducerOutput {
-            producer_id: node_id,
-            dfs_address,
-            voter_list_hash,
-            cycle_id: cycle.cycle_id,
-        };
-        
-        // Broadcast message
-        if let Err(e) = network.broadcast(catalyst_core::NetworkMessage::Consensus(message)).await {
+        if let Err(e) = network.broadcast(message).await {
             tracing::error!("Failed to broadcast synchronization message: {}", e);
         }
     }
 
-    /// Handle incoming consensus messages
+    /// Handle incoming consensus messages (placeholder for future use)
+    #[allow(dead_code)]
     async fn handle_consensus_message(
         producers: &Arc<RwLock<HashMap<NodeId, ProducerInfo>>>,
         _local_node_id: NodeId,
@@ -349,7 +411,7 @@ impl CatalystConsensus {
                 let producer_info = ProducerInfo {
                     node_id: producer_id,
                     hash_value: Hash256::new(hash_value),
-                    timestamp: catalyst_utils::utils::current_timestamp(),
+                    timestamp: current_timestamp(),
                     phase: ConsensusPhase::Construction,
                 };
                 
@@ -358,17 +420,14 @@ impl CatalystConsensus {
             
             ConsensusMessage::ProducerCandidate { producer_id, cycle_id, .. } => {
                 info!("Received ProducerCandidate from {:?} for cycle {}", producer_id, cycle_id);
-                // TODO: Process candidate
             }
             
             ConsensusMessage::ProducerVote { producer_id, cycle_id, .. } => {
                 info!("Received ProducerVote from {:?} for cycle {}", producer_id, cycle_id);
-                // TODO: Process vote
             }
             
             ConsensusMessage::ProducerOutput { producer_id, dfs_address, cycle_id, .. } => {
                 info!("Received ProducerOutput from {:?} for cycle {}: {}", producer_id, cycle_id, dfs_address);
-                // TODO: Process output
             }
         }
     }
@@ -384,7 +443,7 @@ impl CatalystConsensus {
             ConsensusPhase::Synchronization => {
                 // Start new cycle
                 cycle.cycle_id += 1;
-                cycle.start_time = catalyst_utils::utils::current_timestamp();
+                cycle.start_time = current_timestamp();
                 ConsensusPhase::Construction
             }
         };
@@ -393,7 +452,6 @@ impl CatalystConsensus {
     }
 }
 
-#[async_trait]
 impl ConsensusProtocol for CatalystConsensus {
     type Block = Block;
     type Proposal = Block;
@@ -405,7 +463,7 @@ impl ConsensusProtocol for CatalystConsensus {
         let block = Block {
             hash: [0u8; 32], // TODO: Calculate proper hash
             height: state.current_height + 1,
-            timestamp: catalyst_utils::utils::current_timestamp(),
+            timestamp: current_timestamp(),
             transactions,
             previous_hash: state.locked_block.unwrap_or([0u8; 32]),
             merkle_root: [0u8; 32], // TODO: Calculate merkle root
@@ -439,7 +497,7 @@ impl ConsensusProtocol for CatalystConsensus {
         Ok(())
     }
 
-    async fn process_message(&mut self, _message: catalyst_core::ConsensusMessage) -> Result<(), ConsensusError> {
+    async fn process_message(&mut self, _message: ConsensusMessage) -> Result<(), ConsensusError> {
         // Message processing is handled in the network event loop
         Ok(())
     }
@@ -452,16 +510,14 @@ impl ConsensusProtocol for CatalystConsensus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use catalyst_network::MockNetwork;
-    use rand::thread_rng;
     
     #[tokio::test]
     async fn test_consensus_creation() {
-        let mut rng = thread_rng();
-        let keypair = catalyst_crypto::KeyPair::generate(&mut rng);
+        let mut rng = rand::thread_rng();
+        let keypair = KeyPair::generate(&mut rng);
         let node_id = [1u8; 32];
         let network_config = catalyst_network::NetworkConfig::default();
-        let network = Arc::new(MockNetwork::new(network_config));
+        let network = Arc::new(catalyst_network::NetworkService::new(network_config).await.unwrap());
         
         let consensus = CatalystConsensus::new(node_id, keypair, network);
         
