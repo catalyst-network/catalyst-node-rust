@@ -2,35 +2,43 @@
 name = "catalyst-network"
 version = "0.1.0"
 edition = "2021"
-description = "Networking layer for Catalyst Network"
+authors = ["Catalyst Network Team"]
+description = "P2P networking layer for Catalyst Network blockchain"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/catalyst-network/catalyst-node-rust"
+keywords = ["blockchain", "p2p", "networking", "catalyst"]
+categories = ["network-programming", "cryptography"]
 
 [dependencies]
-catalyst-core = { path = "../catalyst-core" }
+# Core Catalyst dependencies
+catalyst-utils = { path = "../catalyst-utils" }
+catalyst-crypto = { path = "../catalyst-crypto" }
+catalyst-config = { path = "../catalyst-config" }
 
-# Networking
-libp2p = { version = "0.53", features = ["kad", "request-response", "tcp", "noise", "yamux", "mdns", "serde"] }
+# Basic networking
+libp2p = { version = "0.53", features = ["tcp", "noise", "yamux"] }
 
-# Async support
+# Async runtime
 tokio = { version = "1.0", features = ["full"] }
-async-trait = "0.1"
-futures = "0.3"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+toml = "0.8"
 
 # Error handling
 thiserror = "1.0"
-anyhow = "1.0"
 
-# Utilities
-tracing = "0.1"
-uuid = { version = "1.0", features = ["v4"] }
+# Logging
+log = "0.4"
+env_logger = "0.10"
+
+# Metrics (optional)
+prometheus = { version = "0.13", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
+tempfile = "3.0"
 
 [features]
-default = []
-full-network = ["libp2p/gossipsub", "libp2p/identify"]
+default = ["metrics"]
+metrics = ["prometheus"]
