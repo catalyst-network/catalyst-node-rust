@@ -40,3 +40,35 @@ pub use async_trait::async_trait;
 
 /// Core result type used throughout the Catalyst system
 pub type CatalystResult<T> = Result<T, CatalystError>;
+
+#[derive(Debug, Clone)]
+pub struct NodeStatus {
+    pub id: String,
+    pub uptime: u64,
+    pub sync_status: SyncStatus,
+    pub metrics: ResourceMetrics,
+}
+
+#[derive(Debug, Clone)]
+pub enum SyncStatus {
+    Synced,
+    Syncing { progress: f64 },
+    NotSynced,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResourceMetrics {
+    pub cpu_usage: f64,
+    pub memory_usage: u64,
+    pub disk_usage: u64,
+}
+
+// Add these module placeholders to catalyst-core/src/lib.rs
+
+pub trait CatalystModule: Send + Sync {}
+pub trait NetworkModule: Send + Sync {}
+pub trait StorageModule: Send + Sync {} 
+pub trait ConsensusModule: Send + Sync {}
+pub trait RuntimeModule: Send + Sync {}
+pub trait ServiceBusModule: Send + Sync {}
+pub trait DfsModule: Send + Sync {}

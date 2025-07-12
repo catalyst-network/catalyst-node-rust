@@ -1,184 +1,59 @@
-//! Updated lib.rs with complete DFS module integration
-
-//! Distributed File System for Catalyst Network
-//! 
-//! Implements IPFS-compatible distributed storage for:
-//! - Historical ledger state updates
-//! - Large files and media
-//! - Smart contract code and data
-//! - Application data storage
+//! Catalyst DFS - Minimal local-only implementation
 
 use async_trait::async_trait;
-use catalyst_core::{Hash, LedgerStateUpdate};
-use cid::Cid;
+use catalyst_utils::LedgerStateUpdate;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
-pub mod storage;
-pub mod swarm;
-pub mod provider;
-pub mod ipfs;
-
-pub use storage::LocalDfsStorage;
-pub use swarm::{DfsSwarm, SwarmConfig, NetworkEvent, NetworkStats};
-pub use provider::{
-    DfsContentProvider, DhtContentProvider, ContentReplicator, 
-    ProviderStats, ReplicationStatus, ReplicationLevel
-};
-pub use ipfs::{NetworkedDfs, IpfsFactory};
-
+/// DFS errors
 #[derive(Error, Debug)]
 pub enum DfsError {
-    #[error("Network error: {0}")]
-    Network(String),
     #[error("Storage error: {0}")]
     Storage(String),
-    #[error("Not found: {0}")]
+    
+    #[error("Content not found: {0}")]
     NotFound(String),
-    #[error("Invalid CID: {0}")]
-    InvalidCid(String),
-    #[error("Timeout: {0}")]
-    Timeout(String),
+    
     #[error("Serialization error: {0}")]
     Serialization(String),
+    
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-}
-
-/// DFS configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DfsConfig {
-    /// Local storage directory
-    pub storage_dir: PathBuf,
-    /// Maximum storage size in bytes
-    pub max_storage_size: u64,
-    /// Enable garbage collection
-    pub enable_gc: bool,
-    /// Garbage collection interval in seconds
-    pub gc_interval: u64,
-    /// Enable content discovery
-    pub enable_discovery: bool,
-    /// Provider announcement interval
-    pub provider_interval: u64,
-    /// Replication factor for important data
-    pub replication_factor: usize,
-    /// Enable networking
-    pub enable_networking: bool,
-    /// Network listen addresses
-    pub listen_addresses: Vec<String>,
-    /// Bootstrap peers for DHT
-    pub bootstrap_peers: Vec<String>,
-}
-
-impl Default for DfsConfig {
-    fn default() -> Self {
-        Self {
-            storage_dir: PathBuf::from("./dfs"),
-            max_storage_size: 100 * 1024 * 1024 * 1024, // 100GB
-            enable_gc: true,
-            gc_interval: 3600, // 1 hour
-            enable_discovery: true,
-            provider_interval: 900, // 15 minutes
-            replication_factor: 3,
-            enable_networking: true,
-            listen_addresses: vec!["/ip4/0.0.0.0/tcp/0".to_string()],
-            bootstrap_peers: Vec::new(),
-        }
-    }
-}
-
-impl DfsConfig {
-    pub fn validate(&self) -> Result<(), DfsError> {
-        if !self.storage_dir.exists() {
-            std::fs::create_dir_all(&self.storage_dir)?;
-        }
-        
-        if self.max_storage_size == 0 {
-            return Err(DfsError::Storage("Max storage size cannot be zero".to_string()));
-        }
-        
-        if self.replication_factor == 0 {
-            return Err(DfsError::Storage("Replication factor cannot be zero".to_string()));
-        }
-        
-        Ok(())
-    }
-
-    /// Create a configuration for testing
-    pub fn test_config(storage_dir: PathBuf) -> Self {
-        Self {
-            storage_dir,
-            max_storage_size: 1024 * 1024 * 1024, // 1GB for testing
-            enable_networking: false, // Disable networking for tests
-            ..Default::default()
-        }
-    }
-
-    /// Create a configuration for development
-    pub fn dev_config(storage_dir: PathBuf) -> Self {
-        Self {
-            storage_dir,
-            enable_gc: true,
-            gc_interval: 300, // 5 minutes for dev
-            provider_interval: 60, // 1 minute for dev
-            ..Default::default()
-        }
-    }
-}
-
-/// Content addressing types
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct ContentId(pub Cid);
-
-impl ContentId {
-    /// Create content ID from data
-    pub fn from_data(data: &[u8]) -> Result<Self, DfsError> {
-        use multihash::{Code, MultihashDigest};
-        
-        let hash = Code::Sha2_256.digest(data);
-        let cid = Cid::new_v1(0x55, hash); // 0x55 = raw codec
-        Ok(ContentId(cid))
-    }
     
-    /// Get CID as string
-    pub fn to_string(&self) -> String {
-        self.0.to_string()
-    }
-    
-    /// Parse CID from string
-    pub fn from_string(s: &str) -> Result<Self, DfsError> {
-        let cid = s.parse::<Cid>()
-            .map_err(|e| DfsError::InvalidCid(e.to_string()))?;
-        Ok(ContentId(cid))
-    }
-
-    /// Get the underlying CID
-    pub fn cid(&self) -> &Cid {
-        &self.0
-    }
+    #[error("Generic error: {0}")]
+    Generic(String),
 }
 
-/// DFS content metadata
+/// Content identifier
+pub type ContentId = String;
+
+/// Content metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentMetadata {
-    /// Content ID
     pub cid: ContentId,
-    /// Content size in bytes
     pub size: u64,
-    /// Content type/MIME type
-    pub content_type: Option<String>,
-    /// Creation timestamp
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    /// Last accessed timestamp
-    pub accessed_at: chrono::DateTime<chrono::Utc>,
-    /// Number of times accessed
-    pub access_count: u64,
-    /// Pin status (prevents garbage collection)
-    pub pinned: bool,
+    pub created_at: u64,
+    pub category: Option<String>,
 }
 
-/// Main DFS interface trait
+/// DFS statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DfsStats {
+    pub total_stored_bytes: u64,
+    pub total_items: u64,
+    pub cache_hit_ratio: f64,
+}
+
+/// Garbage collection result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcResult {
+    pub freed_bytes: u64,
+    pub removed_items: u64,
+}
+
+/// Main DFS trait
 #[async_trait]
 pub trait DistributedFileSystem: Send + Sync {
     /// Store data and return content ID
@@ -187,7 +62,7 @@ pub trait DistributedFileSystem: Send + Sync {
     /// Retrieve data by content ID
     async fn get(&self, cid: &ContentId) -> Result<Vec<u8>, DfsError>;
     
-    /// Check if content exists locally
+    /// Check if content exists
     async fn has(&self, cid: &ContentId) -> Result<bool, DfsError>;
     
     /// Pin content to prevent garbage collection
@@ -199,324 +74,230 @@ pub trait DistributedFileSystem: Send + Sync {
     /// Get content metadata
     async fn metadata(&self, cid: &ContentId) -> Result<ContentMetadata, DfsError>;
     
-    /// List all stored content
+    /// List all content
     async fn list(&self) -> Result<Vec<ContentMetadata>, DfsError>;
     
-    /// Garbage collect unpinned content
+    /// Garbage collection
     async fn gc(&self) -> Result<GcResult, DfsError>;
     
-    /// Get storage statistics
+    /// Get statistics
     async fn stats(&self) -> Result<DfsStats, DfsError>;
 }
 
-/// Garbage collection result
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GcResult {
-    /// Number of objects removed
-    pub objects_removed: u64,
-    /// Bytes freed
-    pub bytes_freed: u64,
-    /// Time taken for GC
-    pub duration_ms: u64,
-}
-
-/// DFS statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DfsStats {
-    /// Total objects stored
-    pub total_objects: u64,
-    /// Total bytes stored
-    pub total_bytes: u64,
-    /// Pinned objects count
-    pub pinned_objects: u64,
-    /// Available storage space
-    pub available_space: u64,
-    /// Hit rate for local requests
-    pub hit_rate: f64,
-    /// Network requests made
-    pub network_requests: u64,
-}
-
-/// Content provider for DFS network
-#[async_trait]
-pub trait ContentProvider: Send + Sync {
-    /// Announce that we provide content
-    async fn provide(&self, cid: &ContentId) -> Result<(), DfsError>;
-    
-    /// Stop providing content
-    async fn unprovide(&self, cid: &ContentId) -> Result<(), DfsError>;
-    
-    /// Find providers for content
-    async fn find_providers(&self, cid: &ContentId) -> Result<Vec<ProviderId>, DfsError>;
-}
-
-/// Provider identifier
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct ProviderId(pub String);
-
-/// DFS content categories for organization
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ContentCategory {
-    /// Ledger state updates
-    LedgerUpdate,
-    /// Smart contract bytecode
-    Contract,
-    /// Application data
-    AppData,
-    /// Media files
-    Media,
-    /// Generic files
-    File,
-}
-
-/// Extended content storage with categorization
+/// Categorized storage trait
 #[async_trait]
 pub trait CategorizedStorage: Send + Sync {
-    /// Store content with category
+    /// Store data with category
     async fn put_categorized(
         &self, 
         data: Vec<u8>, 
-        category: ContentCategory
+        category: &str
     ) -> Result<ContentId, DfsError>;
     
     /// List content by category
     async fn list_by_category(
         &self, 
-        category: ContentCategory
+        category: &str
     ) -> Result<Vec<ContentMetadata>, DfsError>;
-    
-    /// Store ledger update
+}
+
+/// Ledger update storage trait
+#[async_trait]
+pub trait LedgerUpdateStorage: Send + Sync {
+    /// Store a ledger state update
     async fn store_ledger_update(
-        &self, 
+        &self,
         update: &LedgerStateUpdate
     ) -> Result<ContentId, DfsError>;
     
-    /// Retrieve ledger update
+    /// Retrieve a ledger state update
     async fn get_ledger_update(
-        &self, 
+        &self,
         cid: &ContentId
     ) -> Result<LedgerStateUpdate, DfsError>;
 }
 
-/// DFS factory for creating instances
-pub struct DfsFactory;
+/// Simple local-only DFS implementation
+pub struct LocalDfs {
+    storage: Arc<RwLock<HashMap<ContentId, Vec<u8>>>>,
+    metadata: Arc<RwLock<HashMap<ContentId, ContentMetadata>>>,
+}
 
-impl DfsFactory {
-    /// Create a new DFS instance (local only)
-    pub async fn create(config: &DfsConfig) -> Result<Box<dyn DistributedFileSystem>, DfsError> {
-        config.validate()?;
-        
-        let storage = LocalDfsStorage::new(config.clone()).await?;
-        Ok(Box::new(storage))
+impl LocalDfs {
+    pub fn new() -> Self {
+        Self {
+            storage: Arc::new(RwLock::new(HashMap::new())),
+            metadata: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
     
-    /// Create a networked DFS instance with IPFS compatibility
-    pub async fn create_networked(
-        config: &DfsConfig,
-    ) -> Result<Box<dyn DistributedFileSystem>, DfsError> {
-        config.validate()?;
-        
-        if config.enable_networking {
-            let networked_dfs = NetworkedDfs::new(config.clone()).await?;
-            Ok(Box::new(networked_dfs))
-        } else {
-            // Fall back to local storage if networking is disabled
-            Self::create(config).await
-        }
+    fn generate_cid(&self, data: &[u8]) -> String {
+        // Simple hash-based content ID
+        use catalyst_utils::crypto::hash_data;
+        let hash = hash_data(data);
+        hex::encode(hash.as_bytes())
     }
-
-    /// Create a DFS instance with custom provider
-    pub async fn create_with_provider(
-        config: &DfsConfig,
-        _provider: Box<dyn ContentProvider>,
-    ) -> Result<Box<dyn DistributedFileSystem>, DfsError> {
-        // For now, just create a standard networked instance
-        // In the future, this could use the custom provider
-        Self::create_networked(config).await
+    
+    fn current_timestamp() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 }
 
-/// DFS service manager for coordinating multiple components
-pub struct DfsService {
-    dfs: Box<dyn DistributedFileSystem>,
-    provider: Option<Arc<DhtContentProvider>>,
-    replicator: Option<Arc<ContentReplicator>>,
-    config: DfsConfig,
+impl Default for LocalDfs {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-impl DfsService {
-    /// Create a new DFS service
-    pub async fn new(config: DfsConfig) -> Result<Self, DfsError> {
-        let dfs = if config.enable_networking {
-            DfsFactory::create_networked(&config).await?
-        } else {
-            DfsFactory::create(&config).await?
-        };
-
-        let provider = if config.enable_networking {
-            let provider = Arc::new(DhtContentProvider::new());
-            provider.start_dht_tasks();
-            Some(provider)
-        } else {
-            None
-        };
-
-        let replicator = if let Some(ref provider) = provider {
-            let replicator = Arc::new(ContentReplicator::new(
-                Arc::clone(provider),
-                config.replication_factor,
-            ));
-            replicator.start_replication_monitoring();
-            Some(replicator)
-        } else {
-            None
-        };
-
-        Ok(Self {
-            dfs,
-            provider,
-            replicator,
-            config,
-        })
-    }
-
-    /// Get the underlying DFS
-    pub fn dfs(&self) -> &dyn DistributedFileSystem {
-        self.dfs.as_ref()
-    }
-
-    /// Get the content provider
-    pub fn provider(&self) -> Option<&Arc<DhtContentProvider>> {
-        self.provider.as_ref()
-    }
-
-    /// Get the replicator
-    pub fn replicator(&self) -> Option<&Arc<ContentReplicator>> {
-        self.replicator.as_ref()
-    }
-
-    /// Store content with automatic replication
-    pub async fn store_with_replication(&self, data: Vec<u8>) -> Result<ContentId, DfsError> {
-        let cid = self.dfs.put(data).await?;
+#[async_trait]
+impl DistributedFileSystem for LocalDfs {
+    async fn put(&self, data: Vec<u8>) -> Result<ContentId, DfsError> {
+        let cid = self.generate_cid(&data);
+        let size = data.len() as u64;
         
-        if let Some(provider) = &self.provider {
-            provider.provide(&cid).await?;
+        // Store data
+        {
+            let mut storage = self.storage.write().unwrap();
+            storage.insert(cid.clone(), data);
         }
         
-        if let Some(replicator) = &self.replicator {
-            replicator.ensure_replication(&cid).await?;
+        // Store metadata
+        {
+            let mut metadata = self.metadata.write().unwrap();
+            metadata.insert(cid.clone(), ContentMetadata {
+                cid: cid.clone(),
+                size,
+                created_at: Self::current_timestamp(),
+                category: None,
+            });
         }
         
         Ok(cid)
     }
-
-    /// Get comprehensive storage statistics
-    pub async fn comprehensive_stats(&self) -> Result<ComprehensiveStats, DfsError> {
-        let dfs_stats = self.dfs.stats().await?;
+    
+    async fn get(&self, cid: &ContentId) -> Result<Vec<u8>, DfsError> {
+        let storage = self.storage.read().unwrap();
+        storage.get(cid)
+            .cloned()
+            .ok_or_else(|| DfsError::NotFound(format!("Content not found: {}", cid)))
+    }
+    
+    async fn has(&self, cid: &ContentId) -> Result<bool, DfsError> {
+        let storage = self.storage.read().unwrap();
+        Ok(storage.contains_key(cid))
+    }
+    
+    async fn pin(&self, _cid: &ContentId) -> Result<(), DfsError> {
+        // No-op for local storage
+        Ok(())
+    }
+    
+    async fn unpin(&self, _cid: &ContentId) -> Result<(), DfsError> {
+        // No-op for local storage
+        Ok(())
+    }
+    
+    async fn metadata(&self, cid: &ContentId) -> Result<ContentMetadata, DfsError> {
+        let metadata = self.metadata.read().unwrap();
+        metadata.get(cid)
+            .cloned()
+            .ok_or_else(|| DfsError::NotFound(format!("Metadata not found: {}", cid)))
+    }
+    
+    async fn list(&self) -> Result<Vec<ContentMetadata>, DfsError> {
+        let metadata = self.metadata.read().unwrap();
+        Ok(metadata.values().cloned().collect())
+    }
+    
+    async fn gc(&self) -> Result<GcResult, DfsError> {
+        // No-op for local storage - everything stays
+        Ok(GcResult {
+            freed_bytes: 0,
+            removed_items: 0,
+        })
+    }
+    
+    async fn stats(&self) -> Result<DfsStats, DfsError> {
+        let storage = self.storage.read().unwrap();
         
-        let provider_stats = if let Some(provider) = &self.provider {
-            Some(provider.local_provider.provider_stats().await)
-        } else {
-            None
-        };
-
-        Ok(ComprehensiveStats {
-            dfs: dfs_stats,
-            provider: provider_stats,
-            config: self.config.clone(),
+        let total_stored_bytes = storage.values()
+            .map(|data| data.len() as u64)
+            .sum();
+        let total_items = storage.len() as u64;
+        
+        Ok(DfsStats {
+            total_stored_bytes,
+            total_items,
+            cache_hit_ratio: 1.0, // Everything is cached locally
         })
     }
 }
 
-/// Comprehensive statistics for DFS service
-#[derive(Debug, Clone)]
-pub struct ComprehensiveStats {
-    pub dfs: DfsStats,
-    pub provider: Option<ProviderStats>,
-    pub config: DfsConfig,
-}
-
-use std::sync::Arc;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    #[test]
-    fn test_content_id_creation() {
-        let data = b"hello world";
-        let cid = ContentId::from_data(data).unwrap();
+#[async_trait]
+impl CategorizedStorage for LocalDfs {
+    async fn put_categorized(
+        &self, 
+        data: Vec<u8>, 
+        category: &str
+    ) -> Result<ContentId, DfsError> {
+        let cid = self.generate_cid(&data);
+        let size = data.len() as u64;
         
-        // Content ID should be deterministic
-        let cid2 = ContentId::from_data(data).unwrap();
-        assert_eq!(cid, cid2);
+        // Store data
+        {
+            let mut storage = self.storage.write().unwrap();
+            storage.insert(cid.clone(), data);
+        }
         
-        // Different data should produce different CID
-        let cid3 = ContentId::from_data(b"different data").unwrap();
-        assert_ne!(cid, cid3);
+        // Store metadata with category
+        {
+            let mut metadata = self.metadata.write().unwrap();
+            metadata.insert(cid.clone(), ContentMetadata {
+                cid: cid.clone(),
+                size,
+                created_at: Self::current_timestamp(),
+                category: Some(category.to_string()),
+            });
+        }
+        
+        Ok(cid)
     }
-
-    #[test]
-    fn test_content_id_string_conversion() {
-        let data = b"test data";
-        let cid = ContentId::from_data(data).unwrap();
-        
-        let cid_string = cid.to_string();
-        let parsed_cid = ContentId::from_string(&cid_string).unwrap();
-        
-        assert_eq!(cid, parsed_cid);
-    }
-
-    #[tokio::test]
-    async fn test_dfs_factory_local() {
-        let temp_dir = TempDir::new().unwrap();
-        let config = DfsConfig::test_config(temp_dir.path().to_path_buf());
-        
-        let dfs = DfsFactory::create(&config).await.unwrap();
-        
-        // Test basic operations
-        let data = b"test content".to_vec();
-        let cid = dfs.put(data.clone()).await.unwrap();
-        
-        let retrieved = dfs.get(&cid).await.unwrap();
-        assert_eq!(data, retrieved);
-        
-        assert!(dfs.has(&cid).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_dfs_service() {
-        let temp_dir = TempDir::new().unwrap();
-        let config = DfsConfig::test_config(temp_dir.path().to_path_buf());
-        
-        let service = DfsService::new(config).await.unwrap();
-        
-        let data = b"service test".to_vec();
-        let cid = service.store_with_replication(data.clone()).await.unwrap();
-        
-        let retrieved = service.dfs().get(&cid).await.unwrap();
-        assert_eq!(data, retrieved);
-        
-        let stats = service.comprehensive_stats().await.unwrap();
-        assert!(stats.dfs.total_objects > 0);
-    }
-
-    #[test]
-    fn test_config_validation() {
-        let temp_dir = TempDir::new().unwrap();
-        let mut config = DfsConfig::test_config(temp_dir.path().to_path_buf());
-        
-        // Valid config should pass
-        assert!(config.validate().is_ok());
-        
-        // Invalid max storage size
-        config.max_storage_size = 0;
-        assert!(config.validate().is_err());
-        
-        // Reset and test replication factor
-        config.max_storage_size = 1024;
-        config.replication_factor = 0;
-        assert!(config.validate().is_err());
+    
+    async fn list_by_category(
+        &self, 
+        category: &str
+    ) -> Result<Vec<ContentMetadata>, DfsError> {
+        let metadata = self.metadata.read().unwrap();
+        Ok(metadata.values()
+            .filter(|meta| meta.category.as_deref() == Some(category))
+            .cloned()
+            .collect())
     }
 }
+
+#[async_trait]
+impl LedgerUpdateStorage for LocalDfs {
+    async fn store_ledger_update(
+        &self,
+        update: &LedgerStateUpdate
+    ) -> Result<ContentId, DfsError> {
+        let data = update.serialize()
+            .map_err(|e| DfsError::Serialization(e.to_string()))?;
+        self.put_categorized(data, "ledger_update").await
+    }
+    
+    async fn get_ledger_update(
+        &self,
+        cid: &ContentId
+    ) -> Result<LedgerStateUpdate, DfsError> {
+        let data = self.get(cid).await?;
+        LedgerStateUpdate::deserialize(&data)
+            .map_err(|e| DfsError::Serialization(e.to_string()))
+    }
+}
+
+// Re-export main types
+pub use LocalDfs as Dfs;

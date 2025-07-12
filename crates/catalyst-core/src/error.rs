@@ -254,29 +254,26 @@ pub enum ServiceBusError {
 /// Distributed File System errors
 #[derive(Error, Debug)]
 pub enum DfsError {
-    #[error("File not found: {hash}")]
-    FileNotFound { hash: String },
-
-    #[error("File storage failed: {reason}")]
-    StorageFailed { reason: String },
-
-    #[error("File retrieval failed: {hash}, reason: {reason}")]
-    RetrievalFailed { hash: String, reason: String },
-
-    #[error("Invalid file hash: {hash}")]
-    InvalidHash { hash: String },
-
-    #[error("File too large: size {size}, limit {limit}")]
-    FileTooLarge { size: u64, limit: u64 },
-
-    #[error("Insufficient storage providers")]
-    InsufficientProviders,
-
-    #[error("Replication failed: {reason}")]
-    ReplicationFailed { reason: String },
-
-    #[error("Pin operation failed: {hash}, reason: {reason}")]
-    PinFailed { hash: String, reason: String },
+    #[error("Storage error: {0}")]
+    Storage(String),
+    
+    #[error("Network error: {0}")]
+    Network(String),
+    
+    #[error("Content not found: {0}")]
+    NotFound(String),
+    
+    #[error("Invalid content ID: {0}")]
+    InvalidContentId(String),
+    
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+    
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    
+    #[error("Generic error: {0}")]
+    Generic(String),
 }
 
 /// Module-specific errors

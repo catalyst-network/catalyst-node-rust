@@ -19,6 +19,7 @@ serde_json = "1.0"
 # Utilities
 hex = "0.4"
 rand = "0.8"
+sha2 = "0.10"
 
 # Logging (you're using both tracing and custom logging)
 tracing = "0.1"
@@ -30,10 +31,14 @@ tokio = { version = "1.0", features = ["full"] }
 # Additional dependencies used in your code
 libp2p = { version = "0.54", optional = true }
 
+# Metrics dependencies (optional)
+prometheus = { version = "0.13", optional = true }
+
 [dev-dependencies]
 tokio-test = "0.4"
 
 [features]
 default = []
-full = ["libp2p"]
+full = ["libp2p", "metrics"]
 network = ["libp2p"]
+metrics = ["prometheus"]
