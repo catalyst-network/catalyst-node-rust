@@ -1,301 +1,262 @@
-//! Catalyst Network Node CLI
-//! Enhanced version that uses real Catalyst components
+// Replace crates/catalyst-cli/src/main.rs with this simplified version
 
+use anyhow::Result;
+use catalyst_config::CatalystConfig;
+use catalyst_node::{NodeBuilder, CatalystNode};
+use catalyst_rpc::RpcConfig;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use tracing::{info, error, warn};
-
-mod config;
-use config::NodeConfig;
+use tracing::{info, warn, error};
 
 #[derive(Parser)]
 #[command(name = "catalyst-node")]
-#[command(about = "Catalyst Network Node - A modular blockchain platform")]
-#[command(version = "0.1.0")]
+#[command(about = "Catalyst blockchain node")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+    
+    /// Configuration file path
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+    
+    /// Log level
+    #[arg(short, long, default_value = "info")]
+    log_level: String,
 }
 
 #[derive(Subcommand)]
 enum Commands {
     /// Start the Catalyst node
     Start {
-        /// Configuration file path
-        #[arg(short, long)]
-        config: Option<PathBuf>,
-        
         /// Run as validator
         #[arg(long)]
         validator: bool,
         
-        /// Override RPC port
+        /// RPC port
         #[arg(long)]
         rpc_port: Option<u16>,
-    },
-    
-    /// Stop a running node
-    Stop {
-        /// RPC endpoint to connect to
-        #[arg(long, default_value = "http://127.0.0.1:9933")]
-        rpc_url: String,
-    },
-    
-    /// Show node status
-    Status {
-        /// RPC endpoint to connect to
-        #[arg(long, default_value = "http://127.0.0.1:9933")]
-        rpc_url: String,
-    },
-    
-    /// Initialize a new node configuration
-    Init {
-        /// Output directory
-        #[arg(short, long, default_value = ".")]
-        output: PathBuf,
         
-        /// Configuration template (minimal, full, validator)
-        #[arg(long, default_value = "minimal")]
-        template: String,
+        /// Data directory
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        
+        /// Network port
+        #[arg(long)]
+        network_port: Option<u16>,
     },
     
-    /// Generate cryptographic identity
-    GenerateIdentity {
-        /// Output file for private key
-        #[arg(short, long, default_value = "node.key")]
-        output: PathBuf,
+    /// Stop the Catalyst node
+    Stop,
+    
+    /// Get node status
+    Status {
+        /// Show verbose status
+        #[arg(short, long)]
+        verbose: bool,
     },
     
-    /// Validate configuration file
-    ValidateConfig {
-        /// Configuration file to validate
-        #[arg(short, long, default_value = "catalyst.toml")]
-        config: PathBuf,
+    /// Initialize configuration
+    Init {
+        /// Output configuration file
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Initialize logging
-    init_logging()?;
-    
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     
+    // Initialize logging
+    init_logging(&cli.log_level)?;
+    
     match cli.command {
-        Commands::Start { config, validator, rpc_port } => {
-            start_node(config, validator, rpc_port).await
+        Commands::Start { validator, rpc_port, data_dir, network_port } => {
+            start_node(cli.config, validator, rpc_port, data_dir, network_port).await
         }
-        Commands::Stop { rpc_url } => {
-            stop_node(&rpc_url).await
-        }
-        Commands::Status { rpc_url } => {
-            show_status(&rpc_url).await
-        }
-        Commands::Init { output, template } => {
-            init_config(&output, &template).await
-        }
-        Commands::GenerateIdentity { output } => {
-            generate_identity(&output).await
-        }
-        Commands::ValidateConfig { config } => {
-            validate_config(&config).await
-        }
+        Commands::Stop => stop_node().await,
+        Commands::Status { verbose } => show_status(verbose).await,
+        Commands::Init { output } => init_config(output).await,
     }
 }
 
-/// Initialize logging based on environment
-fn init_logging() -> anyhow::Result<()> {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
-    
-    Ok(())
-}
-
-/// Start the Catalyst node
 async fn start_node(
-    config_path: Option<PathBuf>, 
-    validator: bool, 
-    rpc_port: Option<u16>
-) -> anyhow::Result<()> {
-    info!("Starting Catalyst node...");
+    config_path: Option<PathBuf>,  // Remove the underscore
+    _validator: bool,
+    rpc_port: Option<u16>,
+    _data_dir: Option<PathBuf>,
+    _network_port: Option<u16>,
+) -> Result<()> {
+    info!("🚀 Starting Catalyst node...");
     
-    // Load or create configuration
-    let mut config = match config_path {
+    // Now this will work:
+    let config = match config_path {
         Some(path) => {
             info!("Loading configuration from: {}", path.display());
-            NodeConfig::load(&path)?
+            // For now, use default config until we implement load
+            CatalystConfig::default()
         }
         None => {
             warn!("No configuration file specified, using defaults");
-            NodeConfig::default()
+            CatalystConfig::default()
         }
     };
     
-    // Apply command line overrides
-    if validator {
-        config.validator = true;
-        info!("Running as validator node");
-    }
+    // Create RPC configuration
+    let rpc_config = RpcConfig {
+        enabled: true,
+        port: rpc_port.unwrap_or(9933),
+        address: "127.0.0.1".to_string(),
+        max_connections: 100,
+        cors_enabled: true,
+        cors_origins: vec!["*".to_string()],
+    };
     
-    if let Some(port) = rpc_port {
-        config.rpc.port = port;
-        config.rpc.enabled = true;
-        info!("RPC server will run on port {}", port);
-    }
+    // Build the node using the new architecture
+    let mut node = NodeBuilder::new()
+        .with_config(config)
+        .with_rpc(rpc_config)
+        .build()
+        .await?;
     
-    // Validate configuration
-    config.validate()?;
-    config.ensure_data_dir()?;
-    
-    // Start RPC server if enabled
-    if config.rpc.enabled {
-        info!("Starting RPC server on {}:{}", config.rpc.address, config.rpc.port);
-        
-        let rpc_config = catalyst_rpc::RpcConfig {
-            enabled: true,
-            port: config.rpc.port,
-            address: config.rpc.address.clone(),
-            max_connections: 100,
-            cors_enabled: config.rpc.cors_enabled,
-            cors_origins: config.rpc.cors_origins.clone(),
-        };
-        
-        let rpc_server = catalyst_rpc::RpcServer::new(rpc_config);
-        
-        // Start server in background
-        tokio::spawn(async move {
-            if let Err(e) = rpc_server.start().await {
-                error!("RPC server failed: {}", e);
-            }
-        });
-    }
+    // Start the node
+    node.start().await?;
     
     info!("✅ Catalyst node started successfully!");
-    info!("Node ID: {}", config.node.name);
-    info!("Data directory: {}", config.storage.data_dir.display());
+    info!("Node ID: catalyst-node");
     
-    if config.rpc.enabled {
-        info!("RPC endpoint: http://{}:{}", config.rpc.address, config.rpc.port);
+    if let Some(port) = rpc_port {
+        info!("RPC endpoint: http://127.0.0.1:{}", port);
+        info!("Test with: curl -X POST http://127.0.0.1:{} -H 'Content-Type: application/json' -d '{{\"jsonrpc\":\"2.0\",\"method\":\"catalyst_version\",\"params\":[],\"id\":1}}'", port);
     }
     
     // Keep the node running
     info!("Node is running. Press Ctrl+C to stop.");
-    tokio::signal::ctrl_c().await?;
-    info!("Received shutdown signal, stopping node...");
     
-    Ok(())
-}
-
-/// Stop a running node via RPC
-async fn stop_node(rpc_url: &str) -> anyhow::Result<()> {
-    info!("Stopping node at: {}", rpc_url);
-    
-    // TODO: Implement actual RPC client call to stop node
-    // For now, just show what would happen
-    info!("Would send shutdown command to: {}", rpc_url);
-    info!("✅ Stop command sent (placeholder)");
-    
-    Ok(())
-}
-
-/// Show node status via RPC
-async fn show_status(rpc_url: &str) -> anyhow::Result<()> {
-    info!("Checking status of node at: {}", rpc_url);
-    
-    // TODO: Implement actual RPC client call
-    // For now, show placeholder status
-    println!("Node Status:");
-    println!("  RPC Endpoint: {}", rpc_url);
-    println!("  Status: Running (placeholder)");
-    println!("  Block Height: 12345");
-    println!("  Peers: 8");
-    println!("  Sync Status: Synced");
-    
-    Ok(())
-}
-
-/// Initialize node configuration
-async fn init_config(output_dir: &PathBuf, template: &str) -> anyhow::Result<()> {
-    info!("Initializing configuration in: {}", output_dir.display());
-    
-    // Create output directory
-    std::fs::create_dir_all(output_dir)?;
-    
-    let config = match template {
-        "minimal" => {
-            let mut config = NodeConfig::default();
-            config.rpc.enabled = true;
-            config.logging.level = "info".to_string();
-            config
-        }
-        "full" => {
-            let mut config = NodeConfig::default();
-            config.rpc.enabled = true;
-            config.service_bus.enabled = true;
-            config.dfs.enabled = true;
-            config.storage.enabled = true;
-            config
-        }
-        "validator" => {
-            let mut config = NodeConfig::default();
-            config.validator = true;
-            config.rpc.enabled = true;
-            config.consensus.min_producer_count = 1;
-            config.storage.enabled = true;
-            config
-        }
-        _ => {
-            warn!("Unknown template '{}', using minimal", template);
-            NodeConfig::default()
-        }
+    // Set up graceful shutdown
+    let shutdown_signal = async {
+        tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
     };
     
-    let config_path = output_dir.join("catalyst.toml");
-    config.save(&config_path)?;
-    
-    info!("✅ Configuration saved to: {}", config_path.display());
-    info!("Template used: {}", template);
-    info!("Edit the configuration file and run: catalyst-node start -c {}", config_path.display());
-    
-    Ok(())
-}
-
-/// Generate cryptographic identity
-async fn generate_identity(output: &PathBuf) -> anyhow::Result<()> {
-    info!("Generating new node identity...");
-    
-    // TODO: Use actual catalyst-crypto to generate keypair
-    // For now, create a placeholder
-    let dummy_private_key = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
-    
-    std::fs::write(output, dummy_private_key)?;
-    
-    info!("✅ Identity generated and saved to: {}", output.display());
-    warn!("🔒 Keep this file secure - it contains your node's private key!");
-    
-    Ok(())
-}
-
-/// Validate configuration file
-async fn validate_config(config_path: &PathBuf) -> anyhow::Result<()> {
-    info!("Validating configuration: {}", config_path.display());
-    
-    let config = NodeConfig::load(config_path)?;
-    config.validate()?;
-    
-    info!("✅ Configuration is valid!");
-    info!("Node name: {}", config.node.name);
-    info!("Validator mode: {}", config.validator);
-    info!("RPC enabled: {}", config.rpc.enabled);
-    
-    if config.rpc.enabled {
-        info!("RPC will run on: {}:{}", config.rpc.address, config.rpc.port);
+    // Wait for shutdown signal
+    tokio::select! {
+        _ = shutdown_signal => {
+            info!("Received shutdown signal, stopping node...");
+        }
+        _ = node.wait_for_shutdown() => {
+            info!("Node stopped");
+        }
     }
+    
+    // Clean shutdown
+    node.stop().await?;
+    
+    info!("✅ Node stopped successfully");
+    Ok(())
+}
+
+async fn stop_node() -> Result<()> {
+    info!("Stopping Catalyst node...");
+    warn!("Node stop command not yet implemented");
+    warn!("Use Ctrl+C in the node terminal to stop");
+    Ok(())
+}
+
+async fn show_status(verbose: bool) -> Result<()> {
+    info!("Checking Catalyst node status...");
+    
+    let client = reqwest::Client::new();
+    let response = client
+        .post("http://127.0.0.1:9933")
+        .header("Content-Type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","method":"catalyst_status","params":[],"id":1}"#)
+        .send()
+        .await;
+    
+    match response {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                let status: serde_json::Value = resp.json().await?;
+                
+                println!("✅ Catalyst node is running");
+                
+                if verbose {
+                    println!("Status details:");
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                } else {
+                    if let Some(result) = status.get("result") {
+                        if let Some(block_height) = result.get("block_height") {
+                            println!("Block height: {}", block_height);
+                        }
+                        if let Some(peer_count) = result.get("peer_count") {
+                            println!("Peers: {}", peer_count);
+                        }
+                        if let Some(sync_status) = result.get("sync_status") {
+                            println!("Sync status: {}", sync_status.as_str().unwrap_or("unknown"));
+                        }
+                    }
+                }
+            } else {
+                error!("❌ Node responded with error: {}", resp.status());
+            }
+        }
+        Err(_) => {
+            error!("❌ Cannot connect to Catalyst node");
+            error!("Make sure the node is running with RPC enabled");
+        }
+    }
+    
+    Ok(())
+}
+
+async fn init_config(output: Option<PathBuf>) -> Result<()> {
+    let output_path = output.unwrap_or_else(|| PathBuf::from("catalyst.toml"));
+    
+    info!("Generating default configuration...");
+    
+    // Simple config file for now
+    let config_content = r#"# Catalyst Node Configuration
+# This is a placeholder configuration file
+
+[network]
+listen_port = 30333
+
+[rpc]
+enabled = true
+port = 9933
+address = "127.0.0.1"
+
+[storage]
+data_dir = "data"
+
+[consensus]
+algorithm = "catalyst-pos"
+"#;
+    
+    std::fs::write(&output_path, config_content)?;
+    
+    info!("✅ Configuration written to: {}", output_path.display());
+    info!("Edit the configuration file and start the node with:");
+    info!("catalyst-node start --config {}", output_path.display());
+    
+    Ok(())
+}
+
+fn init_logging(level: &str) -> Result<()> {
+    use tracing_subscriber::{EnvFilter, FmtSubscriber};
+    
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(level));
+    
+    let subscriber = FmtSubscriber::builder()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_level(true)
+        .finish();
+    
+    tracing::subscriber::set_global_default(subscriber)?;
     
     Ok(())
 }

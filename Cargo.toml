@@ -12,8 +12,9 @@ members = [
      "crates/catalyst-dfs",
      "crates/catalyst-service-bus",
      "crates/catalyst-rpc",
+     "crates/catalyst-node",
      "crates/catalyst-cli",
-     "rpc-test",
+     "rpc-test", "crates/catalyst-node",
 ]
 
 resolver = "2"

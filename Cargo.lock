@@ -660,9 +660,12 @@ dependencies = [
  "anyhow",
  "catalyst-config",
  "catalyst-core",
+ "catalyst-node",
  "catalyst-rpc",
  "clap",
+ "reqwest",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "tracing",
@@ -774,6 +777,30 @@ dependencies = [
  "tokio",
  "tokio-test",
  "toml",
+]
+
+[[package]]
+name = "catalyst-node"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "catalyst-config",
+ "catalyst-consensus",
+ "catalyst-core",
+ "catalyst-network",
+ "catalyst-rpc",
+ "catalyst-runtime-evm",
+ "catalyst-storage",
+ "catalyst-utils",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
