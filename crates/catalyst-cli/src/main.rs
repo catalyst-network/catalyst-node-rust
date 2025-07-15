@@ -159,6 +159,10 @@ async fn start_node(
         let rpc_config = catalyst_rpc::RpcConfig {
             enabled: true,
             port: config.rpc.port,
+            address: config.rpc.address.clone(),
+            max_connections: 100,
+            cors_enabled: config.rpc.cors_enabled,
+            cors_origins: config.rpc.cors_origins.clone(),
         };
         
         let rpc_server = catalyst_rpc::RpcServer::new(rpc_config);

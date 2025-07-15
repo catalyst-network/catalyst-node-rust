@@ -13,6 +13,7 @@ members = [
      "crates/catalyst-service-bus",
      "crates/catalyst-rpc",
      "crates/catalyst-cli",
+     "rpc-test",
 ]
 
 resolver = "2"

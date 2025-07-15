@@ -1,74 +1,169 @@
-// Core modules
-pub mod types;
-pub mod traits;
-pub mod error;
-pub mod events;
-pub mod runtime;
+// Add these to crates/catalyst-core/src/lib.rs 
+// (Replace the problematic Hash/Address definitions)
 
-// Re-exports - be specific to avoid ambiguity
-pub use types::{
-    NodeId, BlockHash, Address, TokenAmount, LedgerCycle,
-    ResourceEstimate, ResourceProof, Transaction, ExecutionResult,
-    Account, ExecutionContext, ConsensusMessage, RuntimeType,
-    StateChange as TypesStateChange, Event as TypesEvent,
-    // Additional types from the original lib.rs
-    TxHash, Timestamp, Gas, BlockHeight, WorkerPass, NodeRole,
-    NetworkMessage, PeerMessage,
-};
+// First, add these imports at the top:
+use serde::{Serialize, Deserialize};
 
-pub use traits::{
-    ConsensusProtocol, StateManager, NetworkInterface, 
-    EventSubscription as TraitsEventSubscription,
-    EventFilter as TraitsEventFilter,
-};
+// Then add these type definitions (avoid conflicts by using different names or removing imports):
 
-pub use error::*;
+/// 32-byte hash type used throughout Catalyst
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CatalystHash([u8; 32]);
 
-pub use events::{
-    EventSubscription as EventsEventSubscription,
-    EventFilter as EventsEventFilter,
-};
-
-pub use runtime::{RuntimeManager, RuntimeConfig, RuntimeError};
-
-// Version information
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const NAME: &str = env!("CARGO_PKG_NAME");
-
-// Re-export async_trait for convenience when implementing traits
-pub use async_trait::async_trait;
-
-/// Core result type used throughout the Catalyst system
-pub type CatalystResult<T> = Result<T, CatalystError>;
-
-#[derive(Debug, Clone)]
-pub struct NodeStatus {
-    pub id: String,
-    pub uptime: u64,
-    pub sync_status: SyncStatus,
-    pub metrics: ResourceMetrics,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SyncStatus {
+    /// Node is fully synced
     Synced,
+    /// Node is currently syncing
     Syncing { progress: f64 },
+    /// Node is not synced
     NotSynced,
 }
 
-#[derive(Debug, Clone)]
+/// Resource metrics for monitoring
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceMetrics {
+    /// CPU usage percentage (0.0 - 100.0)
     pub cpu_usage: f64,
+    /// Memory usage in bytes
     pub memory_usage: u64,
+    /// Disk usage in bytes
     pub disk_usage: u64,
 }
 
-// Add these module placeholders to catalyst-core/src/lib.rs
+/// Complete node status information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeStatus {
+    /// Node identifier
+    pub id: String,
+    /// Uptime in seconds
+    pub uptime: u64,
+    /// Synchronization status
+    pub sync_status: SyncStatus,
+    /// Resource usage metrics
+    pub metrics: ResourceMetrics,
+}
 
-pub trait CatalystModule: Send + Sync {}
-pub trait NetworkModule: Send + Sync {}
-pub trait StorageModule: Send + Sync {} 
-pub trait ConsensusModule: Send + Sync {}
-pub trait RuntimeModule: Send + Sync {}
-pub trait ServiceBusModule: Send + Sync {}
-pub trait DfsModule: Send + Sync {}
+impl CatalystHash {
+    /// Create a new hash from a 32-byte array
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+    
+    /// Create a hash from a slice (panics if not 32 bytes)
+    pub fn from_slice(slice: &[u8]) -> Self {
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(slice);
+        Self(bytes)
+    }
+    
+    /// Get the hash as a byte array
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+    
+    /// Get the hash as a slice
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+    
+    /// Create a zero hash
+    pub fn zero() -> Self {
+        Self([0u8; 32])
+    }
+    
+    /// Check if this is a zero hash
+    pub fn is_zero(&self) -> bool {
+        self.0 == [0u8; 32]
+    }
+}
+
+impl Default for CatalystHash {
+    fn default() -> Self {
+        Self::zero()
+    }
+}
+
+impl std::fmt::Display for CatalystHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "0x{}", hex::encode(self.0))
+    }
+}
+
+impl From<[u8; 32]> for CatalystHash {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl AsRef<[u8]> for CatalystHash {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Ethereum-style address (20 bytes)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CatalystAddress([u8; 20]);
+
+impl CatalystAddress {
+    /// Create a new address from a 20-byte array
+    pub fn new(bytes: [u8; 20]) -> Self {
+        Self(bytes)
+    }
+    
+    /// Create an address from a slice (panics if not 20 bytes)
+    pub fn from_slice(slice: &[u8]) -> Self {
+        let mut bytes = [0u8; 20];
+        bytes.copy_from_slice(slice);
+        Self(bytes)
+    }
+    
+    /// Get the address as a byte array
+    pub fn as_bytes(&self) -> &[u8; 20] {
+        &self.0
+    }
+    
+    /// Get the address as a slice
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+    
+    /// Create a zero address
+    pub fn zero() -> Self {
+        Self([0u8; 20])
+    }
+    
+    /// Check if this is a zero address
+    pub fn is_zero(&self) -> bool {
+        self.0 == [0u8; 20]
+    }
+}
+
+impl Default for CatalystAddress {
+    fn default() -> Self {
+        Self::zero()
+    }
+}
+
+impl std::fmt::Display for CatalystAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "0x{}", hex::encode(self.0))
+    }
+}
+
+impl From<[u8; 20]> for CatalystAddress {
+    fn from(bytes: [u8; 20]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl AsRef<[u8]> for CatalystAddress {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+// Type aliases for compatibility
+pub type Hash = CatalystHash;
+pub type Address = CatalystAddress;
