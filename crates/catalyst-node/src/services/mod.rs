@@ -11,6 +11,10 @@ use tracing::{info, warn, error};
 pub mod traits;
 pub mod registry;
 
+pub mod storage;
+
+pub use storage::StorageService;
+
 /// Types of services in the Catalyst node
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ServiceType {

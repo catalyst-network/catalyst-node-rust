@@ -812,6 +812,7 @@ dependencies = [
  "catalyst-core",
  "catalyst-network",
  "catalyst-storage",
+ "catalyst-utils",
  "hex",
  "hyper 1.6.0",
  "jsonrpsee",
@@ -822,6 +823,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tower 0.4.13",
+ "tracing",
 ]
 
 [[package]]

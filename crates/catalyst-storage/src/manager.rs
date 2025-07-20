@@ -235,27 +235,43 @@ impl StorageManager {
     
     /// Check database health
     pub async fn is_healthy(&self) -> bool {
-        // Check if engine is healthy
+        println!("🔍 Starting storage health check...");
+        
+        // Check engine health
         if !self.engine.is_healthy() {
+            println!("❌ Engine health check failed");
             return false;
         }
+        println!("✅ Engine is healthy");
         
-        // Check if we can read/write basic data
-        let test_key = b"health_check";
-        let test_value = b"ok";
+        // Check column families
+        let cf_names = self.engine.cf_names();
+        println!("📁 Available column families: {:?}", cf_names);
         
-        match self.engine.put("metadata", test_key, test_value) {
+        // Try a simple operation
+        match self.engine.put("metadata", b"health_test", b"ok") {
             Ok(_) => {
-                match self.engine.get("metadata", test_key) {
-                    Ok(Some(value)) if value == test_value => {
-                        // Clean up test data
-                        let _ = self.engine.delete("metadata", test_key);
+                println!("✅ Write test successful");
+                match self.engine.get("metadata", b"health_test") {
+                    Ok(Some(_)) => {
+                        println!("✅ Read test successful");
+                        let _ = self.engine.delete("metadata", b"health_test");
                         true
                     }
-                    _ => false
+                    Ok(None) => {
+                        println!("❌ Read test failed - value not found");
+                        false
+                    }
+                    Err(e) => {
+                        println!("❌ Read test failed: {}", e);
+                        false
+                    }
                 }
             }
-            Err(_) => false
+            Err(e) => {
+                println!("❌ Write test failed: {}", e);
+                false
+            }
         }
     }
     

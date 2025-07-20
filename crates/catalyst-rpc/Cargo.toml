@@ -9,6 +9,8 @@ license = "MIT OR Apache-2.0"
 catalyst-core = { path = "../catalyst-core" }
 catalyst-storage = { path = "../catalyst-storage" }
 catalyst-network = { path = "../catalyst-network" }
+catalyst-utils = { path = "../catalyst-utils" }
+tracing = "0.1"
 
 # JSON-RPC
 jsonrpsee = { version = "0.21", features = ["server", "macros"] }
