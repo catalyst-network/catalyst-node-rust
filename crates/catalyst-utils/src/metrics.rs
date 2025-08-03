@@ -1,6 +1,6 @@
 // catalyst-utils/src/metrics.rs
 
-use crate::error::{CatalystResult, CatalystError};
+use crate::{CatalystResult, CatalystError};
 use crate::logging::{LogCategory, LogLevel, get_logger, LogValue};
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, VecDeque};

@@ -11,60 +11,17 @@ pub use serde;
 pub use serde_json;
 pub use tokio;
 
-/// Result type used throughout Catalyst
-pub type CatalystResult<T> = Result<T, CatalystError>;
+// Module declarations
+pub mod error;
+pub mod logging;
+pub mod metrics;
+pub mod network;
+pub mod patterns;
+pub mod serialization;
+pub mod state;
 
-/// Common error type for Catalyst operations
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CatalystError {
-    /// Serialization/deserialization error
-    Serialization(String),
-    /// Network-related error
-    Network(String),
-    /// Storage-related error
-    Storage(String),
-    /// Validation error
-    Validation(String),
-    /// Configuration error
-    Config(String),
-    /// Consensus error
-    Consensus(String),
-    /// Transaction error
-    Transaction(String),
-    /// Contract execution error
-    Contract(String),
-    /// DFS (Distributed File System) error
-    Dfs(String),
-    /// Timeout error with duration and operation details
-    Timeout {
-        duration_ms: u64,
-        operation: String,
-    },
-    /// Generic error with message
-    Generic(String),
-}
-
-impl fmt::Display for CatalystError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CatalystError::Serialization(msg) => write!(f, "Serialization error: {}", msg),
-            CatalystError::Network(msg) => write!(f, "Network error: {}", msg),
-            CatalystError::Storage(msg) => write!(f, "Storage error: {}", msg),
-            CatalystError::Validation(msg) => write!(f, "Validation error: {}", msg),
-            CatalystError::Config(msg) => write!(f, "Configuration error: {}", msg),
-            CatalystError::Consensus(msg) => write!(f, "Consensus error: {}", msg),
-            CatalystError::Transaction(msg) => write!(f, "Transaction error: {}", msg),
-            CatalystError::Contract(msg) => write!(f, "Contract error: {}", msg),
-            CatalystError::Dfs(msg) => write!(f, "DFS error: {}", msg),
-            CatalystError::Timeout { duration_ms, operation } => {
-                write!(f, "Timeout error: {} operation timed out after {}ms", operation, duration_ms)
-            },
-            CatalystError::Generic(msg) => write!(f, "Error: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for CatalystError {}
+// Re-export error types for convenience
+pub use error::{CatalystError, CatalystResult};
 
 /// 32-byte hash type used throughout Catalyst
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -101,6 +58,11 @@ impl Hash {
     /// Check if this is a zero hash
     pub fn is_zero(&self) -> bool {
         self.0 == [0u8; 32]
+    }
+    
+    /// Get the length of the hash (always 32)
+    pub fn len(&self) -> usize {
+        32
     }
 }
 
@@ -177,6 +139,11 @@ impl Address {
     pub fn is_zero(&self) -> bool {
         self.0 == [0u8; 20]
     }
+    
+    /// Get the length of the address (always 20)
+    pub fn len(&self) -> usize {
+        20
+    }
 }
 
 impl Default for Address {
@@ -200,6 +167,36 @@ impl From<[u8; 20]> for Address {
 impl AsRef<[u8]> for Address {
     fn as_ref(&self) -> &[u8] {
         &self.0
+    }
+}
+
+/// Type aliases for common cryptographic types
+pub type PublicKey = [u8; 32];
+pub type Signature = [u8; 64];
+
+/// System information structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemInfo {
+    pub node_id: String,
+    pub version: String,
+    pub start_time: u64,
+    pub uptime: u64,
+}
+
+impl SystemInfo {
+    pub fn new() -> Self {
+        Self {
+            node_id: format!("node_{}", rand::random::<u32>()),
+            version: "0.1.0".to_string(),
+            start_time: utils::current_timestamp(),
+            uptime: 0,
+        }
+    }
+}
+
+impl Default for SystemInfo {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -362,115 +359,110 @@ impl PartialLedgerStateUpdate {
     }
 }
 
-/// State management module
-pub mod state {
-    use super::*;
-    use async_trait::async_trait;
-    
-    /// Account state representation
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-    pub struct AccountState {
-        /// Account address
-        pub address: Address,
-        /// Current balance
-        pub balance: u64,
-        /// Transaction nonce
-        pub nonce: u64,
-        /// Code hash (for contracts)
-        pub code_hash: Option<Hash>,
-        /// Storage root hash
-        pub storage_root: Hash,
-    }
-    
-    impl AccountState {
-        pub fn new(address: Address) -> Self {
-            Self {
-                address,
-                balance: 0,
-                nonce: 0,
-                code_hash: None,
-                storage_root: Hash::zero(),
-            }
-        }
-    }
-    
-    /// State manager trait for handling account states and low-level storage
-    #[async_trait]
-    pub trait StateManager: Send + Sync {
-        /// Get raw state by key
-        async fn get_state(&self, key: &[u8]) -> CatalystResult<Option<Vec<u8>>>;
-        
-        /// Set raw state by key
-        async fn set_state(&self, key: &[u8], value: Vec<u8>) -> CatalystResult<()>;
-        
-        /// Delete state by key
-        async fn delete_state(&self, key: &[u8]) -> CatalystResult<bool>;
-        
-        /// Check if state contains key
-        async fn contains_key(&self, key: &[u8]) -> CatalystResult<bool>;
-        
-        /// Get multiple state values
-        async fn get_many(&self, keys: impl Iterator<Item = &[u8]> + Send) -> CatalystResult<Vec<Option<Vec<u8>>>>;
-        
-        /// Set multiple state values
-        async fn set_many(&self, pairs: impl Iterator<Item = (&[u8], Vec<u8>)> + Send) -> CatalystResult<()>;
-        
-        /// Transaction management
-        async fn begin_transaction(&self) -> CatalystResult<u64>;
-        async fn commit_transaction(&self, tx_id: u64) -> CatalystResult<()>;
-        async fn rollback_transaction(&self, tx_id: u64) -> CatalystResult<()>;
-        
-        /// State root management
-        async fn commit(&self) -> CatalystResult<Hash>;
-        async fn get_state_root(&self) -> CatalystResult<Hash>;
-        
-        /// Snapshot management
-        async fn create_snapshot(&self) -> CatalystResult<Hash>;
-        async fn restore_snapshot(&self, snapshot_id: &Hash) -> CatalystResult<()>;
-        
-        /// High-level account methods
-        async fn get_account(&self, address: &Address) -> Result<Option<AccountState>, CatalystError>;
-        async fn update_account(&self, account: &AccountState) -> Result<(), CatalystError>;
-        async fn account_exists(&self, address: &Address) -> Result<bool, CatalystError>;
-    }
-}
-
 /// Utility functions
 pub mod utils {
+    use std::time::SystemTime;
+    
     /// Get current Unix timestamp in seconds
     pub fn current_timestamp() -> u64 {
-        std::time::SystemTime::now()
+        SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
     }
-}
-
-/// Logging utilities
-pub mod logging {
-    use serde::{Deserialize, Serialize};
     
-    /// Log levels
-    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-    pub enum LogLevel {
-        Error,
-        Warn,
-        Info,
-        Debug,
-        Trace,
+    /// Get current Unix timestamp in milliseconds
+    pub fn current_timestamp_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
     }
     
-    /// Log categories for filtering
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-    pub enum LogCategory {
-        Consensus,
-        Network,
-        Storage,
-        Transaction,
-        Contract,
-        Dfs,
-        Config,
-        General,
+    /// Generate random bytes
+    pub fn random_bytes(len: usize) -> Vec<u8> {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        (0..len).map(|_| rng.gen()).collect()
+    }
+    
+    /// Convert bytes to hex string
+    pub fn bytes_to_hex(bytes: &[u8]) -> String {
+        hex::encode(bytes)
+    }
+    
+    /// Convert hex string to bytes
+    pub fn hex_to_bytes(hex_str: &str) -> Result<Vec<u8>, hex::FromHexError> {
+        let cleaned = if hex_str.starts_with("0x") {
+            &hex_str[2..]
+        } else {
+            hex_str
+        };
+        hex::decode(cleaned)
+    }
+    
+    /// Format bytes in human-readable format
+    pub fn format_bytes(bytes: u64) -> String {
+        const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB"];
+        const THRESHOLD: f64 = 1024.0;
+        
+        if bytes == 0 {
+            return "0 B".to_string();
+        }
+        
+        let mut size = bytes as f64;
+        let mut unit_index = 0;
+        
+        while size >= THRESHOLD && unit_index < UNITS.len() - 1 {
+            size /= THRESHOLD;
+            unit_index += 1;
+        }
+        
+        if unit_index == 0 {
+            format!("{} {}", bytes, UNITS[unit_index])
+        } else {
+            format!("{:.2} {}", size, UNITS[unit_index])
+        }
+    }
+    
+    /// Simple rate limiter
+    pub struct RateLimiter {
+        tokens: u32,
+        capacity: u32,
+        refill_rate: u32,
+        last_refill: std::time::Instant,
+    }
+    
+    impl RateLimiter {
+        pub fn new(capacity: u32, refill_rate: u32) -> Self {
+            Self {
+                tokens: capacity,
+                capacity,
+                refill_rate,
+                last_refill: std::time::Instant::now(),
+            }
+        }
+        
+        pub fn try_acquire(&mut self) -> bool {
+            self.refill();
+            if self.tokens > 0 {
+                self.tokens -= 1;
+                true
+            } else {
+                false
+            }
+        }
+        
+        fn refill(&mut self) {
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(self.last_refill).as_secs();
+            
+            if elapsed > 0 {
+                let new_tokens = elapsed as u32 * self.refill_rate;
+                self.tokens = std::cmp::min(self.capacity, self.tokens + new_tokens);
+                self.last_refill = now;
+            }
+        }
     }
 }
 
@@ -557,7 +549,7 @@ pub mod time {
 }
 
 /// Serialization traits for Catalyst types
-pub mod serialization {
+pub mod serialization_traits {
     use super::CatalystError;
     
     /// Trait for serializing Catalyst types
@@ -594,6 +586,7 @@ mod tests {
         let hash = Hash::new([1u8; 32]);
         assert_eq!(hash.as_bytes(), &[1u8; 32]);
         assert!(!hash.is_zero());
+        assert_eq!(hash.len(), 32);
         
         let zero_hash = Hash::zero();
         assert!(zero_hash.is_zero());
@@ -604,6 +597,7 @@ mod tests {
         let addr = Address::new([1u8; 20]);
         assert_eq!(addr.as_bytes(), &[1u8; 20]);
         assert!(!addr.is_zero());
+        assert_eq!(addr.len(), 20);
         
         let zero_addr = Address::zero();
         assert!(zero_addr.is_zero());
@@ -672,5 +666,49 @@ mod tests {
         
         // Should be reasonable timestamps (after 2020)
         assert!(timestamp > 1577836800); // 2020-01-01
+    }
+    
+    #[test]
+    fn test_utils() {
+        // Test hex conversion
+        let data = vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+        let hex = utils::bytes_to_hex(&data);
+        let decoded = utils::hex_to_bytes(&hex).unwrap();
+        assert_eq!(data, decoded);
+        
+        // Test format bytes
+        assert_eq!(utils::format_bytes(0), "0 B");
+        assert_eq!(utils::format_bytes(1024), "1.00 KB");
+        assert_eq!(utils::format_bytes(1536), "1.50 KB");
+        
+        // Test random bytes
+        let random1 = utils::random_bytes(32);
+        let random2 = utils::random_bytes(32);
+        assert_eq!(random1.len(), 32);
+        assert_eq!(random2.len(), 32);
+        assert_ne!(random1, random2);
+    }
+    
+    #[test]
+    fn test_rate_limiter() {
+        let mut limiter = utils::RateLimiter::new(5, 1);
+        
+        // Should allow 5 requests initially
+        for _ in 0..5 {
+            assert!(limiter.try_acquire());
+        }
+        
+        // Should reject the 6th request
+        assert!(!limiter.try_acquire());
+    }
+    
+    #[test]
+    fn test_system_info() {
+        let info1 = SystemInfo::new();
+        let info2 = SystemInfo::default();
+        
+        assert_eq!(info1.version, "0.1.0");
+        assert_eq!(info2.version, "0.1.0");
+        assert!(info1.node_id.starts_with("node_"));
     }
 }

@@ -1,50 +1,50 @@
-// examples/logging_example.rs
+// catalyst-utils/examples/logging_example.rs
 
-use catalyst_utils::*;
-use catalyst_utils::logging::*;
+use catalyst_utils::{
+    CatalystResult,
+    logging::{
+        LogConfig, CatalystLogger, LogCategory, LogLevel, LogValue,
+        init_logger, get_logger,
+    },
+    patterns,
+};
 use std::collections::HashMap;
 
 fn main() -> CatalystResult<()> {
-    println!("=== Catalyst Logging System Example ===\n");
-
-    // 1. Initialize the logging system
-    println!("1. Initializing logging system...");
+    println!("Catalyst Logging System Example");
+    
+    // Initialize the global logger
     let config = LogConfig {
         min_level: LogLevel::Debug,
         include_source: true,
-        json_format: false, // Human readable for this example
+        json_format: false,
         include_timestamp: true,
+        max_file_size: 100 * 1024 * 1024, // 100MB
+        log_dir: None,
         console_output: true,
         filtered_categories: vec![], // Log all categories
-        ..Default::default()
     };
     
     init_logger(config)?;
-    set_node_id("example_node_1".to_string());
-    println!("   ✓ Logging initialized\n");
-
-    // 2. Basic logging with different levels
-    println!("2. Basic logging examples:");
     
-    let logger = create_example_logger();
+    // Basic logging examples
+    println!("\n=== Basic Logging ===");
+    let logger = CatalystLogger::new(LogConfig::default());
     
     logger.trace(LogCategory::System, "This is a trace message")?;
     logger.debug(LogCategory::System, "This is a debug message")?;
-    logger.info(LogCategory::System, "This is an info message")?;
-    logger.warn(LogCategory::System, "This is a warning message")?;
-    logger.error(LogCategory::System, "This is an error message")?;
-    logger.critical(LogCategory::System, "This is a critical message")?;
-    println!();
-
-    // 3. Structured logging with fields
-    println!("3. Structured logging with fields:");
+    logger.info(LogCategory::System, "Application started successfully")?;
+    logger.warn(LogCategory::Network, "Connection timeout detected")?;
+    logger.error(LogCategory::Consensus, "Failed to reach consensus")?;
+    logger.critical(LogCategory::System, "Critical system error")?;
     
+    // Structured logging with fields
+    println!("\n=== Structured Logging ===");
     let fields = vec![
-        ("transaction_id", LogValue::String("tx_12345".to_string())),
-        ("amount", LogValue::Integer(1000)),
-        ("fees", LogValue::Float(0.001)),
-        ("valid", LogValue::Boolean(true)),
-        ("signature", LogValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF])),
+        ("node_id", LogValue::String("node_12345".to_string())),
+        ("block_height", LogValue::Integer(100)),
+        ("processing_time_ms", LogValue::Float(45.7)),
+        ("success", LogValue::Boolean(true)),
     ];
     
     logger.log_with_fields(
@@ -53,203 +53,152 @@ fn main() -> CatalystResult<()> {
         "Transaction processed successfully",
         &fields,
     )?;
-    println!();
-
-    // 4. Category-specific logging
-    println!("4. Category-specific logging:");
     
-    // Network events
-    logger.info(LogCategory::Network, "Peer connected: peer_abc123")?;
-    logger.warn(LogCategory::Network, "Connection timeout to peer_xyz789")?;
+    // Logging different categories
+    println!("\n=== Category-Specific Logging ===");
+    logger.info(LogCategory::Network, "New peer connected: 192.168.1.100")?;
+    logger.info(LogCategory::Consensus, "Started new consensus round")?;
+    logger.info(LogCategory::Transaction, "Added transaction to mempool")?;
+    logger.info(LogCategory::Storage, "Syncing state to disk")?;
+    logger.info(LogCategory::Crypto, "Generated new keypair")?;
+    logger.info(LogCategory::Runtime, "Contract executed successfully")?;
+    logger.info(LogCategory::ServiceBus, "Event published to subscribers")?;
+    logger.info(LogCategory::NodeManagement, "Worker selected for task")?;
+    logger.info(LogCategory::Config, "Configuration reloaded")?;
+    logger.info(LogCategory::Metrics, "Performance metrics collected")?;
     
-    // Consensus events
-    logger.info(LogCategory::Consensus, "Starting construction phase for cycle 42")?;
-    logger.info(LogCategory::Consensus, "Voting phase completed successfully")?;
-    
-    // Storage events
-    logger.debug(LogCategory::Storage, "Writing state update to disk")?;
-    logger.info(LogCategory::Storage, "State snapshot created")?;
-    
-    // Crypto events
-    logger.debug(LogCategory::Crypto, "Verifying aggregated signature")?;
-    logger.warn(LogCategory::Crypto, "Signature verification took longer than expected")?;
-    println!();
-
-    // 5. Advanced patterns for Catalyst Network
-    println!("5. Catalyst-specific logging patterns:");
-    
-    // Simulate consensus cycle tracking
-    logger.set_current_cycle(42);
-    
-    // Log consensus phases
+    // Using logging patterns
+    println!("\n=== Logging Patterns ===");
     patterns::log_consensus_phase(
         &logger,
-        "Construction",
+        "preparation",
         42,
-        "producer_node_1",
+        "node_12345",
         Some({
             let mut fields = HashMap::new();
-            fields.insert("transactions_count".to_string(), LogValue::Integer(150));
-            fields.insert("mempool_size".to_string(), LogValue::Integer(300));
+            fields.insert("validators".to_string(), LogValue::Integer(5));
+            fields.insert("round_time_ms".to_string(), LogValue::Float(1250.0));
             fields
         }),
     )?;
     
-    // Log transaction processing
     patterns::log_transaction(
         &logger,
-        "tx_67890",
-        "validated",
-        Some(2500),
+        "tx_abc123",
+        "confirmed",
+        Some(1000),
     )?;
     
-    // Log network events
     patterns::log_network_event(
         &logger,
         "peer_connected",
-        Some("peer_def456"),
+        Some("peer_xyz789"),
         Some({
             let mut details = HashMap::new();
-            details.insert("peer_type".to_string(), LogValue::String("producer".to_string()));
-            details.insert("latency_ms".to_string(), LogValue::Float(15.5));
+            details.insert("ip_address".to_string(), LogValue::String("192.168.1.100".to_string()));
+            details.insert("port".to_string(), LogValue::Integer(8080));
             details
         }),
     )?;
     
-    // Clear cycle when consensus completes
-    logger.clear_current_cycle();
-    println!();
-
-    // 6. Error logging integration
-    println!("6. Error logging integration:");
+    // JSON format logging
+    println!("\n=== JSON Format Logging ===");
+    let json_config = LogConfig {
+        json_format: true,
+        ..LogConfig::default()
+    };
+    let json_logger = CatalystLogger::new(json_config);
     
-    let error = crypto_error!("Invalid signature for transaction tx_99999");
+    json_logger.info(LogCategory::System, "This message will be in JSON format")?;
+    
+    // Advanced logging with custom fields
+    println!("\n=== Advanced Structured Logging ===");
+    let advanced_fields = vec![
+        ("transaction_id", LogValue::String("tx_def456".to_string())),
+        ("from_address", LogValue::String("0x1234...5678".to_string())),
+        ("to_address", LogValue::String("0xabcd...efgh".to_string())),
+        ("amount", LogValue::Integer(500)),
+        ("gas_used", LogValue::Integer(21000)),
+        ("gas_price", LogValue::Float(20.5)),
+        ("block_number", LogValue::Integer(12345)),
+        ("confirmations", LogValue::Integer(6)),
+        ("valid", LogValue::Boolean(true)),
+        ("signature", LogValue::Bytes(vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xab])),
+    ];
+    
     logger.log_with_fields(
-        LogLevel::Error,
-        LogCategory::Crypto,
-        &format!("Cryptographic error occurred: {}", error),
-        &[
-            ("error_type", LogValue::String("signature_verification".to_string())),
-            ("transaction_id", LogValue::String("tx_99999".to_string())),
-            ("error_code", LogValue::Integer(4001)),
-        ],
-    )?;
-    println!();
-
-    // 7. Performance-sensitive logging
-    println!("7. Performance-sensitive logging:");
-    
-    // Use macros for zero-cost logging when level is filtered out
-    log_trace!(LogCategory::System, "Detailed trace information: {}", "some_data");
-    log_debug!(LogCategory::Network, "Message routing: {} -> {}", "node1", "node2");
-    log_info!(LogCategory::Consensus, "Phase transition: {} -> {}", "voting", "sync");
-    
-    // Structured logging with macros
-    log_with_fields!(
         LogLevel::Info,
         LogCategory::Transaction,
-        "High-frequency transaction processed",
-        "tx_id" => LogValue::String("tx_rapid_001".to_string()),
-        "processing_time_ms" => LogValue::Float(0.125),
-        "gas_used" => LogValue::Integer(21000)
-    );
-    println!();
-
-    // 8. JSON format example
-    println!("8. JSON format example:");
-    println!("   (Reinitializing with JSON format...)");
-    
-    let json_config = LogConfig {
-        min_level: LogLevel::Info,
-        json_format: true,
-        console_output: true,
-        ..Default::default()
-    };
-    
-    // Note: In a real application, you'd typically not reinitialize the logger
-    // This is just for demonstration
-    let mut json_logger = CatalystLogger::new(json_config);
-    json_logger.set_node_id("json_example_node".to_string());
-    
-    json_logger.log_with_fields(
-        LogLevel::Info,
-        LogCategory::System,
-        "JSON formatted log entry",
-        &[
-            ("example", LogValue::Boolean(true)),
-            ("format", LogValue::String("json".to_string())),
-            ("structured", LogValue::Boolean(true)),
-        ],
+        "Transaction details",
+        &advanced_fields,
     )?;
-    println!();
-
-    println!("=== Logging example completed successfully! ===");
-    Ok(())
-}
-
-// Helper function to create a logger for examples
-fn create_example_logger() -> CatalystLogger {
-    let config = LogConfig {
-        min_level: LogLevel::Trace,
-        include_source: false, // Keep output clean for examples
-        json_format: false,
-        console_output: true,
-        ..Default::default()
+    
+    // Filtered logging
+    println!("\n=== Filtered Logging ===");
+    let filtered_config = LogConfig {
+        min_level: LogLevel::Warn,
+        filtered_categories: vec![LogCategory::Network, LogCategory::Consensus],
+        ..LogConfig::default()
     };
+    let filtered_logger = CatalystLogger::new(filtered_config);
     
-    let mut logger = CatalystLogger::new(config);
-    logger.set_node_id("example_node".to_string());
-    logger
-}
-
-// Example of custom log output implementation
-struct FileLogOutput {
-    file_path: String,
-}
-
-impl FileLogOutput {
-    pub fn new(file_path: String) -> Self {
-        Self { file_path }
-    }
-}
-
-impl LogOutput for FileLogOutput {
-    fn write_log(&self, entry: &LogEntry) -> CatalystResult<()> {
-        // In a real implementation, you'd write to a file
-        println!("[FILE LOG] {}: {}", entry.level, entry.message);
-        Ok(())
+    // These won't be logged due to level filter
+    filtered_logger.info(LogCategory::Network, "This info message won't appear")?;
+    filtered_logger.debug(LogCategory::Consensus, "This debug message won't appear")?;
+    
+    // This will be logged (correct level and category)
+    filtered_logger.error(LogCategory::Network, "This error message will appear")?;
+    
+    // This won't be logged (wrong category)
+    filtered_logger.error(LogCategory::System, "This error won't appear (wrong category)")?;
+    
+    // Performance logging
+    println!("\n=== Performance Logging ===");
+    let start_time = std::time::Instant::now();
+    
+    // Simulate some work
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    
+    let elapsed = start_time.elapsed();
+    let perf_fields = vec![
+        ("operation", LogValue::String("block_validation".to_string())),
+        ("duration_ms", LogValue::Float(elapsed.as_millis() as f64)),
+        ("items_processed", LogValue::Integer(150)),
+        ("throughput_per_sec", LogValue::Float(150.0 / elapsed.as_secs_f64())),
+    ];
+    
+    logger.log_with_fields(
+        LogLevel::Info,
+        LogCategory::Metrics,
+        "Performance measurement",
+        &perf_fields,
+    )?;
+    
+    // Error logging with context
+    println!("\n=== Error Logging with Context ===");
+    let error_fields = vec![
+        ("error_code", LogValue::String("CONSENSUS_001".to_string())),
+        ("error_message", LogValue::String("Timeout waiting for votes".to_string())),
+        ("timeout_ms", LogValue::Integer(5000)),
+        ("votes_received", LogValue::Integer(3)),
+        ("votes_required", LogValue::Integer(5)),
+        ("retry_attempt", LogValue::Integer(2)),
+        ("max_retries", LogValue::Integer(3)),
+    ];
+    
+    logger.log_with_fields(
+        LogLevel::Error,
+        LogCategory::Consensus,
+        "Consensus timeout occurred",
+        &error_fields,
+    )?;
+    
+    // Global logger usage
+    println!("\n=== Global Logger Usage ===");
+    if let Some(global_logger) = get_logger() {
+        global_logger.info(LogCategory::System, "Using global logger instance")?;
     }
     
-    fn flush(&self) -> CatalystResult<()> {
-        // In a real implementation, you'd flush the file buffer
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_logging_examples() {
-        // Test that our logging examples work
-        assert!(main().is_ok());
-    }
-    
-    #[test]
-    fn test_log_levels() {
-        assert!(LogLevel::Error > LogLevel::Info);
-        assert!(LogLevel::Critical > LogLevel::Error);
-    }
-    
-    #[test]
-    fn test_log_value_conversions() {
-        let string_val: LogValue = "test".into();
-        let int_val: LogValue = 42i64.into();
-        let bool_val: LogValue = true.into();
-        
-        assert!(matches!(string_val, LogValue::String(_)));
-        assert!(matches!(int_val, LogValue::Integer(42)));
-        assert!(matches!(bool_val, LogValue::Boolean(true)));
-    }
+    println!("\n=== All Logging Examples Completed ===");
+    Ok(())
 }

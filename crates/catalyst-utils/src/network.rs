@@ -1,6 +1,6 @@
 // catalyst-utils/src/network.rs
 
-use crate::error::{CatalystResult, CatalystError};
+use crate::{CatalystResult, CatalystError};
 use serde::{Serialize, Deserialize};
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -289,12 +289,15 @@ impl MessageEnvelope {
     /// Verify the message signature with the given verification function
     pub fn verify<F>(&self, verify_fn: F) -> CatalystResult<bool>
     where
-        F: FnOnce(&[u8], &[u8]) -> CatalystResult<bool>,
+        F: FnOnce(&[u8]) -> CatalystResult<bool>,
     {
         match &self.signature {
             Some(sig) => {
                 let data = self.signing_data()?;
-                verify_fn(&data, sig)
+                // Create a combined data buffer with both message data and signature
+                let mut combined_data = data;
+                combined_data.extend_from_slice(sig);
+                verify_fn(&combined_data)
             }
             None => Ok(false), // Unsigned message
         }

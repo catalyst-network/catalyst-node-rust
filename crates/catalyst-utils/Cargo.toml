@@ -42,3 +42,20 @@ default = []
 full = ["libp2p", "metrics"]
 network = ["libp2p"]
 metrics = ["prometheus"]
+
+# Use unique example names to avoid collisions with other crates
+[[example]]
+name = "utils_basic_usage"
+path = "examples/basic_usage.rs"
+
+[[example]]
+name = "utils_serialization_example"
+path = "examples/serialization_example.rs"
+
+[[example]]
+name = "utils_logging_example"
+path = "examples/logging_example.rs"
+
+[[example]]
+name = "utils_metrics_example"
+path = "examples/metrics_example.rs"

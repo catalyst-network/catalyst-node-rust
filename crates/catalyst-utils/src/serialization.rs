@@ -1,6 +1,6 @@
 // catalyst-utils/src/serialization.rs
 
-use crate::error::{CatalystResult, CatalystError};
+use crate::{CatalystResult, CatalystError};
 use std::io::{Read, Write, Cursor};
 
 /// Core serialization trait for Catalyst protocol messages

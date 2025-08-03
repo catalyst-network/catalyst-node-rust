@@ -355,18 +355,21 @@ impl StateManager for StorageManager {
         }
     }
     
-    async fn get_many(&self, keys: impl Iterator<Item = &[u8]> + Send) -> CatalystResult<Vec<Option<Vec<u8>>>> {
-        let mut results = Vec::new();
+    async fn get_many(&self, keys: &[Vec<u8>]) -> CatalystResult<Vec<Option<Vec<u8>>>> {
+        let mut results = Vec::with_capacity(keys.len());
+        
         for key in keys {
-            let value = self.get_state(key).await?;
-            results.push(value);
+            let result = self.get_state(key).await?;
+            results.push(result);
         }
+        
         Ok(results)
     }
-    
-    async fn set_many(&self, pairs: impl Iterator<Item = (&[u8], Vec<u8>)> + Send) -> CatalystResult<()> {
+
+    // Replace the set_many method (around line 367) with:
+    async fn set_many(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> CatalystResult<()> {
         for (key, value) in pairs {
-            self.set_state(key, value).await?;
+            self.set_state(key, value.clone()).await?;
         }
         Ok(())
     }
