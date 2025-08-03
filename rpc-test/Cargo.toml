@@ -1,0 +1,9 @@
+[package]
+name = "rpc-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+jsonrpsee = { version = "0.21", features = ["server", "macros"] }
+tokio = { version = "1.0", features = ["full"] }
+async-trait = "0.1"

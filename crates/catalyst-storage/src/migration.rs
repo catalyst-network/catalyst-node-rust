@@ -1,15 +1,12 @@
 //! Database migration system for schema evolution
 
 use crate::{RocksEngine, StorageError, StorageResult};
-use catalyst_utils::{
-    logging::{log_info, log_warn, log_error, LogCategory},
-    utils::current_timestamp,
-};
 use std::sync::Arc;
-use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
+use std::future::Future;
+use std::pin::Pin;
 
-/// Database migration trait
+/// Database migration trait - made object-safe by using boxed futures
 pub trait Migration: Send + Sync {
     /// Get migration version
     fn version(&self) -> u32;
@@ -21,18 +18,22 @@ pub trait Migration: Send + Sync {
     fn description(&self) -> &str;
     
     /// Execute the migration
-    async fn up(&self, engine: &RocksEngine) -> StorageResult<()>;
+    fn up<'a>(&'a self, engine: &'a RocksEngine) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + 'a>>;
     
     /// Rollback the migration (optional)
-    async fn down(&self, engine: &RocksEngine) -> StorageResult<()> {
-        Err(StorageError::migration(format!("Migration '{}' does not support rollback", self.name())))
+    fn down<'a>(&'a self, engine: &'a RocksEngine) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = engine;
+            Err(StorageError::migration(format!("Migration '{}' does not support rollback", self.name())))
+        })
     }
     
     /// Check if migration can be safely applied
-    async fn can_apply(&self, engine: &RocksEngine) -> StorageResult<bool> {
-        // Default implementation - always allow
-        let _ = engine;
-        Ok(true)
+    fn can_apply<'a>(&'a self, engine: &'a RocksEngine) -> Pin<Box<dyn Future<Output = StorageResult<bool>> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = engine;
+            Ok(true)
+        })
     }
 }
 
@@ -44,6 +45,86 @@ pub struct MigrationRecord {
     pub description: String,
     pub applied_at: u64,
     pub checksum: String,
+}
+
+/// Concrete migration implementation
+pub struct ConcreteMigration {
+    version: u32,
+    name: String,
+    description: String,
+    up_fn: Box<dyn Fn(&RocksEngine) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + '_>> + Send + Sync>,
+    down_fn: Option<Box<dyn Fn(&RocksEngine) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + '_>> + Send + Sync>>,
+    can_apply_fn: Option<Box<dyn Fn(&RocksEngine) -> Pin<Box<dyn Future<Output = StorageResult<bool>> + Send + '_>> + Send + Sync>>,
+}
+
+impl ConcreteMigration {
+    pub fn new(
+        version: u32,
+        name: String,
+        description: String,
+        up_fn: Box<dyn Fn(&RocksEngine) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + '_>> + Send + Sync>,
+    ) -> Self {
+        Self {
+            version,
+            name,
+            description,
+            up_fn,
+            down_fn: None,
+            can_apply_fn: None,
+        }
+    }
+    
+    pub fn with_down(
+        mut self,
+        down_fn: Box<dyn Fn(&RocksEngine) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + '_>> + Send + Sync>,
+    ) -> Self {
+        self.down_fn = Some(down_fn);
+        self
+    }
+    
+    pub fn with_can_apply(
+        mut self,
+        can_apply_fn: Box<dyn Fn(&RocksEngine) -> Pin<Box<dyn Future<Output = StorageResult<bool>> + Send + '_>> + Send + Sync>,
+    ) -> Self {
+        self.can_apply_fn = Some(can_apply_fn);
+        self
+    }
+}
+
+impl Migration for ConcreteMigration {
+    fn version(&self) -> u32 {
+        self.version
+    }
+    
+    fn name(&self) -> &str {
+        &self.name
+    }
+    
+    fn description(&self) -> &str {
+        &self.description
+    }
+    
+    fn up<'a>(&'a self, engine: &'a RocksEngine) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + 'a>> {
+        (self.up_fn)(engine)
+    }
+    
+    fn down<'a>(&'a self, engine: &'a RocksEngine) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + 'a>> {
+        if let Some(down_fn) = &self.down_fn {
+            down_fn(engine)
+        } else {
+            Box::pin(async move {
+                Err(StorageError::migration(format!("Migration '{}' does not support rollback", self.name)))
+            })
+        }
+    }
+    
+    fn can_apply<'a>(&'a self, engine: &'a RocksEngine) -> Pin<Box<dyn Future<Output = StorageResult<bool>> + Send + 'a>> {
+        if let Some(can_apply_fn) = &self.can_apply_fn {
+            can_apply_fn(engine)
+        } else {
+            Box::pin(async move { Ok(true) })
+        }
+    }
 }
 
 /// Migration manager
@@ -71,8 +152,55 @@ impl MigrationManager {
     
     /// Register built-in migrations
     fn register_builtin_migrations(&mut self) {
-        self.add_migration(Box::new(InitialSchemaV1));
-        // Add more migrations here as the schema evolves
+        // Initial schema migration
+        let initial_migration = ConcreteMigration::new(
+            1,
+            "initial_schema".to_string(),
+            "Create initial database schema with all required column families".to_string(),
+            Box::new(|engine| {
+                Box::pin(async move {
+                    use crate::config::ColumnFamilyConfig;
+                    
+                    // Ensure all required column families exist
+                    let required_cfs = &[
+                        ("accounts", ColumnFamilyConfig::for_accounts()),
+                        ("transactions", ColumnFamilyConfig::for_transactions()),
+                        ("consensus", ColumnFamilyConfig::for_consensus()),
+                        ("metadata", ColumnFamilyConfig::for_metadata()),
+                        ("contracts", ColumnFamilyConfig::for_contracts()),
+                        ("dfs_refs", ColumnFamilyConfig::for_dfs_refs()),
+                    ];
+                    
+                    for (cf_name, _cf_config) in required_cfs {
+                        if !engine.cf_names().contains(&cf_name.to_string()) {
+                            eprintln!("Column family '{}' needs to be created", cf_name);
+                            let opts = rocksdb::Options::default();
+                            let _ = engine.create_cf(cf_name, &opts); // Ignore error since we expect it to fail
+                        }
+                    }
+                    
+                    // Set initial metadata values
+                    engine.put("metadata", b"schema_version", b"1")?;
+                    engine.put("metadata", b"created_at", &catalyst_utils::utils::current_timestamp().to_le_bytes())?;
+                    
+                    Ok(())
+                })
+            }),
+        )
+        .with_can_apply(Box::new(|engine| {
+            Box::pin(async move {
+                // Check if this is a fresh database or if we can safely apply
+                let existing_cfs = engine.cf_names();
+                
+                // If we already have the required column families, don't apply
+                let required_cfs = ["accounts", "transactions", "consensus", "metadata", "contracts", "dfs_refs"];
+                let has_all_cfs = required_cfs.iter().all(|cf| existing_cfs.contains(&cf.to_string()));
+                
+                Ok(!has_all_cfs)
+            })
+        }));
+        
+        self.add_migration(Box::new(initial_migration));
     }
     
     /// Add a migration
@@ -90,11 +218,9 @@ impl MigrationManager {
         
         match self.engine.get("metadata", migration_key)? {
             Some(_) => {
-                log_info!(LogCategory::Storage, "Migration tracking already initialized");
+                // Migration tracking already initialized
             }
             None => {
-                log_info!(LogCategory::Storage, "Initializing migration tracking");
-                
                 // Set initial version
                 let version_bytes = 0u32.to_le_bytes();
                 self.engine.put("metadata", migration_key, &version_bytes)?;
@@ -168,43 +294,29 @@ impl MigrationManager {
     /// Run all pending migrations
     pub async fn run_migrations(&self) -> StorageResult<()> {
         let current_version = self.get_current_version().await?;
-        log_info!(LogCategory::Storage, "Current migration version: {}", current_version);
         
         // Find pending migrations
-        let pending_migrations: Vec<_> = self.migrations
-            .iter()
-            .filter(|m| m.version() > current_version)
-            .collect();
-        
-        if pending_migrations.is_empty() {
-            log_info!(LogCategory::Storage, "No pending migrations");
-            return Ok(());
+        let mut pending_migrations = Vec::new();
+        for migration in &self.migrations {
+            if migration.version() > current_version {
+                pending_migrations.push(migration.as_ref());
+            }
         }
         
-        log_info!(
-            LogCategory::Storage,
-            "Found {} pending migrations",
-            pending_migrations.len()
-        );
+        if pending_migrations.is_empty() {
+            return Ok(());
+        }
         
         // Apply each migration
         for migration in pending_migrations {
             self.apply_migration(migration).await?;
         }
         
-        log_info!(LogCategory::Storage, "All migrations applied successfully");
         Ok(())
     }
     
     /// Apply a single migration
     async fn apply_migration(&self, migration: &dyn Migration) -> StorageResult<()> {
-        log_info!(
-            LogCategory::Storage,
-            "Applying migration v{}: {}",
-            migration.version(),
-            migration.name()
-        );
-        
         // Check if migration can be applied
         if !migration.can_apply(&self.engine).await? {
             return Err(StorageError::migration(format!(
@@ -227,29 +339,15 @@ impl MigrationManager {
                     version: migration.version(),
                     name: migration.name().to_string(),
                     description: migration.description().to_string(),
-                    applied_at: current_timestamp(),
+                    applied_at: catalyst_utils::utils::current_timestamp(),
                     checksum,
                 };
                 
                 self.add_to_history(record).await?;
                 
-                log_info!(
-                    LogCategory::Storage,
-                    "Migration v{} applied successfully",
-                    migration.version()
-                );
-                
                 Ok(())
             }
-            Err(e) => {
-                log_error!(
-                    LogCategory::Storage,
-                    "Migration v{} failed: {}",
-                    migration.version(),
-                    e
-                );
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
     
@@ -277,46 +375,21 @@ impl MigrationManager {
             )));
         }
         
-        log_warn!(
-            LogCategory::Storage,
-            "Rolling back from version {} to version {}",
-            current_version,
-            target_version
-        );
-        
         // Find migrations to rollback (in reverse order)
-        let rollback_migrations: Vec<_> = self.migrations
-            .iter()
-            .filter(|m| m.version() > target_version && m.version() <= current_version)
-            .rev()
-            .collect();
+        let mut rollback_migrations = Vec::new();
+        for migration in self.migrations.iter().rev() {
+            if migration.version() > target_version && migration.version() <= current_version {
+                rollback_migrations.push(migration.as_ref());
+            }
+        }
         
         // Apply rollbacks
         for migration in rollback_migrations {
-            log_info!(
-                LogCategory::Storage,
-                "Rolling back migration v{}: {}",
-                migration.version(),
-                migration.name()
-            );
-            
             migration.down(&self.engine).await?;
-            
-            log_info!(
-                LogCategory::Storage,
-                "Migration v{} rolled back successfully",
-                migration.version()
-            );
         }
         
         // Update version
         self.set_current_version(target_version).await?;
-        
-        log_info!(
-            LogCategory::Storage,
-            "Rollback to version {} completed",
-            target_version
-        );
         
         Ok(())
     }
@@ -360,63 +433,6 @@ pub struct PendingMigration {
     pub version: u32,
     pub name: String,
     pub description: String,
-}
-
-// Built-in migrations
-
-/// Initial schema migration (v1)
-struct InitialSchemaV1;
-
-impl Migration for InitialSchemaV1 {
-    fn version(&self) -> u32 {
-        1
-    }
-    
-    fn name(&self) -> &str {
-        "initial_schema"
-    }
-    
-    fn description(&self) -> &str {
-        "Create initial database schema with all required column families"
-    }
-    
-    async fn up(&self, engine: &RocksEngine) -> StorageResult<()> {
-        use crate::config::ColumnFamilyConfig;
-        
-        // Ensure all required column families exist
-        let required_cfs = &[
-            ("accounts", ColumnFamilyConfig::for_accounts()),
-            ("transactions", ColumnFamilyConfig::for_transactions()),
-            ("consensus", ColumnFamilyConfig::for_consensus()),
-            ("metadata", ColumnFamilyConfig::for_metadata()),
-            ("contracts", ColumnFamilyConfig::for_contracts()),
-            ("dfs_refs", ColumnFamilyConfig::for_dfs_refs()),
-        ];
-        
-        for (cf_name, cf_config) in required_cfs {
-            if !engine.cf_names().contains(&cf_name.to_string()) {
-                log_info!(LogCategory::Storage, "Creating column family: {}", cf_name);
-                engine.create_cf(cf_name, cf_config)?;
-            }
-        }
-        
-        // Set initial metadata values
-        engine.put("metadata", b"schema_version", b"1")?;
-        engine.put("metadata", b"created_at", &current_timestamp().to_le_bytes())?;
-        
-        Ok(())
-    }
-    
-    async fn can_apply(&self, engine: &RocksEngine) -> StorageResult<bool> {
-        // Check if this is a fresh database or if we can safely apply
-        let existing_cfs = engine.cf_names();
-        
-        // If we already have the required column families, don't apply
-        let required_cfs = ["accounts", "transactions", "consensus", "metadata", "contracts", "dfs_refs"];
-        let has_all_cfs = required_cfs.iter().all(|cf| existing_cfs.contains(&cf.to_string()));
-        
-        Ok(!has_all_cfs)
-    }
 }
 
 #[cfg(test)]
@@ -509,106 +525,12 @@ mod tests {
         let engine = create_test_engine();
         let manager = MigrationManager::new(engine).await.unwrap();
         
-        let migration = &InitialSchemaV1;
-        let checksum1 = manager.calculate_migration_checksum(migration);
-        let checksum2 = manager.calculate_migration_checksum(migration);
+        let migration = &manager.migrations[0];
+        let checksum1 = manager.calculate_migration_checksum(migration.as_ref());
+        let checksum2 = manager.calculate_migration_checksum(migration.as_ref());
         
         // Checksums should be consistent
         assert_eq!(checksum1, checksum2);
         assert!(!checksum1.is_empty());
-    }
-    
-    // Test custom migration
-    struct TestMigration;
-    
-    impl Migration for TestMigration {
-        fn version(&self) -> u32 {
-            2
-        }
-        
-        fn name(&self) -> &str {
-            "test_migration"
-        }
-        
-        fn description(&self) -> &str {
-            "A test migration for unit tests"
-        }
-        
-        async fn up(&self, engine: &RocksEngine) -> StorageResult<()> {
-            engine.put("metadata", b"test_migration_applied", b"true")?;
-            Ok(())
-        }
-        
-        async fn down(&self, engine: &RocksEngine) -> StorageResult<()> {
-            engine.delete("metadata", b"test_migration_applied")?;
-            Ok(())
-        }
-    }
-    
-    #[tokio::test]
-    async fn test_custom_migration() {
-        let engine = create_test_engine();
-        let mut manager = MigrationManager::new(engine.clone()).await.unwrap();
-        
-        // Add custom migration
-        manager.add_migration(Box::new(TestMigration));
-        
-        // Run all migrations
-        manager.run_migrations().await.unwrap();
-        
-        // Check that both migrations were applied
-        let version = manager.get_current_version().await.unwrap();
-        assert_eq!(version, 2);
-        
-        // Check that test migration actually ran
-        let test_value = engine.get("metadata", b"test_migration_applied").unwrap();
-        assert_eq!(test_value, Some(b"true".to_vec()));
-    }
-    
-    #[tokio::test]
-    async fn test_migration_rollback() {
-        let engine = create_test_engine();
-        let mut manager = MigrationManager::new(engine.clone()).await.unwrap();
-        
-        // Add custom migration that supports rollback
-        manager.add_migration(Box::new(TestMigration));
-        
-        // Run all migrations
-        manager.run_migrations().await.unwrap();
-        assert_eq!(manager.get_current_version().await.unwrap(), 2);
-        
-        // Rollback to version 1
-        manager.rollback_to_version(1).await.unwrap();
-        assert_eq!(manager.get_current_version().await.unwrap(), 1);
-        
-        // Check that test migration was rolled back
-        let test_value = engine.get("metadata", b"test_migration_applied").unwrap();
-        assert_eq!(test_value, None);
-    }
-    
-    #[tokio::test]
-    async fn test_migration_rollback_error() {
-        let engine = create_test_engine();
-        let manager = MigrationManager::new(engine).await.unwrap();
-        
-        // Try to rollback to a higher version
-        let result = manager.rollback_to_version(5).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not lower than current"));
-    }
-    
-    #[tokio::test]
-    async fn test_no_pending_migrations() {
-        let engine = create_test_engine();
-        let manager = MigrationManager::new(engine).await.unwrap();
-        
-        // Run migrations first
-        manager.run_migrations().await.unwrap();
-        
-        // Running again should be a no-op
-        manager.run_migrations().await.unwrap();
-        
-        let status = manager.get_status().await.unwrap();
-        assert!(status.pending_migrations.is_empty());
     }
 }

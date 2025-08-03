@@ -3,10 +3,7 @@
 use crate::{RocksEngine, StorageError, StorageResult};
 use catalyst_utils::{
     Hash, 
-    state::{AccountState, state_keys},
-    serialization::{CatalystSerialize, CatalystDeserialize},
-    logging::{log_debug, log_error, LogCategory},
-    utils::current_timestamp,
+    state::AccountState,
 };
 use rocksdb::{WriteBatch, WriteOptions};
 use std::sync::Arc;
@@ -86,7 +83,7 @@ impl TransactionBatch {
     /// Create a new transaction batch
     pub fn new(id: String, engine: Arc<RocksEngine>) -> Self {
         let metadata = TransactionMetadata {
-            created_at: current_timestamp(),
+            created_at: catalyst_utils::utils::current_timestamp(),
             operation_count: 0,
             estimated_size: 0,
             checkpoints: Vec::new(),
@@ -267,13 +264,6 @@ impl TransactionBatch {
         let mut metadata = self.metadata.write();
         metadata.checkpoints.push(name.to_string());
         
-        log_debug!(
-            LogCategory::Storage,
-            "Created checkpoint '{}' for transaction {}",
-            name,
-            self.id
-        );
-        
         Ok(())
     }
     
@@ -289,22 +279,14 @@ impl TransactionBatch {
         metadata.operation_count += 1;
         metadata.estimated_size += op_size;
         
-        log_debug!(
-            LogCategory::Storage,
-            "Added operation to transaction {} (total: {} ops, ~{} bytes)",
-            self.id,
-            metadata.operation_count,
-            metadata.estimated_size
-        );
-        
         Ok(())
     }
     
     /// Estimate the size of an operation in bytes
     fn estimate_operation_size(&self, operation: &BatchOperation) -> usize {
         match operation {
-            BatchOperation::PutAccount { account, .. } => {
-                21 + account.serialized_size() // address + account data
+            BatchOperation::PutAccount { .. } => {
+                21 + 100 // address + estimated account data size
             }
             BatchOperation::DeleteAccount { .. } => 21,
             BatchOperation::PutTransaction { data, .. } => {
@@ -351,13 +333,6 @@ impl TransactionBatch {
             return Err(StorageError::transaction("Cannot commit empty transaction".to_string()));
         }
         
-        log_debug!(
-            LogCategory::Storage,
-            "Committing transaction {} with {} operations",
-            self.id,
-            operations.len()
-        );
-        
         // Create RocksDB write batch
         let mut batch = WriteBatch::default();
         let mut hasher = Sha256::new();
@@ -369,83 +344,83 @@ impl TransactionBatch {
         for operation in &operations {
             match operation {
                 BatchOperation::PutAccount { address, account } => {
-                    let key = state_keys::account_key(address);
-                    let value = account.serialize()
-                        .map_err(|e| StorageError::serialization(e.to_string()))?;
+                    let key = [b"acc:", address.as_slice()].concat();
+                    // For now, serialize as simple bytes - this would be replaced with proper serialization
+                    let value = format!("{:?}", account).into_bytes();
                     
-                    let cf_handle = self.engine.cf_handle("accounts")?;
-                    batch.put_cf(&cf_handle, &key, &value);
+                    let cf_handle = self.engine.get_cf_handle("accounts")?;
+                    batch.put_cf(cf_handle, &key, &value);
                     
                     hasher.update(&key);
                     hasher.update(&value);
                 }
                 BatchOperation::DeleteAccount { address } => {
-                    let key = state_keys::account_key(address);
-                    let cf_handle = self.engine.cf_handle("accounts")?;
-                    batch.delete_cf(&cf_handle, &key);
+                    let key = [b"acc:", address.as_slice()].concat();
+                    let cf_handle = self.engine.get_cf_handle("accounts")?;
+                    batch.delete_cf(cf_handle, &key);
                     
                     hasher.update(&key);
                     hasher.update(b"DELETE");
                 }
                 BatchOperation::PutTransaction { hash, data } => {
-                    let key = state_keys::transaction_key(hash);
-                    let cf_handle = self.engine.cf_handle("transactions")?;
-                    batch.put_cf(&cf_handle, &key, data);
+                    let key = [b"tx:", hash.as_slice()].concat();
+                    let cf_handle = self.engine.get_cf_handle("transactions")?;
+                    batch.put_cf(cf_handle, &key, data);
                     
                     hasher.update(&key);
                     hasher.update(data);
                 }
                 BatchOperation::DeleteTransaction { hash } => {
-                    let key = state_keys::transaction_key(hash);
-                    let cf_handle = self.engine.cf_handle("transactions")?;
-                    batch.delete_cf(&cf_handle, &key);
+                    let key = [b"tx:", hash.as_slice()].concat();
+                    let cf_handle = self.engine.get_cf_handle("transactions")?;
+                    batch.delete_cf(cf_handle, &key);
                     
                     hasher.update(&key);
                     hasher.update(b"DELETE");
                 }
                 BatchOperation::PutMetadata { key, value } => {
-                    let key_bytes = state_keys::metadata_key(key);
-                    let cf_handle = self.engine.cf_handle("metadata")?;
-                    batch.put_cf(&cf_handle, &key_bytes, value);
+                    let key_bytes = [b"meta:", key.as_bytes()].concat();
+                    let cf_handle = self.engine.get_cf_handle("metadata")?;
+                    batch.put_cf(cf_handle, &key_bytes, value);
                     
                     hasher.update(&key_bytes);
                     hasher.update(value);
                 }
                 BatchOperation::DeleteMetadata { key } => {
-                    let key_bytes = state_keys::metadata_key(key);
-                    let cf_handle = self.engine.cf_handle("metadata")?;
-                    batch.delete_cf(&cf_handle, &key_bytes);
+                    let key_bytes = [b"meta:", key.as_bytes()].concat();
+                    let cf_handle = self.engine.get_cf_handle("metadata")?;
+                    batch.delete_cf(cf_handle, &key_bytes);
                     
                     hasher.update(&key_bytes);
                     hasher.update(b"DELETE");
                 }
                 BatchOperation::PutConsensus { key, value } => {
-                    let cf_handle = self.engine.cf_handle("consensus")?;
-                    batch.put_cf(&cf_handle, key, value);
+                    let cf_handle = self.engine.get_cf_handle("consensus")?;
+                    batch.put_cf(cf_handle, key, value);
                     
                     hasher.update(key);
                     hasher.update(value);
                 }
                 BatchOperation::DeleteConsensus { key } => {
-                    let cf_handle = self.engine.cf_handle("consensus")?;
-                    batch.delete_cf(&cf_handle, key);
+                    let cf_handle = self.engine.get_cf_handle("consensus")?;
+                    batch.delete_cf(cf_handle, key);
                     
                     hasher.update(key);
                     hasher.update(b"DELETE");
                 }
                 BatchOperation::PutContract { address, code, storage } => {
-                    let cf_handle = self.engine.cf_handle("contracts")?;
+                    let cf_handle = self.engine.get_cf_handle("contracts")?;
                     
                     // Store contract code
                     let code_key = [b"code:", address.as_slice()].concat();
-                    batch.put_cf(&cf_handle, &code_key, code);
+                    batch.put_cf(cf_handle, &code_key, code);
                     hasher.update(&code_key);
                     hasher.update(code);
                     
                     // Store contract storage
                     for (storage_key, storage_value) in storage {
                         let full_key = [b"storage:", address.as_slice(), b":", storage_key.as_slice()].concat();
-                        batch.put_cf(&cf_handle, &full_key, storage_value);
+                        batch.put_cf(cf_handle, &full_key, storage_value);
                         hasher.update(&full_key);
                         hasher.update(storage_value);
                     }
@@ -453,25 +428,25 @@ impl TransactionBatch {
                 BatchOperation::DeleteContract { address } => {
                     // Note: This is a simplified deletion. In practice, you'd need to
                     // iterate and delete all storage keys for this contract
-                    let cf_handle = self.engine.cf_handle("contracts")?;
+                    let cf_handle = self.engine.get_cf_handle("contracts")?;
                     let code_key = [b"code:", address.as_slice()].concat();
-                    batch.delete_cf(&cf_handle, &code_key);
+                    batch.delete_cf(cf_handle, &code_key);
                     
                     hasher.update(&code_key);
                     hasher.update(b"DELETE");
                 }
                 BatchOperation::PutDfsRef { hash, reference } => {
-                    let key = state_keys::dfs_ref_key(hash);
-                    let cf_handle = self.engine.cf_handle("dfs_refs")?;
-                    batch.put_cf(&cf_handle, &key, reference);
+                    let key = dfs_ref_key(hash);
+                    let cf_handle = self.engine.get_cf_handle("dfs_refs")?;
+                    batch.put_cf(cf_handle, &key, reference);
                     
                     hasher.update(&key);
                     hasher.update(reference);
                 }
                 BatchOperation::DeleteDfsRef { hash } => {
-                    let key = state_keys::dfs_ref_key(hash);
-                    let cf_handle = self.engine.cf_handle("dfs_refs")?;
-                    batch.delete_cf(&cf_handle, &key);
+                    let key = dfs_ref_key(hash);
+                    let cf_handle = self.engine.get_cf_handle("dfs_refs")?;
+                    batch.delete_cf(cf_handle, &key);
                     
                     hasher.update(&key);
                     hasher.update(b"DELETE");
@@ -491,13 +466,6 @@ impl TransactionBatch {
         
         // Calculate transaction hash
         let tx_hash: Hash = hasher.finalize().into();
-        
-        log_debug!(
-            LogCategory::Storage,
-            "Transaction {} committed successfully with hash {:?}",
-            self.id,
-            hex::encode(tx_hash)
-        );
         
         Ok(tx_hash)
     }
@@ -609,12 +577,9 @@ impl TransactionBatchBuilder {
     }
 }
 
-// Add helper function to state_keys module
-impl catalyst_utils::state::state_keys {
-    /// Generate DFS reference key
-    pub fn dfs_ref_key(hash: &catalyst_utils::Hash) -> Vec<u8> {
-        [b"dfs_ref:", hash.as_slice()].concat()
-    }
+/// Generate DFS reference key
+pub fn dfs_ref_key(hash: &Hash) -> Vec<u8> {
+    [b"dfs_ref:", hash.as_slice()].concat()
 }
 
 #[cfg(test)]
@@ -759,7 +724,7 @@ mod tests {
         assert!(batch.is_committed());
         
         // Verify data was written
-        let key = state_keys::account_key(&address);
+        let key = [b"acc:", address.as_slice()].concat();
         let stored_data = engine.get("accounts", &key).unwrap();
         assert!(stored_data.is_some());
     }

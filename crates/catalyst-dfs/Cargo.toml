@@ -2,79 +2,31 @@
 name = "catalyst-dfs"
 version = "0.1.0"
 edition = "2021"
-description = "Distributed File System for Catalyst Network based on IPFS"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/catalyst-network/catalyst-dfs"
-documentation = "https://docs.rs/catalyst-dfs"
-keywords = ["blockchain", "ipfs", "distributed", "storage", "p2p"]
-categories = ["network-programming", "filesystem", "cryptography"]
 
 [dependencies]
-# Core Catalyst dependencies
-catalyst-core = { path = "../catalyst-core" }
-
-# IPFS and content addressing
-cid = "0.10"
-multihash = "0.19"
-
-# Networking with libp2p
-libp2p = { version = "0.53", features = [
-    "kad", 
-    "request-response", 
-    "gossipsub", 
-    "identify", 
-    "noise", 
-    "tcp", 
-    "yamux",
-    "async-std"
-] }
-
-# Async runtime
-tokio = { version = "1.0", features = ["full"] }
-tokio-util = { version = "0.7", features = ["codec"] }
-futures = "0.3"
+# Core dependencies
 async-trait = "0.1"
-
-# Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
-# Database and storage
-rocksdb = "0.21"
-
-# Time handling
-chrono = { version = "0.4", features = ["serde"] }
-
-# Error handling
-thiserror = "1.0"
-anyhow = "1.0"
-
-# Utilities
-log = "0.4"
+tokio = { version = "1.0", features = ["full"] }
 uuid = { version = "1.0", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+thiserror = "1.0"
 
-[dev-dependencies]
-tempfile = "3.0"
-tokio-test = "0.4"
-criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
-futures = "0.3"
+# Local crate dependencies
+catalyst-utils = { path = "../catalyst-utils" }
+catalyst-core = { path = "../catalyst-core" }
+
+# Storage - commented out for now
+# rocksdb = "0.22"
+
+# Networking - DISABLED FOR NOW
+# libp2p = { version = "0.54", features = ["gossipsub", "kad", "identify", "noise", "tcp", "request-response"] }
+# cid = "0.10"
+# multihash = "0.18"
 
 [features]
-default = ["full"]
-full = ["networking", "storage", "provider"]
-networking = []
-storage = []
-provider = []
-
-[[bench]]
-name = "dfs_benchmarks"
-harness = false
-path = "benches/dfs_benchmarks.rs"
-
-[profile.release]
-lto = true
-codegen-units = 1
-panic = "abort"
-
-[profile.bench]
-debug = true
+default = ["local-only"]
+local-only = []
+networking = []  # Disabled until libp2p issues are resolved

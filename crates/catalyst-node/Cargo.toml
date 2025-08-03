@@ -1,0 +1,45 @@
+# Create as crates/catalyst-node/Cargo.toml
+
+[package]
+name = "catalyst-node"
+version = "0.1.0"
+edition = "2021"
+description = "Catalyst blockchain node manager and orchestrator"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Core Catalyst crates
+catalyst-config = { path = "../catalyst-config" }
+catalyst-core = { path = "../catalyst-core" }
+catalyst-utils = { path = "../catalyst-utils" }
+catalyst-rpc = { path = "../catalyst-rpc" }
+catalyst-storage = { path = "../catalyst-storage" }
+catalyst-network = { path = "../catalyst-network" }
+catalyst-consensus = { path = "../catalyst-consensus" }
+catalyst-runtime-evm = { path = "../catalyst-runtime-evm" }
+
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Utilities
+uuid = { version = "1.0", features = ["v4"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[features]
+default = ["std"]
+std = []

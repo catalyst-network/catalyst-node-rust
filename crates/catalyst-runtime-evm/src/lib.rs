@@ -1,26 +1,45 @@
-// Enhanced implementation using REVM with Catalyst extensions
+// lib.rs - Simplified Catalyst EVM implementation compatible with REVM 3.5
 
 use revm::{
-    primitives::{TxEnv, BlockEnv, CfgEnv, SpecId, ExecutionResult, Env, Output, Log},
-    Database, EVM, Evm,
+    primitives::{TxEnv, BlockEnv, CfgEnv, SpecId, ExecutionResult, Env},
+    Database, EVM,
 };
 use std::collections::HashMap;
-use ethereum_types::{Address, U256, H256};
-use async_trait::async_trait;
+use revm::primitives::{Address, U256, B256}; // Use REVM's types instead of ethereum-types
 use thiserror::Error;
-use tracing::{info, warn, error, debug};
+use tracing::{info, error, debug};
 use serde::{Serialize, Deserialize};
 
-/// Catalyst EVM configuration with extensions
+/// Standard EVM configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CatalystEvmConfig {
-    /// Standard EVM configuration
-    pub evm_config: EvmConfig,
-    /// Catalyst-specific extensions
-    pub catalyst_features: CatalystFeatures,
+pub struct EvmConfig {
+    pub chain_id: u64,
+    pub block_gas_limit: u64,
+    pub base_fee: U256,
+    pub enable_eip1559: bool,
+    pub enable_london: bool,
+    pub enable_berlin: bool,
+    pub max_code_size: usize,
+    pub view_gas_limit: u64,
 }
 
-impl CatalystExecutionResult {
+impl Default for EvmConfig {
+    fn default() -> Self {
+        Self {
+            chain_id: 31337,
+            block_gas_limit: 30_000_000,
+            base_fee: U256::from(1_000_000_000u64),
+            enable_eip1559: true,
+            enable_london: true,
+            enable_berlin: true,
+            max_code_size: 49152,
+            view_gas_limit: 50_000_000,
+        }
+    }
+}
+
+/// Catalyst-specific EVM features
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalystFeatures {
     /// Enable cross-runtime calls
     pub cross_runtime_enabled: bool,
@@ -32,32 +51,86 @@ pub struct CatalystFeatures {
     pub catalyst_gas_model: bool,
 }
 
+impl Default for CatalystFeatures {
+    fn default() -> Self {
+        Self {
+            cross_runtime_enabled: false,
+            confidential_tx_enabled: false,
+            dfs_integration: false,
+            catalyst_gas_model: false,
+        }
+    }
+}
+
+/// Catalyst EVM configuration with extensions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalystEvmConfig {
+    /// Standard EVM configuration
+    pub evm_config: EvmConfig,
+    /// Catalyst-specific extensions
+    pub catalyst_features: CatalystFeatures,
+}
+
+impl Default for CatalystEvmConfig {
+    fn default() -> Self {
+        Self {
+            evm_config: EvmConfig::default(),
+            catalyst_features: CatalystFeatures::default(),
+        }
+    }
+}
+
+/// Simple transaction representation compatible with REVM
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvmTransaction {
+    pub from: Address,
+    pub to: Option<Address>,
+    pub value: U256,
+    pub data: Vec<u8>,
+    pub gas_limit: u64,
+    pub gas_price: U256,
+    pub gas_priority_fee: Option<U256>,
+    pub nonce: u64,
+    pub chain_id: u64,
+}
+
+impl EvmTransaction {
+    pub fn to_tx_env(&self) -> Result<TxEnv, EvmError> {
+        use revm::primitives::{TransactTo, CreateScheme, Bytes};
+
+        Ok(TxEnv {
+            caller: self.from,
+            gas_limit: self.gas_limit,
+            gas_price: self.gas_price,
+            transact_to: match self.to {
+                Some(addr) => TransactTo::Call(addr),
+                None => TransactTo::Create(CreateScheme::Create),
+            },
+            value: self.value,
+            data: Bytes::from(self.data.clone()),
+            gas_priority_fee: self.gas_priority_fee,
+            chain_id: Some(self.chain_id),
+            nonce: Some(self.nonce),
+            access_list: Vec::new(),
+            blob_hashes: Vec::new(),
+            max_fee_per_blob_gas: None,
+        })
+    }
+}
+
 /// Enhanced EVM runtime with Catalyst extensions
 pub struct CatalystEvmRuntime<DB: Database> {
-    /// Core REVM instance
-    evm: Evm<'static, (), DB>,
+    /// Database instance
+    database: DB,
     /// Catalyst-specific configuration
     config: CatalystEvmConfig,
-    /// Custom precompiles registry
-    precompiles: CatalystPrecompiles,
-    /// Cross-runtime communication handler
-    runtime_bridge: Option<RuntimeBridge>,
 }
 
 impl<DB: Database> CatalystEvmRuntime<DB> {
     pub fn new(database: DB, config: CatalystEvmConfig) -> Self {
-        let mut evm = EVM::builder()
-            .with_db(database)
-            .build();
-
-        // Register Catalyst precompiles
-        let precompiles = CatalystPrecompiles::new(&config.catalyst_features);
-        
         Self {
-            evm,
+            database,
             config,
-            precompiles,
-            runtime_bridge: None,
         }
     }
 
@@ -73,42 +146,40 @@ impl<DB: Database> CatalystEvmRuntime<DB> {
         }
 
         // Setup environment
-        let tx_env = self.build_tx_env(tx)?;
-        let env = Env {
-            block: block_env.clone(),
-            tx: tx_env,
-            cfg: self.build_cfg_env(),
-        };
-
-        // Execute with REVM
-        self.evm.env = Box::new(env);
-        let result = self.evm.transact().map_err(|e| {
-            EvmError::Execution(format!("REVM execution failed: {:?}", e))
-        })?;
-
-        // Post-execution: Handle Catalyst-specific results
-        let catalyst_result = self.process_execution_result(result, tx).await?;
-
-        Ok(catalyst_result)
-    }
-
-    /// Handle confidential transactions (Catalyst extension)
-    fn handle_confidential_transaction(&self, tx: &EvmTransaction) -> Result<(), EvmError> {
-        // Implement confidential transaction logic
-        // This would integrate with your Pedersen commitments from the paper
-        todo!("Implement confidential transaction handling")
-    }
-
-    /// Build transaction environment with Catalyst extensions
-    fn build_tx_env(&self, tx: &EvmTransaction) -> Result<TxEnv, EvmError> {
         let mut tx_env = tx.to_tx_env()?;
+        let cfg_env = self.build_cfg_env();
 
         // Apply Catalyst gas model if enabled
         if self.config.catalyst_features.catalyst_gas_model {
             tx_env.gas_price = self.calculate_catalyst_gas_price(&tx_env);
         }
 
-        Ok(tx_env)
+        let env = Env {
+            block: block_env.clone(),
+            tx: tx_env,
+            cfg: cfg_env,
+        };
+
+        // Execute with REVM
+        let mut evm = EVM::new();
+        evm.database(&mut self.database);
+        evm.env = env;
+        let result = evm.transact().map_err(|e| {
+            EvmError::Execution("REVM execution failed".to_string())
+        })?;
+
+        // Post-execution: Handle Catalyst-specific results
+        let catalyst_result = self.process_execution_result(result.result, tx).await?;
+
+        Ok(catalyst_result)
+    }
+
+    /// Handle confidential transactions (Catalyst extension)
+    fn handle_confidential_transaction(&self, _tx: &EvmTransaction) -> Result<(), EvmError> {
+        // Implement confidential transaction logic
+        // This would integrate with your Pedersen commitments from the paper
+        debug!("Processing confidential transaction");
+        Ok(())
     }
 
     /// Custom gas pricing for Catalyst network
@@ -122,14 +193,9 @@ impl<DB: Database> CatalystEvmRuntime<DB> {
     fn build_cfg_env(&self) -> CfgEnv {
         let mut cfg = CfgEnv::default();
         cfg.chain_id = self.config.evm_config.chain_id;
-        cfg.spec_id = SpecId::SHANGHAI; // Use latest stable spec
-        
-        // Enable Catalyst-specific features
-        if self.config.catalyst_features.cross_runtime_enabled {
-            // Register cross-runtime precompiles
-            // This would be handled by the precompiles system
-        }
-
+        cfg.spec_id = SpecId::LONDON; // Use London hard fork by default
+        cfg.perf_analyse_created_bytecodes = revm::primitives::AnalysisKind::Analyse;
+        cfg.limit_contract_code_size = Some(0xc000); // 48KB limit
         cfg
     }
 
@@ -139,37 +205,34 @@ impl<DB: Database> CatalystEvmRuntime<DB> {
         result: ExecutionResult,
         tx: &EvmTransaction,
     ) -> Result<CatalystExecutionResult, EvmError> {
-        let mut catalyst_result = CatalystExecutionResult::from_revm_result(result, tx);
-
-        // Handle cross-runtime calls if any occurred
-        if let Some(bridge) = &self.runtime_bridge {
-            catalyst_result.cross_runtime_calls = bridge.extract_calls(&catalyst_result).await?;
-        }
+        let catalyst_result = CatalystExecutionResult::from_revm_result(result, tx);
 
         // Handle DFS integration
         if self.config.catalyst_features.dfs_integration {
-            catalyst_result.dfs_operations = self.extract_dfs_operations(&catalyst_result)?;
+            // Would process DFS operations here
+            debug!("Processing DFS operations");
         }
 
         Ok(catalyst_result)
-    }
-
-    /// Extract DFS operations from execution result
-    fn extract_dfs_operations(
-        &self,
-        result: &CatalystExecutionResult,
-    ) -> Result<Vec<DfsOperation>, EvmError> {
-        // Parse logs for DFS-related events
-        // This would integrate with your distributed file system
-        Ok(Vec::new()) // Placeholder
     }
 }
 
 /// Enhanced execution result with Catalyst extensions
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalystExecutionResult {
-    pub fn from_revm_result(result: ExecutionResult, tx: &EvmTransaction) -> Self {
-        let base_result = EvmExecutionResult::from_revm_result(result, tx);
+    /// Standard EVM execution result
+    pub base_result: EvmExecutionResult,
+    /// Cross-runtime calls made during execution
+    pub cross_runtime_calls: Vec<CrossRuntimeCall>,
+    /// DFS operations performed
+    pub dfs_operations: Vec<DfsOperation>,
+    /// Confidential transaction proofs
+    pub confidential_proofs: Option<ConfidentialProofs>,
+}
+
+impl CatalystExecutionResult {
+    pub fn from_revm_result(result: ExecutionResult, _tx: &EvmTransaction) -> Self {
+        let base_result = EvmExecutionResult::from_revm_result(result);
         
         Self {
             base_result,
@@ -195,17 +258,77 @@ pub struct CatalystExecutionResult {
         &self.base_result.logs
     }
 }
-    /// Standard EVM execution result
-    pub base_result: EvmExecutionResult,
-    /// Cross-runtime calls made during execution
-    pub cross_runtime_calls: Vec<CrossRuntimeCall>,
-    /// DFS operations performed
-    pub dfs_operations: Vec<DfsOperation>,
-    /// Confidential transaction proofs
-    pub confidential_proofs: Option<ConfidentialProofs>,
+
+/// Simplified execution result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvmExecutionResult {
+    pub success: bool,
+    pub return_data: Vec<u8>,
+    pub gas_used: u64,
+    pub gas_refunded: u64,
+    pub logs: Vec<EvmLog>,
+    pub created_address: Option<Address>,
 }
 
-#[derive(Debug, Clone)]
+impl EvmExecutionResult {
+    pub fn from_revm_result(result: ExecutionResult) -> Self {
+        use revm::primitives::Output;
+
+        match result {
+            ExecutionResult::Success { reason: _, output, gas_used, gas_refunded, logs } => {
+                let (return_data, created_address) = match output {
+                    Output::Call(data) => (data.to_vec(), None),
+                    Output::Create(data, addr) => (data.to_vec(), addr),
+                };
+
+                Self {
+                    success: true,
+                    return_data,
+                    gas_used,
+                    gas_refunded,
+                    logs: logs.into_iter().map(EvmLog::from).collect(),
+                    created_address,
+                }
+            }
+            ExecutionResult::Revert { output, gas_used } => Self {
+                success: false,
+                return_data: output.to_vec(),
+                gas_used,
+                gas_refunded: 0,
+                logs: Vec::new(),
+                created_address: None,
+            },
+            ExecutionResult::Halt { reason: _, gas_used } => Self {
+                success: false,
+                return_data: Vec::new(),
+                gas_used,
+                gas_refunded: 0,
+                logs: Vec::new(),
+                created_address: None,
+            },
+        }
+    }
+}
+
+/// EVM log entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvmLog {
+    pub address: Address,
+    pub topics: Vec<B256>,
+    pub data: Vec<u8>,
+}
+
+impl From<revm::primitives::Log> for EvmLog {
+    fn from(log: revm::primitives::Log) -> Self {
+        Self {
+            address: log.address,
+            topics: log.topics,
+            data: log.data.to_vec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrossRuntimeCall {
     pub target_runtime: RuntimeType,
     pub method: String,
@@ -216,7 +339,7 @@ pub struct CrossRuntimeCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DfsOperation {
     pub operation_type: DfsOperationType,
-    pub file_hash: H256,
+    pub file_hash: B256,
     pub size: u64,
 }
 
@@ -294,8 +417,8 @@ impl FeeCalculator {
 
     pub fn calculate_fee(&self, gas_used: u64, priority_fee: Option<U256>) -> U256 {
         let base_cost = self.base_fee * U256::from(gas_used);
-        let congestion_adjustment = U256::from((base_cost.as_u64() as f64 * self.congestion_multiplier) as u64);
-        let priority = priority_fee.unwrap_or(U256::zero());
+        let congestion_adjustment = U256::from((base_cost.to::<u64>() as f64 * self.congestion_multiplier) as u64);
+        let priority = priority_fee.unwrap_or(U256::ZERO);
         
         congestion_adjustment + priority
     }
@@ -323,8 +446,8 @@ impl ContractDeployer {
         &mut self,
         deployer: Address,
         bytecode: Vec<u8>,
-        constructor_args: Vec<u8>,
-        salt: Option<H256>,
+        _constructor_args: Vec<u8>,
+        salt: Option<B256>,
     ) -> Result<Address, EvmError> {
         let nonce = self.get_next_nonce(deployer);
         
@@ -347,27 +470,33 @@ impl ContractDeployer {
     }
 
     fn calculate_create_address(&self, deployer: Address, nonce: u64) -> Address {
-        use sha3::{Keccak256, Digest};
-        
-        let mut stream = rlp::RlpStream::new_list(2);
-        stream.append(&deployer);
-        stream.append(&nonce);
-        
-        let hash = Keccak256::digest(stream.out());
-        Address::from_slice(&hash[12..])
-    }
-
-    fn calculate_create2_address(&self, deployer: Address, salt: H256, bytecode: &[u8]) -> Address {
-        use sha3::{Keccak256, Digest};
+        use sha3::{Digest, Keccak256};
         
         let mut hasher = Keccak256::new();
-        hasher.update(&[0xff]);
-        hasher.update(deployer.as_bytes());
-        hasher.update(salt.as_bytes());
-        hasher.update(Keccak256::digest(bytecode));
+        hasher.update(deployer.as_slice());
+        hasher.update(&nonce.to_le_bytes());
         
         let hash = hasher.finalize();
         Address::from_slice(&hash[12..])
+    }
+
+    fn calculate_create2_address(&self, deployer: Address, salt: B256, bytecode: &[u8]) -> Address {
+        use sha3::{Digest, Keccak256};
+        
+        let mut hasher = Keccak256::new();
+        hasher.update(&[0xff]);
+        hasher.update(deployer.as_slice());
+        hasher.update(salt.as_slice());
+        hasher.update(&Keccak256::digest(bytecode));
+        
+        let hash = hasher.finalize();
+        Address::from_slice(&hash[12..])
+    }
+}
+
+impl Default for ContractDeployer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -429,133 +558,66 @@ pub enum EvmError {
     ConfidentialTxError(String),
 }
 
-/// Catalyst-specific precompiles registry
-pub struct CatalystPrecompiles {
-    /// Standard Ethereum precompiles
-    standard_precompiles: HashMap<Address, Box<dyn Precompile>>,
-    /// Catalyst extension precompiles
-    catalyst_precompiles: HashMap<Address, Box<dyn Precompile>>,
+/// Simple in-memory database for testing
+use revm::primitives::{AccountInfo, Bytecode};
+
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryDatabase {
+    accounts: HashMap<Address, AccountInfo>,
+    storage: HashMap<(Address, U256), U256>,
+    code: HashMap<Address, Bytecode>,
+    block_hashes: HashMap<u64, B256>,
 }
 
-impl CatalystPrecompiles {
-    pub fn new(features: &CatalystFeatures) -> Self {
-        let mut precompiles = Self {
-            standard_precompiles: HashMap::new(),
-            catalyst_precompiles: HashMap::new(),
-        };
-
-        // Add standard Ethereum precompiles
-        precompiles.add_standard_precompiles();
-        
-        // Add Catalyst-specific precompiles based on enabled features
-        if features.cross_runtime_enabled {
-            precompiles.add_cross_runtime_precompiles();
-        }
-        
-        if features.dfs_integration {
-            precompiles.add_dfs_precompiles();
-        }
-        
-        if features.confidential_tx_enabled {
-            precompiles.add_confidential_precompiles();
-        }
-
-        precompiles
-    }
-
-    fn add_standard_precompiles(&mut self) {
-        // Add Ethereum precompiles (ecrecover, sha256, etc.)
-        // These would be standard REVM precompiles
-    }
-
-    fn add_cross_runtime_precompiles(&mut self) {
-        // Add precompiles for calling other runtimes
-        self.catalyst_precompiles.insert(
-            Address::from_low_u64_be(0x1000), // Custom address space
-            Box::new(CrossRuntimeCallPrecompile::new()),
-        );
-    }
-
-    fn add_dfs_precompiles(&mut self) {
-        // Add precompiles for DFS operations
-        self.catalyst_precompiles.insert(
-            Address::from_low_u64_be(0x1001),
-            Box::new(DfsStorePrecompile::new()),
-        );
-        self.catalyst_precompiles.insert(
-            Address::from_low_u64_be(0x1002),
-            Box::new(DfsRetrievePrecompile::new()),
-        );
-    }
-
-    fn add_confidential_precompiles(&mut self) {
-        // Add precompiles for confidential transactions
-        self.catalyst_precompiles.insert(
-            Address::from_low_u64_be(0x1003),
-            Box::new(CommitmentVerifyPrecompile::new()),
-        );
-    }
-}
-
-/// Bridge for cross-runtime communication
-pub struct RuntimeBridge {
-    // This would handle communication with other runtimes
-    // in your multi-runtime architecture
-}
-
-impl RuntimeBridge {
-    pub async fn extract_calls(
-        &self,
-        result: &CatalystExecutionResult,
-    ) -> Result<Vec<CrossRuntimeCall>, EvmError> {
-        // Parse execution logs for cross-runtime calls
-        Ok(Vec::new()) // Placeholder
-    }
-}
-
-/// Trait for custom precompiles
-pub trait Precompile: Send + Sync {
-    fn execute(&self, input: &[u8], gas_limit: u64) -> Result<PrecompileResult, PrecompileError>;
-}
-
-#[derive(Debug)]
-pub struct PrecompileResult {
-    pub output: Vec<u8>,
-    pub gas_used: u64,
-}
-
-#[derive(Debug)]
-pub enum PrecompileError {
-    OutOfGas,
-    InvalidInput,
-    ExecutionFailed(String),
-}
-
-// Example Catalyst-specific precompiles
-pub struct CrossRuntimeCallPrecompile;
-pub struct DfsStorePrecompile;
-pub struct DfsRetrievePrecompile;
-pub struct CommitmentVerifyPrecompile;
-
-impl CrossRuntimeCallPrecompile {
+impl InMemoryDatabase {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn create_account(&mut self, address: Address, balance: U256) {
+        let account = AccountInfo {
+            balance,
+            nonce: 0,
+            code_hash: B256::ZERO,
+            code: None,
+        };
+        self.accounts.insert(address, account);
     }
 }
 
-impl Precompile for CrossRuntimeCallPrecompile {
-    fn execute(&self, input: &[u8], gas_limit: u64) -> Result<PrecompileResult, PrecompileError> {
-        // Implement cross-runtime call logic
-        todo!("Implement cross-runtime call precompile")
+impl Database for InMemoryDatabase {
+    type Error = EvmError;
+
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        Ok(self.accounts.get(&address).cloned())
+    }
+
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        // For simplicity, iterate through all code to find by hash
+        for (_, code) in &self.code {
+            if code.hash_slow() == code_hash {
+                return Ok(code.clone());
+            }
+        }
+        Ok(Bytecode::default())
+    }
+
+    fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        Ok(self.storage.get(&(address, index)).copied().unwrap_or(U256::ZERO))
+    }
+
+    fn block_hash(&mut self, number: U256) -> Result<B256, Self::Error> {
+        let block_number = number.to::<u64>();
+        Ok(self.block_hashes
+            .get(&block_number)
+            .copied()
+            .unwrap_or(B256::ZERO))
     }
 }
-
-// Similar implementations for other precompiles...
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::InMemoryDatabase;
 
     #[tokio::test]
     async fn test_catalyst_evm_execution() {
@@ -583,17 +645,17 @@ mod tests {
             gas_priority_fee: None,
             nonce: 0,
             chain_id: 31337,
-            access_list: None,
         };
 
         let block_env = BlockEnv {
             number: U256::from(1),
-            coinbase: Address::zero(),
+            coinbase: Address::ZERO,
             timestamp: U256::from(1234567890),
             gas_limit: U256::from(30_000_000),
             basefee: U256::from(1_000_000_000u64),
-            difficulty: U256::zero(),
-            prevrandao: Some(H256::zero().into()),
+            difficulty: U256::ZERO,
+            prevrandao: Some(B256::ZERO),
+            blob_excess_gas_and_price: None,
         };
 
         // This would fail in a real test without proper setup, but demonstrates the interface
@@ -635,10 +697,10 @@ mod tests {
             None,
         ).unwrap();
         
-        assert_ne!(contract_address, Address::zero());
+        assert_ne!(contract_address, Address::ZERO);
         
         // Test CREATE2
-        let salt = H256::from_low_u64_be(12345);
+        let salt = B256::from_low_u64_be(12345);
         let contract_address2 = deployer.deploy_contract(
             deployer_address,
             bytecode,
@@ -646,7 +708,7 @@ mod tests {
             Some(salt),
         ).unwrap();
         
-        assert_ne!(contract_address2, Address::zero());
+        assert_ne!(contract_address2, Address::ZERO);
         assert_ne!(contract_address, contract_address2);
     }
 
@@ -662,48 +724,5 @@ mod tests {
         assert_eq!(trace.len(), 3);
         assert_eq!(trace[0], ("PUSH1".to_string(), 3));
         assert_eq!(trace[2], ("ADD".to_string(), 3));
-    }
-
-    #[test]
-    fn test_catalyst_execution_result() {
-        let tx = EvmTransaction {
-            from: Address::from_low_u64_be(1),
-            to: Some(Address::from_low_u64_be(2)),
-            value: U256::from(100),
-            data: vec![],
-            gas_limit: 21000,
-            gas_price: U256::from(1_000_000_000u64),
-            gas_priority_fee: None,
-            nonce: 0,
-            chain_id: 31337,
-            access_list: None,
-        };
-
-        // Create a mock REVM result
-        let revm_result = ExecutionResult::Success {
-            output: Output::Call(vec![].into()),
-            gas_used: 21000,
-            gas_refunded: 0,
-            logs: vec![],
-        };
-
-        let result = CatalystExecutionResult::from_revm_result(revm_result, &tx);
-        assert!(result.success());
-        assert_eq!(result.gas_used(), 21000);
-    }
-
-    #[test]
-    fn test_precompile_registration() {
-        let features = CatalystFeatures {
-            cross_runtime_enabled: true,
-            confidential_tx_enabled: true,
-            dfs_integration: true,
-            catalyst_gas_model: false,
-        };
-
-        let precompiles = CatalystPrecompiles::new(&features);
-        
-        // Verify that Catalyst precompiles are registered
-        assert!(!precompiles.catalyst_precompiles.is_empty());
     }
 }

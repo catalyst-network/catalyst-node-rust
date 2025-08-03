@@ -186,6 +186,7 @@ impl Default for KeyValueBatch {
 }
 
 /// Database iterator wrapper for easier use
+/// Note: Some methods are commented out due to RocksDB version compatibility
 pub struct DatabaseIterator<'a> {
     inner: rocksdb::DBIterator<'a>,
 }
@@ -195,17 +196,23 @@ impl<'a> DatabaseIterator<'a> {
         Self { inner }
     }
     
-    pub fn seek_to_first(&mut self) {
-        self.inner.seek_to_first();
-    }
+    // NOTE: These seek methods are not available in the current RocksDB version
+    // They would need to be implemented using iterator positioning or removed
     
-    pub fn seek_to_last(&mut self) {
-        self.inner.seek_to_last();
-    }
+    // pub fn seek_to_first(&mut self) {
+    //     // Not available in current RocksDB version
+    //     // Would need to recreate iterator or use alternative approach
+    // }
     
-    pub fn seek(&mut self, key: &[u8]) {
-        self.inner.seek(key);
-    }
+    // pub fn seek_to_last(&mut self) {
+    //     // Not available in current RocksDB version
+    //     // Would need to recreate iterator or use alternative approach
+    // }
+    
+    // pub fn seek(&mut self, key: &[u8]) {
+    //     // Not available in current RocksDB version
+    //     // Would need to recreate iterator with IteratorMode::From
+    // }
     
     pub fn collect_all(&mut self) -> StorageResult<Vec<KeyValue>> {
         let mut results = Vec::new();

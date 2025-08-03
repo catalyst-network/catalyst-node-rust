@@ -2,10 +2,10 @@
 
 #[cfg(feature = "metrics")]
 use prometheus::{
-    Counter, Gauge, Histogram, IntCounter, IntGauge,
-    register_counter, register_gauge, register_histogram, 
-    register_int_counter, register_int_gauge,
-    HistogramOpts, Opts,
+    // Only import what's actually used
+    Histogram, IntCounter, IntGauge,
+    register_histogram, register_int_counter, register_int_gauge,
+    HistogramOpts,
 };
 
 #[cfg(feature = "metrics")]

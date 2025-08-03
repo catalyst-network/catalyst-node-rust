@@ -3,7 +3,6 @@
 use crate::{RocksEngine, StorageError, StorageResult, SnapshotConfig};
 use catalyst_utils::{
     Hash,
-    logging::{log_info, log_warn, log_error, LogCategory},
     utils::current_timestamp,
 };
 use std::sync::Arc;
@@ -87,24 +86,15 @@ impl SnapshotManager {
                         self.snapshots.write().insert(snapshot.name.clone(), snapshot);
                         loaded_count += 1;
                     }
-                    Err(e) => {
-                        log_warn!(
-                            LogCategory::Storage,
-                            "Failed to load snapshot from {:?}: {}",
-                            path,
-                            e
-                        );
+                    Err(_e) => {
+                        // Log warning in a real implementation
+                        eprintln!("Failed to load snapshot from {:?}", path);
                     }
                 }
             }
         }
         
-        log_info!(
-            LogCategory::Storage,
-            "Loaded {} existing snapshots",
-            loaded_count
-        );
-        
+        println!("Loaded {} existing snapshots", loaded_count);
         Ok(())
     }
     
@@ -125,7 +115,7 @@ impl SnapshotManager {
             return Err(StorageError::snapshot(format!("Snapshot '{}' already exists", name)));
         }
         
-        log_info!(LogCategory::Storage, "Creating snapshot '{}'", name);
+        println!("Creating snapshot '{}'", name);
         
         // Calculate current state root
         let state_root = self.calculate_state_root().await?;
@@ -158,12 +148,7 @@ impl SnapshotManager {
         // Store in memory
         self.snapshots.write().insert(name.to_string(), snapshot.clone());
         
-        log_info!(
-            LogCategory::Storage,
-            "Snapshot '{}' created successfully with state root {}",
-            name,
-            hex::encode(state_root)
-        );
+        println!("Snapshot '{}' created successfully with state root {}", name, hex::encode(state_root));
         
         // Cleanup old snapshots if needed
         self.cleanup_old_snapshots().await?;
@@ -178,10 +163,6 @@ impl SnapshotManager {
             .map_err(|e| StorageError::io(e))?;
         
         // Create RocksDB checkpoint (this creates a consistent point-in-time copy)
-        let checkpoint_path = data_dir.join("checkpoint");
-        
-        // Note: In a real implementation, you'd use RocksDB's checkpoint feature
-        // For now, we'll copy the current state manually
         for cf_name in &snapshot.metadata.column_families {
             let cf_file = data_dir.join(format!("{}.sst", cf_name));
             let mut cf_data = Vec::new();
@@ -244,7 +225,7 @@ impl SnapshotManager {
             .cloned()
             .ok_or_else(|| StorageError::snapshot(format!("Snapshot '{}' not found", name)))?;
         
-        log_info!(LogCategory::Storage, "Loading snapshot '{}'", name);
+        println!("Loading snapshot '{}'", name);
         
         // Clear current data
         self.clear_database().await?;
@@ -252,11 +233,7 @@ impl SnapshotManager {
         // Load snapshot data
         self.load_snapshot_data(&snapshot).await?;
         
-        log_info!(
-            LogCategory::Storage,
-            "Snapshot '{}' loaded successfully",
-            name
-        );
+        println!("Snapshot '{}' loaded successfully", name);
         
         Ok(())
     }
@@ -274,11 +251,7 @@ impl SnapshotManager {
             let cf_file = data_dir.join(format!("{}.sst", cf_name));
             
             if !cf_file.exists() {
-                log_warn!(
-                    LogCategory::Storage,
-                    "Column family file not found: {:?}",
-                    cf_file
-                );
+                eprintln!("Column family file not found: {:?}", cf_file);
                 continue;
             }
             
@@ -351,11 +324,7 @@ impl SnapshotManager {
             
             // Drop and recreate column family
             // This is a simplified approach - in practice you'd iterate and delete keys
-            log_warn!(
-                LogCategory::Storage,
-                "Clearing column family '{}' for snapshot restore",
-                cf_name
-            );
+            eprintln!("Clearing column family '{}' for snapshot restore", cf_name);
         }
         
         Ok(())
@@ -442,7 +411,7 @@ impl SnapshotManager {
                 .map_err(|e| StorageError::io(e))?;
         }
         
-        log_info!(LogCategory::Storage, "Snapshot '{}' deleted successfully", name);
+        println!("Snapshot '{}' deleted successfully", name);
         Ok(())
     }
     
@@ -471,18 +440,9 @@ impl SnapshotManager {
         
         for snapshot_name in old_snapshots {
             if let Err(e) = self.delete_snapshot(&snapshot_name).await {
-                log_error!(
-                    LogCategory::Storage,
-                    "Failed to delete old snapshot '{}': {}",
-                    snapshot_name,
-                    e
-                );
+                eprintln!("Failed to delete old snapshot '{}': {}", snapshot_name, e);
             } else {
-                log_info!(
-                    LogCategory::Storage,
-                    "Deleted old snapshot '{}' during cleanup",
-                    snapshot_name
-                );
+                println!("Deleted old snapshot '{}' during cleanup", snapshot_name);
             }
         }
         
@@ -510,15 +470,10 @@ impl SnapshotManager {
         let data_dest = export_dir.join(format!("{}_data", name));
         
         if data_src.exists() {
-            self.copy_dir_recursive(&data_src, &data_dest).await?;
+            Box::pin(self.copy_dir_recursive(&data_src, &data_dest)).await?;
         }
         
-        log_info!(
-            LogCategory::Storage,
-            "Snapshot '{}' exported to {:?}",
-            name,
-            export_dir
-        );
+        println!("Snapshot '{}' exported to {:?}", name, export_dir);
         
         Ok(())
     }
@@ -572,44 +527,41 @@ impl SnapshotManager {
         let data_dest = self.snapshot_dir.join(format!("{}_data", final_name));
         
         if data_src.exists() {
-            self.copy_dir_recursive(&data_src, &data_dest).await?;
+            Box::pin(self.copy_dir_recursive(&data_src, &data_dest)).await?;
         }
         
         // Add to snapshots map
         self.snapshots.write().insert(final_name.clone(), snapshot);
         
-        log_info!(
-            LogCategory::Storage,
-            "Snapshot imported as '{}' from {:?}",
-            final_name,
-            import_dir
-        );
+        println!("Snapshot imported as '{}' from {:?}", final_name, import_dir);
         
         Ok(final_name)
     }
     
     /// Recursively copy directory
-    async fn copy_dir_recursive(&self, src: &Path, dest: &Path) -> StorageResult<()> {
-        std::fs::create_dir_all(dest)
-            .map_err(|e| StorageError::io(e))?;
-        
-        let entries = std::fs::read_dir(src)
-            .map_err(|e| StorageError::io(e))?;
-        
-        for entry in entries {
-            let entry = entry.map_err(|e| StorageError::io(e))?;
-            let src_path = entry.path();
-            let dest_path = dest.join(entry.file_name());
+    fn copy_dir_recursive<'a>(&'a self, src: &'a Path, dest: &'a Path) -> std::pin::Pin<Box<dyn std::future::Future<Output = StorageResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            std::fs::create_dir_all(dest)
+                .map_err(|e| StorageError::io(e))?;
             
-            if src_path.is_dir() {
-                self.copy_dir_recursive(&src_path, &dest_path).await?;
-            } else {
-                std::fs::copy(&src_path, &dest_path)
-                    .map_err(|e| StorageError::io(e))?;
+            let entries = std::fs::read_dir(src)
+                .map_err(|e| StorageError::io(e))?;
+            
+            for entry in entries {
+                let entry = entry.map_err(|e| StorageError::io(e))?;
+                let src_path = entry.path();
+                let dest_path = dest.join(entry.file_name());
+                
+                if src_path.is_dir() {
+                    Box::pin(self.copy_dir_recursive(&src_path, &dest_path)).await?;
+                } else {
+                    std::fs::copy(&src_path, &dest_path)
+                        .map_err(|e| StorageError::io(e))?;
+                }
             }
-        }
-        
-        Ok(())
+            
+            Ok(())
+        })
     }
     
     /// Get snapshot statistics
@@ -711,7 +663,6 @@ mod tests {
     use super::*;
     use crate::{StorageConfig, RocksEngine};
     use tempfile::TempDir;
-    use catalyst_utils::state::AccountState;
     
     fn create_test_setup() -> (Arc<RocksEngine>, SnapshotManager, TempDir) {
         let temp_dir = TempDir::new().unwrap();
@@ -748,12 +699,7 @@ mod tests {
         let (engine, manager, _temp_dir) = create_test_setup();
         
         // Add some test data
-        let address = [1u8; 21];
-        let account = AccountState::new_non_confidential(address, 1000);
-        let account_data = account.serialize().unwrap();
-        let key = catalyst_utils::state::state_keys::account_key(&address);
-        
-        engine.put("accounts", &key, &account_data).unwrap();
+        engine.put("accounts", b"test_key", b"test_value").unwrap();
         
         // Create snapshot
         let snapshot = manager.create_snapshot("data_snapshot").await.unwrap();

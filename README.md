@@ -220,6 +220,7 @@ impl CatalystModule for MyModule {
     }
 
     async fn health_check(&self) -> CatalystResult<bool> {
+        println!("111111111111111111");
         // Check module health
         Ok(true)
     }

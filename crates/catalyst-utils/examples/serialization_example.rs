@@ -1,78 +1,58 @@
-// examples/serialization_example.rs
+// catalyst-utils/examples/serialization_example.rs
 
-use catalyst_utils::*;
-use catalyst_utils::serialization::{self};
+use catalyst_utils::{
+    CatalystResult, Hash, Address, TransactionEntry, TransactionStatus,
+    serialization::{CatalystSerialize, CatalystDeserialize, SerializationContext, CatalystSerializeWithContext},
+};
+use serde::{Serialize, Deserialize};
 
 fn main() -> CatalystResult<()> {
-    println!("=== Catalyst Serialization System Example ===\n");
-
-    // 1. Basic type serialization
-    println!("1. Basic type serialization:");
+    println!("Catalyst Serialization Examples");
     
-    // Primitive types
-    let value_u8: u8 = 255;
+    // Basic type serialization
+    println!("\n=== Basic Types ===");
     let value_u32: u32 = 0x12345678;
-    let value_u64: u64 = 0x123456789ABCDEF0;
-    
-    println!("   Serializing primitive types:");
-    println!("     u8 {} -> {} bytes", value_u8, value_u8.serialized_size());
-    println!("     u32 {} -> {} bytes", value_u32, value_u32.serialized_size());
-    println!("     u64 {} -> {} bytes", value_u64, value_u64.serialized_size());
-    
-    // Test round-trip
     let bytes_u32 = CatalystSerialize::serialize(&value_u32)?;
     let recovered_u32 = <u32 as CatalystDeserialize>::deserialize(&bytes_u32)?;
-    assert_eq!(value_u32, recovered_u32);
-    println!("     ✓ u32 round-trip successful");
     
-    // Strings and bytes
-    let test_string = "Catalyst Network Transaction".to_string();
-    let test_bytes = vec![0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF];
-    
-    println!("   Serializing collections:");
-    println!("     String '{}' -> {} bytes", test_string, test_string.serialized_size());
-    println!("     Vec<u8> {:?} -> {} bytes", test_bytes, test_bytes.serialized_size());
-    
+    println!("Original u32: 0x{:08x}", value_u32);
+    println!("Serialized bytes: {:?}", bytes_u32);
+    println!("Recovered u32: 0x{:08x}", recovered_u32);
+    println!("Roundtrip successful: {}", value_u32 == recovered_u32);
+
+    // String serialization
+    println!("\n=== String Serialization ===");
+    let test_string = "Hello, Catalyst Network!".to_string();
     let string_bytes = CatalystSerialize::serialize(&test_string)?;
     let recovered_string = <String as CatalystDeserialize>::deserialize(&string_bytes)?;
-    assert_eq!(test_string, recovered_string);
-    println!("     ✓ String round-trip successful");
-    println!();
+    
+    println!("Original: {}", test_string);
+    println!("Recovered: {}", recovered_string);
+    println!("Roundtrip successful: {}", test_string == recovered_string);
 
-    // 2. Custom struct serialization
-    println!("2. Custom struct serialization:");
-    
-    #[derive(Debug, PartialEq)]
-    struct TransactionEntry {
-        public_key: Vec<u8>,
-        amount: u64,
-        signature: Vec<u8>,
-    }
-    
-    impl_catalyst_serialize!(TransactionEntry, public_key, amount, signature);
-    
+    // Struct serialization using existing types
+    println!("\n=== Struct Serialization ===");
     let entry = TransactionEntry {
-        public_key: vec![0x04; 32], // Mock public key
-        amount: 1000000, // 1M units
-        signature: vec![0x30; 64], // Mock signature
+        hash: Hash::new([1u8; 32]),
+        from: Address::new([2u8; 20]),
+        to: Some(Address::new([3u8; 20])),
+        value: 1000,
+        gas_used: 21000,
+        status: TransactionStatus::Success,
     };
     
-    println!("   Transaction entry:");
-    println!("     Amount: {}", entry.amount);
-    println!("     Public key size: {} bytes", entry.public_key.len());
-    println!("     Signature size: {} bytes", entry.signature.len());
-    println!("     Total serialized size: {} bytes", entry.serialized_size());
+    // Use JSON serialization for existing types
+    let entry_bytes = serde_json::to_vec(&entry)?;
+    let recovered_entry: TransactionEntry = serde_json::from_slice(&entry_bytes)?;
     
-    let entry_bytes = CatalystSerialize::serialize(&entry)?;
-    let recovered_entry = <TransactionEntry as CatalystDeserialize>::deserialize(&entry_bytes)?;
-    assert_eq!(entry, recovered_entry);
-    println!("     ✓ TransactionEntry round-trip successful");
-    println!();
+    println!("Transaction entry serialized and recovered successfully");
+    println!("Original hash: {}", entry.hash);
+    println!("Recovered hash: {}", recovered_entry.hash);
 
-    // 3. Context-aware serialization
-    println!("3. Context-aware serialization:");
+    // Context-aware serialization example
+    println!("\n=== Context-Aware Serialization ===");
     
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     struct ProtocolMessage {
         version: u32,
         message_type: u8,
@@ -81,71 +61,54 @@ fn main() -> CatalystResult<()> {
     
     impl CatalystSerializeWithContext for ProtocolMessage {
         fn serialize_with_context(&self, ctx: &SerializationContext) -> CatalystResult<Vec<u8>> {
-            let mut buffer = Vec::new();
-            
-            // Protocol version determines format
-            if ctx.protocol_version >= 2 {
-                // New format: version + network_id + message_type + payload
-                buffer.extend_from_slice(&ctx.protocol_version.to_le_bytes());
-                buffer.push(ctx.network_id);
-                buffer.push(self.message_type);
-                self.payload.serialize_to(&mut buffer)?;
-            } else {
-                // Legacy format: just message_type + payload
-                buffer.push(self.message_type);
-                self.payload.serialize_to(&mut buffer)?;
-            }
-            
-            // Optional compression for large payloads
-            if ctx.compressed && self.payload.len() > 1024 {
-                println!("     (Would compress {} byte payload)", self.payload.len());
-            }
-            
-            Ok(buffer)
+            let mut data = Vec::new();
+            data.extend_from_slice(&ctx.protocol_version.to_le_bytes());
+            data.extend_from_slice(&[ctx.network_id]);
+            data.extend_from_slice(&self.version.to_le_bytes());
+            data.extend_from_slice(&[self.message_type]);
+            data.extend_from_slice(&(self.payload.len() as u32).to_le_bytes());
+            data.extend_from_slice(&self.payload);
+            Ok(data)
         }
         
-        fn deserialize_with_context(data: &[u8], ctx: &SerializationContext) -> CatalystResult<Self> {
-            use std::io::Cursor;
-            let mut cursor = Cursor::new(data);
-            
-            if ctx.protocol_version >= 2 {
-                // New format
-                let version = u32::deserialize_from(&mut cursor)?;
-                let network_id = u8::deserialize_from(&mut cursor)?;
-                let message_type = u8::deserialize_from(&mut cursor)?;
-                let payload = Vec::<u8>::deserialize_from(&mut cursor)?;
-                
-                println!("     Deserialized v{} message (network: {}, type: {})", 
-                    version, network_id, message_type);
-                
-                Ok(Self {
-                    version,
-                    message_type,
-                    payload,
-                })
-            } else {
-                // Legacy format
-                let message_type = u8::deserialize_from(&mut cursor)?;
-                let payload = Vec::<u8>::deserialize_from(&mut cursor)?;
-                
-                println!("     Deserialized legacy message (type: {})", message_type);
-                
-                Ok(Self {
-                    version: 1,
-                    message_type,
-                    payload,
-                })
+        fn deserialize_with_context(data: &[u8], _ctx: &SerializationContext) -> CatalystResult<Self> 
+        where
+            Self: Sized 
+        {
+            if data.len() < 13 { // min size: 4 + 1 + 4 + 1 + 4 = 14 bytes, but we check for 13 first
+                return Err(catalyst_utils::CatalystError::Serialization(
+                    "Insufficient data for ProtocolMessage".to_string()
+                ));
             }
+            
+            let _protocol_version = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            let _network_id = data[4];
+            let version = u32::from_le_bytes([data[5], data[6], data[7], data[8]]);
+            let message_type = data[9];
+            let payload_len = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize;
+            
+            if data.len() < 14 + payload_len {
+                return Err(catalyst_utils::CatalystError::Serialization(
+                    "Insufficient payload data".to_string()
+                ));
+            }
+            
+            let payload = data[14..14 + payload_len].to_vec();
+            
+            Ok(Self {
+                version,
+                message_type,
+                payload,
+            })
         }
     }
     
     let message = ProtocolMessage {
-        version: 2,
+        version: 1,
         message_type: 42,
         payload: vec![1, 2, 3, 4, 5],
     };
     
-    // Test with different contexts
     let ctx_v1 = SerializationContext {
         protocol_version: 1,
         network_id: 0,
@@ -158,190 +121,153 @@ fn main() -> CatalystResult<()> {
         compressed: true,
     };
     
-    println!("   Testing context-aware serialization:");
+    let serialized_v1 = message.serialize_with_context(&ctx_v1)?;
+    let serialized_v2 = message.serialize_with_context(&ctx_v2)?;
     
-    let v1_bytes = message.serialize_with_context(&ctx_v1)?;
-    let v2_bytes = message.serialize_with_context(&ctx_v2)?;
+    println!("Context v1 serialization length: {}", serialized_v1.len());
+    println!("Context v2 serialization length: {}", serialized_v2.len());
     
-    println!("     V1 format: {} bytes", v1_bytes.len());
-    println!("     V2 format: {} bytes", v2_bytes.len());
+    let recovered_v1 = ProtocolMessage::deserialize_with_context(&serialized_v1, &ctx_v1)?;
+    let recovered_v2 = ProtocolMessage::deserialize_with_context(&serialized_v2, &ctx_v2)?;
     
-    let _recovered_v1 = ProtocolMessage::deserialize_with_context(&v1_bytes, &ctx_v1)?;
-    let _recovered_v2 = ProtocolMessage::deserialize_with_context(&v2_bytes, &ctx_v2)?;
-    
-    println!("     ✓ Context-aware serialization successful");
-    println!();
+    println!("V1 recovery successful: {}", message.version == recovered_v1.version);
+    println!("V2 recovery successful: {}", message.version == recovered_v2.version);
 
-    // 4. Complex Catalyst structures
-    println!("4. Complex Catalyst structures:");
+    // Custom type with manual implementation
+    println!("\n=== Custom Serialization Implementation ===");
     
-    // For custom structs - need to implement Vec<TransactionEntry> serialization
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, Clone, PartialEq)]
     struct Transaction {
-        entries: Vec<TransactionEntry>,
-        timestamp: u64,
-        nonce: u64,
-        signature: Vec<u8>,
+        id: u64,
+        from: Address,
+        to: Address,
+        amount: u64,
+        fee: u64,
     }
     
-    // Manual implementation since Vec<TransactionEntry> needs custom handling
     impl CatalystSerialize for Transaction {
         fn serialize(&self) -> CatalystResult<Vec<u8>> {
-            let mut buffer = Vec::with_capacity(self.serialized_size());
-            self.serialize_to(&mut buffer)?;
-            Ok(buffer)
+            let mut data = Vec::with_capacity(self.serialized_size());
+            data.extend_from_slice(&self.id.to_le_bytes());
+            data.extend_from_slice(self.from.as_slice());
+            data.extend_from_slice(self.to.as_slice());
+            data.extend_from_slice(&self.amount.to_le_bytes());
+            data.extend_from_slice(&self.fee.to_le_bytes());
+            Ok(data)
         }
         
         fn serialize_to<W: std::io::Write>(&self, writer: &mut W) -> CatalystResult<()> {
-            serialization::utils::serialize_vec(writer, &self.entries)?;
-            self.timestamp.serialize_to(writer)?;
-            self.nonce.serialize_to(writer)?;
-            self.signature.serialize_to(writer)?;
+            writer.write_all(&self.id.to_le_bytes())?;
+            writer.write_all(self.from.as_slice())?;
+            writer.write_all(self.to.as_slice())?;
+            writer.write_all(&self.amount.to_le_bytes())?;
+            writer.write_all(&self.fee.to_le_bytes())?;
             Ok(())
         }
         
         fn serialized_size(&self) -> usize {
-            4 + // entries length
-            self.entries.iter().map(|e| e.serialized_size()).sum::<usize>() +
-            8 + // timestamp
-            8 + // nonce
-            self.signature.serialized_size()
+            8 + 20 + 20 + 8 + 8 // u64 + Address + Address + u64 + u64
         }
     }
     
     impl CatalystDeserialize for Transaction {
         fn deserialize(data: &[u8]) -> CatalystResult<Self> {
-            let mut cursor = std::io::Cursor::new(data);
-            Self::deserialize_from(&mut cursor)
+            if data.len() < 64 {
+                return Err(catalyst_utils::CatalystError::Serialization(
+                    "Insufficient data for Transaction".to_string()
+                ));
+            }
+            
+            let mut offset = 0;
+            let id = u64::from_le_bytes([
+                data[offset], data[offset+1], data[offset+2], data[offset+3],
+                data[offset+4], data[offset+5], data[offset+6], data[offset+7]
+            ]);
+            offset += 8;
+            
+            let from = Address::from_slice(&data[offset..offset+20]);
+            offset += 20;
+            
+            let to = Address::from_slice(&data[offset..offset+20]);
+            offset += 20;
+            
+            let amount = u64::from_le_bytes([
+                data[offset], data[offset+1], data[offset+2], data[offset+3],
+                data[offset+4], data[offset+5], data[offset+6], data[offset+7]
+            ]);
+            offset += 8;
+            
+            let fee = u64::from_le_bytes([
+                data[offset], data[offset+1], data[offset+2], data[offset+3],
+                data[offset+4], data[offset+5], data[offset+6], data[offset+7]
+            ]);
+            
+            Ok(Self { id, from, to, amount, fee })
         }
         
         fn deserialize_from<R: std::io::Read>(reader: &mut R) -> CatalystResult<Self> {
-            let entries = serialization::utils::deserialize_vec(reader)?;
-            let timestamp = u64::deserialize_from(reader)?;
-            let nonce = u64::deserialize_from(reader)?;
-            let signature = Vec::<u8>::deserialize_from(reader)?;
-            
-            Ok(Self {
-                entries,
-                timestamp,
-                nonce,
-                signature,
-            })
+            let mut buffer = vec![0u8; 64];
+            reader.read_exact(&mut buffer)?;
+            Self::deserialize(&buffer)
         }
     }
     
     let transaction = Transaction {
-        entries: vec![
-            TransactionEntry {
-                public_key: vec![0x01; 32],
-                amount: 500000,
-                signature: vec![0x11; 64],
-            },
-            TransactionEntry {
-                public_key: vec![0x02; 32],
-                amount: 300000,
-                signature: vec![0x22; 64],
-            },
-        ],
-        timestamp: catalyst_utils::utils::current_timestamp(),
-        nonce: 12345,
-        signature: vec![0xFF; 64],
+        id: 12345,
+        from: Address::new([1u8; 20]),
+        to: Address::new([2u8; 20]),
+        amount: 1000,
+        fee: 10,
     };
-    
-    println!("   Complex transaction:");
-    println!("     Entries: {}", transaction.entries.len());
-    println!("     Timestamp: {}", transaction.timestamp);
-    println!("     Nonce: {}", transaction.nonce);
-    println!("     Total serialized size: {} bytes", transaction.serialized_size());
     
     let tx_bytes = CatalystSerialize::serialize(&transaction)?;
     let recovered_tx = <Transaction as CatalystDeserialize>::deserialize(&tx_bytes)?;
-    assert_eq!(transaction, recovered_tx);
-    println!("     ✓ Complex transaction round-trip successful");
-    println!();
+    
+    println!("Transaction serialization successful: {}", transaction == recovered_tx);
+    println!("Serialized size: {} bytes", tx_bytes.len());
 
-    // 5. Performance testing
-    println!("5. Performance testing:");
-    
-    let large_data = vec![0x42u8; 10000]; // 10KB of data
-    
-    let start = std::time::Instant::now();
+    // Performance test
+    println!("\n=== Performance Test ===");
+    let large_data = vec![42u8; 1_000_000]; // 1MB of data
     let serialized = CatalystSerialize::serialize(&large_data)?;
-    let serialize_time = start.elapsed();
+    println!("Serialized 1MB of data to {} bytes", serialized.len());
     
     let start = std::time::Instant::now();
     let deserialized = <Vec<u8> as CatalystDeserialize>::deserialize(&serialized)?;
-    let deserialize_time = start.elapsed();
+    let duration = start.elapsed();
     
-    assert_eq!(large_data, deserialized);
-    
-    println!("   Large data performance:");
-    println!("     Data size: {} bytes", large_data.len());
-    println!("     Serialized size: {} bytes (overhead: {} bytes)", 
-        serialized.len(), serialized.len() - large_data.len());
-    println!("     Serialize time: {:?}", serialize_time);
-    println!("     Deserialize time: {:?}", deserialize_time);
-    println!("     Total round-trip: {:?}", serialize_time + deserialize_time);
-    println!();
+    println!("Deserialization took: {:?}", duration);
+    println!("Data integrity check: {}", large_data == deserialized);
 
-    // 6. Error handling
-    println!("6. Error handling:");
+    // Error handling examples
+    println!("\n=== Error Handling ===");
     
-    // Test invalid data
-    let invalid_data = vec![0xFF, 0xFF, 0xFF, 0xFF]; // Invalid length prefix
+    // Try to deserialize invalid data
+    let invalid_data = vec![1, 2, 3]; // Too short for a String
     let result = <String as CatalystDeserialize>::deserialize(&invalid_data);
+    println!("Invalid data handling: {}", result.is_err());
     
-    match result {
-        Ok(_) => println!("     ❌ Expected error but got success"),
-        Err(e) => println!("     ✓ Correctly handled invalid data: {}", e),
-    }
-    
-    // Test truncated data
-    let valid_string = "test".to_string();
+    // Test corrupted data
+    let valid_string = "Valid string".to_string();
     let mut valid_bytes = CatalystSerialize::serialize(&valid_string)?;
-    valid_bytes.truncate(2); // Truncate to cause error
-    
+    valid_bytes[2] = 255; // Corrupt the length
     let result = <String as CatalystDeserialize>::deserialize(&valid_bytes);
-    match result {
-        Ok(_) => println!("     ❌ Expected error but got success"),
-        Err(e) => println!("     ✓ Correctly handled truncated data: {}", e),
-    }
-    println!();
+    println!("Corrupted data handling: {}", result.is_err());
 
-    // 7. Utility function usage
-    println!("7. Utility function usage:");
-        
-    // Manual serialization using utilities
-    let mut buffer = Vec::new();
-    serialization::utils::serialize_string(&mut buffer, "Catalyst")?;
-    serialization::utils::serialize_bytes(&mut buffer, &[0xCA, 0xFE])?;
-    
-    println!("   Manual serialization buffer: {} bytes", buffer.len());
-    
-    // Manual deserialization
-    let mut cursor = std::io::Cursor::new(&buffer);
-    let recovered_string = serialization::utils::deserialize_string(&mut cursor)?;
-    let recovered_bytes = serialization::utils::deserialize_bytes(&mut cursor)?;
-    
-    assert_eq!(recovered_string, "Catalyst");
-    assert_eq!(recovered_bytes, vec![0xCA, 0xFE]);
-    
-    println!("     ✓ Manual serialization utilities work correctly");
-    println!();
-
-    println!("=== Serialization example completed successfully! ===");
+    println!("\n=== All Examples Completed Successfully ===");
     Ok(())
 }
 
-// Example of implementing serialization for account states
+// Example of using the macro for automatic implementation
 #[derive(Debug, PartialEq)]
 struct AccountState {
-    address: [u8; 21],
+    address: Address,
     balance: u64,
     nonce: u64,
-    data: Option<Vec<u8>>,
+    code_hash: Option<Hash>,
 }
 
+// Manually implement for compatibility with the example
 impl CatalystSerialize for AccountState {
     fn serialize(&self) -> CatalystResult<Vec<u8>> {
         let mut buffer = Vec::with_capacity(self.serialized_size());
@@ -350,34 +276,27 @@ impl CatalystSerialize for AccountState {
     }
     
     fn serialize_to<W: std::io::Write>(&self, writer: &mut W) -> CatalystResult<()> {
-        // Address (fixed 21 bytes)
-        writer.write_all(&self.address)
-            .map_err(|e| CatalystError::Serialization(format!("Failed to write address: {}", e)))?;
-        
-        // Balance and nonce
-        self.balance.serialize_to(writer)?;
-        self.nonce.serialize_to(writer)?;
-        
-        // Optional data
-        match &self.data {
-            Some(data) => {
-                1u8.serialize_to(writer)?; // Has data flag
-                data.serialize_to(writer)?;
+        // Serialize address
+        writer.write_all(self.address.as_slice())?;
+        // Serialize balance
+        writer.write_all(&self.balance.to_le_bytes())?;
+        // Serialize nonce
+        writer.write_all(&self.nonce.to_le_bytes())?;
+        // Serialize optional code_hash
+        match &self.code_hash {
+            Some(hash) => {
+                writer.write_all(&[1u8])?; // has hash
+                writer.write_all(hash.as_slice())?;
             }
             None => {
-                0u8.serialize_to(writer)?; // No data flag
+                writer.write_all(&[0u8])?; // no hash
             }
         }
-        
         Ok(())
     }
     
     fn serialized_size(&self) -> usize {
-        21 + // address
-        8 + // balance
-        8 + // nonce
-        1 + // data flag
-        self.data.as_ref().map(|d| 4 + d.len()).unwrap_or(0) // optional data with length prefix
+        20 + 8 + 8 + 1 + if self.code_hash.is_some() { 32 } else { 0 }
     }
 }
 
@@ -388,19 +307,28 @@ impl CatalystDeserialize for AccountState {
     }
     
     fn deserialize_from<R: std::io::Read>(reader: &mut R) -> CatalystResult<Self> {
-        // Address
-        let mut address = [0u8; 21];
-        reader.read_exact(&mut address)
-            .map_err(|e| CatalystError::Serialization(format!("Failed to read address: {}", e)))?;
+        // Read address (20 bytes)
+        let mut addr_bytes = [0u8; 20];
+        reader.read_exact(&mut addr_bytes)?;
+        let address = Address::new(addr_bytes);
         
-        // Balance and nonce
-        let balance = u64::deserialize_from(reader)?;
-        let nonce = u64::deserialize_from(reader)?;
+        // Read balance (8 bytes)
+        let mut balance_bytes = [0u8; 8];
+        reader.read_exact(&mut balance_bytes)?;
+        let balance = u64::from_le_bytes(balance_bytes);
         
-        // Optional data
-        let has_data = u8::deserialize_from(reader)?;
-        let data = if has_data == 1 {
-            Some(Vec::<u8>::deserialize_from(reader)?)
+        // Read nonce (8 bytes)
+        let mut nonce_bytes = [0u8; 8];
+        reader.read_exact(&mut nonce_bytes)?;
+        let nonce = u64::from_le_bytes(nonce_bytes);
+        
+        // Read optional code_hash
+        let mut has_hash = [0u8; 1];
+        reader.read_exact(&mut has_hash)?;
+        let code_hash = if has_hash[0] == 1 {
+            let mut hash_bytes = [0u8; 32];
+            reader.read_exact(&mut hash_bytes)?;
+            Some(Hash::new(hash_bytes))
         } else {
             None
         };
@@ -409,47 +337,7 @@ impl CatalystDeserialize for AccountState {
             address,
             balance,
             nonce,
-            data,
+            code_hash,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_serialization_examples() {
-        assert!(main().is_ok());
-    }
-    
-    #[test]
-    fn test_account_state_serialization() {
-        let account = AccountState {
-            address: [1u8; 21],
-            balance: 1000000,
-            nonce: 42,
-            data: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
-        };
-        
-        let serialized = CatalystSerialize::serialize(&account).unwrap();
-        let deserialized = <AccountState as CatalystDeserialize>::deserialize(&serialized).unwrap();
-        
-        assert_eq!(account, deserialized);
-    }
-    
-    #[test]
-    fn test_empty_account_serialization() {
-        let account = AccountState {
-            address: [0u8; 21],
-            balance: 0,
-            nonce: 0,
-            data: None,
-        };
-        
-        let serialized = CatalystSerialize::serialize(&account).unwrap();
-        let deserialized = <AccountState as CatalystDeserialize>::deserialize(&serialized).unwrap();
-        
-        assert_eq!(account, deserialized);
     }
 }

@@ -1,10 +1,8 @@
 // catalyst-utils/src/state.rs
 
-use crate::error::CatalystResult;
+use crate::{CatalystResult, Hash, Address};
 use async_trait::async_trait;
-
-// Define types locally since they're not in the main crate yet
-pub type Hash = [u8; 32];
+use serde::{Serialize, Deserialize};
 
 /// Core trait for managing ledger state across the Catalyst network
 /// 
@@ -104,24 +102,12 @@ pub trait StateManager: Send + Sync {
     async fn contains_key(&self, key: &[u8]) -> CatalystResult<bool>;
     
     /// Get multiple values by their keys efficiently
-    /// 
-    /// # Arguments
-    /// * `keys` - Iterator of keys to retrieve
-    /// 
-    /// # Returns
-    /// * `Ok(values)` where each value is `Some(data)` if found or `None` if not found
-    /// * `Err(_)` on storage errors
-    async fn get_many<'a>(&self, keys: impl Iterator<Item = &'a [u8]> + Send) -> CatalystResult<Vec<Option<Vec<u8>>>>;
+    /// This method signature uses a concrete slice type to avoid lifetime issues
+    async fn get_many(&self, keys: &[Vec<u8>]) -> CatalystResult<Vec<Option<Vec<u8>>>>;
     
     /// Set multiple key-value pairs efficiently
-    /// 
-    /// # Arguments
-    /// * `pairs` - Iterator of (key, value) pairs to set
-    /// 
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err(_)` on storage errors
-    async fn set_many<'a>(&self, pairs: impl Iterator<Item = (&'a [u8], Vec<u8>)> + Send) -> CatalystResult<()>;
+    /// This method signature uses a concrete slice type to avoid lifetime issues
+    async fn set_many(&self, pairs: &[(Vec<u8>, Vec<u8>)]) -> CatalystResult<()>;
     
     /// Create a snapshot of the current state
     /// 
@@ -142,10 +128,15 @@ pub trait StateManager: Send + Sync {
     /// * `Ok(())` on successful restore
     /// * `Err(_)` on restore failures
     async fn restore_snapshot(&self, snapshot_id: &Hash) -> CatalystResult<()>;
+    
+    /// High-level account methods
+    async fn get_account(&self, address: &Address) -> CatalystResult<Option<AccountState>>;
+    async fn update_account(&self, account: &AccountState) -> CatalystResult<()>;
+    async fn account_exists(&self, address: &Address) -> CatalystResult<bool>;
 }
 
 /// Account types supported by the Catalyst ledger
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccountType {
     /// Standard account with visible balance
     NonConfidential,
@@ -156,10 +147,10 @@ pub enum AccountType {
 }
 
 /// Account state structure
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountState {
-    /// Account address (21 bytes: 1 byte prefix + 20 bytes hash)
-    pub address: [u8; 21],
+    /// Account address
+    pub address: Address,
     /// Account type
     pub account_type: AccountType,
     /// Account balance (visible for non-confidential, commitment for confidential)
@@ -172,7 +163,7 @@ pub struct AccountState {
 
 impl AccountState {
     /// Create a new non-confidential account
-    pub fn new_non_confidential(address: [u8; 21], balance: u64) -> Self {
+    pub fn new_non_confidential(address: Address, balance: u64) -> Self {
         Self {
             address,
             account_type: AccountType::NonConfidential,
@@ -183,7 +174,7 @@ impl AccountState {
     }
     
     /// Create a new confidential account with Pedersen commitment
-    pub fn new_confidential(address: [u8; 21], commitment: [u8; 32]) -> Self {
+    pub fn new_confidential(address: Address, commitment: [u8; 32]) -> Self {
         Self {
             address,
             account_type: AccountType::Confidential,
@@ -194,7 +185,7 @@ impl AccountState {
     }
     
     /// Create a new contract account
-    pub fn new_contract(address: [u8; 21], balance: u64, contract_data: Option<Vec<u8>>) -> Self {
+    pub fn new_contract(address: Address, balance: u64, contract_data: Option<Vec<u8>>) -> Self {
         // Ensure contract data doesn't exceed 64 bytes
         let data = contract_data.and_then(|d| {
             if d.len() <= 64 {
@@ -248,6 +239,8 @@ impl AccountState {
 
 /// State key prefixes for different data types
 pub mod state_keys {
+    use super::{Hash, Address};
+    
     /// Prefix for account state entries
     pub const ACCOUNT_PREFIX: &[u8] = b"acc:";
     /// Prefix for transaction entries
@@ -260,16 +253,16 @@ pub mod state_keys {
     pub const WORKER_PREFIX: &[u8] = b"work:";
     
     /// Create an account state key from address
-    pub fn account_key(address: &[u8; 21]) -> Vec<u8> {
+    pub fn account_key(address: &Address) -> Vec<u8> {
         let mut key = ACCOUNT_PREFIX.to_vec();
-        key.extend_from_slice(address);
+        key.extend_from_slice(address.as_slice());
         key
     }
     
     /// Create a transaction key from hash
-    pub fn transaction_key(tx_hash: &[u8; 32]) -> Vec<u8> {
+    pub fn transaction_key(tx_hash: &Hash) -> Vec<u8> {
         let mut key = TRANSACTION_PREFIX.to_vec();
-        key.extend_from_slice(tx_hash);
+        key.extend_from_slice(tx_hash.as_slice());
         key
     }
     
@@ -287,7 +280,7 @@ mod tests {
     
     #[test]
     fn test_account_state_creation() {
-        let address = [1u8; 21];
+        let address = Address::new([1u8; 20]);
         
         // Test non-confidential account
         let non_conf = AccountState::new_non_confidential(address, 1000);
@@ -312,12 +305,12 @@ mod tests {
     
     #[test]
     fn test_state_keys() {
-        let address = [1u8; 21];
-        let tx_hash = [2u8; 32];
+        let address = Address::new([1u8; 20]);
+        let tx_hash = Hash::new([2u8; 32]);
         
         let acc_key = state_keys::account_key(&address);
         assert!(acc_key.starts_with(state_keys::ACCOUNT_PREFIX));
-        assert_eq!(acc_key.len(), state_keys::ACCOUNT_PREFIX.len() + 21);
+        assert_eq!(acc_key.len(), state_keys::ACCOUNT_PREFIX.len() + 20);
         
         let tx_key = state_keys::transaction_key(&tx_hash);
         assert!(tx_key.starts_with(state_keys::TRANSACTION_PREFIX));
@@ -325,5 +318,19 @@ mod tests {
         
         let meta_key = state_keys::metadata_key("ledger_height");
         assert!(meta_key.starts_with(state_keys::METADATA_PREFIX));
+    }
+    
+    #[test]
+    fn test_serialization() {
+        let address = Address::new([1u8; 20]);
+        let account = AccountState::new_non_confidential(address, 1000);
+        
+        // Test that AccountState can be serialized and deserialized
+        let serialized = serde_json::to_vec(&account).unwrap();
+        let deserialized: AccountState = serde_json::from_slice(&serialized).unwrap();
+        
+        assert_eq!(account.address, deserialized.address);
+        assert_eq!(account.account_type, deserialized.account_type);
+        assert_eq!(account.get_balance_as_u64(), deserialized.get_balance_as_u64());
     }
 }
