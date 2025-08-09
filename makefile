@@ -102,23 +102,23 @@ docs:
 # Run commands
 run: build
 	@echo "Starting Catalyst node..."
-	RUST_LOG=$(RUST_LOG) ./target/release/catalyst-cli start
+	RUST_LOG=$(RUST_LOG) ./target/release/catalyst-node start
 
 run-dev: dev
 	@echo "Starting Catalyst node (debug)..."
-	RUST_LOG=$(RUST_LOG) $(CARGO) run --bin catalyst-cli -- start
+	RUST_LOG=$(RUST_LOG) $(CARGO) run --bin catalyst-node -- start
 
 run-validator: build
 	@echo "Starting Catalyst validator node..."
-	RUST_LOG=$(RUST_LOG) ./target/release/catalyst-cli start --validator --rpc
+	RUST_LOG=$(RUST_LOG) ./target/release/catalyst-node start --validator --rpc
 
 run-storage: build
 	@echo "Starting Catalyst storage node..."
-	RUST_LOG=$(RUST_LOG) ./target/release/catalyst-cli start --storage --storage-capacity 50
+	RUST_LOG=$(RUST_LOG) ./target/release/catalyst-node start --storage --storage-capacity 50
 
 run-full: build
 	@echo "Starting full Catalyst node (validator + storage + RPC)..."
-	RUST_LOG=$(RUST_LOG) ./target/release/catalyst-cli start --validator --storage --rpc
+	RUST_LOG=$(RUST_LOG) ./target/release/catalyst-node start --validator --storage --rpc
 
 # Docker commands
 docker-build:
@@ -135,11 +135,11 @@ docker-run:
 genesis:
 	@echo "Creating genesis configuration..."
 	mkdir -p configs
-	$(CARGO) run --bin catalyst-cli -- create-genesis --output configs/genesis.json
+	$(CARGO) run --bin catalyst-node -- create-genesis --output configs/genesis.json
 
 identity:
 	@echo "Generating node identity..."
-	$(CARGO) run --bin catalyst-cli -- generate-identity --output identity.json
+	$(CARGO) run --bin catalyst-node -- generate-identity --output identity.json
 
 # Development utilities
 check:
