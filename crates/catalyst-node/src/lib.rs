@@ -1,15 +1,23 @@
-//! Catalyst Node Manager with Storage Integration
-//! Complete implementation with real storage services
+//! Catalyst Node Manager with Real Consensus Integration
+//! Complete implementation with real consensus and storage services
+
+pub mod consensus_service;
+pub mod block_production;
 
 use async_trait::async_trait;
 use catalyst_config::CatalystConfig;
 use catalyst_core::NodeStatus;
-use catalyst_storage::StorageConfig;
-use catalyst_rpc::RpcConfig;
+use catalyst_crypto::KeyPair;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{info, warn, error};
+use blake2::{Blake2b512, Digest};
+use rand;
+use hex;
+
+pub use consensus_service::*;
+pub use block_production::*;
 
 // Add module declarations for services
 pub mod services {
@@ -19,7 +27,7 @@ pub mod services {
 // Re-export the storage service
 pub use services::storage::StorageService;
 
-// Mock configurations for missing crates
+// Mock configurations for missing crates (when not available)
 pub mod catalyst_network {
     use serde::{Serialize, Deserialize};
     
@@ -34,25 +42,6 @@ pub mod catalyst_network {
             Self {
                 listen_port: 30333,
                 max_peers: 50,
-            }
-        }
-    }
-}
-
-pub mod catalyst_consensus {
-    use serde::{Serialize, Deserialize};
-    
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct ConsensusConfig {
-        pub algorithm: String,
-        pub validator: bool,
-    }
-    
-    impl Default for ConsensusConfig {
-        fn default() -> Self {
-            Self {
-                algorithm: "catalyst-pos".to_string(),
-                validator: false,
             }
         }
     }
@@ -109,8 +98,8 @@ pub enum NodeError {
     Network(String),
     #[error("Storage error: {0}")]
     Storage(String),
-    #[error("Consensus error: {0}")]
-    Consensus(String),
+    #[error("Consensus error: {message}")]
+    Consensus { message: String },
     #[error("Runtime error: {0}")]
     Runtime(String),
 }
@@ -377,7 +366,7 @@ impl CatalystService for RpcServiceAdapter {
         if self.started && self.rpc_server.is_running().await {
             ServiceHealth::Healthy
         } else {
-            ServiceHealth::Unhealthy("RPC service not running".to_string())  // ADD STRING PARAMETER
+            ServiceHealth::Unhealthy("RPC service not running".to_string())
         }
     }
 
@@ -404,14 +393,10 @@ impl StorageServiceWrapper {
 #[async_trait]
 impl CatalystService for StorageServiceWrapper {
     async fn start(&mut self) -> Result<(), NodeError> {
-        // The storage service should have been started already, just return Ok
         Ok(())
     }
 
     async fn stop(&mut self) -> Result<(), NodeError> {
-        // Storage service stop is handled by Arc<StorageService>
-        // We can't call stop on Arc<StorageService> directly since it doesn't have a mutable stop method
-        // For now, just return Ok() since the storage service manages its own lifecycle
         Ok(())
     }
 
@@ -424,15 +409,12 @@ impl CatalystService for StorageServiceWrapper {
     }
 
     fn name(&self) -> &str {
-        "Storage Service"  // CHANGE FROM "Storage Service Wrapper" to just "Storage Service"
+        "Storage Service"
     }
 }
 
-/// Mock services for other components
+/// Mock network service
 pub struct NetworkService;
-pub struct ConsensusService;
-pub struct EvmService;
-pub struct ServiceBusService;
 
 impl NetworkService {
     pub async fn new(_config: catalyst_network::NetworkConfig) -> Result<Self, NodeError> {
@@ -465,36 +447,8 @@ impl CatalystService for NetworkService {
     }
 }
 
-impl ConsensusService {
-    pub async fn new(_config: catalyst_consensus::ConsensusConfig) -> Result<Self, NodeError> {
-        Ok(Self)
-    }
-}
-
-#[async_trait]
-impl CatalystService for ConsensusService {
-    async fn start(&mut self) -> Result<(), NodeError> {
-        info!("⚖️ Consensus service started (mock)");
-        Ok(())
-    }
-
-    async fn stop(&mut self) -> Result<(), NodeError> {
-        info!("⚖️ Consensus service stopped");
-        Ok(())
-    }
-
-    async fn health_check(&self) -> ServiceHealth {
-        ServiceHealth::Healthy
-    }
-
-    fn service_type(&self) -> ServiceType {
-        ServiceType::Consensus
-    }
-
-    fn name(&self) -> &str {
-        "Consensus Service"
-    }
-}
+/// Mock EVM service
+pub struct EvmService;
 
 impl EvmService {
     pub async fn new(_config: catalyst_runtime_evm::EvmConfig) -> Result<Self, NodeError> {
@@ -527,6 +481,9 @@ impl CatalystService for EvmService {
     }
 }
 
+/// Mock service bus
+pub struct ServiceBusService;
+
 impl ServiceBusService {
     pub async fn new(_config: catalyst_service_bus::ServiceBusConfig) -> Result<Self, NodeError> {
         Ok(Self)
@@ -558,7 +515,7 @@ impl CatalystService for ServiceBusService {
     }
 }
 
-/// Builder pattern for constructing Catalyst nodes
+/// Builder pattern for constructing Catalyst nodes with real consensus
 pub struct NodeBuilder {
     config: CatalystConfig,
     services: Vec<Box<dyn CatalystService>>,
@@ -588,12 +545,22 @@ impl NodeBuilder {
         self
     }
 
-    /// Build the complete Catalyst node with integrated services
-    pub async fn build(mut self) -> Result<CatalystNode, NodeError> {
+    /// Generate node ID from keypair
+    fn generate_node_id(keypair: &KeyPair) -> [u8; 32] {
+        let mut hasher = Blake2b512::new();
+        hasher.update(&keypair.public_key().to_bytes());
+        let result = hasher.finalize();
+        let mut node_id = [0u8; 32];
+        node_id.copy_from_slice(&result[..32]); // Take first 32 bytes
+        node_id
+    }
+
+    /// Build the complete Catalyst node with real consensus
+    pub async fn build(self) -> Result<CatalystNode, NodeError> {
         let mut services: Vec<Box<dyn CatalystService>> = Vec::new();
         let event_bus = Arc::new(EventBus::new());
 
-        info!("🔨 Building Catalyst node with integrated storage...");
+        info!("🔨 Building Catalyst node with real consensus...");
 
         // 1. Create Storage Service (FIRST - everything depends on this)
         let storage_service = if let Some(storage_config) = self.storage_config {
@@ -619,19 +586,51 @@ impl NodeBuilder {
         let network_service = NetworkService::new(network_config).await?;
         services.push(Box::new(network_service));
 
-        // 3. Create Consensus Service
-        info!("⚖️ Setting up consensus service...");
-        let consensus_config = catalyst_consensus::ConsensusConfig::default();
-        let consensus_service = ConsensusService::new(consensus_config).await?;
-        services.push(Box::new(consensus_service));
-
-        // 4. Create EVM Runtime Service
+        // 3. Create Real Consensus Service (THE KEY CHANGE)
+        info!("⚖️ Setting up REAL consensus service...");
+        
+        // Generate node identity for consensus
+        let mut rng = rand::thread_rng();
+        let keypair = KeyPair::generate(&mut rng);
+        let node_id = Self::generate_node_id(&keypair);
+        
+        info!("🆔 Node ID for consensus: {}", hex::encode(&node_id[..8]));
+        
+        // Create real consensus service with storage
+        let consensus_config = ConsensusConfig::default();
+        let mut consensus_service = ConsensusService::new(
+            node_id,
+            keypair,
+            storage_service.as_ref().unwrap().storage_manager().clone(),
+            consensus_config,
+        );
+        
+        // Set event bus for consensus
+        consensus_service.set_event_bus(event_bus.clone());
+        
+        // Store consensus reference for block production
+        let consensus_arc = Arc::new(consensus_service);
+        
+        // 4. Create Block Production Service (integrates with real consensus)
+        info!("🏗️ Setting up block production service...");
+        let block_production_service = BlockProductionService::new(
+            storage_service.as_ref().unwrap().storage_manager().clone(),
+            consensus_arc.clone(),
+        );
+        
+        // Initialize block production
+        block_production_service.initialize().await?;
+        
+        // Add consensus service to services list
+        services.push(Box::new(ConsensusServiceWrapper::new(consensus_arc.clone())));
+        
+        // 5. Create EVM Runtime Service
         info!("⚡ Setting up EVM runtime service...");
         let evm_config = catalyst_runtime_evm::EvmConfig::default();
         let evm_service = EvmService::new(evm_config).await?;
         services.push(Box::new(evm_service));
 
-        // 5. Create RPC Service with Storage Integration
+        // 6. Create RPC Service with Storage Integration
         if let Some(rpc_config) = self.rpc_config {
             info!("🔌 Setting up RPC service with storage integration...");
             
@@ -655,16 +654,16 @@ impl NodeBuilder {
             services.push(Box::new(rpc_service_adapter));
         }
 
-        // 6. Create Service Bus
+        // 7. Create Service Bus
         info!("🚌 Setting up service bus...");
         let service_bus_config = catalyst_service_bus::ServiceBusConfig::default();
         let service_bus = ServiceBusService::new(service_bus_config).await?;
         services.push(Box::new(service_bus));
 
-        // 7. Add any additional services from the builder
+        // 8. Add any additional services from the builder
         services.extend(self.services);
 
-        info!("✅ Node built successfully with {} services", services.len());
+        info!("✅ Node built successfully with {} services and REAL consensus", services.len());
 
         Ok(CatalystNode {
             config: self.config,
@@ -672,17 +671,69 @@ impl NodeBuilder {
             event_bus,
             node_manager: None,
             storage_service,
+            consensus_service: Some(consensus_arc),
+            block_production_service: Some(Arc::new(block_production_service)),
         })
     }
 }
 
-/// Main Catalyst node implementation
+/// Wrapper for consensus service to integrate with service management
+struct ConsensusServiceWrapper {
+    consensus: Arc<ConsensusService>,
+}
+
+impl ConsensusServiceWrapper {
+    fn new(consensus: Arc<ConsensusService>) -> Self {
+        Self { consensus }
+    }
+}
+
+#[async_trait]
+impl CatalystService for ConsensusServiceWrapper {
+    async fn start(&mut self) -> Result<(), NodeError> {
+        // Start the consensus service
+        let consensus_clone = (*self.consensus).clone();
+        consensus_clone.start().await?;
+        
+        // Start automatic transaction generation for testing
+        self.consensus.start_auto_transaction_generation().await;
+        
+        info!("✅ Real consensus service started with transaction generation");
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> Result<(), NodeError> {
+        let consensus_clone = (*self.consensus).clone();
+        consensus_clone.stop().await?;
+        Ok(())
+    }
+
+    async fn health_check(&self) -> ServiceHealth {
+        if self.consensus.is_running().await {
+            ServiceHealth::Healthy
+        } else {
+            ServiceHealth::Unhealthy("Consensus service not running".to_string())
+        }
+    }
+
+    fn service_type(&self) -> ServiceType {
+        ServiceType::Consensus
+    }
+
+    fn name(&self) -> &str {
+        "Real Catalyst Consensus Service"
+    }
+}
+
+/// Main Catalyst node implementation with real consensus
 pub struct CatalystNode {
     config: CatalystConfig,
     services: Vec<Box<dyn CatalystService>>,
     event_bus: Arc<EventBus>,
     node_manager: Option<NodeManager>,
-    storage_service: Option<Arc<StorageService>>, // Add this field
+    storage_service: Option<Arc<StorageService>>,
+    consensus_service: Option<Arc<ConsensusService>>,
+    block_production_service: Option<Arc<BlockProductionService>>,
 }
 
 impl CatalystNode {
@@ -691,21 +742,76 @@ impl CatalystNode {
         self.storage_service.as_ref()
     }
 
-    /// Start all services including storage initialization
+    /// Get reference to consensus service
+    pub fn consensus(&self) -> Option<&Arc<ConsensusService>> {
+        self.consensus_service.as_ref()
+    }
+
+    /// Get reference to block production service
+    pub fn block_production(&self) -> Option<&Arc<BlockProductionService>> {
+        self.block_production_service.as_ref()
+    }
+
+    /// Get current block height from consensus
+    pub async fn get_block_height(&self) -> u64 {
+        if let Some(consensus) = &self.consensus_service {
+            consensus.get_current_height().await
+        } else {
+            0
+        }
+    }
+
+    /// Get detailed consensus status
+    pub async fn get_consensus_status(&self) -> Option<ConsensusStatus> {
+        if let Some(consensus) = &self.consensus_service {
+            Some(consensus.get_status().await)
+        } else {
+            None
+        }
+    }
+
+    /// Trigger test block production
+    pub async fn trigger_test_block(&self) -> Result<(), NodeError> {
+        if let Some(block_production) = &self.block_production_service {
+            block_production.trigger_test_block().await
+        } else {
+            Err(NodeError::Service("Block production service not available".to_string()))
+        }
+    }
+
+    /// Start automatic test transaction generation
+    pub async fn start_auto_test_transactions(&self, interval_secs: u64) -> Result<(), NodeError> {
+        if let Some(block_production) = &self.block_production_service {
+            block_production.start_auto_test_transactions(interval_secs).await;
+            Ok(())
+        } else {
+            Err(NodeError::Service("Block production service not available".to_string()))
+        }
+    }
+
+    /// Get consensus debug information
+    pub async fn get_consensus_debug_info(&self) -> Result<block_production::ConsensusDebugInfo, NodeError> {
+        if let Some(block_production) = &self.block_production_service {
+            block_production.get_consensus_debug_info().await
+        } else {
+            Err(NodeError::Service("Block production service not available".to_string()))
+        }
+    }
+
+    /// Start all services including real consensus
     pub async fn start(&mut self) -> Result<(), NodeError> {
-        info!("🚀 Starting Catalyst node with {} services...", self.services.len());
+        info!("🚀 Starting Catalyst node with REAL CONSENSUS ({} services)...", self.services.len());
 
         // Start storage service first (if available)
         if let Some(storage) = &self.storage_service {
             info!("🗄️ Initializing storage...");
-            // Storage service start is called during build, just verify it's healthy
             if !matches!(storage.health_check().await, ServiceHealth::Healthy) {
                 return Err(NodeError::Storage("Storage service is not healthy".to_string()));
             }
             info!("✅ Storage initialized successfully");
         }
 
-        // Start all other services
+        // Start all other services (including real consensus)
         for (index, service) in self.services.iter_mut().enumerate() {
             info!("🔄 Starting service {}: {}", index + 1, service.name());
             service.start().await.map_err(|e| {
@@ -718,7 +824,10 @@ impl CatalystNode {
         let node_manager = NodeManager::new(self.config.clone());
         self.node_manager = Some(node_manager);
 
-        info!("🎉 Catalyst node started successfully with real storage!");
+        info!("🎉 Catalyst node started successfully with REAL CONSENSUS!");
+        info!("📊 Real consensus is now producing blocks every 40 seconds");
+        info!("🔄 Automatic test transactions are being generated");
+        
         Ok(())
     }
 
@@ -739,7 +848,6 @@ impl CatalystNode {
         // Stop storage service last
         if let Some(storage) = &self.storage_service {
             info!("🗄️ Stopping storage...");
-            // Storage service manages its own lifecycle
             info!("✅ Storage stopped");
         }
 
@@ -754,8 +862,8 @@ impl CatalystNode {
         let mut service_statuses = Vec::new();
 
         // Check storage service health
-        let storage_healthy = if let Some(storage) = &self.storage_service {
-            storage.health_check().await == ServiceHealth::Healthy
+        let storage_healthy = if let Some(_storage) = &self.storage_service {
+            _storage.health_check().await == ServiceHealth::Healthy
         } else {
             false
         };
