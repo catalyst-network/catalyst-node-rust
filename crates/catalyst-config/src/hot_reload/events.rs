@@ -1,8 +1,7 @@
+use catalyst_utils::{log_error, log_info, log_warn};
 use serde::{Deserialize, Serialize};
-use std::time::SystemTime;
 use std::fmt;
-use catalyst_utils::logging::LogCategory;
-use catalyst_utils::{log_info, log_warn, log_error};
+use std::time::SystemTime;
 
 /// Types of configuration events that can occur
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -184,7 +183,9 @@ impl ConfigEvent {
     pub fn is_error(&self) -> bool {
         matches!(
             self.event_type,
-            ConfigEventType::ReloadFailed | ConfigEventType::WatcherError | ConfigEventType::ValidationFailed
+            ConfigEventType::ReloadFailed
+                | ConfigEventType::WatcherError
+                | ConfigEventType::ValidationFailed
         )
     }
 
@@ -194,8 +195,10 @@ impl ConfigEvent {
             ConfigEventType::FileModified => "Configuration file was modified".to_string(),
             ConfigEventType::ReloadComplete => "Configuration reloaded successfully".to_string(),
             ConfigEventType::ReloadFailed => {
-                format!("Configuration reload failed: {}", 
-                    self.new_value.as_deref().unwrap_or("unknown error"))
+                format!(
+                    "Configuration reload failed: {}",
+                    self.new_value.as_deref().unwrap_or("unknown error")
+                )
             }
             ConfigEventType::ConfigChanged => {
                 if let Some(section) = &self.section {
@@ -220,17 +223,23 @@ impl ConfigEvent {
             }
             ConfigEventType::WatcherStopped => "File watcher stopped".to_string(),
             ConfigEventType::WatcherError => {
-                format!("File watcher error: {}", 
-                    self.new_value.as_deref().unwrap_or("unknown error"))
+                format!(
+                    "File watcher error: {}",
+                    self.new_value.as_deref().unwrap_or("unknown error")
+                )
             }
             ConfigEventType::ValidationFailed => {
                 if let Some(section) = &self.section {
-                    format!("Validation failed for section '{}': {}", 
-                        section, 
-                        self.new_value.as_deref().unwrap_or("unknown error"))
+                    format!(
+                        "Validation failed for section '{}': {}",
+                        section,
+                        self.new_value.as_deref().unwrap_or("unknown error")
+                    )
                 } else {
-                    format!("Configuration validation failed: {}", 
-                        self.new_value.as_deref().unwrap_or("unknown error"))
+                    format!(
+                        "Configuration validation failed: {}",
+                        self.new_value.as_deref().unwrap_or("unknown error")
+                    )
                 }
             }
             ConfigEventType::HotReloadStarted => "Hot reload started".to_string(),
@@ -257,16 +266,15 @@ pub struct ConfigEventLogger;
 impl ConfigEventListener for ConfigEventLogger {
     fn on_event(&self, event: &ConfigEvent) {
         use catalyst_utils::logging::LogCategory;
-        use catalyst_utils::{log_info, log_warn, log_error};
-        
+        use catalyst_utils::{log_error, log_info, log_warn};
+
         match event.event_type {
-            ConfigEventType::ReloadFailed | 
-            ConfigEventType::WatcherError | 
-            ConfigEventType::ValidationFailed => {
+            ConfigEventType::ReloadFailed
+            | ConfigEventType::WatcherError
+            | ConfigEventType::ValidationFailed => {
                 log_error!(LogCategory::Config, "Config event: {}", event);
             }
-            ConfigEventType::FileModified | 
-            ConfigEventType::EnvOverrideDetected => {
+            ConfigEventType::FileModified | ConfigEventType::EnvOverrideDetected => {
                 log_warn!(LogCategory::Config, "Config event: {}", event);
             }
             _ => {
@@ -343,7 +351,8 @@ impl ConfigEventHistory {
 
     /// Get events of a specific type
     pub fn get_events_by_type(&self, event_type: &ConfigEventType) -> Vec<&ConfigEvent> {
-        self.events.iter()
+        self.events
+            .iter()
             .filter(|event| &event.event_type == event_type)
             .collect()
     }
@@ -355,7 +364,8 @@ impl ConfigEventHistory {
 
     /// Get events within a time range
     pub fn get_events_since(&self, since: SystemTime) -> Vec<&ConfigEvent> {
-        self.events.iter()
+        self.events
+            .iter()
             .filter(|event| event.timestamp >= since)
             .collect()
     }
@@ -403,7 +413,7 @@ mod tests {
             Some("9944".to_string()),
             "8080".to_string(),
         );
-        
+
         assert_eq!(event.event_type, ConfigEventType::ConfigChanged);
         assert_eq!(event.section, Some("network.port".to_string()));
         assert_eq!(event.old_value, Some("9944".to_string()));
@@ -413,26 +423,29 @@ mod tests {
     #[test]
     fn test_event_type_display() {
         assert_eq!(ConfigEventType::FileModified.to_string(), "file_modified");
-        assert_eq!(ConfigEventType::ReloadComplete.to_string(), "reload_complete");
+        assert_eq!(
+            ConfigEventType::ReloadComplete.to_string(),
+            "reload_complete"
+        );
         assert_eq!(ConfigEventType::ConfigChanged.to_string(), "config_changed");
     }
 
     #[test]
     fn test_event_description() {
-        let event = ConfigEvent::config_changed(
-            "network.port".to_string(),
-            None,
-            "8080".to_string(),
+        let event =
+            ConfigEvent::config_changed("network.port".to_string(), None, "8080".to_string());
+
+        assert_eq!(
+            event.description(),
+            "Configuration section 'network.port' changed"
         );
-        
-        assert_eq!(event.description(), "Configuration section 'network.port' changed");
     }
 
     #[test]
     fn test_event_is_error() {
         let reload_failed = ConfigEvent::reload_failed("Test error".to_string());
         assert!(reload_failed.is_error());
-        
+
         let reload_complete = ConfigEvent::reload_complete();
         assert!(!reload_complete.is_error());
     }
@@ -441,10 +454,10 @@ mod tests {
     fn test_event_dispatcher() {
         let mut dispatcher = ConfigEventDispatcher::new();
         assert_eq!(dispatcher.listener_count(), 0);
-        
+
         dispatcher.add_listener(Box::new(ConfigEventLogger));
         assert_eq!(dispatcher.listener_count(), 1);
-        
+
         let event = ConfigEvent::reload_complete();
         dispatcher.dispatch(&event); // Should not panic
     }
@@ -454,18 +467,22 @@ mod tests {
         let mut history = ConfigEventHistory::new(3);
         assert_eq!(history.len(), 0);
         assert!(history.is_empty());
-        
+
         history.add_event(ConfigEvent::file_modified());
         history.add_event(ConfigEvent::reload_complete());
-        history.add_event(ConfigEvent::config_changed("test".to_string(), None, "value".to_string()));
-        
+        history.add_event(ConfigEvent::config_changed(
+            "test".to_string(),
+            None,
+            "value".to_string(),
+        ));
+
         assert_eq!(history.len(), 3);
         assert!(!history.is_empty());
-        
+
         // Add one more to test capacity limit
         history.add_event(ConfigEvent::reload_failed("error".to_string()));
         assert_eq!(history.len(), 3); // Should still be 3 due to capacity limit
-        
+
         let latest = history.get_latest_event().unwrap();
         assert_eq!(latest.event_type, ConfigEventType::ReloadFailed);
     }
@@ -473,15 +490,19 @@ mod tests {
     #[test]
     fn test_event_history_filtering() {
         let mut history = ConfigEventHistory::new(10);
-        
+
         history.add_event(ConfigEvent::file_modified());
         history.add_event(ConfigEvent::reload_complete());
         history.add_event(ConfigEvent::file_modified());
-        history.add_event(ConfigEvent::config_changed("test".to_string(), None, "value".to_string()));
-        
+        history.add_event(ConfigEvent::config_changed(
+            "test".to_string(),
+            None,
+            "value".to_string(),
+        ));
+
         let file_modified_events = history.get_events_by_type(&ConfigEventType::FileModified);
         assert_eq!(file_modified_events.len(), 2);
-        
+
         let config_changed_events = history.get_events_by_type(&ConfigEventType::ConfigChanged);
         assert_eq!(config_changed_events.len(), 1);
     }
@@ -490,7 +511,7 @@ mod tests {
     fn test_event_age() {
         let event = ConfigEvent::reload_complete();
         std::thread::sleep(Duration::from_millis(10));
-        
+
         let age = event.age_seconds();
         assert!(age > 0.0);
         assert!(age < 1.0); // Should be less than a second
@@ -500,16 +521,16 @@ mod tests {
     fn test_event_history_time_filtering() {
         let mut history = ConfigEventHistory::new(10);
         let start_time = SystemTime::now();
-        
+
         history.add_event(ConfigEvent::file_modified());
         std::thread::sleep(Duration::from_millis(10));
         let mid_time = SystemTime::now();
         history.add_event(ConfigEvent::reload_complete());
-        
+
         let recent_events = history.get_events_since(mid_time);
         assert_eq!(recent_events.len(), 1);
         assert_eq!(recent_events[0].event_type, ConfigEventType::ReloadComplete);
-        
+
         let all_events = history.get_events_since(start_time);
         assert_eq!(all_events.len(), 2);
     }

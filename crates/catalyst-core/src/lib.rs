@@ -1,8 +1,8 @@
-// Add these to crates/catalyst-core/src/lib.rs 
+// Add these to crates/catalyst-core/src/lib.rs
 // (Replace the problematic Hash/Address definitions)
 
 // First, add these imports at the top:
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 // Then add these type definitions (avoid conflicts by using different names or removing imports):
 
@@ -49,29 +49,29 @@ impl CatalystHash {
     pub fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
-    
+
     /// Create a hash from a slice (panics if not 32 bytes)
     pub fn from_slice(slice: &[u8]) -> Self {
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(slice);
         Self(bytes)
     }
-    
+
     /// Get the hash as a byte array
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
-    
+
     /// Get the hash as a slice
     pub fn as_slice(&self) -> &[u8] {
         &self.0
     }
-    
+
     /// Create a zero hash
     pub fn zero() -> Self {
         Self([0u8; 32])
     }
-    
+
     /// Check if this is a zero hash
     pub fn is_zero(&self) -> bool {
         self.0 == [0u8; 32]
@@ -111,29 +111,29 @@ impl CatalystAddress {
     pub fn new(bytes: [u8; 20]) -> Self {
         Self(bytes)
     }
-    
+
     /// Create an address from a slice (panics if not 20 bytes)
     pub fn from_slice(slice: &[u8]) -> Self {
         let mut bytes = [0u8; 20];
         bytes.copy_from_slice(slice);
         Self(bytes)
     }
-    
+
     /// Get the address as a byte array
     pub fn as_bytes(&self) -> &[u8; 20] {
         &self.0
     }
-    
+
     /// Get the address as a slice
     pub fn as_slice(&self) -> &[u8] {
         &self.0
     }
-    
+
     /// Create a zero address
     pub fn zero() -> Self {
         Self([0u8; 20])
     }
-    
+
     /// Check if this is a zero address
     pub fn is_zero(&self) -> bool {
         self.0 == [0u8; 20]

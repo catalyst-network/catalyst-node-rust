@@ -1,5 +1,5 @@
-use crate::CatalystConfig;
 use crate::config::*;
+use crate::CatalystConfig;
 
 /// Create test network configuration
 pub fn testnet_config() -> CatalystConfig {

@@ -1,7 +1,7 @@
 // catalyst-utils/src/patterns.rs
 
-use crate::logging::{CatalystLogger, LogLevel, LogCategory, LogValue};
-use crate::{CatalystResult};
+use crate::logging::{CatalystLogger, LogCategory, LogLevel, LogValue};
+use crate::CatalystResult;
 use std::collections::HashMap;
 
 /// Log consensus phase transitions
@@ -16,11 +16,11 @@ pub fn log_consensus_phase(
     fields.insert("phase".to_string(), LogValue::String(phase.to_string()));
     fields.insert("cycle".to_string(), LogValue::Integer(cycle as i64));
     fields.insert("node_id".to_string(), LogValue::String(node_id.to_string()));
-    
+
     if let Some(extra) = additional_fields {
         fields.extend(extra);
     }
-    
+
     logger.log(
         LogLevel::Info,
         LogCategory::Consensus,
@@ -37,13 +37,16 @@ pub fn log_transaction(
     amount: Option<u64>,
 ) -> CatalystResult<()> {
     let mut fields = HashMap::new();
-    fields.insert("transaction_id".to_string(), LogValue::String(tx_id.to_string()));
+    fields.insert(
+        "transaction_id".to_string(),
+        LogValue::String(tx_id.to_string()),
+    );
     fields.insert("status".to_string(), LogValue::String(status.to_string()));
-    
+
     if let Some(amt) = amount {
         fields.insert("amount".to_string(), LogValue::Integer(amt as i64));
     }
-    
+
     logger.log(
         LogLevel::Info,
         LogCategory::Transaction,
@@ -60,16 +63,19 @@ pub fn log_network_event(
     details: Option<HashMap<String, LogValue>>,
 ) -> CatalystResult<()> {
     let mut fields = HashMap::new();
-    fields.insert("event_type".to_string(), LogValue::String(event_type.to_string()));
-    
+    fields.insert(
+        "event_type".to_string(),
+        LogValue::String(event_type.to_string()),
+    );
+
     if let Some(peer) = peer_id {
         fields.insert("peer_id".to_string(), LogValue::String(peer.to_string()));
     }
-    
+
     if let Some(extra) = details {
         fields.extend(extra);
     }
-    
+
     logger.log(
         LogLevel::Info,
         LogCategory::Network,

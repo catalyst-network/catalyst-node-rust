@@ -1,5 +1,5 @@
-use crate::CatalystConfig;
 use crate::config::*;
+use crate::CatalystConfig;
 
 /// Create main network configuration
 pub fn mainnet_config() -> CatalystConfig {

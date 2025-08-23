@@ -36,7 +36,7 @@ pub mod transaction;
 pub mod utils;
 
 // Re-exports
-pub use config::{StorageConfig, ColumnFamilyConfig, SnapshotConfig};
+pub use config::{ColumnFamilyConfig, SnapshotConfig, StorageConfig};
 pub use engine::RocksEngine;
 pub use error::{StorageError, StorageResult};
 pub use manager::StorageManager;
@@ -48,7 +48,7 @@ pub use transaction::TransactionBatch;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 
-use catalyst_utils::{CatalystResult, CatalystError};
+use catalyst_utils::{CatalystError, CatalystResult};
 
 /// Initialize the storage subsystem with metrics
 pub async fn init_storage(config: StorageConfig) -> CatalystResult<StorageManager> {
@@ -57,7 +57,7 @@ pub async fn init_storage(config: StorageConfig) -> CatalystResult<StorageManage
         metrics::register_storage_metrics()
             .map_err(|e| CatalystError::Storage(format!("Failed to register metrics: {}", e)))?;
     }
-    
+
     StorageManager::new(config)
         .await
         .map_err(|e| CatalystError::Storage(format!("Failed to initialize storage: {}", e)))
@@ -68,19 +68,19 @@ pub const STORAGE_VERSION: u32 = 1;
 
 /// Default column families for Catalyst Network
 pub const DEFAULT_COLUMN_FAMILIES: &[&str] = &[
-    "accounts",           // Account states
-    "transactions",       // Transaction data
-    "consensus",          // Consensus state
-    "metadata",          // System metadata
-    "contracts",         // Smart contract data
-    "dfs_refs",          // DFS reference data
+    "accounts",     // Account states
+    "transactions", // Transaction data
+    "consensus",    // Consensus state
+    "metadata",     // System metadata
+    "contracts",    // Smart contract data
+    "dfs_refs",     // DFS reference data
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    
+
     #[tokio::test]
     async fn test_storage_initialization() {
         let temp_dir = TempDir::new().unwrap();
@@ -88,7 +88,7 @@ mod tests {
             data_dir: temp_dir.path().to_path_buf(),
             ..Default::default()
         };
-        
+
         let storage = init_storage(config).await.unwrap();
         assert!(storage.is_healthy().await);
     }

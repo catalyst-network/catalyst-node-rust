@@ -1,26 +1,26 @@
 // File: crates/catalyst-node/src/consensus_service.rs
 // Real consensus service implementation with proper block production
 
-use crate::{CatalystService, ServiceType, ServiceHealth, NodeError, EventBus, Event};
-use catalyst_storage::StorageManager;
-use catalyst_crypto::KeyPair;
-use std::sync::Arc;
-use tracing::{info, error, debug};
+use crate::{CatalystService, Event, EventBus, NodeError, ServiceHealth, ServiceType};
 use anyhow::Result;
-use tokio::time::{interval, Duration, Instant};
 use async_trait::async_trait;
-use serde::{Serialize, Deserialize};
 use blake2::{Blake2b512, Digest};
-use tokio::sync::{RwLock, Mutex};
+use catalyst_crypto::KeyPair;
+use catalyst_storage::StorageManager;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::{interval, Duration, Instant};
+use tracing::{debug, error, info};
 
 /// Consensus phases in the Catalyst protocol
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsensusPhase {
-    Propose,    // Phase 1: Block proposal
-    Vote,       // Phase 2: Voting on proposals
-    Commit,     // Phase 3: Commitment to chosen block
-    Finalize,   // Phase 4: Block finalization
+    Propose,  // Phase 1: Block proposal
+    Vote,     // Phase 2: Voting on proposals
+    Commit,   // Phase 3: Commitment to chosen block
+    Finalize, // Phase 4: Block finalization
 }
 
 /// Consensus message types
@@ -122,36 +122,47 @@ pub struct ConsensusState {
 struct VoteTracker {
     prevotes: HashMap<[u8; 32], Vec<[u8; 32]>>, // block_hash -> list of voters
     precommits: HashMap<[u8; 32], Vec<[u8; 32]>>, // block_hash -> list of voters
-    voting_power: HashMap<[u8; 32], u64>, // voter -> voting power
+    voting_power: HashMap<[u8; 32], u64>,       // voter -> voting power
 }
 
 impl VoteTracker {
-    fn add_vote(&mut self, block_hash: [u8; 32], voter: [u8; 32], vote_type: VoteType, voting_power: u64) {
+    fn add_vote(
+        &mut self,
+        block_hash: [u8; 32],
+        voter: [u8; 32],
+        vote_type: VoteType,
+        voting_power: u64,
+    ) {
         self.voting_power.insert(voter, voting_power);
-        
+
         let vote_map = match vote_type {
             VoteType::Prevote => &mut self.prevotes,
             VoteType::Precommit => &mut self.precommits,
         };
-        
-        vote_map.entry(block_hash).or_insert_with(Vec::new).push(voter);
+
+        vote_map
+            .entry(block_hash)
+            .or_insert_with(Vec::new)
+            .push(voter);
     }
-    
+
     fn get_voting_power(&self, block_hash: &[u8; 32], vote_type: VoteType) -> u64 {
         let vote_map = match vote_type {
             VoteType::Prevote => &self.prevotes,
             VoteType::Precommit => &self.precommits,
         };
-        
-        vote_map.get(block_hash)
+
+        vote_map
+            .get(block_hash)
             .map(|voters| {
-                voters.iter()
+                voters
+                    .iter()
                     .map(|voter| self.voting_power.get(voter).unwrap_or(&0))
                     .sum()
             })
             .unwrap_or(0)
     }
-    
+
     fn has_majority(&self, block_hash: &[u8; 32], vote_type: VoteType, total_power: u64) -> bool {
         let power = self.get_voting_power(block_hash, vote_type);
         power * 3 > total_power * 2 // More than 2/3
@@ -195,8 +206,8 @@ pub struct ConsensusConfig {
 impl Default for ConsensusConfig {
     fn default() -> Self {
         Self {
-            phase_duration: Duration::from_secs(10),     // 10 seconds per phase
-            block_time: Duration::from_secs(40),         // 40 seconds per block (4 phases)
+            phase_duration: Duration::from_secs(10), // 10 seconds per phase
+            block_time: Duration::from_secs(40),     // 40 seconds per block (4 phases)
             max_transactions_per_block: 1000,
             max_block_size: 1024 * 1024, // 1MB
             validator_set_size: 100,
@@ -252,16 +263,16 @@ impl ConsensusService {
     /// Start the consensus service
     pub async fn start(&self) -> Result<(), NodeError> {
         info!("🚀 Starting real Catalyst consensus service");
-        
+
         *self.is_running.write().await = true;
         *self.last_block_time.lock().await = Some(Instant::now());
-        
+
         // Initialize genesis block if needed
         self.initialize_genesis().await?;
-        
+
         // Start consensus rounds
         self.start_consensus_loop().await;
-        
+
         info!("✅ Real consensus service started successfully");
         Ok(())
     }
@@ -294,7 +305,8 @@ impl ConsensusService {
             proposer: self.node_id,
             round: 0,
             consensus_data: ConsensusData {
-                validator_set_hash: self.calculate_validator_set_hash(&self.state.read().await.validators),
+                validator_set_hash: self
+                    .calculate_validator_set_hash(&self.state.read().await.validators),
                 evidence_hash: [0u8; 32],
                 next_validator_set_hash: [0u8; 32],
             },
@@ -308,23 +320,25 @@ impl ConsensusService {
 
         self.store_block(&genesis_block).await?;
         info!("✅ Genesis block created and stored");
-        
+
         Ok(())
     }
 
     /// Start the main consensus loop
     async fn start_consensus_loop(&self) {
         let consensus = Arc::new(self.clone());
-        
+
         tokio::spawn(async move {
             let mut phase_timer = interval(consensus.config.phase_duration);
-            
-            info!("🔄 Starting consensus loop with {}s phases", 
-                  consensus.config.phase_duration.as_secs());
-            
+
+            info!(
+                "🔄 Starting consensus loop with {}s phases",
+                consensus.config.phase_duration.as_secs()
+            );
+
             loop {
                 phase_timer.tick().await;
-                
+
                 if !*consensus.is_running.read().await {
                     break;
                 }
@@ -333,7 +347,7 @@ impl ConsensusService {
                     error!("❌ Consensus error: {}", e);
                 }
             }
-            
+
             info!("🔄 Consensus loop stopped");
         });
     }
@@ -341,9 +355,11 @@ impl ConsensusService {
     /// Advance consensus to the next phase
     async fn advance_consensus(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut state = self.state.write().await;
-        
-        debug!("📍 Current phase: {:?}, Height: {}, Round: {}", 
-               state.phase, state.height, state.round);
+
+        debug!(
+            "📍 Current phase: {:?}, Height: {}, Round: {}",
+            state.phase, state.height, state.round
+        );
 
         match state.phase {
             ConsensusPhase::Propose => {
@@ -385,24 +401,38 @@ impl ConsensusService {
     }
 
     /// Handle propose phase
-    async fn handle_propose_phase(&self, state: &mut ConsensusState) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        info!("🔨 Proposing block at height {}, round {}", state.height, state.round);
+    async fn handle_propose_phase(
+        &self,
+        state: &mut ConsensusState,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        info!(
+            "🔨 Proposing block at height {}, round {}",
+            state.height, state.round
+        );
 
         // Get transactions from pool
         let transactions = self.select_transactions().await?;
-        
+
         // Create block
-        let block = self.create_block(state.height, state.round, transactions).await?;
-        
+        let block = self
+            .create_block(state.height, state.round, transactions)
+            .await?;
+
         // Store our proposal
         state.valid_block = Some(block.hash);
-        
+
         // In a real implementation, we would broadcast the proposal
         // For now, we'll just log it
-        info!("📋 Proposed block {} with {} transactions", 
-              state.height, block.transactions.len());
+        info!(
+            "📋 Proposed block {} with {} transactions",
+            state.height,
+            block.transactions.len()
+        );
         info!("   Block hash: {:?}", hex::encode(&block.hash[..8]));
-        info!("   Proposer: {:?}", hex::encode(&state.proposer.unwrap_or([0u8; 32])[..8]));
+        info!(
+            "   Proposer: {:?}",
+            hex::encode(&state.proposer.unwrap_or([0u8; 32])[..8])
+        );
 
         // Store the block proposal
         self.store_block_proposal(&block).await?;
@@ -411,21 +441,37 @@ impl ConsensusService {
     }
 
     /// Handle vote phase
-    async fn handle_vote_phase(&self, state: &mut ConsensusState) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        debug!("🗳️ Voting phase at height {}, round {}", state.height, state.round);
+    async fn handle_vote_phase(
+        &self,
+        state: &mut ConsensusState,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        debug!(
+            "🗳️ Voting phase at height {}, round {}",
+            state.height, state.round
+        );
 
         // Vote for our valid block if we have one
         if let Some(block_hash) = state.valid_block {
-            self.cast_vote(block_hash, VoteType::Prevote, state.round).await?;
-            info!("✅ Cast prevote for block {:?}", hex::encode(&block_hash[..8]));
+            self.cast_vote(block_hash, VoteType::Prevote, state.round)
+                .await?;
+            info!(
+                "✅ Cast prevote for block {:?}",
+                hex::encode(&block_hash[..8])
+            );
         }
 
         Ok(())
     }
 
     /// Handle commit phase
-    async fn handle_commit_phase(&self, state: &mut ConsensusState) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        debug!("📝 Commit phase at height {}, round {}", state.height, state.round);
+    async fn handle_commit_phase(
+        &self,
+        state: &mut ConsensusState,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        debug!(
+            "📝 Commit phase at height {}, round {}",
+            state.height, state.round
+        );
 
         let vote_tracker = self.vote_tracker.lock().await;
         let total_voting_power = self.calculate_total_voting_power(&state.validators);
@@ -434,14 +480,18 @@ impl ConsensusService {
         if let Some(block_hash) = state.valid_block {
             if vote_tracker.has_majority(&block_hash, VoteType::Prevote, total_voting_power) {
                 drop(vote_tracker);
-                
+
                 // Cast precommit vote
-                self.cast_vote(block_hash, VoteType::Precommit, state.round).await?;
-                info!("✅ Cast precommit for block {:?}", hex::encode(&block_hash[..8]));
-                
+                self.cast_vote(block_hash, VoteType::Precommit, state.round)
+                    .await?;
+                info!(
+                    "✅ Cast precommit for block {:?}",
+                    hex::encode(&block_hash[..8])
+                );
+
                 // Lock on this block
                 state.locked_block = Some(block_hash);
-                
+
                 // Check if we can finalize
                 let vote_tracker = self.vote_tracker.lock().await;
                 if vote_tracker.has_majority(&block_hash, VoteType::Precommit, total_voting_power) {
@@ -454,24 +504,29 @@ impl ConsensusService {
     }
 
     /// Handle finalize phase
-    async fn handle_finalize_phase(&self, state: &mut ConsensusState) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn handle_finalize_phase(
+        &self,
+        state: &mut ConsensusState,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("🎯 Finalizing block at height {}", state.height);
 
         if let Some(block_hash) = state.locked_block {
             // Retrieve and finalize the block
             if let Some(block) = self.get_block_proposal_by_hash(&block_hash).await? {
                 self.finalize_block(&block).await?;
-                
+
                 info!("🎉 Block {} finalized successfully!", state.height);
                 info!("   Hash: {:?}", hex::encode(&block.hash[..8]));
                 info!("   Transactions: {}", block.transactions.len());
 
                 // Publish block event
                 if let Some(event_bus) = &self.event_bus {
-                    event_bus.publish(Event::BlockReceived {
-                        block_hash: hex::encode(&block.hash),
-                        block_number: state.height,
-                    }).await;
+                    event_bus
+                        .publish(Event::BlockReceived {
+                            block_hash: hex::encode(&block.hash),
+                            block_number: state.height,
+                        })
+                        .await;
                 }
 
                 // Update last block time
@@ -497,7 +552,7 @@ impl ConsensusService {
 
         let merkle_root = self.calculate_merkle_root(&transactions);
         let state = self.state.read().await;
-        
+
         let header = BlockHeader {
             height,
             previous_hash,
@@ -525,13 +580,15 @@ impl ConsensusService {
     }
 
     /// Select transactions from the pool
-    async fn select_transactions(&self) -> Result<Vec<Transaction>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn select_transactions(
+        &self,
+    ) -> Result<Vec<Transaction>, Box<dyn std::error::Error + Send + Sync>> {
         let mut pool = self.transaction_pool.lock().await;
-        
+
         // For now, take all transactions up to the limit
         let limit = self.config.max_transactions_per_block.min(pool.len());
         let selected = pool.drain(..limit).collect();
-        
+
         // In a real implementation, we would:
         // 1. Validate transactions
         // 2. Sort by fee (highest first)
@@ -554,12 +611,14 @@ impl ConsensusService {
         hasher.update(b"test_transaction");
         hasher.update(&height.to_be_bytes());
         hasher.update(&index.to_be_bytes());
-        hasher.update(&std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-            .to_be_bytes());
-        
+        hasher.update(
+            &std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                .to_be_bytes(),
+        );
+
         let hash_result = hasher.finalize();
         let mut tx_id = [0u8; 32];
         tx_id.copy_from_slice(&hash_result[..32]); // Take first 32 bytes
@@ -629,7 +688,7 @@ impl ConsensusService {
         for tx in transactions {
             hasher.update(&tx.id);
         }
-        
+
         let result = hasher.finalize();
         let mut root = [0u8; 32];
         root.copy_from_slice(&result[..32]); // Take first 32 bytes
@@ -645,12 +704,12 @@ impl ConsensusService {
         hasher.update(&header.timestamp.to_be_bytes());
         hasher.update(&header.proposer);
         hasher.update(&header.round.to_be_bytes());
-        
+
         // Include transaction data
         for tx in transactions {
             hasher.update(&tx.id);
         }
-        
+
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&result[..32]); // Take first 32 bytes
@@ -658,20 +717,27 @@ impl ConsensusService {
     }
 
     /// Store block proposal (temporary storage during consensus)
-    async fn store_block_proposal(&self, block: &Block) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn store_block_proposal(
+        &self,
+        block: &Block,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let key = format!("proposal_{}", hex::encode(&block.hash));
         let data = serde_json::to_vec(block)?;
-        
-        self.storage.engine()
+
+        self.storage
+            .engine()
             .put("proposals", key.as_bytes(), &data)?;
-        
+
         Ok(())
     }
 
     /// Get block proposal by hash
-    async fn get_block_proposal_by_hash(&self, hash: &[u8; 32]) -> Result<Option<Block>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_block_proposal_by_hash(
+        &self,
+        hash: &[u8; 32],
+    ) -> Result<Option<Block>, Box<dyn std::error::Error + Send + Sync>> {
         let key = format!("proposal_{}", hex::encode(hash));
-        
+
         match self.storage.engine().get("proposals", key.as_bytes())? {
             Some(data) => {
                 let block: Block = serde_json::from_slice(&data)?;
@@ -688,22 +754,34 @@ impl ConsensusService {
             .map_err(|e| NodeError::Configuration(format!("Serialization error: {}", e)))?;
 
         // Use 'metadata' column family instead of 'blocks' since it exists
-        self.storage.engine()
+        self.storage
+            .engine()
             .put("metadata", block_key.as_bytes(), &block_data)
             .map_err(|e| NodeError::Storage(e.to_string()))?;
 
         // Store by hash for quick lookups
         let hash_key = format!("block_hash_{}", hex::encode(&block.hash));
-        self.storage.engine()
-            .put("metadata", hash_key.as_bytes(), &block.header.height.to_le_bytes())
+        self.storage
+            .engine()
+            .put(
+                "metadata",
+                hash_key.as_bytes(),
+                &block.header.height.to_le_bytes(),
+            )
             .map_err(|e| NodeError::Storage(e.to_string()))?;
 
         // Update latest block metadata
-        self.storage.engine()
-            .put("metadata", b"latest_block_height", &block.header.height.to_le_bytes())
+        self.storage
+            .engine()
+            .put(
+                "metadata",
+                b"latest_block_height",
+                &block.header.height.to_le_bytes(),
+            )
             .map_err(|e| NodeError::Storage(e.to_string()))?;
 
-        self.storage.engine()
+        self.storage
+            .engine()
             .put("metadata", b"latest_block_hash", &block.hash)
             .map_err(|e| NodeError::Storage(e.to_string()))?;
 
@@ -711,32 +789,38 @@ impl ConsensusService {
     }
 
     /// Finalize block (store permanently and clean up proposals)
-    async fn finalize_block(&self, block: &Block) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn finalize_block(
+        &self,
+        block: &Block,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Store the finalized block
         self.store_block(block).await?;
-        
+
         // Remove from proposals
         let key = format!("proposal_{}", hex::encode(&block.hash));
         let _ = self.storage.engine().delete("proposals", key.as_bytes());
-        
+
         // Process transactions (update state, accounts, etc.)
         // This would be implemented based on your transaction processing logic
-        
+
         Ok(())
     }
 
     /// Get block by height (public method)
     pub async fn get_block_by_height(&self, height: u64) -> Result<Option<Block>, NodeError> {
         let block_key = format!("block_{}", height);
-        
+
         // Use 'metadata' column family instead of 'blocks'
-        match self.storage.engine()
+        match self
+            .storage
+            .engine()
             .get("metadata", block_key.as_bytes())
             .map_err(|e| NodeError::Storage(e.to_string()))?
         {
             Some(data) => {
-                let block: Block = serde_json::from_slice(&data)
-                    .map_err(|e| NodeError::Configuration(format!("Deserialization error: {}", e)))?;
+                let block: Block = serde_json::from_slice(&data).map_err(|e| {
+                    NodeError::Configuration(format!("Deserialization error: {}", e))
+                })?;
                 Ok(Some(block))
             }
             None => Ok(None),
@@ -744,8 +828,14 @@ impl ConsensusService {
     }
 
     /// Get latest block hash
-    async fn get_latest_block_hash(&self) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
-        match self.storage.engine().get("metadata", b"latest_block_hash")? {
+    async fn get_latest_block_hash(
+        &self,
+    ) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+        match self
+            .storage
+            .engine()
+            .get("metadata", b"latest_block_hash")?
+        {
             Some(hash_bytes) => {
                 if hash_bytes.len() != 32 {
                     return Err("Invalid block hash length".into());
@@ -776,22 +866,24 @@ impl ConsensusService {
     /// Start auto transaction generation for testing
     pub async fn start_auto_transaction_generation(&self) {
         let consensus = Arc::new(self.clone());
-        
+
         tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(5)); // Generate transaction every 5 seconds
-            
+
             info!("🔄 Starting automatic transaction generation");
-            
+
             loop {
                 interval.tick().await;
-                
+
                 if !*consensus.is_running.read().await {
                     break;
                 }
 
                 let height = consensus.get_current_height().await;
-                let tx = consensus.create_test_transaction(height, rand::random()).await;
-                
+                let tx = consensus
+                    .create_test_transaction(height, rand::random())
+                    .await;
+
                 if let Err(e) = consensus.add_transaction(tx).await {
                     error!("Failed to add test transaction: {}", e);
                 } else {
@@ -863,7 +955,7 @@ impl ConsensusService {
     pub async fn get_status(&self) -> ConsensusStatus {
         let state = self.state.read().await;
         let pool_size = self.transaction_pool.lock().await.len();
-        
+
         ConsensusStatus {
             is_running: *self.is_running.read().await,
             current_height: state.height,

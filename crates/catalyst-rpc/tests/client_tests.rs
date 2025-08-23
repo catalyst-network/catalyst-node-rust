@@ -6,9 +6,9 @@ use std::collections::HashMap;
 
 pub async fn test_rpc_client(rpc_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
-    
+
     println!("🧪 Testing Catalyst RPC server at: {}", rpc_url);
-    
+
     // Test block number
     let response = client
         .post(rpc_url)
@@ -20,14 +20,14 @@ pub async fn test_rpc_client(rpc_url: &str) -> Result<(), Box<dyn std::error::Er
         }))
         .send()
         .await?;
-    
+
     if response.status().is_success() {
         let result: Value = response.json().await?;
         println!("✅ Block number: {}", result);
     } else {
         println!("❌ Failed to get block number: {}", response.status());
     }
-    
+
     // Test node status
     let response = client
         .post(rpc_url)
@@ -39,14 +39,14 @@ pub async fn test_rpc_client(rpc_url: &str) -> Result<(), Box<dyn std::error::Er
         }))
         .send()
         .await?;
-    
+
     if response.status().is_success() {
         let result: Value = response.json().await?;
         println!("✅ Node status: {}", result);
     } else {
         println!("❌ Failed to get node status: {}", response.status());
     }
-    
+
     // Test network info
     let response = client
         .post(rpc_url)
@@ -58,14 +58,14 @@ pub async fn test_rpc_client(rpc_url: &str) -> Result<(), Box<dyn std::error::Er
         }))
         .send()
         .await?;
-    
+
     if response.status().is_success() {
         let result: Value = response.json().await?;
         println!("✅ Network info: {}", result);
     } else {
         println!("❌ Failed to get network info: {}", response.status());
     }
-    
+
     Ok(())
 }
 

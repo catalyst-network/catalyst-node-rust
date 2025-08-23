@@ -1,5 +1,5 @@
-use crate::CatalystConfig;
 use crate::config::*;
+use crate::CatalystConfig;
 
 /// Create development network configuration
 pub fn devnet_config() -> CatalystConfig {

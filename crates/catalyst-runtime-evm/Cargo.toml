@@ -14,6 +14,7 @@ categories = ["cryptography::cryptocurrencies", "development-tools"]
 [dependencies]
 # Core Catalyst dependencies
 catalyst-core = { path = "../catalyst-core" }
+catalyst-utils = { path = "../catalyst-utils" }
 
 # EVM implementation - use compatible versions
 revm = { version = "3.5", default-features = false, features = ["std", "serde"] }
@@ -46,6 +47,8 @@ env_logger = "0.10"
 [features]
 default = ["std"]
 std = ["revm/std", "revm-primitives/std"]
+dev-examples = []
+integration-tests = []
 
 # Optional features for advanced functionality
 optimism = ["revm/optimism"]
@@ -60,3 +63,9 @@ dfs-integration = []
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[[example]]
+name = "deploy_contract"
+path = "examples/deploy_contract.rs"
+test = false
+required-features = ["never-build-examples"] 

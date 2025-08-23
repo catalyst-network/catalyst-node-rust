@@ -1,14 +1,13 @@
-use crate::{ConfigResult, ConfigError};
-use crate::hot_reload::events::{ConfigEvent, ConfigEventType};
-use catalyst_utils::CatalystError;
+use crate::hot_reload::events::ConfigEvent;
+use crate::{ConfigError, ConfigResult};
 use catalyst_utils::logging::LogCategory;
-use catalyst_utils::{log_info, log_warn, log_error, log_debug};
+use catalyst_utils::{log_debug, log_error, log_info, log_warn};
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Instant};
-use std::fs;
 
 /// File watcher for monitoring configuration file changes
 pub struct FileWatcher {
@@ -47,7 +46,7 @@ impl FileWatcher {
     /// Start watching a file for changes
     pub async fn watch_file<P: AsRef<Path>>(&mut self, path: P) -> ConfigResult<()> {
         let path = path.as_ref().to_path_buf();
-        
+
         log_info!(LogCategory::Config, "Starting to watch file: {:?}", path);
 
         // Get initial file metadata
@@ -57,7 +56,11 @@ impl FileWatcher {
         // Send watcher started event
         let event = ConfigEvent::watcher_started(path.to_string_lossy().to_string());
         if let Err(e) = self.event_sender.send(event) {
-            log_warn!(LogCategory::Config, "Failed to send watcher started event: {}", e);
+            log_warn!(
+                LogCategory::Config,
+                "Failed to send watcher started event: {}",
+                e
+            );
         }
 
         // Start polling if not already running
@@ -71,11 +74,11 @@ impl FileWatcher {
     /// Stop watching a specific file
     pub async fn unwatch_file<P: AsRef<Path>>(&mut self, path: P) -> ConfigResult<()> {
         let path = path.as_ref().to_path_buf();
-        
+
         log_info!(LogCategory::Config, "Stopping watch for file: {:?}", path);
-        
+
         self.watched_files.remove(&path);
-        
+
         // If no more files to watch, stop polling
         if self.watched_files.is_empty() && self.is_running {
             self.stop_polling().await?;
@@ -130,7 +133,11 @@ impl FileWatcher {
 
         if let Some(sender) = self.stop_sender.take() {
             if let Err(e) = sender.send(()) {
-                log_warn!(LogCategory::Config, "Failed to send stop signal to file watcher: {}", e);
+                log_warn!(
+                    LogCategory::Config,
+                    "Failed to send stop signal to file watcher: {}",
+                    e
+                );
             }
         }
 
@@ -139,7 +146,11 @@ impl FileWatcher {
         // Send watcher stopped event
         let event = ConfigEvent::watcher_stopped();
         if let Err(e) = self.event_sender.send(event) {
-            log_warn!(LogCategory::Config, "Failed to send watcher stopped event: {}", e);
+            log_warn!(
+                LogCategory::Config,
+                "Failed to send watcher stopped event: {}",
+                e
+            );
         }
 
         Ok(())
@@ -148,20 +159,18 @@ impl FileWatcher {
     /// Stop watching all files and shut down
     pub async fn stop(&mut self) -> ConfigResult<()> {
         log_info!(LogCategory::Config, "Stopping file watcher");
-        
+
         self.watched_files.clear();
         self.stop_polling().await?;
-        
+
         Ok(())
     }
 
     /// Get file metadata
     fn get_file_metadata(&self, path: &Path) -> ConfigResult<FileMetadata> {
-        let metadata = fs::metadata(path)
-            .map_err(|e| ConfigError::Io(e))?;
+        let metadata = fs::metadata(path).map_err(|e| ConfigError::Io(e))?;
 
-        let last_modified = metadata.modified()
-            .map_err(|e| ConfigError::Io(e))?;
+        let last_modified = metadata.modified().map_err(|e| ConfigError::Io(e))?;
 
         Ok(FileMetadata {
             last_modified,
@@ -181,29 +190,43 @@ impl FileWatcher {
             match Self::check_single_file_for_changes(path, file_metadata) {
                 Ok(Some(new_metadata)) => {
                     log_debug!(LogCategory::Config, "Detected change in file: {:?}", path);
-                    
+
                     // Send file modified event
                     let event = ConfigEvent::file_modified();
                     if let Err(e) = event_sender.send(event) {
-                        log_warn!(LogCategory::Config, "Failed to send file modified event: {}", e);
+                        log_warn!(
+                            LogCategory::Config,
+                            "Failed to send file modified event: {}",
+                            e
+                        );
                     }
 
                     files_to_update.push((path.clone(), new_metadata));
                 }
                 Ok(None) => {
                     // No change detected, update last check time
-                    files_to_update.push((path.clone(), FileMetadata {
-                        last_check: Instant::now(),
-                        ..file_metadata.clone()
-                    }));
+                    files_to_update.push((
+                        path.clone(),
+                        FileMetadata {
+                            last_check: Instant::now(),
+                            ..file_metadata.clone()
+                        },
+                    ));
                 }
                 Err(e) => {
                     log_error!(LogCategory::Config, "Error checking file {:?}: {}", path, e);
-                    
+
                     // Send watcher error event
-                    let event = ConfigEvent::watcher_error(format!("Error checking file {:?}: {}", path, e));
+                    let event = ConfigEvent::watcher_error(format!(
+                        "Error checking file {:?}: {}",
+                        path, e
+                    ));
                     if let Err(send_err) = event_sender.send(event) {
-                        log_warn!(LogCategory::Config, "Failed to send watcher error event: {}", send_err);
+                        log_warn!(
+                            LogCategory::Config,
+                            "Failed to send watcher error event: {}",
+                            send_err
+                        );
                     }
                 }
             }
@@ -227,7 +250,10 @@ impl FileWatcher {
 
         // Check if file still exists
         if !path.exists() {
-            return Err(ConfigError::NotFound(format!("Watched file no longer exists: {:?}", path)));
+            return Err(ConfigError::NotFound(format!(
+                "Watched file no longer exists: {:?}",
+                path
+            )));
         }
 
         // Get current file metadata
@@ -236,8 +262,8 @@ impl FileWatcher {
         let current_size = fs_metadata.len();
 
         // Check if file has changed
-        let has_changed = current_modified != current_metadata.last_modified || 
-                         current_size != current_metadata.last_size;
+        let has_changed = current_modified != current_metadata.last_modified
+            || current_size != current_metadata.last_size;
 
         if has_changed {
             Ok(Some(FileMetadata {
@@ -284,15 +310,17 @@ pub mod utils {
     /// Get the canonical path for a file
     pub fn canonicalize_path<P: AsRef<Path>>(path: P) -> ConfigResult<PathBuf> {
         let path = path.as_ref();
-        path.canonicalize()
-            .map_err(|e| ConfigError::Io(e))
+        path.canonicalize().map_err(|e| ConfigError::Io(e))
     }
 
     /// Check if a file has a valid configuration extension
     pub fn has_config_extension<P: AsRef<Path>>(path: P) -> bool {
         let path = path.as_ref();
         if let Some(extension) = path.extension() {
-            matches!(extension.to_str(), Some("toml") | Some("json") | Some("yaml") | Some("yml"))
+            matches!(
+                extension.to_str(),
+                Some("toml") | Some("json") | Some("yaml") | Some("yml")
+            )
         } else {
             false
         }
@@ -321,14 +349,15 @@ pub mod utils {
 mod tests {
     use super::*;
     use std::fs;
-    use tempfile::{tempdir, NamedTempFile};
+    use tempfile::NamedTempFile;
+    use crate::ConfigEventType;
     use tokio::time::sleep;
 
     #[tokio::test]
     async fn test_file_watcher_creation() {
         let (event_sender, _event_receiver) = mpsc::unbounded_channel();
         let watcher = FileWatcher::new(event_sender);
-        
+
         assert!(!watcher.is_running());
         assert_eq!(watcher.get_poll_interval(), Duration::from_millis(250));
         assert!(watcher.get_watched_files().is_empty());
@@ -338,20 +367,20 @@ mod tests {
     async fn test_watch_file() {
         let temp_file = NamedTempFile::new().unwrap();
         let file_path = temp_file.path().to_path_buf();
-        
+
         let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
         let mut watcher = FileWatcher::new(event_sender);
-        
+
         // Watch the file
         watcher.watch_file(&file_path).await.unwrap();
-        
+
         assert!(watcher.is_watching(&file_path));
         assert!(watcher.is_running());
-        
+
         // Should receive a watcher started event
         let event = event_receiver.recv().await.unwrap();
         assert_eq!(event.event_type, ConfigEventType::WatcherStarted);
-        
+
         watcher.stop().await.unwrap();
     }
 
@@ -360,33 +389,33 @@ mod tests {
     async fn test_file_change_detection() {
         let temp_file = NamedTempFile::new().unwrap();
         let file_path = temp_file.path().to_path_buf();
-        
+
         // Write initial content
         fs::write(&file_path, "initial content").unwrap();
-        
+
         let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
         let mut watcher = FileWatcher::new(event_sender);
         watcher.set_poll_interval(Duration::from_millis(50)); // Fast polling for test
-        
+
         watcher.watch_file(&file_path).await.unwrap();
-        
+
         // Consume the watcher started event
         let _started_event = event_receiver.recv().await.unwrap();
-        
+
         // Wait a bit, then modify the file
         sleep(Duration::from_millis(100)).await;
         fs::write(&file_path, "modified content").unwrap();
-        
+
         // Should detect the change
         let event = tokio::time::timeout(Duration::from_secs(2), event_receiver.recv()).await;
         if event.is_err() {
             eprintln!("Test failed: No event received within timeout");
         }
         assert!(event.is_ok());
-        
+
         let event = event.unwrap().unwrap();
         assert_eq!(event.event_type, ConfigEventType::FileModified);
-        
+
         watcher.stop().await.unwrap();
     }
 
@@ -394,7 +423,7 @@ mod tests {
     fn test_utils_is_valid_config_file() {
         let temp_file = NamedTempFile::new().unwrap();
         assert!(utils::is_valid_config_file(temp_file.path()));
-        
+
         let non_existent = "/path/that/does/not/exist";
         assert!(!utils::is_valid_config_file(non_existent));
     }

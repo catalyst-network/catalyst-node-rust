@@ -10,10 +10,10 @@ use thiserror::Error;
 pub enum ServiceBusError {
     #[error("Service bus error: {0}")]
     Generic(String),
-    
+
     #[error("Connection error: {0}")]
     Connection(String),
-    
+
     #[error("Invalid message: {0}")]
     InvalidMessage(String),
 }
@@ -50,16 +50,16 @@ impl ServiceBus {
     pub fn new(config: ServiceBusConfig) -> Self {
         Self { config }
     }
-    
+
     pub async fn start(&self) -> Result<(), ServiceBusError> {
         // Placeholder - no actual service
         Ok(())
     }
-    
+
     pub async fn stop(&self) -> Result<(), ServiceBusError> {
         Ok(())
     }
-    
+
     pub async fn send_event(&self, _event: &str) -> Result<(), ServiceBusError> {
         Ok(())
     }
@@ -107,5 +107,5 @@ impl AuthToken {
 }
 
 // Export everything
-pub use ServiceBusError as CatalystServiceBusError;
 pub use ServiceBus as CatalystServiceBus;
+pub use ServiceBusError as CatalystServiceBusError;
