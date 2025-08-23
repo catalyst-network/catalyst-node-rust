@@ -1,12 +1,15 @@
 // File: crates/catalyst-node/src/block_production.rs
 // Block production integration with real consensus
 
-use crate::{NodeError, consensus_service::{ConsensusService, Block}};
+use crate::{
+    consensus_service::{Block, ConsensusService},
+    NodeError,
+};
 use catalyst_storage::StorageManager;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{info, error};
-use serde::{Serialize, Deserialize};
 use tokio::sync::RwLock;
+use tracing::{error, info};
 
 /// Block production service that integrates with consensus
 pub struct BlockProductionService {
@@ -44,11 +47,11 @@ impl BlockProductionService {
     /// Initialize the block production service
     pub async fn initialize(&self) -> Result<(), NodeError> {
         info!("🏗️ Initializing block production service with real consensus");
-        
+
         // Get current height from consensus
         let consensus_height = self.consensus.get_current_height().await;
         *self.current_height.write().await = consensus_height;
-        
+
         info!("📏 Current block height: {}", consensus_height);
         Ok(())
     }
@@ -56,13 +59,13 @@ impl BlockProductionService {
     /// Start block production (delegates to consensus)
     pub async fn start(&self) -> Result<(), NodeError> {
         info!("🚀 Starting block production service");
-        
+
         *self.is_running.write().await = true;
-        
+
         // The consensus service handles all block production
         // We just need to monitor and provide statistics
         self.start_monitoring().await;
-        
+
         info!("✅ Block production service started");
         Ok(())
     }
@@ -77,15 +80,16 @@ impl BlockProductionService {
     /// Start monitoring consensus for block production events
     async fn start_monitoring(&self) {
         let service = Arc::new(self.clone());
-        
+
         tokio::spawn(async move {
-            let mut monitoring_interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
-            
+            let mut monitoring_interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(5));
+
             info!("📊 Starting block production monitoring");
-            
+
             loop {
                 monitoring_interval.tick().await;
-                
+
                 if !*service.is_running.read().await {
                     break;
                 }
@@ -93,16 +97,18 @@ impl BlockProductionService {
                 // Update our height tracking based on consensus
                 let consensus_height = service.consensus.get_current_height().await;
                 let mut current_height = service.current_height.write().await;
-                
+
                 if consensus_height > *current_height {
                     let blocks_produced = consensus_height - *current_height;
                     *current_height = consensus_height;
-                    
-                    info!("📈 Block production update: {} new blocks, current height: {}", 
-                          blocks_produced, consensus_height);
+
+                    info!(
+                        "📈 Block production update: {} new blocks, current height: {}",
+                        blocks_produced, consensus_height
+                    );
                 }
             }
-            
+
             info!("📊 Block production monitoring stopped");
         });
     }
@@ -110,13 +116,16 @@ impl BlockProductionService {
     /// Create and add a test transaction to consensus pool
     pub async fn create_test_transaction(&self) -> Result<(), NodeError> {
         let current_height = *self.current_height.read().await;
-        
+
         // Create transaction using consensus service
-        let transaction = self.consensus.create_test_transaction(current_height, rand::random()).await;
-        
+        let transaction = self
+            .consensus
+            .create_test_transaction(current_height, rand::random())
+            .await;
+
         // Add to consensus transaction pool
         self.consensus.add_transaction(transaction).await?;
-        
+
         info!("✅ Test transaction added to consensus pool");
         Ok(())
     }
@@ -132,7 +141,9 @@ impl BlockProductionService {
     }
 
     /// Get consensus status
-    pub async fn get_consensus_status(&self) -> Result<crate::consensus_service::ConsensusStatus, NodeError> {
+    pub async fn get_consensus_status(
+        &self,
+    ) -> Result<crate::consensus_service::ConsensusStatus, NodeError> {
         Ok(self.consensus.get_status().await)
     }
 
@@ -140,7 +151,7 @@ impl BlockProductionService {
     pub async fn get_statistics(&self) -> Result<BlockProductionStats, NodeError> {
         let current_height = *self.current_height.read().await;
         let consensus_status = self.consensus.get_status().await;
-        
+
         // Calculate basic statistics
         // In a real implementation, these would be tracked over time
         Ok(BlockProductionStats {
@@ -160,14 +171,17 @@ impl BlockProductionService {
     /// Force consensus to create a test transaction and advance
     pub async fn trigger_test_block(&self) -> Result<(), NodeError> {
         info!("🔧 Triggering test block production");
-        
+
         // Add some test transactions
         for i in 0..3 {
             let current_height = *self.current_height.read().await;
-            let transaction = self.consensus.create_test_transaction(current_height, i).await;
+            let transaction = self
+                .consensus
+                .create_test_transaction(current_height, i)
+                .await;
             self.consensus.add_transaction(transaction).await?;
         }
-        
+
         info!("✅ Added 3 test transactions to trigger block production");
         Ok(())
     }
@@ -175,15 +189,19 @@ impl BlockProductionService {
     /// Start automatic test transaction generation
     pub async fn start_auto_test_transactions(&self, interval_secs: u64) {
         let service = Arc::new(self.clone());
-        
+
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
-            
-            info!("🔄 Starting automatic test transaction generation every {} seconds", interval_secs);
-            
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+
+            info!(
+                "🔄 Starting automatic test transaction generation every {} seconds",
+                interval_secs
+            );
+
             loop {
                 interval.tick().await;
-                
+
                 if !*service.is_running.read().await {
                     break;
                 }
@@ -194,7 +212,7 @@ impl BlockProductionService {
                     info!("✅ Auto-generated test transaction");
                 }
             }
-            
+
             info!("🔄 Automatic test transaction generation stopped");
         });
     }
@@ -203,7 +221,7 @@ impl BlockProductionService {
     pub async fn get_consensus_debug_info(&self) -> Result<ConsensusDebugInfo, NodeError> {
         let consensus_state = self.consensus.get_consensus_state().await;
         let consensus_status = self.consensus.get_status().await;
-        
+
         Ok(ConsensusDebugInfo {
             current_height: consensus_state.height,
             current_round: consensus_state.round,
@@ -244,16 +262,23 @@ impl Clone for BlockProductionService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use catalyst_storage::StorageConfig;
     use catalyst_crypto::KeyPair;
+    use catalyst_storage::StorageConfig;
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn test_block_production_service_creation() {
         // Create storage
+        // Use a unique temporary data directory to avoid RocksDB LOCK contention.
+        let tmp = TempDir::new().expect("create temp dir");
+        let mut cfg = StorageConfig::for_development();
+        // If your StorageConfig uses String instead of PathBuf, replace to_path_buf() with
+        // tmp.path().to_string_lossy().into_owned()
+        cfg.data_dir = tmp.path().to_path_buf();
         let storage = Arc::new(
-            StorageManager::new(StorageConfig::for_development())
+            StorageManager::new(cfg)
                 .await
-                .expect("Failed to create storage")
+                .expect("Failed to create storage"),
         );
 
         // Create keypair and node ID
@@ -270,7 +295,7 @@ mod tests {
 
         // Create block production service
         let block_production = BlockProductionService::new(storage, consensus);
-        
+
         assert_eq!(block_production.get_current_height().await, 0);
         assert!(!block_production.is_running().await);
     }
@@ -278,10 +303,14 @@ mod tests {
     #[tokio::test]
     async fn test_statistics_generation() {
         // Create test service
+        // Use a unique temporary data directory to avoid RocksDB LOCK contention.
+        let tmp = TempDir::new().expect("create temp dir");
+        let mut cfg = StorageConfig::for_development();
+        cfg.data_dir = tmp.path().to_path_buf();
         let storage = Arc::new(
-            StorageManager::new(StorageConfig::for_development())
+            StorageManager::new(cfg)
                 .await
-                .expect("Failed to create storage")
+                .expect("Failed to create storage"),
         );
 
         let keypair = KeyPair::generate(&mut rand::thread_rng());
@@ -295,10 +324,10 @@ mod tests {
         ));
 
         let block_production = BlockProductionService::new(storage, consensus);
-        
+
         // Get statistics
         let stats = block_production.get_statistics().await.unwrap();
-        
+
         assert_eq!(stats.current_height, 0);
         assert_eq!(stats.total_blocks_produced, 0);
         assert_eq!(stats.average_block_time, 40.0);

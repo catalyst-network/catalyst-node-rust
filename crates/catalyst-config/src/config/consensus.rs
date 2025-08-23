@@ -1,45 +1,45 @@
-use serde::{Deserialize, Serialize};
 use crate::error::{ConfigError, ConfigResult};
+use serde::{Deserialize, Serialize};
 
 /// Consensus algorithm configuration for the 4-phase collaborative process
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsensusConfig {
     /// Total cycle duration in milliseconds (Δtp + Δtc + Δtv + Δts)
     pub cycle_duration_ms: u64,
-    
+
     /// Construction phase duration in milliseconds (Δtp)
     pub construction_phase_ms: u64,
-    
+
     /// Campaigning phase duration in milliseconds (Δtc)
     pub campaigning_phase_ms: u64,
-    
+
     /// Voting phase duration in milliseconds (Δtv)
     pub voting_phase_ms: u64,
-    
+
     /// Synchronization phase duration in milliseconds (Δts)
     pub synchronization_phase_ms: u64,
-    
+
     /// Number of producer nodes selected per cycle (P)
     pub producer_count: usize,
-    
+
     /// Supermajority threshold for voting (typically 0.67 for >67%)
     pub supermajority_threshold: f64,
-    
+
     /// Statistical confidence threshold (typically 0.99999 for 99.999%)
     pub statistical_confidence: f64,
-    
+
     /// Minimum number of producers required for consensus
     pub min_producers: usize,
-    
+
     /// Maximum transaction batch size per producer
     pub max_transaction_batch_size: usize,
-    
+
     /// Worker pool management settings
     pub worker_pool: WorkerPoolConfig,
-    
+
     /// Producer selection settings
     pub producer_selection: ProducerSelectionConfig,
-    
+
     /// Consensus security settings
     pub security: ConsensusSecurityConfig,
 }
@@ -48,16 +48,16 @@ pub struct ConsensusConfig {
 pub struct WorkerPoolConfig {
     /// Maximum size of the worker pool
     pub max_worker_pool_size: usize,
-    
+
     /// Minimum worker score to be eligible for producer selection
     pub min_worker_score: f64,
-    
+
     /// Worker pass duration in milliseconds
     pub worker_pass_duration_ms: u64,
-    
+
     /// Resource proof requirements
     pub resource_proof_required: bool,
-    
+
     /// Scoring algorithm parameters
     pub scoring: ScoringConfig,
 }
@@ -66,13 +66,13 @@ pub struct WorkerPoolConfig {
 pub struct ScoringConfig {
     /// Weight for network uptime in scoring (0.0 to 1.0)
     pub uptime_weight: f64,
-    
+
     /// Weight for resource availability in scoring (0.0 to 1.0)
     pub resource_weight: f64,
-    
+
     /// Weight for participation history in scoring (0.0 to 1.0)
     pub participation_weight: f64,
-    
+
     /// Decay factor for historical performance (0.0 to 1.0)
     pub history_decay_factor: f64,
 }
@@ -81,13 +81,13 @@ pub struct ScoringConfig {
 pub struct ProducerSelectionConfig {
     /// Use pseudo-random selection based on previous cycle Merkle root
     pub use_pseudo_random_selection: bool,
-    
+
     /// Rotation strategy for producer selection
     pub rotation_strategy: RotationStrategy,
-    
+
     /// Minimum time between producer selections for same node (ms)
     pub min_selection_interval_ms: u64,
-    
+
     /// Geographic distribution preference
     pub geographic_distribution_enabled: bool,
 }
@@ -106,22 +106,22 @@ pub enum RotationStrategy {
 pub struct ConsensusSecurityConfig {
     /// Maximum allowed Byzantine nodes percentage (0.0 to 1.0)
     pub max_byzantine_ratio: f64,
-    
+
     /// Enable additional validation checks
     pub strict_validation: bool,
-    
+
     /// Timeout for receiving producer quantities (ms)
     pub producer_quantity_timeout_ms: u64,
-    
+
     /// Timeout for receiving candidate updates (ms)
     pub candidate_timeout_ms: u64,
-    
+
     /// Timeout for receiving votes (ms)
     pub vote_timeout_ms: u64,
-    
+
     /// Maximum allowed clock drift in milliseconds
     pub max_clock_drift_ms: u64,
-    
+
     /// Enable anti-spam measures
     pub anti_spam_enabled: bool,
 }
@@ -169,7 +169,7 @@ impl ConsensusConfig {
             },
         }
     }
-    
+
     /// Create test network consensus configuration
     pub fn testnet() -> Self {
         Self {
@@ -212,7 +212,7 @@ impl ConsensusConfig {
             },
         }
     }
-    
+
     /// Create main network consensus configuration (production)
     pub fn mainnet() -> Self {
         Self {
@@ -255,57 +255,72 @@ impl ConsensusConfig {
             },
         }
     }
-    
+
     /// Validate consensus configuration
     pub fn validate(&self) -> ConfigResult<()> {
         // Validate phase durations sum to cycle duration
-        let total_phases = self.construction_phase_ms + 
-                          self.campaigning_phase_ms + 
-                          self.voting_phase_ms + 
-                          self.synchronization_phase_ms;
-        
+        let total_phases = self.construction_phase_ms
+            + self.campaigning_phase_ms
+            + self.voting_phase_ms
+            + self.synchronization_phase_ms;
+
         if total_phases != self.cycle_duration_ms {
-            return Err(ConfigError::ValidationFailed(
-                format!("Phase durations ({}) don't sum to cycle duration ({})", 
-                       total_phases, self.cycle_duration_ms)
-            ));
+            return Err(ConfigError::ValidationFailed(format!(
+                "Phase durations ({}) don't sum to cycle duration ({})",
+                total_phases, self.cycle_duration_ms
+            )));
         }
-        
+
         // Validate producer count
         if self.producer_count == 0 {
-            return Err(ConfigError::ValidationFailed("Producer count must be greater than 0".to_string()));
+            return Err(ConfigError::ValidationFailed(
+                "Producer count must be greater than 0".to_string(),
+            ));
         }
-        
+
         if self.producer_count < self.min_producers {
-            return Err(ConfigError::ValidationFailed("Producer count cannot be less than min_producers".to_string()));
+            return Err(ConfigError::ValidationFailed(
+                "Producer count cannot be less than min_producers".to_string(),
+            ));
         }
-        
+
         // Validate thresholds
         if self.supermajority_threshold <= 0.5 || self.supermajority_threshold > 1.0 {
-            return Err(ConfigError::ValidationFailed("Supermajority threshold must be between 0.5 and 1.0".to_string()));
+            return Err(ConfigError::ValidationFailed(
+                "Supermajority threshold must be between 0.5 and 1.0".to_string(),
+            ));
         }
-        
+
         if self.statistical_confidence <= 0.0 || self.statistical_confidence >= 1.0 {
-            return Err(ConfigError::ValidationFailed("Statistical confidence must be between 0.0 and 1.0".to_string()));
+            return Err(ConfigError::ValidationFailed(
+                "Statistical confidence must be between 0.0 and 1.0".to_string(),
+            ));
         }
-        
+
         // Validate security settings
         if self.security.max_byzantine_ratio >= 0.5 {
-            return Err(ConfigError::ValidationFailed("Byzantine ratio must be less than 0.5 for security".to_string()));
+            return Err(ConfigError::ValidationFailed(
+                "Byzantine ratio must be less than 0.5 for security".to_string(),
+            ));
         }
-        
+
         // Validate worker pool settings
         if self.worker_pool.max_worker_pool_size < self.producer_count {
-            return Err(ConfigError::ValidationFailed("Worker pool size must be at least as large as producer count".to_string()));
+            return Err(ConfigError::ValidationFailed(
+                "Worker pool size must be at least as large as producer count".to_string(),
+            ));
         }
-        
+
         // Validate scoring weights sum to 1.0
         let scoring = &self.worker_pool.scoring;
-        let weight_sum = scoring.uptime_weight + scoring.resource_weight + scoring.participation_weight;
+        let weight_sum =
+            scoring.uptime_weight + scoring.resource_weight + scoring.participation_weight;
         if (weight_sum - 1.0).abs() > 0.001 {
-            return Err(ConfigError::ValidationFailed("Scoring weights must sum to 1.0".to_string()));
+            return Err(ConfigError::ValidationFailed(
+                "Scoring weights must sum to 1.0".to_string(),
+            ));
         }
-        
+
         Ok(())
     }
 }

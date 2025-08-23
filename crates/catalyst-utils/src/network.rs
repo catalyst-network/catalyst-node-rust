@@ -1,49 +1,51 @@
 // catalyst-utils/src/network.rs
 
-use crate::{CatalystResult, CatalystError};
-use serde::{Serialize, Deserialize};
+use crate::{CatalystError, CatalystResult};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Core trait for network messages in the Catalyst protocol
-/// 
+///
 /// All messages passed between nodes must implement this trait to ensure
 /// proper serialization, deserialization, and message type identification.
 pub trait NetworkMessage: Send + Sync + Clone {
     /// Serialize the message to bytes for network transmission
     fn serialize(&self) -> CatalystResult<Vec<u8>>;
-    
+
     /// Deserialize bytes into a message instance
-    fn deserialize(data: &[u8]) -> CatalystResult<Self> where Self: Sized;
-    
+    fn deserialize(data: &[u8]) -> CatalystResult<Self>
+    where
+        Self: Sized;
+
     /// Get the message type identifier
     fn message_type(&self) -> MessageType;
-    
+
     /// Get the protocol version this message supports
     fn protocol_version(&self) -> u32 {
         1 // Default to version 1
     }
-    
+
     /// Validate the message content
     fn validate(&self) -> CatalystResult<()> {
         Ok(()) // Default implementation accepts all messages
     }
-    
+
     /// Get message priority (higher number = higher priority)
     fn priority(&self) -> u8 {
         MessagePriority::Normal as u8
     }
-    
+
     /// Check if this message should be gossiped to peers
     fn should_gossip(&self) -> bool {
         true // Most messages should be gossiped by default
     }
-    
+
     /// Get the maximum time this message should live in the network (seconds)
     fn ttl(&self) -> u32 {
         300 // 5 minutes default TTL
     }
-    
+
     /// Get estimated size of the message when serialized
     fn estimated_size(&self) -> usize {
         self.serialize().map(|data| data.len()).unwrap_or(0)
@@ -55,49 +57,49 @@ pub trait NetworkMessage: Send + Sync + Clone {
 pub enum MessageType {
     // Consensus messages
     ProducerQuantity,
-    ProducerCandidate, 
+    ProducerCandidate,
     ProducerVote,
     ProducerOutput,
     ConsensusSync,
-    
+
     // Transaction messages
     Transaction,
     TransactionBatch,
     TransactionRequest,
-    
+
     // Network management messages
     PeerDiscovery,
     PeerHandshake,
     PeerHeartbeat,
     PeerDisconnect,
-    
+
     // Storage and state messages
     StateRequest,
     StateResponse,
     StorageSync,
     FileRequest,
     FileResponse,
-    
+
     // Service bus messages
     EventNotification,
     EventSubscription,
     EventUnsubscription,
-    
+
     // Node management messages
     WorkerRegistration,
     WorkerSelection,
     ProducerSelection,
     NodeStatus,
-    
+
     // System messages
     HealthCheck,
     ConfigUpdate,
     NetworkInfo,
     MetricsReport,
-    
+
     // Error handling
     ErrorResponse,
-    
+
     // Custom/Extension types for future use
     Custom(u16),
 }
@@ -105,42 +107,43 @@ pub enum MessageType {
 impl MessageType {
     /// Check if this message type is critical for consensus
     pub fn is_consensus_critical(&self) -> bool {
-        matches!(self, 
-            MessageType::ProducerQuantity |
-            MessageType::ProducerCandidate |
-            MessageType::ProducerVote |
-            MessageType::ProducerOutput |
-            MessageType::ConsensusSync
+        matches!(
+            self,
+            MessageType::ProducerQuantity
+                | MessageType::ProducerCandidate
+                | MessageType::ProducerVote
+                | MessageType::ProducerOutput
+                | MessageType::ConsensusSync
         )
     }
-    
+
     /// Check if this message type relates to transactions
     pub fn is_transaction_related(&self) -> bool {
-        matches!(self,
-            MessageType::Transaction |
-            MessageType::TransactionBatch |
-            MessageType::TransactionRequest
+        matches!(
+            self,
+            MessageType::Transaction
+                | MessageType::TransactionBatch
+                | MessageType::TransactionRequest
         )
     }
-    
+
     /// Get the default priority for this message type
     pub fn default_priority(&self) -> MessagePriority {
         match self {
             // Consensus messages have highest priority
-            MessageType::ProducerQuantity |
-            MessageType::ProducerCandidate |
-            MessageType::ProducerVote |
-            MessageType::ProducerOutput => MessagePriority::Critical,
-            
+            MessageType::ProducerQuantity
+            | MessageType::ProducerCandidate
+            | MessageType::ProducerVote
+            | MessageType::ProducerOutput => MessagePriority::Critical,
+
             // Transactions are high priority
-            MessageType::Transaction |
-            MessageType::TransactionBatch => MessagePriority::High,
-            
+            MessageType::Transaction | MessageType::TransactionBatch => MessagePriority::High,
+
             // Network management is normal priority
-            MessageType::PeerDiscovery |
-            MessageType::PeerHandshake |
-            MessageType::PeerHeartbeat => MessagePriority::Normal,
-            
+            MessageType::PeerDiscovery
+            | MessageType::PeerHandshake
+            | MessageType::PeerHeartbeat => MessagePriority::Normal,
+
             // Everything else is normal priority
             _ => MessagePriority::Normal,
         }
@@ -245,7 +248,7 @@ impl MessageEnvelope {
             routing_info: None,
         }
     }
-    
+
     /// Create envelope from a NetworkMessage
     pub fn from_message<T: NetworkMessage>(
         message: &T,
@@ -259,23 +262,23 @@ impl MessageEnvelope {
         envelope.version = message.protocol_version();
         Ok(envelope)
     }
-    
+
     /// Extract and deserialize the message from payload
     pub fn extract_message<T: NetworkMessage>(&self) -> CatalystResult<T> {
         T::deserialize(&self.payload)
     }
-    
+
     /// Check if the message has expired
     pub fn is_expired(&self) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        
+
         let expiry = self.timestamp + (self.ttl as u64 * 1000);
         now > expiry
     }
-    
+
     /// Sign the message with the given signing function
     pub fn sign<F>(&mut self, sign_fn: F) -> CatalystResult<()>
     where
@@ -285,7 +288,7 @@ impl MessageEnvelope {
         self.signature = Some(sign_fn(&data)?);
         Ok(())
     }
-    
+
     /// Verify the message signature with the given verification function
     pub fn verify<F>(&self, verify_fn: F) -> CatalystResult<bool>
     where
@@ -302,15 +305,16 @@ impl MessageEnvelope {
             None => Ok(false), // Unsigned message
         }
     }
-    
+
     /// Get the data that should be signed
     fn signing_data(&self) -> CatalystResult<Vec<u8>> {
         let mut envelope = self.clone();
         envelope.signature = None; // Remove signature for signing
-        serde_json::to_vec(&envelope)
-            .map_err(|e| CatalystError::Serialization(format!("Failed to serialize envelope for signing: {}", e)))
+        serde_json::to_vec(&envelope).map_err(|e| {
+            CatalystError::Serialization(format!("Failed to serialize envelope for signing: {}", e))
+        })
     }
-    
+
     /// Add routing information
     pub fn with_routing_info(mut self, routing_info: RoutingInfo) -> Self {
         self.routing_info = Some(routing_info);
@@ -344,27 +348,27 @@ impl RoutingInfo {
             ordered_delivery: false,
         }
     }
-    
+
     /// Add a visited node and increment hop count
     pub fn add_hop(&mut self, node_id: String) -> CatalystResult<()> {
         if self.hop_count >= self.max_hops {
             return Err(CatalystError::Network("Maximum hops exceeded".to_string()));
         }
-        
+
         if self.visited_nodes.contains(&node_id) {
             return Err(CatalystError::Network("Routing loop detected".to_string()));
         }
-        
+
         self.visited_nodes.push(node_id);
         self.hop_count += 1;
         Ok(())
     }
-    
+
     /// Check if a node has been visited
     pub fn has_visited(&self, node_id: &str) -> bool {
         self.visited_nodes.contains(&node_id.to_string())
     }
-    
+
     /// Check if more hops are allowed
     pub fn can_hop(&self) -> bool {
         self.hop_count < self.max_hops
@@ -392,15 +396,17 @@ pub struct BasicMessage {
 
 impl NetworkMessage for BasicMessage {
     fn serialize(&self) -> CatalystResult<Vec<u8>> {
-        serde_json::to_vec(self)
-            .map_err(|e| CatalystError::Serialization(format!("Failed to serialize BasicMessage: {}", e)))
+        serde_json::to_vec(self).map_err(|e| {
+            CatalystError::Serialization(format!("Failed to serialize BasicMessage: {}", e))
+        })
     }
-    
+
     fn deserialize(data: &[u8]) -> CatalystResult<Self> {
-        serde_json::from_slice(data)
-            .map_err(|e| CatalystError::Serialization(format!("Failed to deserialize BasicMessage: {}", e)))
+        serde_json::from_slice(data).map_err(|e| {
+            CatalystError::Serialization(format!("Failed to deserialize BasicMessage: {}", e))
+        })
     }
-    
+
     fn message_type(&self) -> MessageType {
         self.message_type
     }
@@ -410,10 +416,10 @@ impl NetworkMessage for BasicMessage {
 pub trait MessageHandler: Send + Sync {
     /// Handle an incoming message
     fn handle_message(&self, envelope: MessageEnvelope) -> CatalystResult<Option<MessageEnvelope>>;
-    
+
     /// Get the message types this handler can process
     fn supported_types(&self) -> Vec<MessageType>;
-    
+
     /// Check if this handler can process a specific message type
     fn can_handle(&self, message_type: MessageType) -> bool {
         self.supported_types().contains(&message_type)
@@ -432,7 +438,7 @@ impl MessageRouter {
             handlers: std::collections::HashMap::new(),
         }
     }
-    
+
     /// Register a handler for specific message types
     pub fn register_handler(&mut self, handler: std::sync::Arc<dyn MessageHandler>) {
         let supported_types = handler.supported_types();
@@ -440,17 +446,21 @@ impl MessageRouter {
             self.handlers.insert(msg_type, handler.clone());
         }
     }
-    
+
     /// Route a message to the appropriate handler
-    pub fn route_message(&self, envelope: MessageEnvelope) -> CatalystResult<Option<MessageEnvelope>> {
+    pub fn route_message(
+        &self,
+        envelope: MessageEnvelope,
+    ) -> CatalystResult<Option<MessageEnvelope>> {
         match self.handlers.get(&envelope.message_type) {
             Some(handler) => handler.handle_message(envelope),
-            None => Err(CatalystError::Network(
-                format!("No handler for message type: {}", envelope.message_type)
-            )),
+            None => Err(CatalystError::Network(format!(
+                "No handler for message type: {}",
+                envelope.message_type
+            ))),
         }
     }
-    
+
     /// Get all registered message types
     pub fn registered_types(&self) -> Vec<MessageType> {
         self.handlers.keys().cloned().collect()
@@ -489,67 +499,77 @@ impl NetworkStats {
     pub fn record_sent_message(&mut self, message_type: MessageType, size: usize) {
         self.messages_sent += 1;
         self.bytes_sent += size as u64;
-        *self.messages_by_type.entry(message_type.to_string()).or_insert(0) += 1;
+        *self
+            .messages_by_type
+            .entry(message_type.to_string())
+            .or_insert(0) += 1;
     }
-    
+
     /// Record a received message
     pub fn record_received_message(&mut self, message_type: MessageType, size: usize) {
         self.messages_received += 1;
         self.bytes_received += size as u64;
-        *self.messages_by_type.entry(message_type.to_string()).or_insert(0) += 1;
+        *self
+            .messages_by_type
+            .entry(message_type.to_string())
+            .or_insert(0) += 1;
     }
-    
+
     /// Record a delivery failure
     pub fn record_delivery_failure(&mut self) {
         self.delivery_failures += 1;
     }
-    
+
     /// Record an expired message
     pub fn record_expired_message(&mut self) {
         self.expired_messages += 1;
     }
-    
+
     /// Update average processing time
     pub fn update_processing_time(&mut self, processing_time_ms: f64) {
         // Simple exponential moving average
         let alpha = 0.1;
-        self.avg_processing_time_ms = alpha * processing_time_ms + (1.0 - alpha) * self.avg_processing_time_ms;
+        self.avg_processing_time_ms =
+            alpha * processing_time_ms + (1.0 - alpha) * self.avg_processing_time_ms;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_message_type_display() {
         assert_eq!(MessageType::Transaction.to_string(), "transaction");
-        assert_eq!(MessageType::ProducerQuantity.to_string(), "producer_quantity");
+        assert_eq!(
+            MessageType::ProducerQuantity.to_string(),
+            "producer_quantity"
+        );
         assert_eq!(MessageType::Custom(123).to_string(), "custom_123");
     }
-    
+
     #[test]
     fn test_message_type_classification() {
         assert!(MessageType::ProducerQuantity.is_consensus_critical());
         assert!(MessageType::Transaction.is_transaction_related());
         assert!(!MessageType::PeerHeartbeat.is_consensus_critical());
     }
-    
+
     #[test]
     fn test_basic_message() {
         let msg = BasicMessage {
             content: "Hello, World!".to_string(),
             message_type: MessageType::HealthCheck,
         };
-        
+
         // Use explicit trait method to avoid ambiguity with serde::Serialize
         let serialized = NetworkMessage::serialize(&msg).unwrap();
         let deserialized = <BasicMessage as NetworkMessage>::deserialize(&serialized).unwrap();
-        
+
         assert_eq!(msg.content, deserialized.content);
         assert_eq!(msg.message_type, deserialized.message_type);
     }
-    
+
     #[test]
     fn test_message_envelope() {
         let payload = b"test payload".to_vec();
@@ -559,51 +579,51 @@ mod tests {
             Some("node2".to_string()),
             payload.clone(),
         );
-        
+
         assert_eq!(envelope.message_type, MessageType::Transaction);
         assert_eq!(envelope.sender, "node1");
         assert_eq!(envelope.target, Some("node2".to_string()));
         assert_eq!(envelope.payload, payload);
         assert!(!envelope.is_expired());
     }
-    
+
     #[test]
     fn test_routing_info() {
         let mut routing = RoutingInfo::new(5);
-        
+
         assert!(routing.can_hop());
         assert!(!routing.has_visited("node1"));
-        
+
         routing.add_hop("node1".to_string()).unwrap();
         assert!(routing.has_visited("node1"));
         assert_eq!(routing.hop_count, 1);
-        
+
         // Test loop detection
         let result = routing.add_hop("node1".to_string());
         assert!(result.is_err());
     }
-    
+
     #[test]
     fn test_message_id_generation() {
         let id1 = generate_message_id();
         let id2 = generate_message_id();
-        
+
         assert_ne!(id1, id2);
         assert_eq!(id1.len(), 32); // 16 hex chars for timestamp + 16 for random
     }
-    
+
     #[test]
     fn test_network_stats() {
         let mut stats = NetworkStats::default();
-        
+
         stats.record_sent_message(MessageType::Transaction, 100);
         stats.record_received_message(MessageType::ProducerQuantity, 50);
-        
+
         assert_eq!(stats.messages_sent, 1);
         assert_eq!(stats.messages_received, 1);
         assert_eq!(stats.bytes_sent, 100);
         assert_eq!(stats.bytes_received, 50);
-        
+
         let tx_count = stats.messages_by_type.get("transaction").unwrap();
         assert_eq!(*tx_count, 1);
     }

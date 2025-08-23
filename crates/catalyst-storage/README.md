@@ -151,7 +151,7 @@ storage.set_account(&address, &account).await?;
 let balance = storage.get_account(&address).await?;
 
 // Transaction storage
-let tx_hash = [2u8; 32];
+let tx_hash: Hash = [2u8; 32].into();
 let tx_data = b"transaction data";
 
 storage.set_transaction(&tx_hash, tx_data).await?;
@@ -232,7 +232,7 @@ async fn use_as_state_manager(storage: &dyn StateManager) -> Result<(), Box<dyn 
     storage.set_account(&address, &account).await?;
     
     // Transaction operations
-    let tx_hash = [2u8; 32];
+    let tx_hash: Hash = [2u8; 32].into();
     storage.set_transaction(&tx_hash, b"tx_data".to_vec()).await?;
     
     // Commit changes and get state root

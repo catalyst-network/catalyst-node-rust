@@ -1,17 +1,17 @@
 // catalyst-utils/examples/basic_usage.rs
 
 use catalyst_utils::{
-    CatalystResult, SystemInfo, Hash, Address,
-    utils::RateLimiter,
-    logging::{LogConfig, CatalystLogger, LogCategory},
-    crypto::hash_data,
-    time::current_timestamp,
     consensus_error,
+    crypto::hash_data,
+    logging::{CatalystLogger, LogCategory, LogConfig},
+    time::current_timestamp,
+    utils::RateLimiter,
+    Address, CatalystResult, Hash, SystemInfo,
 };
 
 fn main() -> CatalystResult<()> {
     println!("Catalyst Utils Basic Usage Example");
-    
+
     // System Information
     let system_info = SystemInfo::new();
     println!("\n=== System Information ===");
@@ -24,7 +24,7 @@ fn main() -> CatalystResult<()> {
     println!("\n=== Cryptographic Types ===");
     let hash: Hash = Hash::new([0u8; 32]);
     let address: Address = Address::new([1u8; 20]);
-    
+
     println!("   Zero hash: {}", hash);
     println!("   Test address: {}", address);
     println!("   Hash is zero: {}", hash.is_zero());
@@ -34,7 +34,7 @@ fn main() -> CatalystResult<()> {
     println!("\n=== Logging Example ===");
     let config = LogConfig::default();
     let logger = CatalystLogger::new(config);
-    
+
     logger.info(LogCategory::System, "Application started successfully")?;
     logger.warn(LogCategory::Network, "This is a warning message")?;
 
@@ -46,10 +46,19 @@ fn main() -> CatalystResult<()> {
     // Rate limiting
     println!("\n=== Rate Limiting ===");
     let mut rate_limiter = RateLimiter::new(5, 1);
-    
-    println!("   Initial state - can acquire token: {}", rate_limiter.try_acquire());
-    println!("   After using 1 - can acquire another: {}", rate_limiter.try_acquire());
-    println!("   After using 2 - can acquire another: {}", rate_limiter.try_acquire());
+
+    println!(
+        "   Initial state - can acquire token: {}",
+        rate_limiter.try_acquire()
+    );
+    println!(
+        "   After using 1 - can acquire another: {}",
+        rate_limiter.try_acquire()
+    );
+    println!(
+        "   After using 2 - can acquire another: {}",
+        rate_limiter.try_acquire()
+    );
 
     // Cryptographic operations
     println!("\n=== Cryptographic Operations ===");

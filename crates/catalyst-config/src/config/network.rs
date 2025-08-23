@@ -1,43 +1,42 @@
-use serde::{Deserialize, Serialize};
-use catalyst_utils::CatalystResult;
 use crate::error::{ConfigError, ConfigResult};
+use serde::{Deserialize, Serialize};
 
 /// Network configuration for P2P communication and API endpoints
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
     /// Network name identifier
     pub name: String,
-    
+
     /// P2P networking port
     pub p2p_port: u16,
-    
+
     /// REST API port
     pub api_port: u16,
-    
+
     /// Maximum number of concurrent peer connections
     pub max_peers: usize,
-    
+
     /// Minimum number of peers to maintain
     pub min_peers: usize,
-    
+
     /// Connection timeout in milliseconds
     pub connection_timeout_ms: u64,
-    
+
     /// Heartbeat interval in milliseconds
     pub heartbeat_interval_ms: u64,
-    
+
     /// Maximum message size in bytes
     pub max_message_size: usize,
-    
+
     /// Enable IPv6 support
     pub ipv6_enabled: bool,
-    
+
     /// Bootstrap peer addresses
     pub bootstrap_peers: Vec<String>,
-    
+
     /// Network discovery settings
     pub discovery: DiscoveryConfig,
-    
+
     /// Bandwidth limiting settings
     pub bandwidth: BandwidthConfig,
 }
@@ -46,13 +45,13 @@ pub struct NetworkConfig {
 pub struct DiscoveryConfig {
     /// Enable peer discovery
     pub enabled: bool,
-    
+
     /// Discovery interval in milliseconds
     pub discovery_interval_ms: u64,
-    
+
     /// Maximum peers to discover per interval
     pub max_discovery_peers: usize,
-    
+
     /// Discovery timeout in milliseconds
     pub discovery_timeout_ms: u64,
 }
@@ -61,13 +60,13 @@ pub struct DiscoveryConfig {
 pub struct BandwidthConfig {
     /// Enable bandwidth limiting
     pub enabled: bool,
-    
+
     /// Maximum upload bandwidth in bytes per second
     pub max_upload_bps: Option<u64>,
-    
+
     /// Maximum download bandwidth in bytes per second
     pub max_download_bps: Option<u64>,
-    
+
     /// Burst allowance in bytes
     pub burst_allowance: u64,
 }
@@ -85,10 +84,7 @@ impl NetworkConfig {
             heartbeat_interval_ms: 30000,
             max_message_size: 1024 * 1024, // 1MB
             ipv6_enabled: true,
-            bootstrap_peers: vec![
-                "127.0.0.1:7001".to_string(),
-                "127.0.0.1:7002".to_string(),
-            ],
+            bootstrap_peers: vec!["127.0.0.1:7001".to_string(), "127.0.0.1:7002".to_string()],
             discovery: DiscoveryConfig {
                 enabled: true,
                 discovery_interval_ms: 10000,
@@ -103,7 +99,7 @@ impl NetworkConfig {
             },
         }
     }
-    
+
     /// Create default test network configuration
     pub fn testnet() -> Self {
         Self {
@@ -130,11 +126,11 @@ impl NetworkConfig {
                 enabled: true,
                 max_upload_bps: Some(10 * 1024 * 1024), // 10 MB/s
                 max_download_bps: Some(50 * 1024 * 1024), // 50 MB/s
-                burst_allowance: 5 * 1024 * 1024, // 5MB
+                burst_allowance: 5 * 1024 * 1024,       // 5MB
             },
         }
     }
-    
+
     /// Create default main network configuration
     pub fn mainnet() -> Self {
         Self {
@@ -162,53 +158,71 @@ impl NetworkConfig {
                 enabled: true,
                 max_upload_bps: Some(100 * 1024 * 1024), // 100 MB/s
                 max_download_bps: Some(500 * 1024 * 1024), // 500 MB/s
-                burst_allowance: 10 * 1024 * 1024, // 10MB
+                burst_allowance: 10 * 1024 * 1024,       // 10MB
             },
         }
     }
-    
+
     /// Validate network configuration
     pub fn validate(&self) -> ConfigResult<()> {
         if self.name.is_empty() {
-            return Err(ConfigError::ValidationFailed("Network name cannot be empty".to_string()));
+            return Err(ConfigError::ValidationFailed(
+                "Network name cannot be empty".to_string(),
+            ));
         }
-        
+
         if self.p2p_port == 0 {
-            return Err(ConfigError::ValidationFailed("P2P port cannot be 0".to_string()));
+            return Err(ConfigError::ValidationFailed(
+                "P2P port cannot be 0".to_string(),
+            ));
         }
-        
+
         if self.api_port == 0 {
-            return Err(ConfigError::ValidationFailed("API port cannot be 0".to_string()));
+            return Err(ConfigError::ValidationFailed(
+                "API port cannot be 0".to_string(),
+            ));
         }
-        
+
         if self.p2p_port == self.api_port {
-            return Err(ConfigError::ValidationFailed("P2P and API ports cannot be the same".to_string()));
+            return Err(ConfigError::ValidationFailed(
+                "P2P and API ports cannot be the same".to_string(),
+            ));
         }
-        
+
         if self.max_peers == 0 {
-            return Err(ConfigError::ValidationFailed("Max peers must be greater than 0".to_string()));
+            return Err(ConfigError::ValidationFailed(
+                "Max peers must be greater than 0".to_string(),
+            ));
         }
-        
+
         if self.min_peers > self.max_peers {
-            return Err(ConfigError::ValidationFailed("Min peers cannot exceed max peers".to_string()));
+            return Err(ConfigError::ValidationFailed(
+                "Min peers cannot exceed max peers".to_string(),
+            ));
         }
-        
+
         if self.connection_timeout_ms == 0 {
-            return Err(ConfigError::ValidationFailed("Connection timeout must be greater than 0".to_string()));
+            return Err(ConfigError::ValidationFailed(
+                "Connection timeout must be greater than 0".to_string(),
+            ));
         }
-        
+
         if self.max_message_size == 0 {
-            return Err(ConfigError::ValidationFailed("Max message size must be greater than 0".to_string()));
+            return Err(ConfigError::ValidationFailed(
+                "Max message size must be greater than 0".to_string(),
+            ));
         }
-        
+
         // Validate bootstrap peers
         for peer in &self.bootstrap_peers {
             if peer.is_empty() {
-                return Err(ConfigError::ValidationFailed("Bootstrap peer address cannot be empty".to_string()));
+                return Err(ConfigError::ValidationFailed(
+                    "Bootstrap peer address cannot be empty".to_string(),
+                ));
             }
             // Could add more sophisticated address validation here
         }
-        
+
         Ok(())
     }
 }

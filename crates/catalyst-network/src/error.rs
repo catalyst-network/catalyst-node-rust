@@ -91,12 +91,10 @@ impl From<NetworkError> for CatalystError {
             NetworkError::ConnectionFailed { peer_id, reason } => {
                 CatalystError::Network(format!("Connection to {} failed: {}", peer_id, reason))
             }
-            NetworkError::Timeout { duration } => {
-                CatalystError::Timeout {
-                    duration_ms: duration.as_millis() as u64,
-                    operation: "network operation".to_string(),
-                }
-            }
+            NetworkError::Timeout { duration } => CatalystError::Timeout {
+                duration_ms: duration.as_millis() as u64,
+                operation: "network operation".to_string(),
+            },
             NetworkError::SerializationFailed(msg) => {
                 CatalystError::Serialization(format!("Network serialization: {}", msg))
             }
@@ -185,7 +183,7 @@ mod tests {
         let duration = Duration::from_secs(30);
         let err = NetworkError::Timeout { duration };
         let catalyst_err: CatalystError = err.into();
-        
+
         if let CatalystError::Timeout { duration_ms, .. } = catalyst_err {
             assert_eq!(duration_ms, 30000);
         } else {

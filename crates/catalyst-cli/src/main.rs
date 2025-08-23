@@ -6,7 +6,7 @@ use catalyst_node::NodeBuilder;
 use catalyst_rpc::RpcConfig;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 // Simplified storage config struct for CLI use
 #[derive(Debug, Clone)]
@@ -39,11 +39,11 @@ impl Default for SimpleStorageConfig {
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-    
+
     /// Configuration file path
     #[arg(short, long)]
     config: Option<PathBuf>,
-    
+
     /// Log level
     #[arg(short, long, default_value = "info")]
     log_level: String,
@@ -56,34 +56,34 @@ enum Commands {
         /// Run as validator
         #[arg(long)]
         validator: bool,
-        
+
         /// RPC port
         #[arg(long, default_value = "9933")]
         rpc_port: u16,
-        
+
         /// Data directory
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        
+
         /// Network port
         #[arg(long, default_value = "30333")]
         network_port: u16,
     },
-    
+
     /// Stop the Catalyst node
     Stop,
-    
+
     /// Get node status
     Status {
         /// Show verbose status
         #[arg(short, long)]
         verbose: bool,
-        
+
         /// RPC port to connect to
         #[arg(long, default_value = "9933")]
         rpc_port: u16,
     },
-    
+
     /// Initialize configuration
     Init {
         /// Output configuration file
@@ -95,14 +95,17 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    
+
     // Initialize logging
     init_logging(&cli.log_level)?;
-    
+
     match cli.command {
-        Commands::Start { validator, rpc_port, data_dir, network_port } => {
-            start_node(cli.config, validator, rpc_port, data_dir, network_port).await
-        }
+        Commands::Start {
+            validator,
+            rpc_port,
+            data_dir,
+            network_port,
+        } => start_node(cli.config, validator, rpc_port, data_dir, network_port).await,
         Commands::Stop => stop_node().await,
         Commands::Status { verbose, rpc_port } => show_status(verbose, rpc_port).await,
         Commands::Init { output } => init_config(output).await,
@@ -117,7 +120,7 @@ async fn start_node(
     _network_port: u16,
 ) -> Result<()> {
     info!("🚀 Starting Catalyst node...");
-    
+
     // Load or create configuration
     let config = match config_path {
         Some(path) => {
@@ -130,7 +133,7 @@ async fn start_node(
             CatalystConfig::default()
         }
     };
-    
+
     // Create simplified storage configuration
     let storage_config = SimpleStorageConfig {
         data_dir: data_dir.unwrap_or_else(|| PathBuf::from("./catalyst_blockchain_data")),
@@ -210,24 +213,24 @@ async fn stop_node() -> Result<()> {
 
 async fn show_status(verbose: bool, rpc_port: u16) -> Result<()> {
     info!("Checking Catalyst node status...");
-    
+
     let client = reqwest::Client::new();
     let rpc_url = format!("http://127.0.0.1:{}", rpc_port);
-    
+
     let response = client
         .post(&rpc_url)
         .header("Content-Type", "application/json")
         .body(r#"{"jsonrpc":"2.0","method":"catalyst_status","params":[],"id":1}"#)
         .send()
         .await;
-    
+
     match response {
         Ok(resp) => {
             if resp.status().is_success() {
                 let status: serde_json::Value = resp.json().await?;
-                
+
                 println!("✅ Catalyst node is running on port {}", rpc_port);
-                
+
                 if verbose {
                     println!("Status details:");
                     println!("{}", serde_json::to_string_pretty(&status)?);
@@ -245,7 +248,7 @@ async fn show_status(verbose: bool, rpc_port: u16) -> Result<()> {
                 // Test additional endpoints
                 if verbose {
                     println!("\n🧪 Testing additional RPC endpoints:");
-                    
+
                     // Test version
                     let version_response = client
                         .post(&rpc_url)
@@ -253,7 +256,7 @@ async fn show_status(verbose: bool, rpc_port: u16) -> Result<()> {
                         .body(r#"{"jsonrpc":"2.0","method":"catalyst_version","params":[],"id":2}"#)
                         .send()
                         .await;
-                    
+
                     if let Ok(resp) = version_response {
                         if let Ok(version_data) = resp.json::<serde_json::Value>().await {
                             if let Some(result) = version_data.get("result") {
@@ -272,15 +275,15 @@ async fn show_status(verbose: bool, rpc_port: u16) -> Result<()> {
             error!("Try: catalyst-node start --rpc-port {}", rpc_port);
         }
     }
-    
+
     Ok(())
 }
 
 async fn init_config(output: Option<PathBuf>) -> Result<()> {
     let output_path = output.unwrap_or_else(|| PathBuf::from("catalyst.toml"));
-    
+
     info!("Generating default configuration...");
-    
+
     // Simplified config file
     let config_content = r#"# Catalyst Node Configuration
 
@@ -316,9 +319,9 @@ gas_limit = "8000000"
 enabled = true
 port = 9615
 "#;
-    
+
     std::fs::write(&output_path, config_content)?;
-    
+
     info!("✅ Configuration written to: {}", output_path.display());
     info!("📝 Edit the configuration file and start the node with:");
     info!("   catalyst-node start --config {}", output_path.display());
@@ -328,25 +331,24 @@ port = 9615
     info!("");
     info!("📊 Check node status:");
     info!("   catalyst-node status");
-    
+
     Ok(())
 }
 
 fn init_logging(level: &str) -> Result<()> {
     use tracing_subscriber::{EnvFilter, FmtSubscriber};
-    
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
-    
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+
     let subscriber = FmtSubscriber::builder()
         .with_env_filter(filter)
         .with_target(false)
         .with_thread_ids(false)
         .with_level(true)
         .finish();
-    
+
     tracing::subscriber::set_global_default(subscriber)?;
-    
+
     Ok(())
 }
 
@@ -358,13 +360,13 @@ mod tests {
     #[tokio::test]
     async fn test_simple_node_startup() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let storage_config = SimpleStorageConfig {
             data_dir: temp_dir.path().to_path_buf(),
             max_open_files: 100,
             write_buffer_size: 16 * 1024 * 1024, // 16 MB for tests
-            block_cache_size: 32 * 1024 * 1024, // 32 MB for tests
-            compression_enabled: false, // Disable for faster tests
+            block_cache_size: 32 * 1024 * 1024,  // 32 MB for tests
+            compression_enabled: false,          // Disable for faster tests
             enable_statistics: false,
         };
 
