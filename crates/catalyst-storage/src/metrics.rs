@@ -2,18 +2,12 @@
 
 #[cfg(feature = "metrics")]
 use prometheus::{
-    register_histogram,
-    register_int_counter,
-    register_int_gauge,
-    // Only import what's actually used
-    Histogram,
-    HistogramOpts,
-    IntCounter,
-    IntGauge,
+    register_histogram, register_int_counter, register_int_gauge, Histogram, HistogramOpts,
+    IntCounter, IntGauge,
 };
 
 #[cfg(feature = "metrics")]
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 #[cfg(feature = "metrics")]
 /// Storage metrics registry
@@ -42,36 +36,55 @@ pub struct StorageMetrics {
 #[cfg(feature = "metrics")]
 static STORAGE_METRICS: OnceLock<StorageMetrics> = OnceLock::new();
 
+/// Guard to make registration race-safe (no duplicate Prometheus registration on races)
 #[cfg(feature = "metrics")]
-/// Register storage metrics with Prometheus
+static REGISTRATION_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[cfg(feature = "metrics")]
+fn reg_lock() -> std::sync::MutexGuard<'static, ()> {
+    REGISTRATION_GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("metrics registration mutex poisoned")
+}
+
+#[cfg(feature = "metrics")]
+/// Register storage metrics with Prometheus (idempotent, race-safe)
 pub fn register_storage_metrics() -> Result<(), Box<dyn std::error::Error>> {
+    // Fast path: already initialized
+    if STORAGE_METRICS.get().is_some() {
+        return Ok(());
+    }
+
+    // Slow path: take the guard and check again to avoid races
+    let _g = reg_lock();
+    if STORAGE_METRICS.get().is_some() {
+        return Ok(());
+    }
+
+    // First time: actually register the metrics with the default registry
     let metrics = StorageMetrics {
         // Counters
         operations_total: register_int_counter!(
             "catalyst_storage_operations_total",
             "Total number of storage operations performed"
         )?,
-
         errors_total: register_int_counter!(
             "catalyst_storage_errors_total",
             "Total number of storage errors encountered"
         )?,
-
         transactions_committed_total: register_int_counter!(
             "catalyst_storage_transactions_committed_total",
             "Total number of transactions successfully committed"
         )?,
-
         transactions_rolled_back_total: register_int_counter!(
             "catalyst_storage_transactions_rolled_back_total",
             "Total number of transactions rolled back"
         )?,
-
         snapshots_created_total: register_int_counter!(
             "catalyst_storage_snapshots_created_total",
             "Total number of snapshots created"
         )?,
-
         migrations_applied_total: register_int_counter!(
             "catalyst_storage_migrations_applied_total",
             "Total number of database migrations applied"
@@ -82,17 +95,14 @@ pub fn register_storage_metrics() -> Result<(), Box<dyn std::error::Error>> {
             "catalyst_storage_pending_transactions",
             "Number of transactions currently pending"
         )?,
-
         active_snapshots: register_int_gauge!(
             "catalyst_storage_active_snapshots",
             "Number of snapshots currently stored"
         )?,
-
         database_size_bytes: register_int_gauge!(
             "catalyst_storage_database_size_bytes",
             "Total size of the database in bytes"
         )?,
-
         memory_usage_bytes: register_int_gauge!(
             "catalyst_storage_memory_usage_bytes",
             "Memory usage of storage components in bytes"
@@ -106,21 +116,18 @@ pub fn register_storage_metrics() -> Result<(), Box<dyn std::error::Error>> {
         .buckets(vec![
             0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0
         ]))?,
-
         transaction_size_bytes: register_histogram!(HistogramOpts::new(
             "catalyst_storage_transaction_size_bytes",
             "Size of transactions in bytes"
         )
         .buckets(vec![
-            100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0
+            100.0, 1_000.0, 10_000.0, 100_000.0, 1_000_000.0, 10_000_000.0
         ]))?,
-
         transaction_duration: register_histogram!(HistogramOpts::new(
             "catalyst_storage_transaction_duration_seconds",
             "Duration of transaction commits in seconds"
         )
         .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]))?,
-
         snapshot_creation_duration: register_histogram!(HistogramOpts::new(
             "catalyst_storage_snapshot_creation_duration_seconds",
             "Duration of snapshot creation in seconds"
@@ -128,10 +135,8 @@ pub fn register_storage_metrics() -> Result<(), Box<dyn std::error::Error>> {
         .buckets(vec![0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0]))?,
     };
 
-    STORAGE_METRICS
-        .set(metrics)
-        .map_err(|_| "Storage metrics already initialized")?;
-
+    // Set OnceLock; if another thread won the race just treat as success
+    let _ = STORAGE_METRICS.set(metrics);
     Ok(())
 }
 
@@ -323,7 +328,7 @@ mod tests {
 
     #[test]
     fn test_metrics_compilation() {
-        // Test that metrics functions compile and don't panic
+        // Functions should be callable even if registration wasn't done
         increment_operations();
         increment_errors();
         record_transaction_commit(0.1, 1000.0);
@@ -340,19 +345,15 @@ mod tests {
     #[test]
     fn test_operation_timer() {
         let timer = OperationTimer::new();
-        // Simulate some work
         std::thread::sleep(std::time::Duration::from_millis(1));
         timer.finish();
     }
 
     #[cfg(feature = "metrics")]
     #[test]
-    fn test_metrics_registration() {
-        // Note: This test might fail if metrics are already registered
-        // In a real test environment, you'd want to use a separate registry
-        let result = register_storage_metrics();
-        // Don't assert on the result since metrics might already be registered
-        // in other tests
-        drop(result);
+    fn test_metrics_registration_is_idempotent() {
+        assert!(register_storage_metrics().is_ok());
+        // Calling again should be a no-op, not an error
+        assert!(register_storage_metrics().is_ok());
     }
 }

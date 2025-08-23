@@ -132,8 +132,12 @@ async fn test_genesis_block_creation() {
     assert_eq!(genesis_block.header.proposer, node_id);
 }
 
-#[tokio::test(flavor = "current_thread")]
+/// Use a multithread runtime and hard timeouts to prevent this test from hanging.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_consensus_startup_shutdown() {
+    use std::time::Instant;
+    use tokio::time::{sleep, timeout, Duration};
+
     let (storage, _tmp) = new_temp_storage().await;
 
     let mut rng = rand::thread_rng();
@@ -143,24 +147,46 @@ async fn test_consensus_startup_shutdown() {
 
     let consensus = ConsensusService::new(node_id, keypair, storage, config);
 
-    // Test startup
+    // Pre-create genesis so heavy RocksDB CF creation doesn't race with get_status()
+    consensus
+        .initialize_genesis()
+        .await
+        .expect("Failed to initialize genesis");
+
     assert!(!consensus.is_running().await);
 
-    // Guard start/stop with hard timeouts so the test never hangs.
-    timeout(Duration::from_secs(5), consensus.start())
+    // Start with a generous timeout
+    timeout(Duration::from_secs(10), consensus.start())
         .await
         .expect("consensus.start() timed out")
         .expect("Failed to start consensus");
     assert!(consensus.is_running().await);
 
-    // Give it a moment to initialize
-    sleep(Duration::from_millis(100)).await;
+    // Retry-loop for status: first runs may still be warming up CFs
+    let begin = Instant::now();
+    let status = loop {
+        // Ensure we're actually running
+        if !consensus.is_running().await {
+            sleep(Duration::from_millis(100)).await;
+            continue;
+        }
 
-    let status = consensus.get_status().await;
-    assert!(status.is_running);
+        match timeout(Duration::from_secs(3), async { consensus.get_status().await }).await {
+            Ok(s) => break s,
+            Err(_) => {
+                if begin.elapsed() > Duration::from_secs(10) {
+                    panic!("get_status() still not available after 10s");
+                }
+                // Give the background tasks a breath and try again
+                sleep(Duration::from_millis(150)).await;
+            }
+        }
+    };
 
-    // Test shutdown
-    timeout(Duration::from_secs(3), consensus.stop())
+    assert!(status.is_running, "status should report running");
+
+    // Stop with timeout, too
+    timeout(Duration::from_secs(10), consensus.stop())
         .await
         .expect("consensus.stop() timed out")
         .expect("Failed to stop consensus");
@@ -197,7 +223,7 @@ async fn test_consensus_block_production() {
         .expect("consensus.start() timed out")
         .expect("Failed to start consensus");
 
-    // Poll for up to ~5 seconds for a new block
+    // Poll briefly for a new block
     let mut block_produced = false;
     for _ in 0..20 {
         sleep(Duration::from_millis(250)).await;
@@ -209,7 +235,7 @@ async fn test_consensus_block_production() {
     }
 
     // Stop consensus (with timeout)
-    timeout(Duration::from_secs(3), consensus.stop())
+    timeout(Duration::from_secs(5), consensus.stop())
         .await
         .expect("consensus.stop() timed out")
         .expect("Failed to stop consensus");

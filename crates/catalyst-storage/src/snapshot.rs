@@ -8,11 +8,13 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A point-in-time snapshot of the database
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     name: String,
+    /// Milliseconds since UNIX epoch (was seconds; increased precision to avoid ties)
     created_at: u64,
     state_root: Hash,
     metadata: SnapshotMetadata,
@@ -71,11 +73,11 @@ impl SnapshotManager {
             return Ok(());
         }
 
-        let entries = std::fs::read_dir(&self.snapshot_dir).map_err(|e| StorageError::io(e))?;
+        let entries = std::fs::read_dir(&self.snapshot_dir).map_err(StorageError::io)?;
 
         let mut loaded_count = 0;
         for entry in entries {
-            let entry = entry.map_err(|e| StorageError::io(e))?;
+            let entry = entry.map_err(StorageError::io)?;
             let path = entry.path();
 
             if path.is_file() && path.extension() == Some(std::ffi::OsStr::new("snapshot")) {
@@ -100,7 +102,7 @@ impl SnapshotManager {
 
     /// Load snapshot metadata from file
     async fn load_snapshot_metadata(&self, path: &Path) -> StorageResult<Snapshot> {
-        let content = std::fs::read_to_string(path).map_err(|e| StorageError::io(e))?;
+        let content = std::fs::read_to_string(path).map_err(StorageError::io)?;
 
         let snapshot: Snapshot = serde_json::from_str(&content).map_err(|e| {
             StorageError::serialization(format!("Failed to parse snapshot metadata: {}", e))
@@ -132,7 +134,11 @@ impl SnapshotManager {
         // Create the snapshot
         let snapshot = Snapshot {
             name: name.to_string(),
-            created_at: current_timestamp(),
+            // Use millisecond precision to avoid ties during rapid creations
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or_else(|_| (current_timestamp() as u64) * 1000),
             state_root,
             metadata,
             file_path: snapshot_file.clone(),
@@ -146,7 +152,7 @@ impl SnapshotManager {
             StorageError::serialization(format!("Failed to serialize snapshot: {}", e))
         })?;
 
-        std::fs::write(&snapshot_file, metadata_content).map_err(|e| StorageError::io(e))?;
+        std::fs::write(&snapshot_file, metadata_content).map_err(StorageError::io)?;
 
         // Store in memory
         self.snapshots
@@ -168,7 +174,7 @@ impl SnapshotManager {
     /// Write snapshot data to disk
     async fn write_snapshot_data(&self, snapshot: &Snapshot) -> StorageResult<()> {
         let data_dir = self.snapshot_dir.join(format!("{}_data", snapshot.name));
-        std::fs::create_dir_all(&data_dir).map_err(|e| StorageError::io(e))?;
+        std::fs::create_dir_all(&data_dir).map_err(StorageError::io)?;
 
         // Create RocksDB checkpoint (this creates a consistent point-in-time copy)
         for cf_name in &snapshot.metadata.column_families {
@@ -195,7 +201,7 @@ impl SnapshotManager {
                 cf_data
             };
 
-            std::fs::write(&cf_file, final_data).map_err(|e| StorageError::io(e))?;
+            std::fs::write(&cf_file, final_data).map_err(StorageError::io)?;
         }
 
         Ok(())
@@ -267,7 +273,7 @@ impl SnapshotManager {
                 continue;
             }
 
-            let file_data = std::fs::read(&cf_file).map_err(|e| StorageError::io(e))?;
+            let file_data = std::fs::read(&cf_file).map_err(StorageError::io)?;
 
             // Decompress if needed
             let data = self.decompress_data(&file_data)?;
@@ -419,13 +425,13 @@ impl SnapshotManager {
 
         // Delete metadata file
         if snapshot.file_path.exists() {
-            std::fs::remove_file(&snapshot.file_path).map_err(|e| StorageError::io(e))?;
+            std::fs::remove_file(&snapshot.file_path).map_err(StorageError::io)?;
         }
 
         // Delete data directory
         let data_dir = self.snapshot_dir.join(format!("{}_data", name));
         if data_dir.exists() {
-            std::fs::remove_dir_all(&data_dir).map_err(|e| StorageError::io(e))?;
+            std::fs::remove_dir_all(&data_dir).map_err(StorageError::io)?;
         }
 
         println!("Snapshot '{}' deleted successfully", name);
@@ -441,9 +447,14 @@ impl SnapshotManager {
             return Ok(());
         }
 
-        // Sort snapshots by creation time
+        // Sort snapshots by creation time ASC, tie-break by name for determinism
         let mut sorted_snapshots: Vec<_> = snapshots.values().collect();
-        sorted_snapshots.sort_by_key(|s| s.created_at);
+        sorted_snapshots.sort_by(|a, b| {
+            match a.created_at.cmp(&b.created_at) {
+                std::cmp::Ordering::Equal => a.name.cmp(&b.name),
+                other => other,
+            }
+        });
 
         // Delete oldest snapshots
         let to_delete = snapshot_count - self.config.max_snapshots;
@@ -476,11 +487,11 @@ impl SnapshotManager {
             .ok_or_else(|| StorageError::snapshot(format!("Snapshot '{}' not found", name)))?;
 
         // Create export directory
-        std::fs::create_dir_all(export_dir).map_err(|e| StorageError::io(e))?;
+        std::fs::create_dir_all(export_dir).map_err(StorageError::io)?;
 
         // Copy metadata file
         let metadata_dest = export_dir.join(format!("{}.snapshot", name));
-        std::fs::copy(&snapshot.file_path, &metadata_dest).map_err(|e| StorageError::io(e))?;
+        std::fs::copy(&snapshot.file_path, &metadata_dest).map_err(StorageError::io)?;
 
         // Copy data directory
         let data_src = self.snapshot_dir.join(format!("{}_data", name));
@@ -509,11 +520,11 @@ impl SnapshotManager {
         }
 
         // Find snapshot metadata file
-        let entries = std::fs::read_dir(import_dir).map_err(|e| StorageError::io(e))?;
+        let entries = std::fs::read_dir(import_dir).map_err(StorageError::io)?;
 
         let mut metadata_file = None;
         for entry in entries {
-            let entry = entry.map_err(|e| StorageError::io(e))?;
+            let entry = entry.map_err(StorageError::io)?;
             let path = entry.path();
 
             if path.is_file() && path.extension() == Some(std::ffi::OsStr::new("snapshot")) {
@@ -530,6 +541,7 @@ impl SnapshotManager {
 
         // Load snapshot metadata
         let mut snapshot = self.load_snapshot_metadata(&metadata_file).await?;
+        let original_name = snapshot.name.clone();
 
         // Use new name if provided
         let final_name = new_name
@@ -543,14 +555,18 @@ impl SnapshotManager {
             )));
         }
 
+        // Update in-memory snapshot struct
         snapshot.name = final_name.clone();
         snapshot.file_path = self.snapshot_dir.join(format!("{}.snapshot", final_name));
 
-        // Copy metadata file
-        std::fs::copy(&metadata_file, &snapshot.file_path).map_err(|e| StorageError::io(e))?;
+        // Persist UPDATED metadata (do not copy stale file)
+        let updated = serde_json::to_string_pretty(&snapshot).map_err(|e| {
+            StorageError::serialization(format!("Failed to serialize snapshot: {}", e))
+        })?;
+        std::fs::write(&snapshot.file_path, updated).map_err(StorageError::io)?;
 
-        // Copy data directory if it exists
-        let data_src = import_dir.join(format!("{}_data", snapshot.name));
+        // Copy data directory if it exists (use original name for source)
+        let data_src = import_dir.join(format!("{}_data", original_name));
         let data_dest = self.snapshot_dir.join(format!("{}_data", final_name));
 
         if data_src.exists() {
@@ -575,19 +591,19 @@ impl SnapshotManager {
         dest: &'a Path,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = StorageResult<()>> + Send + 'a>> {
         Box::pin(async move {
-            std::fs::create_dir_all(dest).map_err(|e| StorageError::io(e))?;
+            std::fs::create_dir_all(dest).map_err(StorageError::io)?;
 
-            let entries = std::fs::read_dir(src).map_err(|e| StorageError::io(e))?;
+            let entries = std::fs::read_dir(src).map_err(StorageError::io)?;
 
             for entry in entries {
-                let entry = entry.map_err(|e| StorageError::io(e))?;
+                let entry = entry.map_err(StorageError::io)?;
                 let src_path = entry.path();
                 let dest_path = dest.join(entry.file_name());
 
                 if src_path.is_dir() {
                     Box::pin(self.copy_dir_recursive(&src_path, &dest_path)).await?;
                 } else {
-                    std::fs::copy(&src_path, &dest_path).map_err(|e| StorageError::io(e))?;
+                    std::fs::copy(&src_path, &dest_path).map_err(StorageError::io)?;
                 }
             }
 
@@ -602,7 +618,6 @@ impl SnapshotManager {
         let total_size: u64 = snapshots.values().map(|s| s.metadata.total_size).sum();
 
         let oldest_timestamp = snapshots.values().map(|s| s.created_at).min();
-
         let newest_timestamp = snapshots.values().map(|s| s.created_at).max();
 
         SnapshotStatistics {
@@ -633,7 +648,7 @@ impl Snapshot {
         &self.name
     }
 
-    /// Get creation timestamp
+    /// Get creation timestamp (milliseconds)
     pub fn created_at(&self) -> u64 {
         self.created_at
     }
@@ -651,11 +666,11 @@ impl Snapshot {
     /// Export to directory (convenience method)
     pub async fn export_to_directory(&self, export_dir: &Path) -> StorageResult<()> {
         // Create export directory
-        std::fs::create_dir_all(export_dir).map_err(|e| StorageError::io(e))?;
+        std::fs::create_dir_all(export_dir).map_err(StorageError::io)?;
 
         // Copy metadata file
         let metadata_dest = export_dir.join(format!("{}.snapshot", self.name));
-        std::fs::copy(&self.file_path, &metadata_dest).map_err(|e| StorageError::io(e))?;
+        std::fs::copy(&self.file_path, &metadata_dest).map_err(StorageError::io)?;
 
         // Note: In a full implementation, you'd also copy the data directory
         // This is simplified for the example
@@ -674,7 +689,7 @@ impl Snapshot {
             )));
         }
 
-        let content = std::fs::read_to_string(&metadata_file).map_err(|e| StorageError::io(e))?;
+        let content = std::fs::read_to_string(&metadata_file).map_err(StorageError::io)?;
 
         let snapshot: Snapshot = serde_json::from_str(&content).map_err(|e| {
             StorageError::serialization(format!("Failed to parse snapshot metadata: {}", e))
@@ -690,7 +705,7 @@ mod tests {
     use crate::{RocksEngine, StorageConfig};
     use tempfile::TempDir;
 
-    fn create_test_setup() -> (Arc<RocksEngine>, SnapshotManager, TempDir) {
+    async fn create_test_setup() -> (Arc<RocksEngine>, SnapshotManager, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let mut config = StorageConfig::default();
         config.data_dir = temp_dir.path().join("db");
@@ -704,9 +719,8 @@ mod tests {
             snapshot_dir: Some(temp_dir.path().join("snapshots")),
         };
 
-        let snapshot_manager = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(SnapshotManager::new(engine.clone(), snapshot_config))
+        let snapshot_manager = SnapshotManager::new(engine.clone(), snapshot_config)
+            .await
             .unwrap();
 
         (engine, snapshot_manager, temp_dir)
@@ -714,7 +728,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_creation() {
-        let (_engine, manager, _temp_dir) = create_test_setup();
+        let (_engine, manager, _temp_dir) = create_test_setup().await;
 
         let snapshot = manager.create_snapshot("test_snapshot").await.unwrap();
         assert_eq!(snapshot.name(), "test_snapshot");
@@ -723,7 +737,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_with_data() {
-        let (engine, manager, _temp_dir) = create_test_setup();
+        let (engine, manager, _temp_dir) = create_test_setup().await;
 
         // Add some test data
         engine.put("accounts", b"test_key", b"test_value").unwrap();
@@ -736,7 +750,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_list() {
-        let (_engine, manager, _temp_dir) = create_test_setup();
+        let (_engine, manager, _temp_dir) = create_test_setup().await;
 
         // Create multiple snapshots
         manager.create_snapshot("snapshot1").await.unwrap();
@@ -752,7 +766,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_info() {
-        let (_engine, manager, _temp_dir) = create_test_setup();
+        let (_engine, manager, _temp_dir) = create_test_setup().await;
 
         let created_snapshot = manager.create_snapshot("info_test").await.unwrap();
 
@@ -767,7 +781,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_deletion() {
-        let (_engine, manager, _temp_dir) = create_test_setup();
+        let (_engine, manager, _temp_dir) = create_test_setup().await;
 
         manager.create_snapshot("delete_test").await.unwrap();
 
@@ -782,7 +796,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_cleanup() {
-        let (_engine, manager, _temp_dir) = create_test_setup();
+        let (_engine, manager, _temp_dir) = create_test_setup().await;
 
         // Create more snapshots than the limit (5)
         for i in 0..8 {
@@ -805,7 +819,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_statistics() {
-        let (_engine, manager, _temp_dir) = create_test_setup();
+        let (_engine, manager, _temp_dir) = create_test_setup().await;
 
         manager.create_snapshot("stats_test_1").await.unwrap();
         manager.create_snapshot("stats_test_2").await.unwrap();
@@ -820,7 +834,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duplicate_snapshot_name() {
-        let (_engine, manager, _temp_dir) = create_test_setup();
+        let (_engine, manager, _temp_dir) = create_test_setup().await;
 
         manager.create_snapshot("duplicate_test").await.unwrap();
 
@@ -831,7 +845,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_metadata_collection() {
-        let (engine, manager, _temp_dir) = create_test_setup();
+        let (engine, manager, _temp_dir) = create_test_setup().await;
 
         // Add data to multiple column families
         engine.put("accounts", b"key1", b"value1").unwrap();
