@@ -9,14 +9,20 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 # Core Catalyst crates
+catalyst-consensus = { path = "../catalyst-consensus" }
 catalyst-config = { path = "../catalyst-config" }
 catalyst-core = { path = "../catalyst-core" }
 catalyst-utils = { path = "../catalyst-utils" }
 catalyst-rpc = { path = "../catalyst-rpc" }
 catalyst-storage = { path = "../catalyst-storage" }
 catalyst-network = { path = "../catalyst-network" }
-catalyst-consensus = { path = "../catalyst-consensus" }
 catalyst-runtime-evm = { path = "../catalyst-runtime-evm" }
+catalyst-crypto = { path = "../catalyst-crypto" }
+
+# Cryptography
+blake2 = "0.10"
+hex = "0.4"
+rand = "0.8"
 
 # Async runtime
 tokio = { version = "1.0", features = ["full"] }
@@ -39,6 +45,7 @@ uuid = { version = "1.0", features = ["v4"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
+rand = "0.8"
 
 [features]
 default = ["std"]
