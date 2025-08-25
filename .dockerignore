@@ -1,0 +1,11 @@
+target
+**/target
+.git
+.git/
+deploy/devnet/**/data
+deploy/devnet/**/volumes
+deploy/devnet/**/logs
+**/.DS_Store
+**/.idea
+**/.vscode
+*.log

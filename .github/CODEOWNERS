@@ -1,8 +1,13 @@
-# Example — adjust to your GH handles
-/catalyst-crypto/      @darren-olp @crypto-tl
-/catalyst-consensus/   @consensus-tl
-/catalyst-network/     @network-tl
-/catalyst-storage/     @storage-tl
-/catalyst-dfs/         @storage-tl
-/catalyst-service-bus/ @platform-tl
-/catalyst-runtime-*/   @runtimes-tl
+# Place this at .github/CODEOWNERS or /CODEOWNERS
+
+# Per-crate (optional; functionally equivalent to just the wildcard below)
+ /crates/catalyst-crypto/       @TheNewAutonomy
+ /crates/catalyst-consensus/    @TheNewAutonomy
+ /crates/catalyst-network/      @TheNewAutonomy
+ /crates/catalyst-storage/      @TheNewAutonomy
+ /crates/catalyst-dfs/          @TheNewAutonomy
+ /crates/catalyst-service-bus/  @TheNewAutonomy
+ /crates/catalyst-runtime-*/    @TheNewAutonomy
+
+# Fallback for everything else — keep last (last match wins)
+*                                 @TheNewAutonomy
