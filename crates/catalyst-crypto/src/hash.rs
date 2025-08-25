@@ -1,6 +1,7 @@
+use std::fmt;
+
 use blake2::{Blake2b512, Digest};
 use serde::{Deserialize, Serialize};
-use std::fmt;
 
 pub const HASH_SIZE: usize = 32; // Blake2b-256
 

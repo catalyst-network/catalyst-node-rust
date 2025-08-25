@@ -1,9 +1,10 @@
 // examples/metrics_example.rs
 
-use catalyst_utils::metrics::*;
-use catalyst_utils::*;
 use std::thread;
 use std::time::Duration;
+
+use catalyst_utils::metrics::*;
+use catalyst_utils::*;
 
 fn main() -> CatalystResult<()> {
     println!("=== Catalyst Metrics System Example ===\n");

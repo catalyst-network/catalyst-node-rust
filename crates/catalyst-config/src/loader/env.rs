@@ -1,9 +1,9 @@
-use crate::config::logging::LogFormat;
-use crate::config::logging::LogLevel;
-use crate::networks::NetworkType;
-use crate::{CatalystConfig, ConfigError, ConfigResult};
 use std::env;
 use std::str::FromStr;
+
+use crate::config::logging::{LogFormat, LogLevel};
+use crate::networks::NetworkType;
+use crate::{CatalystConfig, ConfigError, ConfigResult};
 
 /// Environment variable-based configuration loader
 pub struct EnvLoader;

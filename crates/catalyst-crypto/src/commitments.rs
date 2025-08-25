@@ -1,11 +1,10 @@
-use crate::{blake2b_hash, CryptoError, CryptoResult};
-use curve25519_dalek::{
-    constants::RISTRETTO_BASEPOINT_POINT,
-    ristretto::{CompressedRistretto, RistrettoPoint},
-    scalar::Scalar,
-};
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
+use curve25519_dalek::scalar::Scalar;
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
+
+use crate::{blake2b_hash, CryptoError, CryptoResult};
 
 /// Pedersen Commitment for confidential transactions
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,7 +36,7 @@ impl PedersenCommitment {
     ) -> Self {
         // C = v * G + r * H
         let value_scalar = Scalar::from(value);
-        let commitment = value_scalar * &RISTRETTO_BASEPOINT_POINT + blinding_factor * generator_h;
+        let commitment = value_scalar * RISTRETTO_BASEPOINT_POINT + blinding_factor * generator_h;
 
         Self {
             commitment,
@@ -92,7 +91,7 @@ impl CommitmentScheme {
 
         // Use hash-to-curve to get H point (simplified)
         let h_scalar = Scalar::from_bytes_mod_order(*h_hash.as_bytes());
-        let generator_h = &h_scalar * &RISTRETTO_BASEPOINT_POINT;
+        let generator_h = h_scalar * RISTRETTO_BASEPOINT_POINT;
 
         Self { generator_h }
     }

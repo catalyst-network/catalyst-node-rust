@@ -1,0 +1,12 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features=["derive"] }
+duct = "0.13"   # run shell cmds portably
+anyhow = "1"
+
+[lints]
+workspace = true

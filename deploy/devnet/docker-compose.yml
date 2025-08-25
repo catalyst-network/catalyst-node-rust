@@ -1,0 +1,29 @@
+version: "3.8"
+services:
+  ipfs:
+    image: ipfs/kubo:latest
+    ports: [ "5001:5001", "8080:8080" ]
+    volumes: [ "ipfs:/data/ipfs" ]
+
+  node-a:
+    build: ../../
+    image: catalyst/node:dev
+    command: ["./target/release/catalyst-node","--dev","--p2p-port","7001","--rpc-port","9001","--ipfs","http://ipfs:5001"]
+    depends_on: [ ipfs ]
+    ports: [ "7001:7001", "9001:9001" ]
+
+  node-b:
+    image: catalyst/node:dev
+    command: ["./target/release/catalyst-node","--dev","--p2p-port","7002","--rpc-port","9002","--ipfs","http://ipfs:5001","--boot","node-a:7001"]
+    depends_on: [ node-a ]
+    ports: [ "7002:7002", "9002:9002" ]
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: [ "9090:9090" ]
+    depends_on: [ node-a, node-b ]
+
+volumes:
+  ipfs:

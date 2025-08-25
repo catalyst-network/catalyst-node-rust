@@ -1,9 +1,11 @@
+use std::collections::HashMap;
+use std::env;
+
+use catalyst_utils::{CatalystError, CatalystResult};
+
 use crate::error::ConfigResult;
 use crate::loader::ConfigLoader;
 use crate::networks::{Network, NetworkConfig};
-use catalyst_utils::{CatalystError, CatalystResult};
-use std::collections::HashMap;
-use std::env;
 
 /// Environment variable prefix for Catalyst configuration
 pub const CATALYST_ENV_PREFIX: &str = "CATALYST_";
@@ -213,8 +215,9 @@ pub fn load_config_with_env_overrides(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::env;
+
+    use super::*;
 
     #[test]
     fn test_env_override_creation() {

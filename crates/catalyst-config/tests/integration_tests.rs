@@ -1,3 +1,6 @@
+use std::time::Duration;
+use std::{env, fs};
+
 use catalyst_config::env_override::EnvOverride;
 use catalyst_config::events::{ConfigEvent, ConfigEventType};
 use catalyst_config::hot_reload::HotReloadManager;
@@ -5,9 +8,6 @@ use catalyst_config::loader::ConfigLoader;
 use catalyst_config::networks::{Network, NetworkConfig};
 use catalyst_config::validation::ConfigValidator;
 use catalyst_config::*;
-use std::env;
-use std::fs;
-use std::time::Duration;
 use tempfile::{tempdir, NamedTempFile};
 use tokio::time::{sleep, timeout};
 

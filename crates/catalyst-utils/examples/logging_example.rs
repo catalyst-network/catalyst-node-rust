@@ -1,12 +1,11 @@
 // catalyst-utils/examples/logging_example.rs
 
-use catalyst_utils::{
-    logging::{
-        get_logger, init_logger, CatalystLogger, LogCategory, LogConfig, LogLevel, LogValue,
-    },
-    patterns, CatalystResult,
-};
 use std::collections::HashMap;
+
+use catalyst_utils::logging::{
+    get_logger, init_logger, CatalystLogger, LogCategory, LogConfig, LogLevel, LogValue,
+};
+use catalyst_utils::{patterns, CatalystResult};
 
 fn main() -> CatalystResult<()> {
     println!("Catalyst Logging System Example");

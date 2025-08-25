@@ -18,14 +18,13 @@ pub mod signatures;
 pub mod utils;
 
 pub use commitments::{CommitmentScheme, PedersenCommitment};
-pub use errors::{CryptoError, CryptoResult};
-pub use hash::{blake2b_hash, blake2b_hash_multiple, Hash256, HASH_SIZE}; // Added blake2b_hash_multiple
-pub use keys::{Curve25519KeyPair, KeyPair, PrivateKey, PublicKey};
-pub use signatures::{MuSigSignature, Signature, SignatureScheme};
-
 // Re-export commonly used types
 pub use curve25519_dalek::{
     constants::RISTRETTO_BASEPOINT_POINT,
     ristretto::{CompressedRistretto, RistrettoPoint},
     scalar::Scalar,
 };
+pub use errors::{CryptoError, CryptoResult};
+pub use hash::{blake2b_hash, blake2b_hash_multiple, Hash256, HASH_SIZE}; // Added blake2b_hash_multiple
+pub use keys::{Curve25519KeyPair, KeyPair, PrivateKey, PublicKey};
+pub use signatures::{MuSigSignature, Signature, SignatureScheme};

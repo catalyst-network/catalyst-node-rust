@@ -1,11 +1,9 @@
 // catalyst-utils/examples/serialization_example.rs
 
-use catalyst_utils::{
-    serialization::{
-        CatalystDeserialize, CatalystSerialize, CatalystSerializeWithContext, SerializationContext,
-    },
-    Address, CatalystResult, Hash, TransactionEntry, TransactionStatus,
+use catalyst_utils::serialization::{
+    CatalystDeserialize, CatalystSerialize, CatalystSerializeWithContext, SerializationContext,
 };
+use catalyst_utils::{Address, CatalystResult, Hash, TransactionEntry, TransactionStatus};
 use serde::{Deserialize, Serialize};
 
 fn main() -> CatalystResult<()> {

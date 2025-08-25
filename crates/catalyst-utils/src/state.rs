@@ -1,8 +1,9 @@
 // catalyst-utils/src/state.rs
 
-use crate::{Address, CatalystResult, Hash};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+
+use crate::{Address, CatalystResult, Hash};
 
 /// Core trait for managing ledger state across the Catalyst network
 ///

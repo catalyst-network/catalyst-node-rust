@@ -3,13 +3,12 @@
 //! This crate provides shared utilities, types, and functions used across
 //! the Catalyst blockchain implementation.
 
-use serde::{Deserialize, Serialize};
 use std::fmt;
 
 // Re-export commonly used external crates
 pub use serde;
-pub use serde_json;
-pub use tokio;
+use serde::{Deserialize, Serialize};
+pub use {serde_json, tokio};
 
 // Module declarations
 pub mod error;
@@ -63,6 +62,11 @@ impl Hash {
     /// Get the length of the hash (always 32)
     pub fn len(&self) -> usize {
         32
+    }
+
+    /// Returns true if this `Hash` has zero length.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -143,6 +147,11 @@ impl Address {
     /// Get the length of the address (always 20)
     pub fn len(&self) -> usize {
         20
+    }
+
+    /// Returns true if this `Hash` has zero length.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -386,11 +395,7 @@ pub mod utils {
 
     /// Convert hex string to bytes
     pub fn hex_to_bytes(hex_str: &str) -> Result<Vec<u8>, hex::FromHexError> {
-        let cleaned = if hex_str.starts_with("0x") {
-            &hex_str[2..]
-        } else {
-            hex_str
-        };
+        let cleaned = hex_str.strip_prefix("0x").unwrap_or(hex_str);
         hex::decode(cleaned)
     }
 
@@ -500,8 +505,9 @@ macro_rules! log_trace {
 
 /// Cryptographic utilities
 pub mod crypto {
-    use super::Hash;
     use sha2::{Digest, Sha256};
+
+    use super::Hash;
 
     /// Hash arbitrary data using SHA-256
     pub fn hash_data(data: &[u8]) -> Hash {

@@ -4,20 +4,18 @@
 pub mod block_production;
 pub mod consensus_service;
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use blake2::{Blake2b512, Digest};
+pub use block_production::*;
 use catalyst_config::CatalystConfig;
 use catalyst_core::NodeStatus;
 use catalyst_crypto::KeyPair;
-use hex;
-use rand;
-use std::sync::Arc;
+pub use consensus_service::*;
 use thiserror::Error;
 use tokio::sync::{broadcast, RwLock};
-use tracing::{error, info, warn};
-
-pub use block_production::*;
-pub use consensus_service::*;
+use tracing::{info, warn}; // drop `error` (unused)
 
 // Add module declarations for services
 pub mod services {
@@ -307,6 +305,7 @@ impl Default for ServiceManager {
 
 /// Main node manager - orchestrates all node components
 pub struct NodeManager {
+    #[allow(dead_code)]
     config: CatalystConfig,
 }
 
@@ -555,7 +554,7 @@ impl NodeBuilder {
     /// Generate node ID from keypair
     fn generate_node_id(keypair: &KeyPair) -> [u8; 32] {
         let mut hasher = Blake2b512::new();
-        hasher.update(&keypair.public_key().to_bytes());
+        hasher.update(keypair.public_key().to_bytes()); // remove needless borrow
         let result = hasher.finalize();
         let mut node_id = [0u8; 32];
         node_id.copy_from_slice(&result[..32]); // Take first 32 bytes
@@ -711,7 +710,7 @@ impl CatalystService for ConsensusServiceWrapper {
         consensus_clone.start().await?;
 
         // Start automatic transaction generation for testing
-        self.consensus.start_auto_transaction_generation().await;
+        self.consensus.spawn_auto_transaction_generation().await;
 
         info!("✅ Real consensus service started with transaction generation");
         Ok(())
@@ -744,6 +743,7 @@ impl CatalystService for ConsensusServiceWrapper {
 pub struct CatalystNode {
     config: CatalystConfig,
     services: Vec<Box<dyn CatalystService>>,
+    #[allow(dead_code)]
     event_bus: Arc<EventBus>,
     node_manager: Option<NodeManager>,
     storage_service: Option<Arc<StorageService>>,
@@ -884,7 +884,7 @@ impl CatalystNode {
         }
 
         // Stop storage service last
-        if let Some(storage) = &self.storage_service {
+        if let Some(_storage) = &self.storage_service {
             info!("🗄️ Stopping storage...");
             info!("✅ Storage stopped");
         }

@@ -1,11 +1,13 @@
 // catalyst-utils/src/metrics.rs
 
-use crate::logging::{get_logger, LogCategory, LogLevel, LogValue};
-use crate::{CatalystError, CatalystResult};
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
+
+use serde::{Deserialize, Serialize};
+
+use crate::logging::{get_logger, LogCategory, LogLevel, LogValue};
+use crate::{CatalystError, CatalystResult};
 
 /// Types of metrics supported by Catalyst
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -536,6 +538,12 @@ impl MetricsRegistry {
 
         self.last_export = now;
         Ok(())
+    }
+}
+
+impl Default for MetricsRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

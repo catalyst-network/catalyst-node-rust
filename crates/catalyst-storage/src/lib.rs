@@ -78,8 +78,9 @@ pub const DEFAULT_COLUMN_FAMILIES: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_storage_initialization() {

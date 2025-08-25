@@ -1,6 +1,8 @@
-use crate::error::{ConfigError, ConfigResult};
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{ConfigError, ConfigResult};
 
 /// Storage configuration for local state management and distributed file system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -642,13 +644,11 @@ impl StorageConfig {
             }
         }
 
-        // Validate backup settings
-        if self.backup.enabled {
-            if self.backup.retention_count == 0 {
-                return Err(ConfigError::ValidationFailed(
-                    "Backup retention count must be greater than 0".to_string(),
-                ));
-            }
+        // Validate backup settings (collapsed nested `if`)
+        if self.backup.enabled && self.backup.retention_count == 0 {
+            return Err(ConfigError::ValidationFailed(
+                "Backup retention count must be greater than 0".to_string(),
+            ));
         }
 
         Ok(())

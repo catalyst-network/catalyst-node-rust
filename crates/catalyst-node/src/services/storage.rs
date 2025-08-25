@@ -1,12 +1,14 @@
 //! Storage service implementing the CatalystService trait
 
-use crate::{CatalystService, EventBus, NodeError, ServiceHealth, ServiceType};
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use catalyst_storage::{StorageConfig, StorageManager};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
+
+use crate::{CatalystService, EventBus, NodeError, ServiceHealth, ServiceType};
 
 /// Storage service managing persistent data
 pub struct StorageService {

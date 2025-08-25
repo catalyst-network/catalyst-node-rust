@@ -1,7 +1,8 @@
-use catalyst_utils::{log_error, log_info, log_warn};
-use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::SystemTime;
+
+use catalyst_utils::{log_error, log_info, log_warn};
+use serde::{Deserialize, Serialize};
 
 /// Types of configuration events that can occur
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -394,8 +395,9 @@ impl Default for ConfigEventHistory {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use super::*;
 
     #[test]
     fn test_config_event_creation() {

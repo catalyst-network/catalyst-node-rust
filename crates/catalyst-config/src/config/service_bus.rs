@@ -1,5 +1,6 @@
-use crate::error::{ConfigError, ConfigResult};
 use serde::{Deserialize, Serialize};
+
+use crate::error::{ConfigError, ConfigResult};
 
 /// Service Bus configuration for Web2 integration and event streaming
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1023,13 +1024,13 @@ impl ServiceBusConfig {
             ));
         }
 
-        // Validate compression settings
-        if self.websocket.compression.enabled {
-            if self.websocket.compression.level == 0 || self.websocket.compression.level > 9 {
-                return Err(ConfigError::ValidationFailed(
-                    "Compression level must be between 1 and 9".to_string(),
-                ));
-            }
+        // Validate compression settings (collapsed nested `if`)
+        if self.websocket.compression.enabled
+            && (self.websocket.compression.level == 0 || self.websocket.compression.level > 9)
+        {
+            return Err(ConfigError::ValidationFailed(
+                "Compression level must be between 1 and 9".to_string(),
+            ));
         }
 
         // Validate TLS configuration

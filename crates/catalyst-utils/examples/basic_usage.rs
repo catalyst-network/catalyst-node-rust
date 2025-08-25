@@ -1,13 +1,10 @@
 // catalyst-utils/examples/basic_usage.rs
 
-use catalyst_utils::{
-    consensus_error,
-    crypto::hash_data,
-    logging::{CatalystLogger, LogCategory, LogConfig},
-    time::current_timestamp,
-    utils::RateLimiter,
-    Address, CatalystResult, Hash, SystemInfo,
-};
+use catalyst_utils::crypto::hash_data;
+use catalyst_utils::logging::{CatalystLogger, LogCategory, LogConfig};
+use catalyst_utils::time::current_timestamp;
+use catalyst_utils::utils::RateLimiter;
+use catalyst_utils::{consensus_error, Address, CatalystResult, Hash, SystemInfo};
 
 fn main() -> CatalystResult<()> {
     println!("Catalyst Utils Basic Usage Example");

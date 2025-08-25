@@ -1,9 +1,11 @@
 // catalyst-utils/src/network.rs
 
-use crate::{CatalystError, CatalystResult};
-use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use crate::{CatalystError, CatalystResult};
 
 /// Core trait for network messages in the Catalyst protocol
 ///

@@ -1,6 +1,8 @@
-use crate::error::{ConfigError, ConfigResult};
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{ConfigError, ConfigResult};
 
 /// Metrics collection and monitoring configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1387,20 +1389,18 @@ impl MetricsConfig {
             }
         }
 
-        // Validate custom metrics settings
-        if self.custom_metrics.enabled {
-            if self.custom_metrics.dynamic_creation.enabled {
-                if self.custom_metrics.dynamic_creation.max_dynamic_metrics == 0 {
-                    return Err(ConfigError::ValidationFailed(
-                        "Max dynamic metrics must be greater than 0".to_string(),
-                    ));
-                }
+        // Validate custom metrics settings (collapsed nested ifs to satisfy clippy)
+        if self.custom_metrics.enabled && self.custom_metrics.dynamic_creation.enabled {
+            if self.custom_metrics.dynamic_creation.max_dynamic_metrics == 0 {
+                return Err(ConfigError::ValidationFailed(
+                    "Max dynamic metrics must be greater than 0".to_string(),
+                ));
+            }
 
-                if self.custom_metrics.dynamic_creation.metric_lifetime_seconds == 0 {
-                    return Err(ConfigError::ValidationFailed(
-                        "Metric lifetime must be greater than 0".to_string(),
-                    ));
-                }
+            if self.custom_metrics.dynamic_creation.metric_lifetime_seconds == 0 {
+                return Err(ConfigError::ValidationFailed(
+                    "Metric lifetime must be greater than 0".to_string(),
+                ));
             }
         }
 

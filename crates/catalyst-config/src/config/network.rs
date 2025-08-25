@@ -1,5 +1,6 @@
-use crate::error::{ConfigError, ConfigResult};
 use serde::{Deserialize, Serialize};
+
+use crate::error::{ConfigError, ConfigResult};
 
 /// Network configuration for P2P communication and API endpoints
 #[derive(Debug, Clone, Serialize, Deserialize)]

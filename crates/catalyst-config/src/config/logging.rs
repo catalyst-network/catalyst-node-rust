@@ -1,6 +1,8 @@
-use crate::error::{ConfigError, ConfigResult};
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{ConfigError, ConfigResult};
 
 /// Logging configuration for the Catalyst Network
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -779,13 +781,13 @@ impl LoggingConfig {
             }
         }
 
-        // Validate context tracking settings
-        if self.structured.context_tracking.enabled {
-            if self.structured.context_tracking.max_context_depth == 0 {
-                return Err(ConfigError::ValidationFailed(
-                    "Max context depth must be greater than 0".to_string(),
-                ));
-            }
+        // Validate context tracking settings (collapsed if to satisfy clippy)
+        if self.structured.context_tracking.enabled
+            && self.structured.context_tracking.max_context_depth == 0
+        {
+            return Err(ConfigError::ValidationFailed(
+                "Max context depth must be greater than 0".to_string(),
+            ));
         }
 
         Ok(())

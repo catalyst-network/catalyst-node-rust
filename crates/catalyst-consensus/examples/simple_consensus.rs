@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use catalyst_consensus::{
     CatalystConsensus,
     ConsensusProtocol, // Import the trait to use its methods
@@ -5,7 +7,6 @@ use catalyst_consensus::{
 };
 use catalyst_crypto::{KeyPair, Signature};
 use catalyst_network::{NetworkConfig, NetworkService};
-use std::sync::Arc;
 use tokio;
 
 #[tokio::main]
@@ -69,7 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if is_valid {
         // Create a dummy signature for the demo
         // In a real implementation, this would be a proper signature from the keypair
-        use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
+        use curve25519_dalek::ristretto::RistrettoPoint;
+        use curve25519_dalek::scalar::Scalar;
 
         let r = RistrettoPoint::default();
         let s = Scalar::ZERO;

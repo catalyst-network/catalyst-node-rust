@@ -1,11 +1,10 @@
-use crate::{blake2b_hash, CryptoError, CryptoResult, Hash256, PrivateKey, PublicKey};
-use curve25519_dalek::{
-    constants::RISTRETTO_BASEPOINT_POINT,
-    ristretto::{CompressedRistretto, RistrettoPoint},
-    scalar::Scalar,
-};
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
+use curve25519_dalek::scalar::Scalar;
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
+
+use crate::{blake2b_hash, CryptoError, CryptoResult, Hash256, PrivateKey, PublicKey};
 
 pub const SIGNATURE_SIZE: usize = 64;
 
@@ -108,7 +107,7 @@ impl SignatureScheme {
         let k = Scalar::from_bytes_mod_order(nonce_bytes);
 
         // R = k * G
-        let r = &k * &RISTRETTO_BASEPOINT_POINT;
+        let r = k * RISTRETTO_BASEPOINT_POINT;
 
         // Calculate challenge: e = H(R || P || m)
         let public_key = private_key.public_key();
@@ -140,7 +139,7 @@ impl SignatureScheme {
         let e = Scalar::from_bytes_mod_order(*challenge_hash.as_bytes());
 
         // Verify: s * G = R + e * P
-        let left = &signature.s * &RISTRETTO_BASEPOINT_POINT;
+        let left = signature.s * RISTRETTO_BASEPOINT_POINT;
         let right = signature.r + e * public_key.point();
 
         Ok(left == right)
@@ -214,7 +213,7 @@ impl SignatureScheme {
         let e = Scalar::from_bytes_mod_order(*challenge_hash.as_bytes());
 
         // Verify: s * G = R + e * P_agg
-        let left = &musig_signature.aggregated_signature.s * &RISTRETTO_BASEPOINT_POINT;
+        let left = musig_signature.aggregated_signature.s * RISTRETTO_BASEPOINT_POINT;
         let right = musig_signature.aggregated_signature.r
             + e * musig_signature.aggregated_public_key.point();
 

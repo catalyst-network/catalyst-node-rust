@@ -1,10 +1,8 @@
 //! Catalyst DFS: local content-addressed store with optional IPFS HTTP backend.
 
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 // NOTE: use cid's re-exported multihash to avoid version conflicts.
@@ -13,8 +11,8 @@ use multihash_codetable::{Code, MultihashDigest};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{fs, io::AsyncWriteExt};
-
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
 #[cfg(feature = "ipfs-http")]
 use {reqwest::Client, reqwest::Url};
 
@@ -45,22 +43,17 @@ pub enum DfsError {
 }
 
 /// Replication levels for content
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash, Default)]
 pub enum ReplicationLevel {
     /// Keep only locally (no IPFS pin)
     None,
     /// Attempt single remote replica
+    #[default]
     Low,
     /// Attempt a few replicas
     Medium,
     /// Aggressively replicate/pin
     High,
-}
-
-impl Default for ReplicationLevel {
-    fn default() -> Self {
-        ReplicationLevel::Low
-    }
 }
 
 /// DFS configuration
@@ -185,7 +178,11 @@ impl CategorizedStorage {
         }
     }
 
-    pub fn with_backend(self, category: ContentCategory, backend: Arc<dyn DistributedFileSystem>) -> Self {
+    pub fn with_backend(
+        self,
+        category: ContentCategory,
+        backend: Arc<dyn DistributedFileSystem>,
+    ) -> Self {
         self.map.write().insert(category, backend);
         self
     }
@@ -232,7 +229,11 @@ impl ContentReplicator {
     }
 
     /// Best-effort pin/replicate according to desired level.
-    pub async fn replicate(&self, dfs: &dyn DistributedFileSystem, cid: &ContentId) -> DfsResult<()> {
+    pub async fn replicate(
+        &self,
+        dfs: &dyn DistributedFileSystem,
+        cid: &ContentId,
+    ) -> DfsResult<()> {
         match self.level {
             ReplicationLevel::None => Ok(()),
             _ => dfs.pin(cid).await,
@@ -256,7 +257,11 @@ impl IpfsDfs {
         {
             let client = reqwest::Client::builder().tcp_nodelay(true).build().ok();
             let api_base = cfg.ipfs_api.as_ref().and_then(|s| Url::parse(s).ok());
-            Self { cfg, client, api_base }
+            Self {
+                cfg,
+                client,
+                api_base,
+            }
         }
         #[cfg(not(feature = "ipfs-http"))]
         {
@@ -286,7 +291,12 @@ impl IpfsDfs {
         let part = reqwest::multipart::Part::bytes(data.to_vec()).file_name("data.bin");
         let form = reqwest::multipart::Form::new().part("file", part);
 
-        let resp = client.post(url).query(&[("pin", "true")]).multipart(form).send().await?;
+        let resp = client
+            .post(url)
+            .query(&[("pin", "true")])
+            .multipart(form)
+            .send()
+            .await?;
 
         let v: serde_json::Value = resp.json().await?;
         let Some(hash) = v.get("Hash").and_then(|h| h.as_str()) else {

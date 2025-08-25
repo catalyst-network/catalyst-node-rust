@@ -1,19 +1,21 @@
 //! Network configuration structures - Section 1: Core Structures and Imports
 
-use crate::error::{NetworkError, NetworkResult};
-use libp2p::{identity::Keypair, Multiaddr, PeerId};
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use libp2p::identity::Keypair;
+use libp2p::{Multiaddr, PeerId};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet},
-    net::IpAddr,
-    path::PathBuf,
-    time::Duration,
-};
+
+use crate::error::{NetworkError, NetworkResult};
 
 // Duration serialization helper module
 mod duration_serde {
-    use serde::{self, Deserialize, Deserializer, Serializer};
     use std::time::Duration;
+
+    use serde::{self, Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -37,7 +39,7 @@ mod multiaddr_serde {
     use libp2p::Multiaddr;
     use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
 
-    pub fn serialize<S>(addrs: &Vec<Multiaddr>, serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<S>(addrs: &[Multiaddr], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -70,7 +72,7 @@ mod bootstrap_peers_serde {
     use libp2p::{Multiaddr, PeerId};
     use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
 
-    pub fn serialize<S>(peers: &Vec<(PeerId, Multiaddr)>, serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<S>(peers: &[(PeerId, Multiaddr)], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -101,7 +103,7 @@ mod bootstrap_peers_serde {
 }
 
 /// Main network configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NetworkConfig {
     /// Local peer configuration
     pub peer: PeerConfig,
@@ -743,7 +745,7 @@ pub struct MessagePriorityConfig {
 }
 
 /// Traffic shaping configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TrafficShapingConfig {
     /// Enable traffic shaping
     pub enabled: bool,
@@ -1162,7 +1164,7 @@ pub struct ReputationPersistence {
 }
 
 /// Advanced scoring configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AdvancedScoringConfig {
     /// Enable machine learning scoring
     pub enable_ml_scoring: bool,
@@ -1728,22 +1730,6 @@ pub struct ResourceLimits {
     pub max_connections: Option<u64>,
 }
 
-// Default implementations for all configuration structures
-impl Default for NetworkConfig {
-    fn default() -> Self {
-        Self {
-            peer: PeerConfig::default(),
-            transport: TransportConfig::default(),
-            gossip: GossipConfig::default(),
-            discovery: DiscoveryConfig::default(),
-            security: SecurityConfig::default(),
-            bandwidth: BandwidthConfig::default(),
-            reputation: ReputationConfig::default(),
-            monitoring: MonitoringConfig::default(),
-        }
-    }
-}
-
 impl Default for PeerConfig {
     fn default() -> Self {
         Self {
@@ -2069,18 +2055,6 @@ impl Default for MessagePriorityConfig {
     }
 }
 
-impl Default for TrafficShapingConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            token_bucket: TokenBucketConfig::default(),
-            fair_queuing: false,
-            congestion_control: CongestionControlConfig::default(),
-            traffic_classification: TrafficClassificationConfig::default(),
-        }
-    }
-}
-
 impl Default for TokenBucketConfig {
     fn default() -> Self {
         Self {
@@ -2272,19 +2246,6 @@ impl Default for ReputationPersistence {
             enable_backup: true,
             backup_interval: Duration::from_secs(24 * 3600), // 24 hours
             max_backup_files: 7,
-        }
-    }
-}
-
-impl Default for AdvancedScoringConfig {
-    fn default() -> Self {
-        Self {
-            enable_ml_scoring: false,
-            behavioral_analysis: BehavioralAnalysisConfig::default(),
-            pattern_recognition: PatternRecognitionConfig::default(),
-            anomaly_detection: AnomalyDetectionConfig::default(),
-            trust_propagation: TrustPropagationConfig::default(),
-            temporal_scoring: TemporalScoringConfig::default(),
         }
     }
 }

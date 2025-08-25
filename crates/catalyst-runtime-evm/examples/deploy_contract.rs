@@ -1,18 +1,18 @@
 // examples/deploy_contract.rs
 //! Example demonstrating how to deploy and interact with a smart contract
-//! 
+//!
 //! This example shows:
 //! - Setting up the Catalyst EVM runtime
 //! - Deploying a simple smart contract
 //! - Calling contract methods
 //! - Handling execution results
 
-use catalyst_runtime_evm::{
-    CatalystEvmRuntime, CatalystEvmConfig, CatalystFeatures, EvmConfig,
-    EvmTransaction, ContractDeployer, BlockEnv
-};
 use catalyst_runtime_evm::database::InMemoryDatabase;
-use ethereum_types::{Address, U256, H256};
+use catalyst_runtime_evm::{
+    BlockEnv, CatalystEvmConfig, CatalystEvmRuntime, CatalystFeatures, ContractDeployer, EvmConfig,
+    EvmTransaction,
+};
+use ethereum_types::{Address, H256, U256};
 use hex;
 
 #[tokio::main]
@@ -44,11 +44,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create database and runtime
     let mut database = InMemoryDatabase::new();
-    
+
     // Setup test accounts with initial balances
     let deployer_address = Address::from_str("0x742d35Cc6527C3c7Bb91B6B4d0e71b46C7E3e8F4")?;
     let user_address = Address::from_str("0x8ba1f109551bD432803012645Hac136c2Bb25F00c")?;
-    
+
     database.create_account(deployer_address, U256::from(10_000_000_000_000_000_000u64)); // 10 ETH
     database.create_account(user_address, U256::from(5_000_000_000_000_000_000u64)); // 5 ETH
 
@@ -62,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Deploy the contract
     println!("📦 Deploying contract...");
-    
+
     let deploy_tx = EvmTransaction {
         from: deployer_address,
         to: None, // Contract creation
@@ -91,16 +91,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if deploy_result.success() {
         println!("✅ Contract deployed successfully!");
         println!("   Gas used: {}", deploy_result.gas_used());
-        
+
         if let Some(contract_address) = deploy_result.base_result.created_address {
             println!("   Contract address: {:?}", contract_address);
-            
+
             // 4. Call the contract's increment function
             println!("📞 Calling contract increment function...");
-            
+
             // Function signature for increment(): d09de08a
             let call_data = hex::decode("d09de08a")?;
-            
+
             let call_tx = EvmTransaction {
                 from: user_address,
                 to: Some(contract_address),
@@ -115,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let call_result = runtime.execute_transaction(&call_tx, &block_env).await?;
-            
+
             if call_result.success() {
                 println!("✅ Contract call successful!");
                 println!("   Gas used: {}", call_result.gas_used());
@@ -134,27 +134,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // examples/cross_runtime_call.rs
-//! Example demonstrating cross-runtime calls between EVM and other runtimes
-//! 
-//! This example shows:
-//! - Calling from EVM to Solana runtime
-//! - Handling cross-runtime data exchange
-//! - Managing gas costs across runtimes
+// Example demonstrating cross-runtime calls between EVM and other runtimes
+//
+// This example shows:
+// - Calling from EVM to Solana runtime
+// - Handling cross-runtime data exchange
+/// - Managing gas costs across runtimes
 
 #[cfg(feature = "cross-runtime")]
 use catalyst_runtime_evm::{
-    CatalystEvmRuntime, CatalystEvmConfig, CatalystFeatures, EvmConfig,
-    CrossRuntimeCall, RuntimeType
+    CatalystEvmConfig, CatalystEvmRuntime, CatalystFeatures, CrossRuntimeCall, EvmConfig,
+    RuntimeType,
 };
 
 #[cfg(feature = "cross-runtime")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🔗 Catalyst Cross-Runtime Call Example");
-    
+
     // This would demonstrate calling between EVM and SVM runtimes
     // Implementation depends on the multi-runtime system being ready
-    
+
     println!("Cross-runtime functionality coming soon!");
     Ok(())
 }
@@ -166,13 +166,12 @@ fn main() {
 }
 
 // examples/gas_estimation.rs
-//! Example demonstrating gas estimation and optimization
-
-use catalyst_runtime_evm::{
-    CatalystEvmRuntime, CatalystEvmConfig, CatalystFeatures, EvmConfig,
-    EvmTransaction, FeeCalculator, GasMeter
-};
 use catalyst_runtime_evm::database::InMemoryDatabase;
+/// Example demonstrating gas estimation and optimization
+use catalyst_runtime_evm::{
+    CatalystEvmConfig, CatalystEvmRuntime, CatalystFeatures, EvmConfig, EvmTransaction,
+    FeeCalculator, GasMeter,
+};
 use ethereum_types::{Address, U256};
 
 #[tokio::main]
@@ -221,26 +220,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Calculate gas and fees for each transaction
     let fee_calculator = FeeCalculator::new(U256::from(1_000_000_000u64));
-    
+
     for (name, tx) in transactions {
         println!("\n📊 Transaction: {}", name);
-        
+
         let mut gas_meter = GasMeter::new(tx.gas_limit, tx.gas_price);
-        
+
         // Simulate some gas consumption
         let estimated_gas = match name {
             "Simple Transfer" => 21000,
             "Contract Call" => 45000,
             _ => 30000,
         };
-        
+
         gas_meter.consume_gas(estimated_gas)?;
-        
-        let total_fee = fee_calculator.calculate_fee(
-            gas_meter.gas_used(),
-            tx.gas_priority_fee,
-        );
-        
+
+        let total_fee = fee_calculator.calculate_fee(gas_meter.gas_used(), tx.gas_priority_fee);
+
         println!("   Gas Limit: {}", tx.gas_limit);
         println!("   Estimated Gas: {}", estimated_gas);
         println!("   Gas Remaining: {}", gas_meter.gas_remaining());

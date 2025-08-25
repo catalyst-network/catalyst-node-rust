@@ -6,17 +6,16 @@
 //! 3. Voting Phase - Producer votes
 //! 4. Synchronization Phase - Final output
 
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::info;
-
-// Network imports
-use catalyst_network::{NetworkEvent, NetworkMessage, NetworkService};
 
 // Crypto imports - use actual catalyst_crypto types
 use catalyst_crypto::{Hash256, KeyPair, Signature};
+// Network imports
+use catalyst_network::{NetworkEvent, NetworkMessage, NetworkService};
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+use tracing::info;
 
 // For now, define the missing core types locally until catalyst_core is available
 pub type NodeId = [u8; 32];

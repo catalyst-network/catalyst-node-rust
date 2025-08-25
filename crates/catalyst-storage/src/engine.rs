@@ -1,13 +1,15 @@
 //! RocksDB engine implementation for Catalyst storage
 
-use crate::{ColumnFamilyConfig, StorageConfig, StorageError, StorageResult};
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use parking_lot::RwLock;
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, Options, ReadOptions, WriteBatch,
     WriteOptions, DB,
 };
-use std::collections::HashMap;
-use std::sync::Arc;
+
+use crate::{ColumnFamilyConfig, StorageConfig, StorageError, StorageResult};
 
 /// Thread-safe wrapper for column family names
 /// Instead of storing handles directly, we store names and get handles on-demand
@@ -31,7 +33,9 @@ pub struct RocksEngine {
     db: Arc<DB>,
     column_families: RwLock<HashMap<String, ColumnFamilyHandle>>,
     config: StorageConfig,
+    #[allow(dead_code)]
     block_cache: Option<Cache>,
+    #[allow(dead_code)]
     row_cache: Option<Cache>,
 }
 
@@ -287,7 +291,7 @@ impl RocksEngine {
     }
 
     /// Create an iterator for a column family
-    pub fn iterator(&self, cf: &str) -> StorageResult<rocksdb::DBIterator> {
+    pub fn iterator(&self, cf: &str) -> StorageResult<rocksdb::DBIterator<'_>> {
         let cf_handle = self.get_cf_handle(cf)?;
         Ok(self.db.iterator_cf(cf_handle, rocksdb::IteratorMode::Start))
     }
@@ -298,7 +302,7 @@ impl RocksEngine {
         cf: &str,
         read_opts: ReadOptions,
         mode: rocksdb::IteratorMode,
-    ) -> StorageResult<rocksdb::DBIterator> {
+    ) -> StorageResult<rocksdb::DBIterator<'_>> {
         let cf_handle = self.get_cf_handle(cf)?;
         Ok(self.db.iterator_cf_opt(cf_handle, read_opts, mode))
     }
@@ -399,7 +403,7 @@ impl RocksEngine {
     }
 
     /// Get a write batch builder for atomic operations
-    pub fn batch_builder(&self) -> WriteBatchBuilder {
+    pub fn batch_builder(&self) -> WriteBatchBuilder<'_> {
         WriteBatchBuilder::new(self)
     }
 }
@@ -458,9 +462,10 @@ unsafe impl Sync for RocksEngine {}
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
     use crate::config::StorageConfig;
-    use tempfile::TempDir;
 
     #[test]
     fn test_engine_creation() {

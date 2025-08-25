@@ -1,12 +1,23 @@
 //! Database migration system for schema evolution
 
-use crate::{RocksEngine, StorageError, StorageResult};
-use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-/// Database migration trait - made object-safe by using boxed futures
+use serde::{Deserialize, Serialize};
+
+use crate::{RocksEngine, StorageError, StorageResult};
+
+/// Boxed future aliases with a `'static` lifetime so we don't borrow the engine across `.await`.
+type BoxFutUnit = Pin<Box<dyn Future<Output = StorageResult<()>> + Send + 'static>>;
+type BoxFutBool = Pin<Box<dyn Future<Output = StorageResult<bool>> + Send + 'static>>;
+
+/// Function types that accept an `Arc<RocksEngine>` and return boxed futures.
+/// Using `Arc` avoids lifetime issues from holding `&RocksEngine` across awaits.
+type EngineFn = dyn Fn(Arc<RocksEngine>) -> BoxFutUnit + Send + Sync + 'static;
+type EngineBoolFn = dyn Fn(Arc<RocksEngine>) -> BoxFutBool + Send + Sync + 'static;
+
+/// Database migration trait - object-safe via boxed futures
 pub trait Migration: Send + Sync {
     /// Get migration version
     fn version(&self) -> u32;
@@ -18,34 +29,25 @@ pub trait Migration: Send + Sync {
     fn description(&self) -> &str;
 
     /// Execute the migration
-    fn up<'a>(
-        &'a self,
-        engine: &'a RocksEngine,
-    ) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + 'a>>;
+    fn up(&self, engine: Arc<RocksEngine>) -> BoxFutUnit;
 
     /// Rollback the migration (optional)
-    fn down<'a>(
-        &'a self,
-        engine: &'a RocksEngine,
-    ) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + 'a>> {
+    fn down(&self, engine: Arc<RocksEngine>) -> BoxFutUnit {
+        let _ = engine;
+        // IMPORTANT: clone name so we don't capture `&self` in the `'static` future.
+        let name = self.name().to_string();
         Box::pin(async move {
-            let _ = engine;
             Err(StorageError::migration(format!(
                 "Migration '{}' does not support rollback",
-                self.name()
+                name
             )))
         })
     }
 
     /// Check if migration can be safely applied
-    fn can_apply<'a>(
-        &'a self,
-        engine: &'a RocksEngine,
-    ) -> Pin<Box<dyn Future<Output = StorageResult<bool>> + Send + 'a>> {
-        Box::pin(async move {
-            let _ = engine;
-            Ok(true)
-        })
+    fn can_apply(&self, engine: Arc<RocksEngine>) -> BoxFutBool {
+        let _ = engine;
+        Box::pin(async move { Ok(true) })
     }
 }
 
@@ -64,38 +66,13 @@ pub struct ConcreteMigration {
     version: u32,
     name: String,
     description: String,
-    up_fn: Box<
-        dyn Fn(&RocksEngine) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + '_>>
-            + Send
-            + Sync,
-    >,
-    down_fn: Option<
-        Box<
-            dyn Fn(&RocksEngine) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + '_>>
-                + Send
-                + Sync,
-        >,
-    >,
-    can_apply_fn: Option<
-        Box<
-            dyn Fn(&RocksEngine) -> Pin<Box<dyn Future<Output = StorageResult<bool>> + Send + '_>>
-                + Send
-                + Sync,
-        >,
-    >,
+    up_fn: Box<EngineFn>,
+    down_fn: Option<Box<EngineFn>>,
+    can_apply_fn: Option<Box<EngineBoolFn>>,
 }
 
 impl ConcreteMigration {
-    pub fn new(
-        version: u32,
-        name: String,
-        description: String,
-        up_fn: Box<
-            dyn Fn(&RocksEngine) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + '_>>
-                + Send
-                + Sync,
-        >,
-    ) -> Self {
+    pub fn new(version: u32, name: String, description: String, up_fn: Box<EngineFn>) -> Self {
         Self {
             version,
             name,
@@ -106,26 +83,12 @@ impl ConcreteMigration {
         }
     }
 
-    pub fn with_down(
-        mut self,
-        down_fn: Box<
-            dyn Fn(&RocksEngine) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + '_>>
-                + Send
-                + Sync,
-        >,
-    ) -> Self {
+    pub fn with_down(mut self, down_fn: Box<EngineFn>) -> Self {
         self.down_fn = Some(down_fn);
         self
     }
 
-    pub fn with_can_apply(
-        mut self,
-        can_apply_fn: Box<
-            dyn Fn(&RocksEngine) -> Pin<Box<dyn Future<Output = StorageResult<bool>> + Send + '_>>
-                + Send
-                + Sync,
-        >,
-    ) -> Self {
+    pub fn with_can_apply(mut self, can_apply_fn: Box<EngineBoolFn>) -> Self {
         self.can_apply_fn = Some(can_apply_fn);
         self
     }
@@ -144,33 +107,26 @@ impl Migration for ConcreteMigration {
         &self.description
     }
 
-    fn up<'a>(
-        &'a self,
-        engine: &'a RocksEngine,
-    ) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + 'a>> {
+    fn up(&self, engine: Arc<RocksEngine>) -> BoxFutUnit {
         (self.up_fn)(engine)
     }
 
-    fn down<'a>(
-        &'a self,
-        engine: &'a RocksEngine,
-    ) -> Pin<Box<dyn Future<Output = StorageResult<()>> + Send + 'a>> {
+    fn down(&self, engine: Arc<RocksEngine>) -> BoxFutUnit {
         if let Some(down_fn) = &self.down_fn {
             down_fn(engine)
         } else {
+            // Clone name so the future owns data and doesn't capture `&self`.
+            let name = self.name.clone();
             Box::pin(async move {
                 Err(StorageError::migration(format!(
                     "Migration '{}' does not support rollback",
-                    self.name
+                    name
                 )))
             })
         }
     }
 
-    fn can_apply<'a>(
-        &'a self,
-        engine: &'a RocksEngine,
-    ) -> Pin<Box<dyn Future<Output = StorageResult<bool>> + Send + 'a>> {
+    fn can_apply(&self, engine: Arc<RocksEngine>) -> BoxFutBool {
         if let Some(can_apply_fn) = &self.can_apply_fn {
             can_apply_fn(engine)
         } else {
@@ -182,7 +138,7 @@ impl Migration for ConcreteMigration {
 /// Migration manager
 pub struct MigrationManager {
     engine: Arc<RocksEngine>,
-    migrations: Vec<Box<dyn Migration>>,
+    pub(crate) migrations: Vec<Box<dyn Migration>>,
 }
 
 impl MigrationManager {
@@ -209,7 +165,7 @@ impl MigrationManager {
             1,
             "initial_schema".to_string(),
             "Create initial database schema with all required column families".to_string(),
-            Box::new(|engine| {
+            Box::new(|engine: Arc<RocksEngine>| {
                 Box::pin(async move {
                     use crate::config::ColumnFamilyConfig;
 
@@ -243,7 +199,7 @@ impl MigrationManager {
                 })
             }),
         )
-        .with_can_apply(Box::new(|engine| {
+        .with_can_apply(Box::new(|engine: Arc<RocksEngine>| {
             Box::pin(async move {
                 // Check if this is a fresh database or if we can safely apply
                 let existing_cfs = engine.cf_names();
@@ -310,9 +266,7 @@ impl MigrationManager {
         match self.engine.get("metadata", migration_key)? {
             Some(data) => {
                 if data.len() != 4 {
-                    return Err(StorageError::migration(
-                        "Invalid migration version data".to_string(),
-                    ));
+                    return Err(StorageError::migration("Invalid migration version data"));
                 }
 
                 let version = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
@@ -385,7 +339,7 @@ impl MigrationManager {
     /// Apply a single migration
     async fn apply_migration(&self, migration: &dyn Migration) -> StorageResult<()> {
         // Check if migration can be applied
-        if !migration.can_apply(&self.engine).await? {
+        if !migration.can_apply(self.engine.clone()).await? {
             return Err(StorageError::migration(format!(
                 "Migration '{}' cannot be safely applied",
                 migration.name()
@@ -396,7 +350,7 @@ impl MigrationManager {
         let checksum = self.calculate_migration_checksum(migration);
 
         // Apply the migration
-        match migration.up(&self.engine).await {
+        match migration.up(self.engine.clone()).await {
             Ok(_) => {
                 // Update version
                 self.set_current_version(migration.version()).await?;
@@ -451,7 +405,7 @@ impl MigrationManager {
 
         // Apply rollbacks
         for migration in rollback_migrations {
-            migration.down(&self.engine).await?;
+            migration.down(self.engine.clone()).await?;
         }
 
         // Update version
@@ -509,9 +463,10 @@ pub struct PendingMigration {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
     use crate::{RocksEngine, StorageConfig};
-    use tempfile::TempDir;
 
     fn create_test_engine() -> Arc<RocksEngine> {
         let temp_dir = TempDir::new().unwrap();

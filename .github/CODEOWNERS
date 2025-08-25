@@ -1,0 +1,8 @@
+# Example — adjust to your GH handles
+/catalyst-crypto/      @darren-olp @crypto-tl
+/catalyst-consensus/   @consensus-tl
+/catalyst-network/     @network-tl
+/catalyst-storage/     @storage-tl
+/catalyst-dfs/         @storage-tl
+/catalyst-service-bus/ @platform-tl
+/catalyst-runtime-*/   @runtimes-tl

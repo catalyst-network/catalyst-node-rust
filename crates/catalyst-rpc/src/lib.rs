@@ -1,17 +1,16 @@
 //! JSON-RPC server for Catalyst Network
 //! Complete version with storage integration - Simplified error handling
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use catalyst_core::{NodeStatus, ResourceMetrics, SyncStatus};
 use catalyst_utils::Hash;
-use jsonrpsee::{
-    core::RpcResult,
-    proc_macros::rpc,
-    server::{ServerBuilder, ServerHandle},
-};
+use jsonrpsee::core::RpcResult;
+use jsonrpsee::proc_macros::rpc;
+use jsonrpsee::server::{ServerBuilder, ServerHandle};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -447,7 +446,7 @@ impl CatalystRpcImpl {
         }
     }
 
-    /// Convert storage TransactionData to RPC RpcTransaction  
+    /// Convert storage TransactionData to RPC RpcTransaction
     fn convert_transaction_data_to_rpc(
         &self,
         tx_data: &storage_types::TransactionData,
@@ -838,7 +837,7 @@ impl CatalystRpcServer for CatalystRpcImpl {
             .as_nanos()
             .to_le_bytes();
 
-        let tx_hash: Hash = Sha256::digest(&time_bytes).into(); // uses Hash::from(GenericArray)
+        let tx_hash: Hash = Sha256::digest(time_bytes).into(); // uses Hash::from(GenericArray)
         let tx_hash_hex = format!("0x{}", hex::encode(tx_hash.as_bytes()));
         Ok(tx_hash_hex)
     }
@@ -921,11 +920,9 @@ impl CatalystRpcServer for CatalystRpcImpl {
         println!("📞 RPC call: catalyst_metrics");
 
         // Get real storage statistics if available
-        let (total_blocks, database_size) = if let Some(storage) = &self.storage_service {
-            match storage.get_storage_statistics().await {
-                Ok(stats) => stats,
-                Err(_) => (0, 0),
-            }
+        let (total_blocks, database_size): (u64, u64) = if let Some(storage) = &self.storage_service
+        {
+            storage.get_storage_statistics().await.unwrap_or_default()
         } else {
             (0, 0)
         };

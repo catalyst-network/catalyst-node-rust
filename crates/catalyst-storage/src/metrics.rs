@@ -1,6 +1,9 @@
 //! Metrics collection for storage operations
 
 #[cfg(feature = "metrics")]
+use std::sync::OnceLock;
+
+#[cfg(feature = "metrics")]
 use prometheus::{
     register_histogram,
     register_int_counter,
@@ -11,9 +14,6 @@ use prometheus::{
     IntCounter,
     IntGauge,
 };
-
-#[cfg(feature = "metrics")]
-use std::sync::OnceLock;
 
 #[cfg(feature = "metrics")]
 /// Storage metrics registry

@@ -1,11 +1,12 @@
 // Updated crates/catalyst-cli/src/main.rs - Fixed imports
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use catalyst_config::CatalystConfig;
 use catalyst_node::NodeBuilder;
 use catalyst_rpc::RpcConfig;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
 use tracing::{error, info, warn};
 
 // Simplified storage config struct for CLI use
@@ -234,14 +235,12 @@ async fn show_status(verbose: bool, rpc_port: u16) -> Result<()> {
                 if verbose {
                     println!("Status details:");
                     println!("{}", serde_json::to_string_pretty(&status)?);
-                } else {
-                    if let Some(result) = status.get("result") {
-                        if let Some(version) = result.get("version") {
-                            println!("Version: {}", version.as_str().unwrap_or("unknown"));
-                        }
-                        if let Some(status) = result.get("status") {
-                            println!("Status: {}", status.as_str().unwrap_or("unknown"));
-                        }
+                } else if let Some(result) = status.get("result") {
+                    if let Some(version) = result.get("version") {
+                        println!("Version: {}", version.as_str().unwrap_or("unknown"));
+                    }
+                    if let Some(status) = result.get("status") {
+                        println!("Status: {}", status.as_str().unwrap_or("unknown"));
                     }
                 }
 
@@ -354,8 +353,9 @@ fn init_logging(level: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_simple_node_startup() {

@@ -1,5 +1,6 @@
-use crate::error::{ConfigError, ConfigResult};
 use serde::{Deserialize, Serialize};
+
+use crate::error::{ConfigError, ConfigResult};
 
 /// Consensus algorithm configuration for the 4-phase collaborative process
 #[derive(Debug, Clone, Serialize, Deserialize)]

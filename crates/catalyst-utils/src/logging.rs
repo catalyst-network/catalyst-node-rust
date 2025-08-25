@@ -1,11 +1,13 @@
 // catalyst-utils/src/logging.rs
 
-use crate::{CatalystError, CatalystResult};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use crate::{CatalystError, CatalystResult};
 
 /// Log levels supported by Catalyst
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

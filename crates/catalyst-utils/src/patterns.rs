@@ -1,8 +1,9 @@
 // catalyst-utils/src/patterns.rs
 
+use std::collections::HashMap;
+
 use crate::logging::{CatalystLogger, LogCategory, LogLevel, LogValue};
 use crate::CatalystResult;
-use std::collections::HashMap;
 
 /// Log consensus phase transitions
 pub fn log_consensus_phase(

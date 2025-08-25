@@ -1,11 +1,12 @@
 // File: crates/catalyst-node/tests/simple_consensus_test.rs
 // Simple consensus tests without private method calls
 
+use std::sync::Arc;
+
 use catalyst_crypto::KeyPair;
 use catalyst_node::consensus_service::{ConsensusConfig, ConsensusService};
 use catalyst_storage::{StorageConfig, StorageManager};
 use rand;
-use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
 #[tokio::test]

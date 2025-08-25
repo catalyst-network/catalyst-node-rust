@@ -1,18 +1,20 @@
 // File: crates/catalyst-node/src/consensus_service.rs
 // Real consensus service implementation with proper block production
 
-use crate::{CatalystService, Event, EventBus, NodeError, ServiceHealth, ServiceType};
-use anyhow::Result;
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use blake2::{Blake2b512, Digest};
 use catalyst_crypto::KeyPair;
 use catalyst_storage::StorageManager;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration, Instant};
 use tracing::{debug, error, info};
+
+use crate::{CatalystService, Event, EventBus, NodeError, ServiceHealth, ServiceType};
 
 /// Consensus phases in the Catalyst protocol
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +29,7 @@ pub enum ConsensusPhase {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ConsensusMessage {
     Proposal {
-        block: Block,
+        block: Box<Block>,
         proposer: [u8; 32],
         round: u64,
         signature: Vec<u8>,
@@ -157,7 +159,7 @@ impl VoteTracker {
             .map(|voters| {
                 voters
                     .iter()
-                    .map(|voter| self.voting_power.get(voter).unwrap_or(&0))
+                    .map(|v| self.voting_power.get(v).unwrap_or(&0))
                     .sum()
             })
             .unwrap_or(0)
@@ -191,6 +193,9 @@ pub struct ConsensusService {
     config: ConsensusConfig,
     /// Last block time for timing calculations
     last_block_time: Arc<Mutex<Option<Instant>>>,
+    /// Background task handles (so we can stop cleanly in tests)
+    consensus_task: Arc<RwLock<Option<JoinHandle<()>>>>,
+    txgen_task: Arc<RwLock<Option<JoinHandle<()>>>>,
 }
 
 /// Consensus configuration
@@ -252,6 +257,8 @@ impl ConsensusService {
             transaction_pool: Arc::new(Mutex::new(Vec::new())),
             config,
             last_block_time: Arc::new(Mutex::new(None)),
+            consensus_task: Arc::new(RwLock::new(None)),
+            txgen_task: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -270,17 +277,27 @@ impl ConsensusService {
         // Initialize genesis block if needed
         self.initialize_genesis().await?;
 
-        // Start consensus rounds
-        self.start_consensus_loop().await;
+        // Spawn consensus round loop (tracked)
+        self.spawn_consensus_loop().await;
 
         info!("✅ Real consensus service started successfully");
         Ok(())
     }
 
-    /// Stop the consensus service
+    /// Stop the consensus service (abort background tasks promptly)
     pub async fn stop(&self) -> Result<(), NodeError> {
         info!("🛑 Stopping consensus service");
         *self.is_running.write().await = false;
+
+        // Abort consensus loop
+        if let Some(handle) = self.consensus_task.write().await.take() {
+            handle.abort();
+        }
+        // Abort txgen loop
+        if let Some(handle) = self.txgen_task.write().await.take() {
+            handle.abort();
+        }
+
         Ok(())
     }
 
@@ -324,11 +341,11 @@ impl ConsensusService {
         Ok(())
     }
 
-    /// Start the main consensus loop
-    async fn start_consensus_loop(&self) {
+    /// Spawn the main consensus loop and track the JoinHandle
+    async fn spawn_consensus_loop(&self) {
         let consensus = Arc::new(self.clone());
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut phase_timer = interval(consensus.config.phase_duration);
 
             info!(
@@ -350,6 +367,8 @@ impl ConsensusService {
 
             info!("🔄 Consensus loop stopped");
         });
+
+        *self.consensus_task.write().await = Some(handle);
     }
 
     /// Advance consensus to the next phase
@@ -422,7 +441,6 @@ impl ConsensusService {
         state.valid_block = Some(block.hash);
 
         // In a real implementation, we would broadcast the proposal
-        // For now, we'll just log it
         info!(
             "📋 Proposed block {} with {} transactions",
             state.height,
@@ -523,7 +541,7 @@ impl ConsensusService {
                 if let Some(event_bus) = &self.event_bus {
                     event_bus
                         .publish(Event::BlockReceived {
-                            block_hash: hex::encode(&block.hash),
+                            block_hash: hex::encode(block.hash),
                             block_number: state.height,
                         })
                         .await;
@@ -589,12 +607,6 @@ impl ConsensusService {
         let limit = self.config.max_transactions_per_block.min(pool.len());
         let selected = pool.drain(..limit).collect();
 
-        // In a real implementation, we would:
-        // 1. Validate transactions
-        // 2. Sort by fee (highest first)
-        // 3. Check for conflicts
-        // 4. Ensure total size doesn't exceed block limit
-
         Ok(selected)
     }
 
@@ -609,10 +621,10 @@ impl ConsensusService {
     pub async fn create_test_transaction(&self, height: u64, index: u32) -> Transaction {
         let mut hasher = Blake2b512::new();
         hasher.update(b"test_transaction");
-        hasher.update(&height.to_be_bytes());
-        hasher.update(&index.to_be_bytes());
+        hasher.update(height.to_be_bytes());
+        hasher.update(index.to_be_bytes());
         hasher.update(
-            &std::time::SystemTime::now()
+            std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
@@ -669,8 +681,8 @@ impl ConsensusService {
     fn calculate_validator_set_hash(&self, validators: &[Validator]) -> [u8; 32] {
         let mut hasher = Blake2b512::new();
         for validator in validators {
-            hasher.update(&validator.address);
-            hasher.update(&validator.voting_power.to_be_bytes());
+            hasher.update(validator.address);
+            hasher.update(validator.voting_power.to_be_bytes());
         }
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
@@ -686,7 +698,7 @@ impl ConsensusService {
 
         let mut hasher = Blake2b512::new();
         for tx in transactions {
-            hasher.update(&tx.id);
+            hasher.update(tx.id);
         }
 
         let result = hasher.finalize();
@@ -698,16 +710,16 @@ impl ConsensusService {
     /// Calculate block hash
     fn calculate_block_hash(&self, header: &BlockHeader, transactions: &[Transaction]) -> [u8; 32] {
         let mut hasher = Blake2b512::new();
-        hasher.update(&header.height.to_be_bytes());
-        hasher.update(&header.previous_hash);
-        hasher.update(&header.merkle_root);
-        hasher.update(&header.timestamp.to_be_bytes());
-        hasher.update(&header.proposer);
-        hasher.update(&header.round.to_be_bytes());
+        hasher.update(header.height.to_be_bytes());
+        hasher.update(header.previous_hash);
+        hasher.update(header.merkle_root);
+        hasher.update(header.timestamp.to_be_bytes());
+        hasher.update(header.proposer);
+        hasher.update(header.round.to_be_bytes());
 
         // Include transaction data
         for tx in transactions {
-            hasher.update(&tx.id);
+            hasher.update(tx.id);
         }
 
         let result = hasher.finalize();
@@ -721,7 +733,7 @@ impl ConsensusService {
         &self,
         block: &Block,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let key = format!("proposal_{}", hex::encode(&block.hash));
+        let key = format!("proposal_{}", hex::encode(block.hash));
         let data = serde_json::to_vec(block)?;
 
         self.storage
@@ -760,7 +772,7 @@ impl ConsensusService {
             .map_err(|e| NodeError::Storage(e.to_string()))?;
 
         // Store by hash for quick lookups
-        let hash_key = format!("block_hash_{}", hex::encode(&block.hash));
+        let hash_key = format!("block_hash_{}", hex::encode(block.hash));
         self.storage
             .engine()
             .put(
@@ -797,11 +809,8 @@ impl ConsensusService {
         self.store_block(block).await?;
 
         // Remove from proposals
-        let key = format!("proposal_{}", hex::encode(&block.hash));
+        let key = format!("proposal_{}", hex::encode(block.hash));
         let _ = self.storage.engine().delete("proposals", key.as_bytes());
-
-        // Process transactions (update state, accounts, etc.)
-        // This would be implemented based on your transaction processing logic
 
         Ok(())
     }
@@ -863,17 +872,17 @@ impl ConsensusService {
         *self.is_running.read().await
     }
 
-    /// Start auto transaction generation for testing
-    pub async fn start_auto_transaction_generation(&self) {
+    /// Spawn automatic transaction generation for testing (tracked)
+    pub async fn spawn_auto_transaction_generation(&self) {
         let consensus = Arc::new(self.clone());
 
-        tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(5)); // Generate transaction every 5 seconds
+        let handle = tokio::spawn(async move {
+            let mut tick = interval(Duration::from_secs(5)); // Generate transaction every 5 seconds
 
             info!("🔄 Starting automatic transaction generation");
 
             loop {
-                interval.tick().await;
+                tick.tick().await;
 
                 if !*consensus.is_running.read().await {
                     break;
@@ -890,7 +899,11 @@ impl ConsensusService {
                     debug!("Added test transaction to pool");
                 }
             }
+
+            info!("🔄 Auto-transaction generation stopped");
         });
+
+        *self.txgen_task.write().await = Some(handle);
     }
 }
 
@@ -907,6 +920,8 @@ impl Clone for ConsensusService {
             transaction_pool: Arc::clone(&self.transaction_pool),
             config: self.config.clone(),
             last_block_time: Arc::clone(&self.last_block_time),
+            consensus_task: Arc::clone(&self.consensus_task),
+            txgen_task: Arc::clone(&self.txgen_task),
         }
     }
 }

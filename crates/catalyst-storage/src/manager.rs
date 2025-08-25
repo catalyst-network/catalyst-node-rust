@@ -1,28 +1,29 @@
 //! Storage manager implementing the StateManager trait and providing high-level storage operations
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use catalyst_utils::state::{AccountState, StateManager};
+use catalyst_utils::{async_trait, Address, CatalystError, CatalystResult, Hash};
+use parking_lot::RwLock;
+use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
+
 use crate::{
     MigrationManager, RocksEngine, Snapshot, SnapshotManager, StorageConfig, StorageError,
     StorageResult, TransactionBatch,
 };
-use catalyst_utils::{
-    async_trait,
-    state::{AccountState, StateManager},
-    Address, CatalystError, CatalystResult, Hash,
-};
-use parking_lot::RwLock;
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Semaphore;
 
 /// High-level storage manager for Catalyst Network
 pub struct StorageManager {
     engine: Arc<RocksEngine>,
     snapshot_manager: SnapshotManager,
+    #[allow(dead_code)]
     migration_manager: MigrationManager,
     transaction_semaphore: Arc<Semaphore>,
     pending_transactions: RwLock<HashMap<String, TransactionBatch>>,
     current_state_root: RwLock<Option<Hash>>,
+    #[allow(dead_code)]
     metrics_enabled: bool,
 }
 
@@ -436,8 +437,9 @@ unsafe impl Sync for StorageManager {}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     async fn create_test_manager() -> StorageManager {
         let temp_dir = TempDir::new().unwrap();

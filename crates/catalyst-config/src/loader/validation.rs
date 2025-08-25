@@ -11,7 +11,7 @@ impl ConfigValidator {
     /// Perform comprehensive validation of a configuration
     pub fn validate_comprehensive(config: &CatalystConfig) -> ConfigResult<()> {
         // Basic validation first
-        config.validate().map_err(|e| ConfigError::Catalyst(e))?;
+        config.validate().map_err(ConfigError::Catalyst)?;
 
         // Additional cross-section validations
         Self::validate_port_conflicts(config)?;
@@ -24,7 +24,7 @@ impl ConfigValidator {
     }
 
     pub fn validate(&self, config: &CatalystConfig) -> ConfigResult<()> {
-        config.validate().map_err(|e| ConfigError::Catalyst(e))
+        config.validate().map_err(ConfigError::Catalyst)
     }
 
     /// Check for port conflicts across different services
@@ -47,30 +47,26 @@ impl ConfigValidator {
         }
 
         // Service bus ports
-        if config.service_bus.enabled {
-            if !used_ports.insert(config.service_bus.websocket.port) {
-                return Err(ConfigError::ValidationFailed(format!(
-                    "Port conflict: {} is used by multiple services",
-                    config.service_bus.websocket.port
-                )));
-            }
+        if config.service_bus.enabled && !used_ports.insert(config.service_bus.websocket.port) {
+            return Err(ConfigError::ValidationFailed(format!(
+                "Port conflict: {} is used by multiple services",
+                config.service_bus.websocket.port
+            )));
+        }
 
-            if !used_ports.insert(config.service_bus.rest_api.port) {
-                return Err(ConfigError::ValidationFailed(format!(
-                    "Port conflict: {} is used by multiple services",
-                    config.service_bus.rest_api.port
-                )));
-            }
+        if config.service_bus.enabled && !used_ports.insert(config.service_bus.rest_api.port) {
+            return Err(ConfigError::ValidationFailed(format!(
+                "Port conflict: {} is used by multiple services",
+                config.service_bus.rest_api.port
+            )));
         }
 
         // Metrics port
-        if config.metrics.enabled {
-            if !used_ports.insert(config.metrics.server.port) {
-                return Err(ConfigError::ValidationFailed(format!(
-                    "Port conflict: {} is used by multiple services",
-                    config.metrics.server.port
-                )));
-            }
+        if config.metrics.enabled && !used_ports.insert(config.metrics.server.port) {
+            return Err(ConfigError::ValidationFailed(format!(
+                "Port conflict: {} is used by multiple services",
+                config.metrics.server.port
+            )));
         }
 
         Ok(())
@@ -87,10 +83,9 @@ impl ConfigValidator {
                 .memory_management
                 .max_memory_bytes;
 
-        // Warn if total cache usage exceeds 2GB (reasonable for most systems)
+        // Warning only; hook into logging if you want
         if total_cache_memory > 2 * 1024 * 1024 * 1024 {
-            // This is a warning, not an error, so we just log it
-            // In a real implementation, you might want to use the logging system
+            // > 2GB combined cache/memory budget
         }
 
         // Check thread allocations
@@ -132,14 +127,13 @@ impl ConfigValidator {
         }
 
         // Service bus timeouts
-        if config.service_bus.enabled {
-            if config.service_bus.websocket.connection_timeout_ms
+        if config.service_bus.enabled
+            && config.service_bus.websocket.connection_timeout_ms
                 > config.consensus.cycle_duration_ms
-            {
-                return Err(ConfigError::ValidationFailed(
-                    "WebSocket connection timeout exceeds consensus cycle duration".to_string(),
-                ));
-            }
+        {
+            return Err(ConfigError::ValidationFailed(
+                "WebSocket connection timeout exceeds consensus cycle duration".to_string(),
+            ));
         }
 
         Ok(())
@@ -149,7 +143,6 @@ impl ConfigValidator {
     fn validate_security_requirements(config: &CatalystConfig) -> ConfigResult<()> {
         // Production security checks
         if config.network.name == "mainnet" {
-            // Ensure strong crypto settings for mainnet
             if !config.crypto.security.constant_time_operations {
                 return Err(ConfigError::ValidationFailed(
                     "Constant time operations must be enabled for mainnet".to_string(),
@@ -162,28 +155,24 @@ impl ConfigValidator {
                 ));
             }
 
-            // Check key derivation iterations
             if config.crypto.key_derivation.iterations < 10000 {
                 return Err(ConfigError::ValidationFailed(
                     "Key derivation iterations too low for mainnet (minimum 10000)".to_string(),
                 ));
             }
 
-            // Ensure storage encryption for mainnet
             if !config.storage.security.encryption_at_rest {
                 return Err(ConfigError::ValidationFailed(
                     "Storage encryption at rest must be enabled for mainnet".to_string(),
                 ));
             }
 
-            // Service bus security
             if config.service_bus.enabled && !config.service_bus.auth.enabled {
                 return Err(ConfigError::ValidationFailed(
                     "Service bus authentication must be enabled for mainnet".to_string(),
                 ));
             }
 
-            // Metrics security
             if config.metrics.enabled && !config.metrics.server.auth_enabled {
                 return Err(ConfigError::ValidationFailed(
                     "Metrics server authentication must be enabled for mainnet".to_string(),
@@ -223,21 +212,18 @@ impl ConfigValidator {
 
     /// Validate performance settings
     fn validate_performance_settings(config: &CatalystConfig) -> ConfigResult<()> {
-        // Consensus performance validation
         if config.consensus.producer_count > config.consensus.worker_pool.max_worker_pool_size {
             return Err(ConfigError::ValidationFailed(
                 "Producer count cannot exceed worker pool size".to_string(),
             ));
         }
 
-        // Network performance validation
         if config.network.max_peers < config.network.min_peers {
             return Err(ConfigError::ValidationFailed(
                 "Max peers cannot be less than min peers".to_string(),
             ));
         }
 
-        // Service bus performance validation
         if config.service_bus.enabled {
             let buffer_size = config.service_bus.event_processing.buffer.size;
             let batch_size = config.service_bus.event_processing.buffer.max_batch_size;
@@ -249,7 +235,6 @@ impl ConfigValidator {
             }
         }
 
-        // Storage performance validation
         if config.storage.cache.enabled {
             let total_cache_layers = config.storage.cache.layers.l1_size_bytes
                 + config.storage.cache.layers.l2_size_bytes
@@ -277,7 +262,6 @@ impl ConfigValidator {
             )));
         }
 
-        // Network-specific validations
         match expected_network {
             "devnet" => Self::validate_devnet_specific(config)?,
             "testnet" => Self::validate_testnet_specific(config)?,
@@ -294,14 +278,12 @@ impl ConfigValidator {
     }
 
     fn validate_devnet_specific(config: &CatalystConfig) -> ConfigResult<()> {
-        // Devnet should have fast consensus cycles
         if config.consensus.cycle_duration_ms > 30000 {
             return Err(ConfigError::ValidationFailed(
                 "Devnet consensus cycles should be fast (≤30s) for development".to_string(),
             ));
         }
 
-        // Devnet should have small producer pools
         if config.consensus.producer_count > 20 {
             return Err(ConfigError::ValidationFailed(
                 "Devnet should have small producer pools (≤20) for development".to_string(),
@@ -312,7 +294,6 @@ impl ConfigValidator {
     }
 
     fn validate_testnet_specific(config: &CatalystConfig) -> ConfigResult<()> {
-        // Testnet should have moderate settings
         if config.consensus.cycle_duration_ms < 15000 || config.consensus.cycle_duration_ms > 60000
         {
             return Err(ConfigError::ValidationFailed(
@@ -330,7 +311,6 @@ impl ConfigValidator {
     }
 
     fn validate_mainnet_specific(config: &CatalystConfig) -> ConfigResult<()> {
-        // Mainnet should have production-ready settings
         if config.consensus.cycle_duration_ms < 30000 {
             return Err(ConfigError::ValidationFailed(
                 "Mainnet consensus cycles should be stable (≥30s) for production".to_string(),
@@ -343,10 +323,8 @@ impl ConfigValidator {
             ));
         }
 
-        // Mainnet should have robust storage settings
         if let Some(max_size) = config.storage.database.max_db_size_bytes {
             if max_size < 10 * 1024 * 1024 * 1024 {
-                // 10GB
                 return Err(ConfigError::ValidationFailed(
                     "Mainnet database size should be at least 10GB".to_string(),
                 ));
@@ -360,15 +338,15 @@ impl ConfigValidator {
     pub fn generate_report(config: &CatalystConfig) -> String {
         let mut report = String::new();
 
-        report.push_str(&format!("Catalyst Network Configuration Report\n"));
-        report.push_str(&format!("=====================================\n\n"));
+        report.push_str("Catalyst Network Configuration Report\n");
+        report.push_str("=====================================\n\n");
 
         report.push_str(&format!("Network: {}\n", config.network.name));
         report.push_str(&format!("P2P Port: {}\n", config.network.p2p_port));
         report.push_str(&format!("API Port: {}\n", config.network.api_port));
         report.push_str(&format!("Max Peers: {}\n\n", config.network.max_peers));
 
-        report.push_str(&format!("Consensus:\n"));
+        report.push_str("Consensus:\n");
         report.push_str(&format!(
             "  Cycle Duration: {}ms\n",
             config.consensus.cycle_duration_ms
@@ -382,7 +360,7 @@ impl ConfigValidator {
             config.consensus.supermajority_threshold * 100.0
         ));
 
-        report.push_str(&format!("Storage:\n"));
+        report.push_str("Storage:\n");
         report.push_str(&format!(
             "  Database Type: {:?}\n",
             config.storage.database.db_type
@@ -397,7 +375,7 @@ impl ConfigValidator {
         ));
 
         if config.service_bus.enabled {
-            report.push_str(&format!("Service Bus:\n"));
+            report.push_str("Service Bus:\n");
             report.push_str(&format!(
                 "  WebSocket Port: {}\n",
                 config.service_bus.websocket.port
@@ -413,7 +391,7 @@ impl ConfigValidator {
         }
 
         if config.metrics.enabled {
-            report.push_str(&format!("Metrics:\n"));
+            report.push_str("Metrics:\n");
             report.push_str(&format!("  Server Port: {}\n", config.metrics.server.port));
             report.push_str(&format!(
                 "  Collection Interval: {}s\n",
@@ -425,7 +403,7 @@ impl ConfigValidator {
             ));
         }
 
-        report.push_str(&format!("Security:\n"));
+        report.push_str("Security:\n");
         report.push_str(&format!(
             "  Encryption at Rest: {}\n",
             config.storage.security.encryption_at_rest
@@ -444,5 +422,12 @@ impl ConfigValidator {
         ));
 
         report
+    }
+}
+
+// Satisfy clippy::new_without_default
+impl Default for ConfigValidator {
+    fn default() -> Self {
+        Self::new()
     }
 }

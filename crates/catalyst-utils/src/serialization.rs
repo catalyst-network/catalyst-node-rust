@@ -1,7 +1,8 @@
 // catalyst-utils/src/serialization.rs
 
-use crate::{CatalystError, CatalystResult};
 use std::io::{Cursor, Read, Write};
+
+use crate::{CatalystError, CatalystResult};
 
 /// Core serialization trait for Catalyst protocol messages
 ///
@@ -185,7 +186,7 @@ impl CatalystSerialize for u8 {
 
 impl CatalystDeserialize for u8 {
     fn deserialize(data: &[u8]) -> CatalystResult<Self> {
-        if data.len() < 1 {
+        if data.is_empty() {
             return Err(CatalystError::Serialization(
                 "Insufficient data for u8".to_string(),
             ));

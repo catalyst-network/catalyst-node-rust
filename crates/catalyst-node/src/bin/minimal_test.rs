@@ -1,11 +1,10 @@
+use std::sync::Arc;
+
 use catalyst_crypto::KeyPair;
 use catalyst_node::consensus_service::{ConsensusConfig, ConsensusService};
 use catalyst_storage::{StorageConfig, StorageManager};
-use rand;
-use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{info, Level};
-use tracing_subscriber;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

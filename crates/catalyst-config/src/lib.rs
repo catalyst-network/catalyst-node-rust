@@ -12,12 +12,10 @@ pub mod utils;
 
 // Re-exports for convenience
 pub use config::*;
-pub use hot_reload::*;
-pub use loader::*;
-pub use utils::ConfigUtils;
-
 // Re-export main types
 pub use error::{ConfigError, ConfigResult};
-
+pub use hot_reload::*;
+pub use loader::*;
 // Re-export network configurations
 pub use networks::{devnet_config, mainnet_config, testnet_config, NetworkType};
+pub use utils::ConfigUtils;

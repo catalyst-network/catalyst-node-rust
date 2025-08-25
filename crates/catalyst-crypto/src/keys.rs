@@ -1,12 +1,11 @@
-use crate::{blake2b_hash, CryptoError, CryptoResult};
-use curve25519_dalek::{
-    constants::RISTRETTO_BASEPOINT_POINT,
-    ristretto::{CompressedRistretto, RistrettoPoint},
-    scalar::Scalar,
-};
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
+use curve25519_dalek::scalar::Scalar;
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+use crate::{blake2b_hash, CryptoError, CryptoResult};
 
 pub const PRIVATE_KEY_SIZE: usize = 32;
 pub const PUBLIC_KEY_SIZE: usize = 32;
@@ -47,7 +46,7 @@ impl PrivateKey {
 
     /// Derive public key from this private key
     pub fn public_key(&self) -> PublicKey {
-        let point = &self.scalar * &RISTRETTO_BASEPOINT_POINT;
+        let point = self.scalar * RISTRETTO_BASEPOINT_POINT;
         PublicKey { point }
     }
 }

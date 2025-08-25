@@ -1,8 +1,9 @@
 //! Configuration for the storage layer
 
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
 
 /// Configuration for the storage manager
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -487,6 +488,7 @@ impl StorageConfig {
     #[cfg(feature = "testing")]
     pub fn for_testing() -> Self {
         use std::env;
+
         use uuid::Uuid;
 
         Self {

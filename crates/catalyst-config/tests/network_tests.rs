@@ -1,10 +1,11 @@
+use std::fs;
+
 use catalyst_config::loader::ConfigLoader;
 use catalyst_config::networks::{
     ConsensusConfig, Network, NetworkConfig, NetworkSettings, NodeConfig, RpcConfig,
     ServiceBusConfig, StorageConfig,
 };
 use catalyst_config::validation::ConfigValidator;
-use std::fs;
 use tempfile::tempdir;
 
 /// Test default network configurations

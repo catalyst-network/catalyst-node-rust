@@ -1,8 +1,9 @@
 //! Utility functions for storage operations
 
-use crate::{StorageError, StorageResult};
 use std::fs;
 use std::path::Path;
+
+use crate::{StorageError, StorageResult};
 
 /// Calculate directory size recursively
 pub fn calculate_directory_size(path: &Path) -> StorageResult<u64> {
@@ -11,20 +12,20 @@ pub fn calculate_directory_size(path: &Path) -> StorageResult<u64> {
     }
 
     if path.is_file() {
-        return Ok(path.metadata().map_err(|e| StorageError::io(e))?.len());
+        return Ok(path.metadata().map_err(StorageError::io)?.len());
     }
 
     let mut size = 0u64;
-    let entries = fs::read_dir(path).map_err(|e| StorageError::io(e))?;
+    let entries = fs::read_dir(path).map_err(StorageError::io)?;
 
     for entry in entries {
-        let entry = entry.map_err(|e| StorageError::io(e))?;
+        let entry = entry.map_err(StorageError::io)?;
         let entry_path = entry.path();
 
         if entry_path.is_dir() {
             size += calculate_directory_size(&entry_path)?;
         } else {
-            size += entry.metadata().map_err(|e| StorageError::io(e))?.len();
+            size += entry.metadata().map_err(StorageError::io)?.len();
         }
     }
 
@@ -108,6 +109,7 @@ pub fn format_bytes(bytes: u64) -> String {
 #[cfg(feature = "testing")]
 pub fn random_test_path() -> std::path::PathBuf {
     use std::env;
+
     use uuid::Uuid;
 
     let temp_dir = env::temp_dir();
@@ -118,7 +120,7 @@ pub fn random_test_path() -> std::path::PathBuf {
 #[cfg(feature = "testing")]
 pub fn cleanup_test_db(path: &Path) -> StorageResult<()> {
     if path.exists() {
-        fs::remove_dir_all(path).map_err(|e| StorageError::io(e))?;
+        fs::remove_dir_all(path).map_err(StorageError::io)?;
     }
     Ok(())
 }
@@ -390,8 +392,9 @@ pub struct IntegrityReport {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[test]
     fn test_format_bytes() {

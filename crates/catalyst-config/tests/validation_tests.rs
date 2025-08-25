@@ -1,9 +1,10 @@
+use std::path::PathBuf;
+
 use catalyst_config::networks::{
     ConsensusConfig, NetworkConfig, NetworkSettings, NodeConfig, RpcConfig, ServiceBusConfig,
     StorageConfig,
 };
 use catalyst_config::validation::{ConfigValidator, ValidationError, ValidationResult};
-use std::path::PathBuf;
 
 /// Test valid configuration validation
 #[test]

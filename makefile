@@ -1,7 +1,15 @@
 # Catalyst Node Makefile
 # Provides convenient commands for building, testing, and running the Catalyst node
 
-.PHONY: help build test run clean setup dev docker fmt clippy docs bench
+.PHONY: fmt lint build test devnet-up devnet-down health
+
+fmt: ; cargo fmt --all
+lint: ; cargo clippy --workspace --all-features -D warnings
+build: ; cargo build --workspace --all-features
+test: ; cargo test --workspace --all-features -- --nocapture
+devnet-up: ; cargo xtask devnet-up
+devnet-down: ; cargo xtask devnet-down
+health: ; cargo xtask health
 
 # Default target
 help:

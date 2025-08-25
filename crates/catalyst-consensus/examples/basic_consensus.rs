@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use catalyst_consensus::{
     CatalystConsensus,
     ConsensusConfig,
@@ -8,7 +10,6 @@ use catalyst_consensus::{
 };
 use catalyst_crypto::{KeyPair, Signature};
 use catalyst_network::{NetworkConfig, NetworkService};
-use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
 async fn demonstrate_consensus_phases() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -86,7 +87,8 @@ async fn demonstrate_consensus_phases() -> Result<(), Box<dyn std::error::Error 
         println!("Phase 3: Voting");
         if is_valid {
             // Create a dummy signature for the demo
-            use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
+            use curve25519_dalek::ristretto::RistrettoPoint;
+            use curve25519_dalek::scalar::Scalar;
 
             let r = RistrettoPoint::default();
             let s = Scalar::ZERO;

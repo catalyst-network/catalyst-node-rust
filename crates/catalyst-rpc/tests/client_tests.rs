@@ -1,8 +1,9 @@
 //! Simple RPC client for testing
 //! You can create this as a test file or separate binary
 
-use serde_json::{json, Value};
 use std::collections::HashMap;
+
+use serde_json::{json, Value};
 
 pub async fn test_rpc_client(rpc_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();

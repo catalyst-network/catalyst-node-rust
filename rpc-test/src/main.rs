@@ -1,4 +1,6 @@
-use jsonrpsee::{core::RpcResult, proc_macros::rpc, server::ServerBuilder};
+use jsonrpsee::core::RpcResult;
+use jsonrpsee::proc_macros::rpc;
+use jsonrpsee::server::ServerBuilder;
 
 #[rpc(server)]
 pub trait TestApi {

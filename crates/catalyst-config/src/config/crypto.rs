@@ -1,5 +1,6 @@
-use crate::error::{ConfigError, ConfigResult};
 use serde::{Deserialize, Serialize};
+
+use crate::error::{ConfigError, ConfigResult};
 
 /// Cryptographic configuration for Catalyst Network
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,7 +30,7 @@ pub struct CryptoConfig {
     pub security: CryptoSecurityConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum CurveType {
     /// Twisted Edwards Curve25519 (as specified in the project)
     Curve25519,
@@ -38,7 +39,7 @@ pub enum CurveType {
     Ed25519,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum HashAlgorithm {
     /// Blake2b-256 (as specified in the project)
     Blake2b256,
@@ -47,7 +48,7 @@ pub enum HashAlgorithm {
     Sha3_256,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum SignatureScheme {
     /// MuSig aggregated signatures (as specified)
     MuSig,
@@ -75,7 +76,7 @@ pub struct KeyDerivationConfig {
     pub salt_size: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum KeyDerivationFunction {
     /// PBKDF2 with HMAC
     Pbkdf2,
@@ -121,7 +122,7 @@ pub struct ConfidentialTransactionConfig {
     pub batch_verification: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum RangeProofSystem {
     /// Bulletproofs for efficient range proofs
     Bulletproofs,
@@ -146,7 +147,7 @@ pub struct RandomGenerationConfig {
     pub use_hardware_rng: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum RandomGeneratorType {
     /// ChaCha20 PRNG
     ChaCha20,
@@ -156,7 +157,7 @@ pub enum RandomGeneratorType {
     HardwareRng,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum EntropySource {
     /// System entropy source
     System,
@@ -244,7 +245,7 @@ impl CryptoConfig {
                 key_size_bits: 256,
                 deterministic: false,
                 kdf: KeyDerivationFunction::Argon2,
-                iterations: 10000,
+                iterations: 10_000,
                 salt_size: 32,
             },
             signature_aggregation: SignatureAggregationConfig {
@@ -271,8 +272,8 @@ impl CryptoConfig {
                 constant_time_operations: true,
                 secure_memory_cleanup: true,
                 side_channel_resistance: true,
-                key_refresh_interval_ms: Some(3600000), // 1 hour
-                max_key_usage_count: Some(10000),
+                key_refresh_interval_ms: Some(3_600_000), // 1 hour
+                max_key_usage_count: Some(10_000),
                 additional_checks: true,
             },
         }
@@ -288,7 +289,7 @@ impl CryptoConfig {
                 key_size_bits: 256,
                 deterministic: false,
                 kdf: KeyDerivationFunction::Argon2,
-                iterations: 100000, // High security
+                iterations: 100_000, // High security
                 salt_size: 32,
             },
             signature_aggregation: SignatureAggregationConfig {
@@ -315,8 +316,8 @@ impl CryptoConfig {
                 constant_time_operations: true,
                 secure_memory_cleanup: true,
                 side_channel_resistance: true,
-                key_refresh_interval_ms: Some(1800000), // 30 minutes
-                max_key_usage_count: Some(50000),
+                key_refresh_interval_ms: Some(1_800_000), // 30 minutes
+                max_key_usage_count: Some(50_000),
                 additional_checks: true,
             },
         }
@@ -333,8 +334,8 @@ impl CryptoConfig {
 
         // Validate curve compatibility
         match (&self.curve, &self.signature_scheme) {
-            (CurveType::Curve25519, SignatureScheme::MuSig) => {} // Valid combination
-            (CurveType::Curve25519, SignatureScheme::Schnorr) => {} // Valid combination
+            (CurveType::Curve25519, SignatureScheme::MuSig)
+            | (CurveType::Curve25519, SignatureScheme::Schnorr) => {}
             _ => {
                 return Err(ConfigError::ValidationFailed(
                     "Invalid curve and signature scheme combination".to_string(),
@@ -370,13 +371,13 @@ impl CryptoConfig {
             ));
         }
 
-        // Validate confidential transaction settings
-        if self.confidential_transactions.enabled {
-            if self.confidential_transactions.blinding_factor_size == 0 {
-                return Err(ConfigError::ValidationFailed(
-                    "Blinding factor size must be greater than 0".to_string(),
-                ));
-            }
+        // Validate confidential transaction settings (collapse nested if)
+        if self.confidential_transactions.enabled
+            && self.confidential_transactions.blinding_factor_size == 0
+        {
+            return Err(ConfigError::ValidationFailed(
+                "Blinding factor size must be greater than 0".to_string(),
+            ));
         }
 
         // Validate random generation settings
@@ -386,20 +387,17 @@ impl CryptoConfig {
             ));
         }
 
-        // Validate security settings for production
-        if self.security.constant_time_operations {
-            // If constant time operations are enabled, certain other security features should be too
-            if !self.security.secure_memory_cleanup {
-                return Err(ConfigError::ValidationFailed(
-                    "Secure memory cleanup should be enabled when using constant time operations"
-                        .to_string(),
-                ));
-            }
+        // Validate security settings when constant time is enabled (collapse nested if)
+        if self.security.constant_time_operations && !self.security.secure_memory_cleanup {
+            return Err(ConfigError::ValidationFailed(
+                "Secure memory cleanup should be enabled when using constant time operations"
+                    .to_string(),
+            ));
         }
 
         // Validate key refresh settings
         if let Some(refresh_interval) = self.security.key_refresh_interval_ms {
-            if refresh_interval < 60000 {
+            if refresh_interval < 60_000 {
                 // Less than 1 minute
                 return Err(ConfigError::ValidationFailed(
                     "Key refresh interval must be at least 1 minute".to_string(),
@@ -417,9 +415,9 @@ impl CryptoConfig {
 
         // Validate KDF iterations based on security level
         let min_iterations = match self.key_derivation.kdf {
-            KeyDerivationFunction::Pbkdf2 => 10000,
+            KeyDerivationFunction::Pbkdf2 => 10_000,
             KeyDerivationFunction::Argon2 => 3,
-            KeyDerivationFunction::Scrypt => 16384,
+            KeyDerivationFunction::Scrypt => 16_384,
         };
 
         if self.key_derivation.iterations < min_iterations {
@@ -451,9 +449,9 @@ impl CryptoConfig {
 
         // Must have high iteration count for key derivation
         let min_iterations = match self.key_derivation.kdf {
-            KeyDerivationFunction::Pbkdf2 => 100000,
+            KeyDerivationFunction::Pbkdf2 => 100_000,
             KeyDerivationFunction::Argon2 => 10,
-            KeyDerivationFunction::Scrypt => 32768,
+            KeyDerivationFunction::Scrypt => 32_768,
         };
 
         if self.key_derivation.iterations < min_iterations {
@@ -461,15 +459,10 @@ impl CryptoConfig {
         }
 
         // Must have security features enabled
-        if !self.security.constant_time_operations {
-            return false;
-        }
-
-        if !self.security.secure_memory_cleanup {
-            return false;
-        }
-
-        if !self.security.side_channel_resistance {
+        if !self.security.constant_time_operations
+            || !self.security.secure_memory_cleanup
+            || !self.security.side_channel_resistance
+        {
             return false;
         }
 
@@ -519,18 +512,18 @@ impl CryptoConfig {
                 }
             }
             KeyDerivationFunction::Scrypt => {
-                if self.key_derivation.iterations >= 32768 {
+                if self.key_derivation.iterations >= 32_768 {
                     12
-                } else if self.key_derivation.iterations >= 16384 {
+                } else if self.key_derivation.iterations >= 16_384 {
                     8
                 } else {
                     4
                 }
             }
             KeyDerivationFunction::Pbkdf2 => {
-                if self.key_derivation.iterations >= 100000 {
+                if self.key_derivation.iterations >= 100_000 {
                     10
-                } else if self.key_derivation.iterations >= 10000 {
+                } else if self.key_derivation.iterations >= 10_000 {
                     6
                 } else {
                     2
@@ -591,7 +584,6 @@ impl CryptoConfig {
     pub fn estimate_performance_impact(&self) -> CryptoPerformanceEstimate {
         let mut signing_overhead = 1.0;
         let mut verification_overhead = 1.0;
-        let mut key_derivation_overhead = 1.0;
 
         // Signature scheme impact
         match self.signature_scheme {
@@ -628,11 +620,11 @@ impl CryptoConfig {
             verification_overhead *= 1.05;
         }
 
-        // KDF impact
-        key_derivation_overhead = match self.key_derivation.kdf {
+        // KDF impact (no redundant initialization)
+        let key_derivation_overhead = match self.key_derivation.kdf {
             KeyDerivationFunction::Argon2 => self.key_derivation.iterations as f64 / 3.0,
-            KeyDerivationFunction::Scrypt => self.key_derivation.iterations as f64 / 16384.0,
-            KeyDerivationFunction::Pbkdf2 => self.key_derivation.iterations as f64 / 10000.0,
+            KeyDerivationFunction::Scrypt => self.key_derivation.iterations as f64 / 16_384.0,
+            KeyDerivationFunction::Pbkdf2 => self.key_derivation.iterations as f64 / 10_000.0,
         };
 
         CryptoPerformanceEstimate {

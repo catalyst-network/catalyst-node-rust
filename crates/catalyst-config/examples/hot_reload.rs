@@ -1,16 +1,18 @@
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+
+use catalyst_utils::logging::{log_error, log_info, log_warn, LogCategory};
+use catalyst_utils::{CatalystError, CatalystResult};
+use tokio::sync::mpsc;
+use tokio::time::sleep;
+
 use crate::env_override::EnvOverride;
 use crate::error::ConfigResult;
 use crate::events::{ConfigEvent, ConfigEventType};
 use crate::loader::ConfigLoader;
 use crate::networks::{Network, NetworkConfig};
 use crate::watcher::FileWatcher;
-use catalyst_utils::logging::{log_error, log_info, log_warn, LogCategory};
-use catalyst_utils::{CatalystError, CatalystResult};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
-use tokio::time::sleep;
 
 /// Configuration hot reload manager
 pub struct HotReloadManager {
@@ -416,9 +418,11 @@ impl Drop for HotReloadManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs;
+
     use tempfile::tempdir;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_hot_reload_manager_creation() {

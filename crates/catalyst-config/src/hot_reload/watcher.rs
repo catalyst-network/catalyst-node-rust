@@ -1,13 +1,15 @@
-use crate::hot_reload::events::ConfigEvent;
-use crate::{ConfigError, ConfigResult};
-use catalyst_utils::logging::LogCategory;
-use catalyst_utils::{log_debug, log_error, log_info, log_warn};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+use catalyst_utils::logging::LogCategory;
+use catalyst_utils::{log_debug, log_error, log_info, log_warn};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Instant};
+
+use crate::hot_reload::events::ConfigEvent;
+use crate::{ConfigError, ConfigResult};
 
 /// File watcher for monitoring configuration file changes
 pub struct FileWatcher {
@@ -168,9 +170,9 @@ impl FileWatcher {
 
     /// Get file metadata
     fn get_file_metadata(&self, path: &Path) -> ConfigResult<FileMetadata> {
-        let metadata = fs::metadata(path).map_err(|e| ConfigError::Io(e))?;
+        let metadata = fs::metadata(path).map_err(ConfigError::Io)?;
 
-        let last_modified = metadata.modified().map_err(|e| ConfigError::Io(e))?;
+        let last_modified = metadata.modified().map_err(ConfigError::Io)?;
 
         Ok(FileMetadata {
             last_modified,
@@ -310,7 +312,7 @@ pub mod utils {
     /// Get the canonical path for a file
     pub fn canonicalize_path<P: AsRef<Path>>(path: P) -> ConfigResult<PathBuf> {
         let path = path.as_ref();
-        path.canonicalize().map_err(|e| ConfigError::Io(e))
+        path.canonicalize().map_err(ConfigError::Io)
     }
 
     /// Check if a file has a valid configuration extension
@@ -347,11 +349,13 @@ pub mod utils {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs;
+
     use tempfile::NamedTempFile;
-    use crate::ConfigEventType;
     use tokio::time::sleep;
+
+    use super::*;
+    use crate::ConfigEventType;
 
     #[tokio::test]
     async fn test_file_watcher_creation() {

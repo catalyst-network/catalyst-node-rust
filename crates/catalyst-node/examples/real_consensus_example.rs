@@ -11,15 +11,14 @@
 #[cfg(any())] // <-- never true; the real example is excluded from normal builds/tests
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use tokio::time::{sleep, Duration};
-    use tracing::{info, Level};
-    use tracing_subscriber;
-
     // Bring these inside the guarded block so the file compiles even if APIs differ.
     use catalyst_config::{CatalystConfig, NetworkType};
     use catalyst_node::NodeBuilder;
     use catalyst_rpc::RpcConfig;
     use catalyst_storage::StorageConfig;
+    use tokio::time::{sleep, Duration};
+    use tracing::{info, Level};
+    use tracing_subscriber;
 
     // Logging
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();

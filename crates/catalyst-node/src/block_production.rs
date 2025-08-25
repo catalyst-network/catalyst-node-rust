@@ -1,15 +1,15 @@
 // File: crates/catalyst-node/src/block_production.rs
 // Block production integration with real consensus
 
-use crate::{
-    consensus_service::{Block, ConsensusService},
-    NodeError,
-};
+use std::sync::Arc;
+
 use catalyst_storage::StorageManager;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info};
+
+use crate::consensus_service::{Block, ConsensusService};
+use crate::NodeError;
 
 /// Block production service that integrates with consensus
 pub struct BlockProductionService {
@@ -158,7 +158,7 @@ impl BlockProductionService {
             total_blocks_produced: current_height,
             current_height,
             average_block_time: 40.0, // Based on our 40-second block time
-            transactions_processed: current_height * 1, // Estimate: 1 tx per block average
+            transactions_processed: current_height, // Estimate: 1 tx per block average
             consensus_rounds: consensus_status.current_round,
         })
     }
@@ -261,10 +261,11 @@ impl Clone for BlockProductionService {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use catalyst_crypto::KeyPair;
     use catalyst_storage::StorageConfig;
     use tempfile::TempDir;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_block_production_service_creation() {

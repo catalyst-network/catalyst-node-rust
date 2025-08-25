@@ -1,5 +1,6 @@
-use crate::{CryptoError, CryptoResult};
 use rand::{CryptoRng, RngCore};
+
+use crate::{CryptoError, CryptoResult};
 
 /// Secure random number generation utilities
 pub struct SecureRandom;

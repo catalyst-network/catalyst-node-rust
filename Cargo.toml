@@ -14,7 +14,7 @@ members = [
      "crates/catalyst-rpc",
      "crates/catalyst-node",
      "crates/catalyst-cli",
-     "rpc-test", "crates/catalyst-node",
+     "rpc-test", "crates/catalyst-node", "xtask",
 ]
 
 resolver = "2"
@@ -47,3 +47,11 @@ tracing = "0.1"
 
 # Configuration
 toml = "0.8"
+
+[workspace.lints.rust]
+unused_imports = "deny"
+warnings = "deny"      # tighten later if needed
+
+[workspace.lints.clippy]
+all = "deny"
+pedantic = "allow"     # start permissive, tighten per-crate

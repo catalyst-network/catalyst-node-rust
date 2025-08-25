@@ -4,9 +4,6 @@
 //! including peer discovery, message routing, consensus communication, and
 //! service bus integration.
 
-use std::sync::Arc;
-use tokio::sync::broadcast;
-
 // Re-export commonly used types
 pub use config::NetworkConfig;
 pub use error::{NetworkError, NetworkResult};
@@ -24,10 +21,9 @@ pub enum NetworkMessage {
 
 // Simple stubs to get compilation working
 pub mod service {
-    use super::*;
-    use crate::{config::NetworkConfig, error::NetworkResult};
-    use std::sync::Arc;
-    use tokio::sync::{broadcast, RwLock};
+    use crate::config::NetworkConfig;
+    use crate::error::NetworkResult;
+    use crate::{NetworkEvent, NetworkMessage};
 
     #[derive(Debug, Clone, Default)]
     pub struct NetworkStats {
@@ -38,23 +34,25 @@ pub mod service {
 
     pub struct NetworkService {
         config: NetworkConfig,
-        stats: Arc<RwLock<NetworkStats>>,
-        event_sender: broadcast::Sender<NetworkEvent>,
+        stats: std::sync::Arc<tokio::sync::RwLock<NetworkStats>>,
+        event_sender: tokio::sync::broadcast::Sender<NetworkEvent>,
     }
 
     impl NetworkService {
         pub async fn new(config: NetworkConfig) -> NetworkResult<Self> {
             config.validate()?;
-            let (event_sender, _) = broadcast::channel(1000);
+            let (event_sender, _) = tokio::sync::broadcast::channel(1000);
 
             Ok(Self {
                 config,
-                stats: Arc::new(RwLock::new(NetworkStats::default())),
+                stats: std::sync::Arc::new(tokio::sync::RwLock::new(NetworkStats::default())),
                 event_sender,
             })
         }
 
-        pub async fn subscribe_events(&self) -> NetworkResult<broadcast::Receiver<NetworkEvent>> {
+        pub async fn subscribe_events(
+            &self,
+        ) -> NetworkResult<tokio::sync::broadcast::Receiver<NetworkEvent>> {
             Ok(self.event_sender.subscribe())
         }
 
@@ -93,7 +91,7 @@ pub mod service {
         fn clone(&self) -> Self {
             Self {
                 config: self.config.clone(),
-                stats: Arc::clone(&self.stats),
+                stats: std::sync::Arc::clone(&self.stats),
                 event_sender: self.event_sender.clone(),
             }
         }
@@ -130,21 +128,23 @@ pub fn init() -> Result<(), Box<dyn std::error::Error>> {
 // Mock implementation for testing
 #[cfg(test)]
 pub struct MockNetwork {
-    event_sender: broadcast::Sender<NetworkEvent>,
-    stats: Arc<tokio::sync::RwLock<service::NetworkStats>>,
+    event_sender: tokio::sync::broadcast::Sender<NetworkEvent>,
+    stats: std::sync::Arc<tokio::sync::RwLock<service::NetworkStats>>,
 }
 
 #[cfg(test)]
 impl MockNetwork {
     pub fn new(_config: NetworkConfig) -> Self {
-        let (event_sender, _) = broadcast::channel(1000);
+        let (event_sender, _) = tokio::sync::broadcast::channel(1000);
         Self {
             event_sender,
-            stats: Arc::new(tokio::sync::RwLock::new(service::NetworkStats::default())),
+            stats: std::sync::Arc::new(tokio::sync::RwLock::new(service::NetworkStats::default())),
         }
     }
 
-    pub async fn subscribe_events(&self) -> NetworkResult<broadcast::Receiver<NetworkEvent>> {
+    pub async fn subscribe_events(
+        &self,
+    ) -> NetworkResult<tokio::sync::broadcast::Receiver<NetworkEvent>> {
         Ok(self.event_sender.subscribe())
     }
 

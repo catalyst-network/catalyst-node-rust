@@ -10,6 +10,8 @@
 #![cfg(feature = "integration-tests")]
 #![cfg(feature = "evm_tests")]
 
+use std::str::FromStr;
+
 use catalyst_runtime_evm::database::InMemoryDatabase;
 use catalyst_runtime_evm::{
     BlockEnv, CatalystEvmConfig, CatalystEvmRuntime, CatalystExecutionResult, CatalystFeatures,
@@ -17,7 +19,6 @@ use catalyst_runtime_evm::{
 };
 use ethereum_types::{Address, H256, U256};
 use hex;
-use std::str::FromStr;
 
 /// Helper function to create a test runtime
 fn create_test_runtime() -> CatalystEvmRuntime<InMemoryDatabase> {

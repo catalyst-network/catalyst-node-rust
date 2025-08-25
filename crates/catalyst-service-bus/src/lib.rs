@@ -1,9 +1,9 @@
 //! Minimal Catalyst Service Bus implementation
 //! This is a placeholder implementation to get the build working
 
-use catalyst_utils::CatalystResult;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -43,6 +43,7 @@ impl Default for ServiceBusConfig {
 
 /// Minimal service bus
 pub struct ServiceBus {
+    #[allow(dead_code)]
     config: ServiceBusConfig,
 }
 
@@ -107,5 +108,4 @@ impl AuthToken {
 }
 
 // Export everything
-pub use ServiceBus as CatalystServiceBus;
-pub use ServiceBusError as CatalystServiceBusError;
+pub use {ServiceBus as CatalystServiceBus, ServiceBusError as CatalystServiceBusError};

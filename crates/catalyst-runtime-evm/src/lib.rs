@@ -1,11 +1,13 @@
 // lib.rs - Simplified Catalyst EVM implementation compatible with REVM 3.5
 
-use revm::{
-    primitives::{Address, BlockEnv, CfgEnv, Env, ExecutionResult, SpecId, TxEnv, B256, U256},
-    Database, EVM,
-};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use revm::primitives::{
+    AccountInfo, Address, BlockEnv, Bytecode, CfgEnv, Env, ExecutionResult, SpecId, TxEnv, B256,
+    U256,
+};
+use revm::{Database, EVM};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, error, info};
 
@@ -38,7 +40,7 @@ impl Default for EvmConfig {
 }
 
 /// Catalyst-specific EVM features
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CatalystFeatures {
     /// Enable cross-runtime calls
     pub cross_runtime_enabled: bool,
@@ -50,33 +52,13 @@ pub struct CatalystFeatures {
     pub catalyst_gas_model: bool,
 }
 
-impl Default for CatalystFeatures {
-    fn default() -> Self {
-        Self {
-            cross_runtime_enabled: false,
-            confidential_tx_enabled: false,
-            dfs_integration: false,
-            catalyst_gas_model: false,
-        }
-    }
-}
-
 /// Catalyst EVM configuration with extensions
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CatalystEvmConfig {
     /// Standard EVM configuration
     pub evm_config: EvmConfig,
     /// Catalyst-specific extensions
     pub catalyst_features: CatalystFeatures,
-}
-
-impl Default for CatalystEvmConfig {
-    fn default() -> Self {
-        Self {
-            evm_config: EvmConfig::default(),
-            catalyst_features: CatalystFeatures::default(),
-        }
-    }
 }
 
 /// Simple transaction representation compatible with REVM
@@ -377,6 +359,7 @@ pub struct ConfidentialProofs {
 pub struct GasMeter {
     gas_limit: u64,
     gas_used: u64,
+    #[allow(dead_code)]
     gas_price: U256,
 }
 
@@ -485,7 +468,7 @@ impl ContractDeployer {
 
         let mut hasher = Keccak256::new();
         hasher.update(deployer.as_slice());
-        hasher.update(&nonce.to_le_bytes());
+        hasher.update(nonce.to_le_bytes());
 
         let hash = hasher.finalize();
         Address::from_slice(&hash[12..])
@@ -495,10 +478,10 @@ impl ContractDeployer {
         use sha3::{Digest, Keccak256};
 
         let mut hasher = Keccak256::new();
-        hasher.update(&[0xff]);
+        hasher.update([0xff]);
         hasher.update(deployer.as_slice());
         hasher.update(salt.as_slice());
-        hasher.update(&Keccak256::digest(bytecode));
+        hasher.update(Keccak256::digest(bytecode));
 
         let hash = hasher.finalize();
         Address::from_slice(&hash[12..])
@@ -571,8 +554,6 @@ pub enum EvmError {
 }
 
 /// Simple in-memory database for testing
-use revm::primitives::{AccountInfo, Bytecode};
-
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryDatabase {
     accounts: HashMap<Address, AccountInfo>,
@@ -606,7 +587,7 @@ impl Database for InMemoryDatabase {
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
         // For simplicity, iterate through all code to find by hash
-        for (_, code) in &self.code {
+        for code in self.code.values() {
             if code.hash_slow() == code_hash {
                 return Ok(code.clone());
             }

@@ -5,12 +5,13 @@ pub mod file;
 pub mod validation;
 
 // Re-export the loaders that other code expects
+use std::path::Path;
+
 pub use env::EnvLoader;
 pub use file::FileLoader;
 pub use validation::*;
 
 use crate::{CatalystConfig, ConfigResult};
-use std::path::Path;
 
 /// Main configuration loader
 pub struct ConfigLoader {
@@ -73,5 +74,11 @@ impl ConfigLoader {
 
         config.validate()?;
         Ok(config)
+    }
+}
+
+impl Default for ConfigLoader {
+    fn default() -> Self {
+        Self::new()
     }
 }

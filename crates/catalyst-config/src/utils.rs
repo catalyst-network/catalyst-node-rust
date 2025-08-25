@@ -1,6 +1,7 @@
+use std::path::{Path, PathBuf};
+
 use crate::loader::FileLoader;
 use crate::{CatalystConfig, ConfigError, ConfigResult};
-use std::path::{Path, PathBuf};
 
 /// Configuration utility functions
 pub struct ConfigUtils;
@@ -58,7 +59,7 @@ impl ConfigUtils {
     pub fn ensure_config_directory<P: AsRef<Path>>(path: P) -> ConfigResult<()> {
         let path = path.as_ref();
         if !path.exists() {
-            std::fs::create_dir_all(path).map_err(|e| ConfigError::Io(e))?;
+            std::fs::create_dir_all(path).map_err(ConfigError::Io)?;
         } else if !path.is_dir() {
             return Err(ConfigError::ValidationFailed(format!(
                 "Path exists but is not a directory: {}",
@@ -107,7 +108,7 @@ impl ConfigUtils {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let metadata = path.metadata().map_err(|e| ConfigError::Io(e))?;
+            let metadata = path.metadata().map_err(ConfigError::Io)?;
             let permissions = metadata.permissions();
             let mode = permissions.mode();
 
@@ -134,7 +135,7 @@ impl ConfigUtils {
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
         let backup_path = config_path.with_extension(format!("backup_{}.toml", timestamp));
 
-        std::fs::copy(config_path, &backup_path).map_err(|e| ConfigError::Io(e))?;
+        std::fs::copy(config_path, &backup_path).map_err(ConfigError::Io)?;
 
         Ok(backup_path)
     }
@@ -182,9 +183,9 @@ impl ConfigUtils {
             "example" => include_str!("../configs/example.toml"), // Fixed path
             "custom" => {
                 let config = CatalystConfig::default();
-                return Ok(toml::to_string_pretty(&config).map_err(|e| {
+                return toml::to_string_pretty(&config).map_err(|e| {
                     ConfigError::InvalidFormat(format!("Template generation failed: {}", e))
-                })?);
+                });
             }
             _ => {
                 return Err(ConfigError::InvalidNetwork(format!(
@@ -199,15 +200,14 @@ impl ConfigUtils {
     /// Validate configuration file syntax without loading
     pub fn validate_syntax<P: AsRef<Path>>(path: P) -> ConfigResult<()> {
         let path = path.as_ref();
-        let content = std::fs::read_to_string(path).map_err(|e| ConfigError::Io(e))?;
+        let content = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
 
         match Self::get_file_extension(path).as_deref() {
             Some("toml") => {
-                toml::from_str::<toml::Value>(&content).map_err(|e| ConfigError::Toml(e))?;
+                toml::from_str::<toml::Value>(&content).map_err(ConfigError::Toml)?;
             }
             Some("json") => {
-                serde_json::from_str::<serde_json::Value>(&content)
-                    .map_err(|e| ConfigError::Json(e))?;
+                serde_json::from_str::<serde_json::Value>(&content).map_err(ConfigError::Json)?;
             }
             _ => {
                 // Try both formats
@@ -422,9 +422,9 @@ pub fn generate_config_template(network: &str) -> ConfigResult<String> {
         "example" => include_str!("../configs/example.toml"),
         "custom" => {
             let config = CatalystConfig::default();
-            return Ok(toml::to_string_pretty(&config).map_err(|e| {
+            return toml::to_string_pretty(&config).map_err(|e| {
                 ConfigError::InvalidFormat(format!("Template generation failed: {}", e))
-            })?);
+            });
         }
         _ => {
             return Err(ConfigError::InvalidFormat(format!(

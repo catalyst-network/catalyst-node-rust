@@ -1,13 +1,16 @@
 //! Transaction batching for atomic storage operations
 
-use crate::{RocksEngine, StorageError, StorageResult};
-use catalyst_utils::{state::AccountState, Address, Hash};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use catalyst_utils::state::AccountState;
+use catalyst_utils::{Address, Hash};
 use parking_lot::RwLock;
 use rocksdb::{WriteBatch, WriteOptions};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::sync::Arc;
 use uuid::Uuid;
+
+use crate::{RocksEngine, StorageError, StorageResult};
 
 /// A transaction batch for atomic storage operations
 #[derive(Clone)]
@@ -21,7 +24,8 @@ pub struct TransactionBatch {
 
 /// Metadata for a transaction batch
 #[derive(Debug, Clone)]
-struct TransactionMetadata {
+pub struct TransactionMetadata {
+    #[allow(dead_code)]
     created_at: u64,
     operation_count: usize,
     estimated_size: usize,
@@ -111,7 +115,11 @@ impl TransactionBatch {
     }
 
     /// Add an account operation
-    pub async fn set_account(&self, address: &Address, account: &AccountState) -> StorageResult<()> {
+    pub async fn set_account(
+        &self,
+        address: &Address,
+        account: &AccountState,
+    ) -> StorageResult<()> {
         self.check_not_committed()?;
 
         let operation = BatchOperation::PutAccount {
@@ -284,7 +292,10 @@ impl TransactionBatch {
             BatchOperation::DeleteConsensus { key } => key.len(),
             BatchOperation::PutContract { code, storage, .. } => {
                 20 + code.len()
-                    + storage.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+                    + storage
+                        .iter()
+                        .map(|(k, v)| k.len() + v.len())
+                        .sum::<usize>()
             }
             BatchOperation::DeleteContract { .. } => 20,
             BatchOperation::PutDfsRef { reference, .. } => 32 + reference.len(), // hash + reference
@@ -309,9 +320,7 @@ impl TransactionBatch {
 
         let operations = self.operations.read().clone();
         if operations.is_empty() {
-            return Err(StorageError::transaction(
-                "Cannot commit empty transaction".to_string(),
-            ));
+            return Err(StorageError::transaction("Cannot commit empty transaction"));
         }
 
         // Create RocksDB write batch
@@ -590,11 +599,12 @@ pub fn dfs_ref_key(hash: &Hash) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{RocksEngine, StorageConfig};
     use catalyst_utils::state::{AccountState, AccountType};
     use catalyst_utils::Address;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::{RocksEngine, StorageConfig};
 
     fn create_test_engine() -> Arc<RocksEngine> {
         let temp_dir = TempDir::new().unwrap();

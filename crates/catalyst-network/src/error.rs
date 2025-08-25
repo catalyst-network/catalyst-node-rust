@@ -1,8 +1,9 @@
 //! Network-specific error types
 
+use std::time::Duration;
+
 use catalyst_utils::CatalystError;
 use libp2p::PeerId;
-use std::time::Duration;
 use thiserror::Error;
 
 /// Network-specific error types
@@ -153,8 +154,9 @@ macro_rules! security_error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use catalyst_utils::CatalystError;
+
+    use super::*;
 
     #[test]
     fn test_error_conversion() {
