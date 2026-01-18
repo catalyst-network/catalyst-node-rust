@@ -4,23 +4,18 @@
 
 use crate::{
     ContentId, ContentMetadata, DfsConfig, DfsError, DfsStats, 
-    DistributedFileSystem, GcResult, CategorizedStorage, ContentCategory
+    DistributedFileSystem, GcResult, CategorizedStorage, ContentCategory,
+    LedgerStateUpdate  // Remove unused Hash import
 };
-use catalyst_core::{Hash, LedgerStateUpdate};
-use chrono::{DateTime, Utc};
+use chrono::Utc;  // Remove unused DateTime import
 use rocksdb::{DB, Options, WriteBatch};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::PathBuf;  // Remove unused serde imports
 use std::sync::{Arc, RwLock};
 use tokio::fs;
-use uuid::Uuid;
 
 /// Metadata storage key prefixes
 const METADATA_PREFIX: &[u8] = b"meta:";
-const CONTENT_PREFIX: &[u8] = b"content:";
 const CATEGORY_PREFIX: &[u8] = b"category:";
-const PIN_PREFIX: &[u8] = b"pin:";
 
 /// Local DFS storage implementation
 pub struct LocalDfsStorage {
@@ -415,13 +410,12 @@ impl CategorizedStorage for LocalDfsStorage {
         
         let iter = self.db.prefix_iterator(CATEGORY_PREFIX);
         for item in iter {
-            let (_, value) = item.map_err(|e| DfsError::Storage(e.to_string()))?;
+            let (key, value) = item.map_err(|e| DfsError::Storage(e.to_string()))?;
             
             if let Ok(stored_category) = serde_json::from_slice::<ContentCategory>(&value) {
                 if std::mem::discriminant(&stored_category) == std::mem::discriminant(&category) {
                     // Extract CID from key and get metadata
-                    // This is a simplified approach - in practice you'd want to store the CID reference
-                    let key_str = String::from_utf8_lossy(&item.0);
+                    let key_str = String::from_utf8_lossy(&key);
                     if let Some(cid_str) = key_str.strip_prefix("category:") {
                         if let Ok(cid) = ContentId::from_string(cid_str) {
                             if let Ok(Some(metadata)) = self.get_metadata(&cid) {
@@ -440,9 +434,8 @@ impl CategorizedStorage for LocalDfsStorage {
         &self, 
         update: &LedgerStateUpdate
     ) -> Result<ContentId, DfsError> {
-        use catalyst_core::serialization::CatalystSerialize;
-        
-        let data = update.serialize()
+        // Simple serialization - in a real implementation, you'd use proper serialization
+        let data = serde_json::to_vec(update)
             .map_err(|e| DfsError::Serialization(format!("Failed to serialize ledger update: {}", e)))?;
         
         self.put_categorized(data, ContentCategory::LedgerUpdate).await
@@ -452,11 +445,9 @@ impl CategorizedStorage for LocalDfsStorage {
         &self, 
         cid: &ContentId
     ) -> Result<LedgerStateUpdate, DfsError> {
-        use catalyst_core::serialization::CatalystDeserialize;
-        
         let data = self.get(cid).await?;
         
-        LedgerStateUpdate::deserialize(&data)
+        serde_json::from_slice(&data)
             .map_err(|e| DfsError::Serialization(format!("Failed to deserialize ledger update: {}", e)))
     }
 }

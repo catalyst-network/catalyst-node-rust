@@ -1,3 +1,4 @@
+#![cfg(feature = "ethereum-tests")]
 // tests/integration.rs
 //! Integration tests for the Catalyst EVM runtime
 //! 

@@ -540,6 +540,13 @@ macro_rules! log_with_fields {
     };
 }
 
+// Allow calling logging macros via `catalyst_utils::logging::log_info!` etc.
+// The macros themselves are defined with `#[macro_export]` (at crate root),
+// but some crates expect them under the `logging` module path.
+pub use crate::{
+    log_critical, log_debug, log_error, log_info, log_trace, log_warn, log_with_fields,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;

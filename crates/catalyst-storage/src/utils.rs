@@ -12,23 +12,23 @@ pub fn calculate_directory_size(path: &Path) -> StorageResult<u64> {
     
     if path.is_file() {
         return Ok(path.metadata()
-            .map_err(|e| StorageError::io(e))?
+            .map_err(StorageError::from)?
             .len());
     }
     
     let mut size = 0u64;
     let entries = fs::read_dir(path)
-        .map_err(|e| StorageError::io(e))?;
+        .map_err(StorageError::from)?;
     
     for entry in entries {
-        let entry = entry.map_err(|e| StorageError::io(e))?;
+        let entry = entry.map_err(StorageError::from)?;
         let entry_path = entry.path();
         
         if entry_path.is_dir() {
             size += calculate_directory_size(&entry_path)?;
         } else {
             size += entry.metadata()
-                .map_err(|e| StorageError::io(e))?
+                .map_err(StorageError::from)?
                 .len();
         }
     }
@@ -114,7 +114,7 @@ pub fn random_test_path() -> std::path::PathBuf {
 pub fn cleanup_test_db(path: &Path) -> StorageResult<()> {
     if path.exists() {
         fs::remove_dir_all(path)
-            .map_err(|e| StorageError::io(e))?;
+            .map_err(StorageError::from)?;
     }
     Ok(())
 }
@@ -193,18 +193,6 @@ pub struct DatabaseIterator<'a> {
 impl<'a> DatabaseIterator<'a> {
     pub fn new(inner: rocksdb::DBIterator<'a>) -> Self {
         Self { inner }
-    }
-    
-    pub fn seek_to_first(&mut self) {
-        self.inner.seek_to_first();
-    }
-    
-    pub fn seek_to_last(&mut self) {
-        self.inner.seek_to_last();
-    }
-    
-    pub fn seek(&mut self, key: &[u8]) {
-        self.inner.seek(key);
     }
     
     pub fn collect_all(&mut self) -> StorageResult<Vec<KeyValue>> {

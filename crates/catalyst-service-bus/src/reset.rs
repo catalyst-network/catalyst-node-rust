@@ -13,7 +13,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use catalyst_utils::{CatalystResult, logging::LogCategory};
+use catalyst_utils::{CatalystError, CatalystResult, logging::LogCategory};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
@@ -94,7 +94,7 @@ pub struct ErrorResponse {
 }
 
 /// Create REST API router
-pub fn create_rest_router(state: RestApiState) -> Router {
+pub fn create_rest_router() -> Router<RestApiState> {
     Router::new()
         // Health and status endpoints
         .route("/health", get(health_check))
@@ -116,8 +116,6 @@ pub fn create_rest_router(state: RestApiState) -> Router {
         
         // API documentation (if enabled)
         .route("/docs", get(api_documentation))
-        
-        .with_state(state)
 }
 
 /// Health check endpoint
@@ -504,7 +502,7 @@ fn parse_event_type(type_str: &str) -> CatalystResult<crate::events::EventType> 
             let custom_name = custom.strip_prefix("custom:").unwrap();
             Ok(EventType::Custom(custom_name.to_string()))
         }
-        _ => Err(ServiceBusError::InvalidEventType(type_str.to_string()).into()),
+        _ => Err(CatalystError::from(ServiceBusError::InvalidEventType(type_str.to_string()))),
     }
 }
 
@@ -515,16 +513,19 @@ fn parse_address_list(addresses_str: &str) -> CatalystResult<Vec<catalyst_utils:
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|addr_str| {
-            catalyst_utils::utils::hex_to_bytes(addr_str)
-                .and_then(|bytes| {
-                    if bytes.len() == 21 {
-                        let mut addr = [0u8; 21];
-                        addr.copy_from_slice(&bytes);
-                        Ok(addr)
-                    } else {
-                        Err(ServiceBusError::InvalidAddress(addr_str.to_string()).into())
-                    }
-                })
+            // Accept both `0x...` and raw hex.
+            let addr_str = addr_str.strip_prefix("0x").or_else(|| addr_str.strip_prefix("0X")).unwrap_or(addr_str);
+
+            let bytes = catalyst_utils::utils::hex_to_bytes(addr_str)
+                .map_err(|e| CatalystError::from(ServiceBusError::InvalidAddress(format!("{}: {}", addr_str, e))))?;
+
+            if bytes.len() == 21 {
+                let mut addr = [0u8; 21];
+                addr.copy_from_slice(&bytes);
+                Ok(addr)
+            } else {
+                Err(CatalystError::from(ServiceBusError::InvalidAddress(addr_str.to_string())))
+            }
         })
         .collect()
 }

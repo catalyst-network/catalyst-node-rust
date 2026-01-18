@@ -1,9 +1,12 @@
 //! Snapshot management for point-in-time state recovery
 
-use crate::{RocksEngine, StorageError, StorageResult, SnapshotConfig};
+use crate::{RocksEngine, StorageError, StorageResult, config::SnapshotConfig};
 use catalyst_utils::{
+    // Import macros from root level
+    log_info, log_warn, log_error,
+    
     Hash,
-    logging::{log_info, log_warn, log_error, LogCategory},
+    logging::LogCategory,  // Only LogCategory from logging module if needed
     utils::current_timestamp,
 };
 use std::sync::Arc;
@@ -74,11 +77,11 @@ impl SnapshotManager {
         }
         
         let entries = std::fs::read_dir(&self.snapshot_dir)
-            .map_err(|e| StorageError::io(e))?;
+            .map_err(StorageError::from)?;
         
         let mut loaded_count = 0;
         for entry in entries {
-            let entry = entry.map_err(|e| StorageError::io(e))?;
+            let entry = entry.map_err(StorageError::from)?;
             let path = entry.path();
             
             if path.is_file() && path.extension() == Some(std::ffi::OsStr::new("snapshot")) {
@@ -111,7 +114,7 @@ impl SnapshotManager {
     /// Load snapshot metadata from file
     async fn load_snapshot_metadata(&self, path: &Path) -> StorageResult<Snapshot> {
         let content = std::fs::read_to_string(path)
-            .map_err(|e| StorageError::io(e))?;
+            .map_err(StorageError::from)?;
         
         let snapshot: Snapshot = serde_json::from_str(&content)
             .map_err(|e| StorageError::serialization(format!("Failed to parse snapshot metadata: {}", e)))?;
@@ -153,7 +156,7 @@ impl SnapshotManager {
             .map_err(|e| StorageError::serialization(format!("Failed to serialize snapshot: {}", e)))?;
         
         std::fs::write(&snapshot_file, metadata_content)
-            .map_err(|e| StorageError::io(e))?;
+            .map_err(StorageError::from)?;
         
         // Store in memory
         self.snapshots.write().insert(name.to_string(), snapshot.clone());
@@ -175,7 +178,7 @@ impl SnapshotManager {
     async fn write_snapshot_data(&self, snapshot: &Snapshot) -> StorageResult<()> {
         let data_dir = self.snapshot_dir.join(format!("{}_data", snapshot.name));
         std::fs::create_dir_all(&data_dir)
-            .map_err(|e| StorageError::io(e))?;
+            .map_err(StorageError::from)?;
         
         // Create RocksDB checkpoint (this creates a consistent point-in-time copy)
         let checkpoint_path = data_dir.join("checkpoint");
@@ -207,7 +210,7 @@ impl SnapshotManager {
             };
             
             std::fs::write(&cf_file, final_data)
-                .map_err(|e| StorageError::io(e))?;
+                .map_err(StorageError::from)?;
         }
         
         Ok(())
@@ -283,7 +286,7 @@ impl SnapshotManager {
             }
             
             let file_data = std::fs::read(&cf_file)
-                .map_err(|e| StorageError::io(e))?;
+                .map_err(StorageError::from)?;
             
             // Decompress if needed
             let data = self.decompress_data(&file_data)?;
@@ -432,14 +435,14 @@ impl SnapshotManager {
         // Delete metadata file
         if snapshot.file_path.exists() {
             std::fs::remove_file(&snapshot.file_path)
-                .map_err(|e| StorageError::io(e))?;
+                .map_err(StorageError::from)?;
         }
         
         // Delete data directory
         let data_dir = self.snapshot_dir.join(format!("{}_data", name));
         if data_dir.exists() {
             std::fs::remove_dir_all(&data_dir)
-                .map_err(|e| StorageError::io(e))?;
+                .map_err(StorageError::from)?;
         }
         
         log_info!(LogCategory::Storage, "Snapshot '{}' deleted successfully", name);
@@ -448,26 +451,31 @@ impl SnapshotManager {
     
     /// Cleanup old snapshots based on configuration
     pub async fn cleanup_old_snapshots(&self) -> StorageResult<()> {
-        let snapshots = self.snapshots.read();
-        let snapshot_count = snapshots.len();
-        
-        if snapshot_count <= self.config.max_snapshots {
-            return Ok(());
-        }
-        
-        // Sort snapshots by creation time
-        let mut sorted_snapshots: Vec<_> = snapshots.values().collect();
-        sorted_snapshots.sort_by_key(|s| s.created_at);
-        
-        // Delete oldest snapshots
-        let to_delete = snapshot_count - self.config.max_snapshots;
-        let old_snapshots: Vec<String> = sorted_snapshots
-            .iter()
-            .take(to_delete)
-            .map(|s| s.name.clone())
-            .collect();
-        
-        drop(snapshots); // Release the read lock
+        let old_snapshots: Vec<String> = {
+            let snapshots = self.snapshots.read();
+            let snapshot_count = snapshots.len();
+
+            if snapshot_count <= self.config.max_snapshots {
+                return Ok(());
+            }
+
+            // Collect owned (created_at, name) so we don't hold a non-Send lock guard across awaits
+            let mut snapshot_times: Vec<(u64, String)> = snapshots
+                .values()
+                .map(|s| (s.created_at, s.name.clone()))
+                .collect();
+
+            // Sort snapshots by creation time
+            snapshot_times.sort_by_key(|(created_at, _name)| *created_at);
+
+            // Select oldest snapshots
+            let to_delete = snapshot_count - self.config.max_snapshots;
+            snapshot_times
+                .into_iter()
+                .take(to_delete)
+                .map(|(_created_at, name)| name)
+                .collect()
+        };
         
         for snapshot_name in old_snapshots {
             if let Err(e) = self.delete_snapshot(&snapshot_name).await {
@@ -498,19 +506,19 @@ impl SnapshotManager {
         
         // Create export directory
         std::fs::create_dir_all(export_dir)
-            .map_err(|e| StorageError::io(e))?;
+            .map_err(StorageError::from)?;
         
         // Copy metadata file
         let metadata_dest = export_dir.join(format!("{}.snapshot", name));
         std::fs::copy(&snapshot.file_path, &metadata_dest)
-            .map_err(|e| StorageError::io(e))?;
+            .map_err(StorageError::from)?;
         
         // Copy data directory
         let data_src = self.snapshot_dir.join(format!("{}_data", name));
         let data_dest = export_dir.join(format!("{}_data", name));
         
         if data_src.exists() {
-            self.copy_dir_recursive(&data_src, &data_dest).await?;
+            self.copy_dir_recursive(&data_src, &data_dest)?;
         }
         
         log_info!(
@@ -531,11 +539,11 @@ impl SnapshotManager {
         
         // Find snapshot metadata file
         let entries = std::fs::read_dir(import_dir)
-            .map_err(|e| StorageError::io(e))?;
+            .map_err(StorageError::from)?;
         
         let mut metadata_file = None;
         for entry in entries {
-            let entry = entry.map_err(|e| StorageError::io(e))?;
+            let entry = entry.map_err(StorageError::from)?;
             let path = entry.path();
             
             if path.is_file() && path.extension() == Some(std::ffi::OsStr::new("snapshot")) {
@@ -565,14 +573,14 @@ impl SnapshotManager {
         
         // Copy metadata file
         std::fs::copy(&metadata_file, &snapshot.file_path)
-            .map_err(|e| StorageError::io(e))?;
+            .map_err(StorageError::from)?;
         
         // Copy data directory if it exists
         let data_src = import_dir.join(format!("{}_data", snapshot.name));
         let data_dest = self.snapshot_dir.join(format!("{}_data", final_name));
         
         if data_src.exists() {
-            self.copy_dir_recursive(&data_src, &data_dest).await?;
+            self.copy_dir_recursive(&data_src, &data_dest)?;
         }
         
         // Add to snapshots map
@@ -589,23 +597,23 @@ impl SnapshotManager {
     }
     
     /// Recursively copy directory
-    async fn copy_dir_recursive(&self, src: &Path, dest: &Path) -> StorageResult<()> {
+    fn copy_dir_recursive(&self, src: &Path, dest: &Path) -> StorageResult<()> {
         std::fs::create_dir_all(dest)
-            .map_err(|e| StorageError::io(e))?;
+            .map_err(StorageError::from)?;
         
         let entries = std::fs::read_dir(src)
-            .map_err(|e| StorageError::io(e))?;
+            .map_err(StorageError::from)?;
         
         for entry in entries {
-            let entry = entry.map_err(|e| StorageError::io(e))?;
+            let entry = entry.map_err(StorageError::from)?;
             let src_path = entry.path();
             let dest_path = dest.join(entry.file_name());
             
             if src_path.is_dir() {
-                self.copy_dir_recursive(&src_path, &dest_path).await?;
+                self.copy_dir_recursive(&src_path, &dest_path)?;
             } else {
                 std::fs::copy(&src_path, &dest_path)
-                    .map_err(|e| StorageError::io(e))?;
+                    .map_err(StorageError::from)?;
             }
         }
         
@@ -675,12 +683,12 @@ impl Snapshot {
     pub async fn export_to_directory(&self, export_dir: &Path) -> StorageResult<()> {
         // Create export directory
         std::fs::create_dir_all(export_dir)
-            .map_err(|e| StorageError::io(e))?;
+            .map_err(StorageError::from)?;
         
         // Copy metadata file
         let metadata_dest = export_dir.join(format!("{}.snapshot", self.name));
         std::fs::copy(&self.file_path, &metadata_dest)
-            .map_err(|e| StorageError::io(e))?;
+            .map_err(StorageError::from)?;
         
         // Note: In a full implementation, you'd also copy the data directory
         // This is simplified for the example
@@ -697,7 +705,7 @@ impl Snapshot {
         }
         
         let content = std::fs::read_to_string(&metadata_file)
-            .map_err(|e| StorageError::io(e))?;
+            .map_err(StorageError::from)?;
         
         let snapshot: Snapshot = serde_json::from_str(&content)
             .map_err(|e| StorageError::serialization(format!("Failed to parse snapshot metadata: {}", e)))?;
@@ -709,6 +717,7 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use catalyst_utils::CatalystSerialize;
     use crate::{StorageConfig, RocksEngine};
     use tempfile::TempDir;
     use catalyst_utils::state::AccountState;

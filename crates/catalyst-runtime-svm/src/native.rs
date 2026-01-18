@@ -5,11 +5,20 @@ use std::collections::HashMap;
 use wasmtime::{Engine, Module, Store, Linker};
 
 /// Native BPF runtime using rbpf
-#[derive(Debug)]
 pub struct NativeRuntime {
     config: SvmConfig,
     bpf_config: BpfConfig,
     wasm_engine: Engine,
+}
+
+impl std::fmt::Debug for NativeRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeRuntime")
+            .field("config", &self.config)
+            .field("bpf_config", &self.bpf_config)
+            .field("wasm_engine", &"<Engine>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]

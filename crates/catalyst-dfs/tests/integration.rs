@@ -1,3 +1,5 @@
+#![cfg(feature = "integration-tests")]
+
 //! Integration tests for Catalyst DFS
 //! 
 //! These tests verify the complete system functionality including

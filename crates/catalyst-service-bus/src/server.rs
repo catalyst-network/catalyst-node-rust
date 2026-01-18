@@ -17,7 +17,6 @@ use axum::{
 };
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{net::TcpListener, sync::broadcast};
-use tower::ServiceBuilder;
 use tower_http::{
     cors::{CorsLayer, Any},
     trace::TraceLayer,
@@ -155,7 +154,9 @@ impl ServiceBusServer {
     
     /// Create the main application router
     async fn create_app_router(self) -> CatalystResult<Router> {
-        let mut app = Router::new();
+        // Keep the overall app state as `()` and provide state per-route with `.with_state(...)`.
+        // This lets us mount routes that need different state types (WebSocketState vs RestApiState).
+        let mut app: Router = Router::new();
         
         // Add WebSocket endpoint if enabled
         if self.config.websocket.enabled {
@@ -164,8 +165,10 @@ impl ServiceBusServer {
                 config: self.config.websocket.clone(),
             };
             
-            app = app.route(&self.config.websocket.path, get(websocket_handler))
-                .with_state(ws_state);
+            app = app.route(
+                &self.config.websocket.path,
+                get(websocket_handler).with_state(ws_state),
+            );
         }
         
         // Add REST API endpoints if enabled
@@ -175,44 +178,36 @@ impl ServiceBusServer {
                 config: self.config.rest_api.clone(),
             };
             
-            let rest_router = create_rest_router(rest_state);
+            // Build a router that expects `RestApiState` and then "provide" that state,
+            // turning it into a `Router<()>` that can be nested into the main app.
+            let rest_router = create_rest_router().with_state(rest_state);
             app = app.nest(&self.config.rest_api.path_prefix, rest_router);
         }
         
         // Add root status endpoint
         app = app.route("/", get(root_handler));
-        
-        // Create middleware stack
-        let service_builder = ServiceBuilder::new();
-        
+
         // Add CORS if enabled
-        let service_builder = if self.config.cors.enabled {
+        if self.config.cors.enabled {
             let cors = CorsLayer::new()
                 .allow_origin(Any) // In production, configure this properly
                 .allow_methods(Any)
                 .allow_headers(Any);
-            
-            service_builder.layer(cors)
-        } else {
-            service_builder
-        };
-        
+            app = app.layer(cors);
+        }
+
         // Add authentication middleware if enabled
-        let service_builder = if self.config.auth.enabled {
+        if self.config.auth.enabled {
             let auth_state = AuthState {
                 auth_manager: Arc::clone(&self.auth_manager),
             };
-            
-            service_builder
-                .layer(middleware::from_fn_with_state(auth_state, auth_middleware))
-        } else {
-            service_builder
-        };
-        
+            app = app.layer(middleware::from_fn_with_state(auth_state, auth_middleware));
+        }
+
         // Add tracing
-        let service_builder = service_builder.layer(TraceLayer::new_for_http());
-        
-        Ok(app.layer(service_builder))
+        app = app.layer(TraceLayer::new_for_http());
+
+        Ok(app)
     }
 }
 

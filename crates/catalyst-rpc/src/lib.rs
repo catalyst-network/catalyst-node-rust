@@ -4,24 +4,19 @@
 //! including transaction submission, account queries, and network information.
 
 use async_trait::async_trait;
-use catalyst_core::{Transaction, Block, Hash, Account};
 use jsonrpsee::{
-    core::{Error as RpcError, RpcResult},
+    core::RpcResult,
     proc_macros::rpc,
-    server::{ServerBuilder, ServerHandle},
-    types::ErrorCode,
+    server::ServerHandle,
+    types::ErrorObjectOwned,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use thiserror::Error;
 
-pub mod methods;
-pub mod server;
-pub mod types;
-
-pub use methods::*;
-pub use server::*;
-pub use types::*;
+// Note: The initial scaffold referenced sub-modules (`methods`, `server`, `types`) that
+// aren't present yet. Keeping the RPC types and traits in this file for now so the
+// crate builds successfully.
 
 #[derive(Error, Debug)]
 pub enum RpcServerError {
@@ -30,39 +25,31 @@ pub enum RpcServerError {
     #[error("Invalid parameters: {0}")]
     InvalidParams(String),
     #[error("Transaction not found: {0}")]
-    TransactionNotFound(Hash),
+    TransactionNotFound(String),
     #[error("Block not found: {0}")]
-    BlockNotFound(Hash),
+    BlockNotFound(String),
     #[error("Account not found: {0}")]
-    AccountNotFound(Hash),
+    AccountNotFound(String),
     #[error("Network error: {0}")]
     Network(String),
 }
 
-impl From<RpcServerError> for RpcError {
+impl From<RpcServerError> for ErrorObjectOwned {
     fn from(err: RpcServerError) -> Self {
+        use jsonrpsee::types::error::{
+            CALL_EXECUTION_FAILED_CODE, INTERNAL_ERROR_CODE, INVALID_PARAMS_CODE,
+        };
+
         match err {
             RpcServerError::InvalidParams(msg) => {
-                RpcError::Call(jsonrpsee::types::error::CallError::InvalidParams(msg.into()))
+                ErrorObjectOwned::owned(INVALID_PARAMS_CODE, msg, None::<()>)
             }
-            RpcServerError::TransactionNotFound(_) | 
-            RpcServerError::BlockNotFound(_) | 
+            RpcServerError::TransactionNotFound(_) |
+            RpcServerError::BlockNotFound(_) |
             RpcServerError::AccountNotFound(_) => {
-                RpcError::Call(jsonrpsee::types::error::CallError::Custom(
-                    jsonrpsee::types::error::ErrorObject::owned(
-                        ErrorCode::InvalidRequest.code(),
-                        err.to_string(),
-                        None::<()>,
-                    )
-                ))
+                ErrorObjectOwned::owned(CALL_EXECUTION_FAILED_CODE, err.to_string(), None::<()>)
             }
-            _ => RpcError::Call(jsonrpsee::types::error::CallError::Failed(
-                jsonrpsee::types::error::ErrorObject::owned(
-                    ErrorCode::InternalError.code(),
-                    err.to_string(),
-                    None::<()>,
-                )
-            ))
+            _ => ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, err.to_string(), None::<()>),
         }
     }
 }

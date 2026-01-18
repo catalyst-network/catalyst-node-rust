@@ -1,32 +1,29 @@
-//! Updated lib.rs with complete DFS module integration
-
 //! Distributed File System for Catalyst Network
 //! 
-//! Implements IPFS-compatible distributed storage for:
-//! - Historical ledger state updates
-//! - Large files and media
-//! - Smart contract code and data
-//! - Application data storage
+//! This is a simplified version that focuses on storage functionality
+//! without the networking components to avoid libp2p compatibility issues.
 
 use async_trait::async_trait;
-use catalyst_core::{Hash, LedgerStateUpdate};
 use cid::Cid;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
 
+// Local type definitions
+pub type Hash = [u8; 32];
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerStateUpdate {
+    pub data: Vec<u8>,
+}
+
+// Only include storage module for now
 pub mod storage;
-pub mod swarm;
 pub mod provider;
-pub mod ipfs;
 
 pub use storage::LocalDfsStorage;
-pub use swarm::{DfsSwarm, SwarmConfig, NetworkEvent, NetworkStats};
 pub use provider::{
-    DfsContentProvider, DhtContentProvider, ContentReplicator, 
-    ProviderStats, ReplicationStatus, ReplicationLevel
+    DfsContentProvider, ProviderStats, ReplicationLevel
 };
-pub use ipfs::{NetworkedDfs, IpfsFactory};
 
 #[derive(Error, Debug)]
 pub enum DfsError {
@@ -63,7 +60,7 @@ pub struct DfsConfig {
     pub provider_interval: u64,
     /// Replication factor for important data
     pub replication_factor: usize,
-    /// Enable networking
+    /// Enable networking (currently disabled)
     pub enable_networking: bool,
     /// Network listen addresses
     pub listen_addresses: Vec<String>,
@@ -81,7 +78,7 @@ impl Default for DfsConfig {
             enable_discovery: true,
             provider_interval: 900, // 15 minutes
             replication_factor: 3,
-            enable_networking: true,
+            enable_networking: false, // Disabled for now
             listen_addresses: vec!["/ip4/0.0.0.0/tcp/0".to_string()],
             bootstrap_peers: Vec::new(),
         }
@@ -110,7 +107,7 @@ impl DfsConfig {
         Self {
             storage_dir,
             max_storage_size: 1024 * 1024 * 1024, // 1GB for testing
-            enable_networking: false, // Disable networking for tests
+            enable_networking: false, // Disabled for tests
             ..Default::default()
         }
     }
@@ -122,6 +119,7 @@ impl DfsConfig {
             enable_gc: true,
             gc_interval: 300, // 5 minutes for dev
             provider_interval: 60, // 1 minute for dev
+            enable_networking: false, // Disabled for now
             ..Default::default()
         }
     }
@@ -134,10 +132,17 @@ pub struct ContentId(pub Cid);
 impl ContentId {
     /// Create content ID from data
     pub fn from_data(data: &[u8]) -> Result<Self, DfsError> {
-        use multihash::{Code, MultihashDigest};
+        use sha2::{Sha256, Digest};
         
-        let hash = Code::Sha2_256.digest(data);
-        let cid = Cid::new_v1(0x55, hash); // 0x55 = raw codec
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let hash_bytes = hasher.finalize();
+        
+        // Create multihash using the compatible v0.18 API
+        use multihash::{Code, MultihashDigest};
+        let mh = Code::Sha2_256.digest(&hash_bytes);
+        
+        let cid = Cid::new_v1(0x55, mh); // 0x55 = raw codec
         Ok(ContentId(cid))
     }
     
@@ -180,7 +185,7 @@ pub struct ContentMetadata {
 
 /// Main DFS interface trait
 #[async_trait]
-pub trait DistributedFileSystem: Send + Sync {
+pub trait DistributedFileSystem: Send {
     /// Store data and return content ID
     async fn put(&self, data: Vec<u8>) -> Result<ContentId, DfsError>;
     
@@ -239,7 +244,7 @@ pub struct DfsStats {
 
 /// Content provider for DFS network
 #[async_trait]
-pub trait ContentProvider: Send + Sync {
+pub trait ContentProvider: Send {
     /// Announce that we provide content
     async fn provide(&self, cid: &ContentId) -> Result<(), DfsError>;
     
@@ -271,7 +276,7 @@ pub enum ContentCategory {
 
 /// Extended content storage with categorization
 #[async_trait]
-pub trait CategorizedStorage: Send + Sync {
+pub trait CategorizedStorage: Send {
     /// Store content with category
     async fn put_categorized(
         &self, 
@@ -302,7 +307,7 @@ pub trait CategorizedStorage: Send + Sync {
 pub struct DfsFactory;
 
 impl DfsFactory {
-    /// Create a new DFS instance (local only)
+    /// Create a new DFS instance (local storage only)
     pub async fn create(config: &DfsConfig) -> Result<Box<dyn DistributedFileSystem>, DfsError> {
         config.validate()?;
         
@@ -310,19 +315,13 @@ impl DfsFactory {
         Ok(Box::new(storage))
     }
     
-    /// Create a networked DFS instance with IPFS compatibility
+    /// Create a networked DFS instance (currently same as local)
     pub async fn create_networked(
         config: &DfsConfig,
     ) -> Result<Box<dyn DistributedFileSystem>, DfsError> {
-        config.validate()?;
-        
-        if config.enable_networking {
-            let networked_dfs = NetworkedDfs::new(config.clone()).await?;
-            Ok(Box::new(networked_dfs))
-        } else {
-            // Fall back to local storage if networking is disabled
-            Self::create(config).await
-        }
+        // For now, networking is disabled, so return local storage
+        log::warn!("Networking is currently disabled, falling back to local storage");
+        Self::create(config).await
     }
 
     /// Create a DFS instance with custom provider
@@ -330,44 +329,26 @@ impl DfsFactory {
         config: &DfsConfig,
         _provider: Box<dyn ContentProvider>,
     ) -> Result<Box<dyn DistributedFileSystem>, DfsError> {
-        // For now, just create a standard networked instance
-        // In the future, this could use the custom provider
-        Self::create_networked(config).await
+        // For now, just create a standard local instance
+        Self::create(config).await
     }
 }
 
 /// DFS service manager for coordinating multiple components
 pub struct DfsService {
     dfs: Box<dyn DistributedFileSystem>,
-    provider: Option<Arc<DhtContentProvider>>,
-    replicator: Option<Arc<ContentReplicator>>,
+    provider: Option<std::sync::Arc<DfsContentProvider>>,
     config: DfsConfig,
 }
 
 impl DfsService {
     /// Create a new DFS service
     pub async fn new(config: DfsConfig) -> Result<Self, DfsError> {
-        let dfs = if config.enable_networking {
-            DfsFactory::create_networked(&config).await?
-        } else {
-            DfsFactory::create(&config).await?
-        };
+        let dfs = DfsFactory::create(&config).await?;
 
-        let provider = if config.enable_networking {
-            let provider = Arc::new(DhtContentProvider::new());
-            provider.start_dht_tasks();
+        let provider = if config.enable_discovery {
+            let provider = std::sync::Arc::new(DfsContentProvider::new());
             Some(provider)
-        } else {
-            None
-        };
-
-        let replicator = if let Some(ref provider) = provider {
-            let replicator = Arc::new(ContentReplicator::new(
-                Arc::clone(provider),
-                config.replication_factor,
-            ));
-            replicator.start_replication_monitoring();
-            Some(replicator)
         } else {
             None
         };
@@ -375,7 +356,6 @@ impl DfsService {
         Ok(Self {
             dfs,
             provider,
-            replicator,
             config,
         })
     }
@@ -386,25 +366,16 @@ impl DfsService {
     }
 
     /// Get the content provider
-    pub fn provider(&self) -> Option<&Arc<DhtContentProvider>> {
+    pub fn provider(&self) -> Option<&std::sync::Arc<DfsContentProvider>> {
         self.provider.as_ref()
     }
 
-    /// Get the replicator
-    pub fn replicator(&self) -> Option<&Arc<ContentReplicator>> {
-        self.replicator.as_ref()
-    }
-
-    /// Store content with automatic replication
+    /// Store content with automatic provider announcement
     pub async fn store_with_replication(&self, data: Vec<u8>) -> Result<ContentId, DfsError> {
         let cid = self.dfs.put(data).await?;
         
         if let Some(provider) = &self.provider {
             provider.provide(&cid).await?;
-        }
-        
-        if let Some(replicator) = &self.replicator {
-            replicator.ensure_replication(&cid).await?;
         }
         
         Ok(cid)
@@ -415,7 +386,7 @@ impl DfsService {
         let dfs_stats = self.dfs.stats().await?;
         
         let provider_stats = if let Some(provider) = &self.provider {
-            Some(provider.local_provider.provider_stats().await)
+            Some(provider.provider_stats().await)
         } else {
             None
         };
@@ -435,8 +406,6 @@ pub struct ComprehensiveStats {
     pub provider: Option<ProviderStats>,
     pub config: DfsConfig,
 }
-
-use std::sync::Arc;
 
 #[cfg(test)]
 mod tests {

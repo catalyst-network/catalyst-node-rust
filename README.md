@@ -38,6 +38,22 @@ A truly decentralized blockchain node implementation that prioritizes accessibil
 - Git
 - IPFS ([install](https://ipfs.io/docs/install/))
 
+#### Linux system packages (required for building)
+
+Some crates use native dependencies (e.g. RocksDB / zstd / OpenSSL) and require a C toolchain + headers.
+
+- **Ubuntu/Debian**:
+  - `sudo apt update && sudo apt install -y build-essential pkg-config libssl-dev clang libclang-dev cmake`
+- **Fedora/RHEL**:
+  - `sudo dnf install -y gcc gcc-c++ make pkgconf-pkg-config openssl-devel clang clang-devel cmake`
+
+#### Working from a network filesystem (GVFS/SMB)
+
+If your repo lives under a GVFS mount (paths containing `/gvfs/`), Cargo’s file locking inside `target/` may fail with **`Operation not supported (os error 95)`**.
+This repo’s `makefile`/`Makefile` automatically sets `CARGO_TARGET_DIR` to a local cache dir in that case.
+
+Additionally, some GVFS/SMB mounts prevent Cargo from updating `Cargo.lock`. In that case, `make build` will build from a **local rsynced mirror** under `~/.cache/catalyst-node/gvfs-workdir/src` to avoid lockfile write failures.
+
 ### Build and Run
 
 ```bash

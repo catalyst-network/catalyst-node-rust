@@ -7,7 +7,7 @@ description = "Command line interface for Catalyst Network"
 license = "MIT"
 
 [[bin]]
-name = "catalyst-node"
+name = "catalyst-cli"
 path = "src/main.rs"
 
 [dependencies]

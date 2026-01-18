@@ -4,6 +4,7 @@ pub mod traits;
 pub mod error;
 pub mod events;
 pub mod runtime;
+pub mod protocol;
 
 // Re-exports - be specific to avoid ambiguity
 pub use types::{

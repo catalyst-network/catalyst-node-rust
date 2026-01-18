@@ -9,6 +9,7 @@ use catalyst_utils::{CatalystResult, logging::LogCategory};
 pub mod config;
 pub mod server;
 pub mod websocket;
+#[path = "reset.rs"]
 pub mod rest;
 pub mod events;
 pub mod filters;
@@ -20,7 +21,8 @@ pub use config::ServiceBusConfig;
 pub use server::ServiceBusServer;
 pub use events::{BlockchainEvent, EventFilter, EventType};
 pub use filters::FilterEngine;
-pub use auth::{AuthConfig, AuthToken};
+pub use config::AuthConfig;
+pub use auth::AuthToken;
 pub use client::ServiceBusClient;
 pub use error::ServiceBusError;
 

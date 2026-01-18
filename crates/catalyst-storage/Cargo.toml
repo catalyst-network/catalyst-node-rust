@@ -10,12 +10,15 @@ repository = "https://github.com/catalyst-network/catalyst-node-rust"
 [dependencies]
 # Core Catalyst dependencies
 catalyst-utils = { path = "../catalyst-utils" }
+blake3 = "1.5"
+hex = "0.4"
 
 # Storage backend
-rocksdb = "0.22"
+rocksdb = { workspace = true }
 
 # Async runtime
 tokio = { version = "1.0", features = ["full"] }
+async-trait = { workspace = true }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -30,14 +33,13 @@ anyhow = "1.0"
 uuid = { version = "1.0", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
-hex = "0.4"
 
 # Concurrency
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
 
 # Metrics and monitoring
-prometheus = "0.13"
+prometheus = { version = "0.13", optional = true }
 
 [dev-dependencies]
 tempfile = "3.0"

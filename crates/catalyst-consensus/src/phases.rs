@@ -1,16 +1,16 @@
 use crate::{
-    types::*, error::ConsensusError, Producer
+    types::*, error::ConsensusError, producer::Producer
 };
 use catalyst_utils::{CatalystResult, Hash};
 use catalyst_utils::logging::{LogCategory, log_info, log_warn, log_error};
-use catalyst_utils::metrics::{increment_counter, observe_histogram, time_operation};
+use catalyst_utils::{increment_counter, observe_histogram, time_operation};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use indexmap::IndexMap;
 
 /// Construction Phase Implementation
 pub struct ConstructionPhase {
-    producer: Producer,
+    pub(crate) producer: Producer,
 }
 
 impl ConstructionPhase {
@@ -43,9 +43,10 @@ impl ConstructionPhase {
         // Sort transactions by hash for deterministic ordering
         let mut sorted_entries = transactions;
         sorted_entries.sort_by_key(|entry| hash_data(entry).unwrap_or_default());
+        let entry_count = sorted_entries.len();
 
         // Create hash tree of transaction signatures
-        let signatures: Vec<_> = sorted_entries.iter().map(|e| e.signature).collect();
+        let signatures: Vec<Vec<u8>> = sorted_entries.iter().map(|e| e.signature.clone()).collect();
         let signatures_hash = self.compute_hash_tree(&signatures)?;
 
         // Calculate total fees
@@ -76,21 +77,21 @@ impl ConstructionPhase {
             timestamp: current_timestamp_ms(),
         };
 
-        observe_histogram!("consensus_transaction_count", sorted_entries.len() as f64);
+        observe_histogram!("consensus_transaction_count", entry_count as f64);
         
         Ok(quantity)
     }
 
-    fn compute_hash_tree(&self, signatures: &[catalyst_crypto::Signature]) -> CatalystResult<Hash> {
-        use blake2::{Blake2b256, Digest};
+    fn compute_hash_tree(&self, signatures: &[Vec<u8>]) -> CatalystResult<Hash> {
+        use blake2::{Blake2b512, Digest};
         
         if signatures.is_empty() {
             return Ok([0u8; 32]);
         }
 
-        let mut hasher = Blake2b256::new();
-        for sig in signatures {
-            hasher.update(&sig.to_bytes());
+        let mut hasher = Blake2b512::new();
+        for sig_bytes in signatures {
+            hasher.update(sig_bytes);
         }
         
         let result = hasher.finalize();
@@ -102,7 +103,7 @@ impl ConstructionPhase {
 
 /// Campaigning Phase Implementation
 pub struct CampaigningPhase {
-    producer: Producer,
+    pub(crate) producer: Producer,
     collected_quantities: HashMap<String, ProducerQuantity>,
 }
 
@@ -177,6 +178,7 @@ impl CampaigningPhase {
         }
 
         // Include self if we have the majority hash
+        let producer_list_len = producer_list.len();
         let mut final_producer_list = producer_list;
         if let Some(our_hash) = self.producer.first_hash {
             if our_hash == majority_hash && !final_producer_list.contains(&self.producer.id) {
@@ -197,18 +199,18 @@ impl CampaigningPhase {
             timestamp: current_timestamp_ms(),
         };
 
-        observe_histogram!("consensus_majority_size", producer_list.len() as f64);
+        observe_histogram!("consensus_majority_size", producer_list_len as f64);
         
         Ok(candidate)
     }
 
     fn hash_producer_list(&self, producer_list: &[String]) -> CatalystResult<Hash> {
-        use blake2::{Blake2b256, Digest};
+        use blake2::{Blake2b512, Digest};
         
         let mut sorted_list = producer_list.to_vec();
         sorted_list.sort();
         
-        let mut hasher = Blake2b256::new();
+        let mut hasher = Blake2b512::new();
         for producer_id in &sorted_list {
             hasher.update(producer_id.as_bytes());
         }
@@ -222,7 +224,7 @@ impl CampaigningPhase {
 
 /// Voting Phase Implementation
 pub struct VotingPhase {
-    producer: Producer,
+    pub(crate) producer: Producer,
     collected_candidates: HashMap<String, ProducerCandidate>,
 }
 
@@ -406,12 +408,12 @@ impl VotingPhase {
     }
 
     fn hash_producer_list(&self, producer_list: &[String]) -> CatalystResult<Hash> {
-        use blake2::{Blake2b256, Digest};
+        use blake2::{Blake2b512, Digest};
         
         let mut sorted_list = producer_list.to_vec();
         sorted_list.sort();
         
-        let mut hasher = Blake2b256::new();
+        let mut hasher = Blake2b512::new();
         for producer_id in &sorted_list {
             hasher.update(producer_id.as_bytes());
         }
@@ -425,7 +427,7 @@ impl VotingPhase {
 
 /// Synchronization Phase Implementation
 pub struct SynchronizationPhase {
-    producer: Producer,
+    pub(crate) producer: Producer,
     collected_votes: HashMap<String, ProducerVote>,
 }
 
@@ -547,8 +549,11 @@ impl SynchronizationPhase {
         }
 
         // Include only producers that appear in at least Cn/2 vote lists
-        let cn = self.producer.producer_list.as_ref()
-            .map(|list| list.len())
+        let cn = self
+            .producer
+            .producer_list
+            .as_ref()
+            .map(|list: &Vec<String>| list.len())
             .unwrap_or(0);
         let threshold = (cn + 1) / 2;  // Cn/2 threshold
         
@@ -568,8 +573,8 @@ impl SynchronizationPhase {
         
         // In a real implementation, this would store to the distributed file system
         // For now, we'll create a content-based address using hash
-        use blake2::{Blake2b256, Digest};
-        let mut hasher = Blake2b256::new();
+        use blake2::{Blake2b512, Digest};
+        let mut hasher = Blake2b512::new();
         hasher.update(&serialized);
         let result = hasher.finalize();
         
@@ -583,12 +588,12 @@ impl SynchronizationPhase {
     }
 
     fn hash_producer_list(&self, producer_list: &[String]) -> CatalystResult<Hash> {
-        use blake2::{Blake2b256, Digest};
+        use blake2::{Blake2b512, Digest};
         
         let mut sorted_list = producer_list.to_vec();
         sorted_list.sort();
         
-        let mut hasher = Blake2b256::new();
+        let mut hasher = Blake2b512::new();
         for producer_id in &sorted_list {
             hasher.update(producer_id.as_bytes());
         }

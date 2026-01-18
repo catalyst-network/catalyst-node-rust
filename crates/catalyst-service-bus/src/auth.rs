@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, time::{SystemTime, UNIX_EPOCH}};
 
 /// JWT claims structure
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     /// Subject (user ID)
     pub sub: String,
@@ -64,7 +64,6 @@ impl AuthManager {
         
         let mut validation = Validation::default();
         validation.validate_exp = true;
-        validation.validate_iat = true;
         
         let api_keys: HashSet<String> = config.api_keys.iter().cloned().collect();
         

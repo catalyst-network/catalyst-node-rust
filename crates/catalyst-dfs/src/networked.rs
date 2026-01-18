@@ -2,12 +2,16 @@
 //! 
 //! Provides a full distributed file system with IPFS compatibility
 
+//! Networked DFS implementation combining local storage with P2P networking
+//! 
+//! Provides a full distributed file system with IPFS compatibility
+
 use crate::{
     ContentId, ContentMetadata, DfsConfig, DfsError, DfsStats, 
     DistributedFileSystem, GcResult, CategorizedStorage, ContentCategory,
-    LocalDfsStorage, DfsSwarm, SwarmConfig, NetworkEvent, ProviderId
+    LocalDfsStorage, DfsSwarm, SwarmConfig, NetworkEvent, ProviderId,
+    Hash, LedgerStateUpdate  // Use local types instead of catalyst_core
 };
-use catalyst_core::{Hash, LedgerStateUpdate};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{Duration, timeout};
@@ -334,9 +338,8 @@ impl CategorizedStorage for NetworkedDfs {
                 // Try to get from network
                 let data = self.get_from_network(cid).await?;
                 
-                // Deserialize as ledger update
-                use catalyst_core::serialization::CatalystDeserialize;
-                LedgerStateUpdate::deserialize(&data)
+                // Deserialize as ledger update using serde_json instead of custom trait
+                serde_json::from_slice(&data)
                     .map_err(|e| DfsError::Serialization(format!("Failed to deserialize ledger update: {}", e)))
             }
             Err(e) => Err(e),
@@ -362,6 +365,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config = DfsConfig {
             storage_dir: temp_dir.path().to_path_buf(),
+            enable_networking: false, // Disable networking for tests
             ..Default::default()
         };
         
@@ -374,6 +378,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config = DfsConfig {
             storage_dir: temp_dir.path().to_path_buf(),
+            enable_networking: false, // Disable networking for tests
             ..Default::default()
         };
         
@@ -391,6 +396,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let config = DfsConfig {
             storage_dir: temp_dir.path().to_path_buf(),
+            enable_networking: false, // Disable networking for tests
             ..Default::default()
         };
         

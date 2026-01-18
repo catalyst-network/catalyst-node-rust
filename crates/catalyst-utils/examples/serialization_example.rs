@@ -27,7 +27,7 @@ fn main() -> CatalystResult<()> {
     
     // Strings and bytes
     let test_string = "Catalyst Network Transaction".to_string();
-    let test_bytes = vec![0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF];
+    let test_bytes: Vec<u8> = vec![0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF];
     
     println!("   Serializing collections:");
     println!("     String '{}' -> {} bytes", test_string, test_string.serialized_size());

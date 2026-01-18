@@ -275,6 +275,11 @@ impl DhtContentProvider {
             }
         });
     }
+
+    /// Get provider statistics - public method
+    pub async fn provider_stats(&self) -> ProviderStats {
+        self.local_provider.provider_stats().await
+    }
 }
 
 #[async_trait::async_trait]
@@ -330,7 +335,9 @@ impl ContentReplicator {
         Self {
             provider,
             target_replication,
-            min_replication: target_replication / 2,
+            // Require a strict majority of the target count before calling it "Adequate".
+            // (e.g. target=3 => min=2, target=4 => min=2)
+            min_replication: (target_replication + 1) / 2,
         }
     }
 

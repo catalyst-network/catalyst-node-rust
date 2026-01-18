@@ -76,7 +76,7 @@ impl SvmRuntime {
         }
     }
 
-    pub async fn execute_program(
+    pub async fn execute_program_bytes(
         &self,
         program: &[u8],
         input: &[u8],
@@ -86,7 +86,7 @@ impl SvmRuntime {
         manager.execute_program(program, input, context).await
     }
 
-    pub async fn validate_program(&self, program: &[u8]) -> Result<(), RuntimeError> {
+    pub async fn validate_program_bytes(&self, program: &[u8]) -> Result<(), RuntimeError> {
         let manager = self.runtime_manager.read().await;
         manager.validate_program(program).await
     }
@@ -114,11 +114,11 @@ impl CatalystRuntime for SvmRuntime {
         _transaction: &Self::Transaction,
     ) -> Result<ExecutionResult, RuntimeError> {
         let input = vec![]; // TODO: Extract input from transaction
-        self.execute_program(program, &input, context.clone()).await
+        self.execute_program_bytes(program, &input, context.clone()).await
     }
 
     async fn validate_program(&self, program: &Self::Program) -> Result<(), RuntimeError> {
-        self.validate_program(program).await
+        self.validate_program_bytes(program).await
     }
 
     async fn estimate_resources(

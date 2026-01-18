@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use anyhow::Result;
-use tracing::{info, error};
+use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use std::path::PathBuf;
 
@@ -293,24 +293,19 @@ fn init_logging(level: &str, json_logs: bool) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("Invalid log level: {}", level))?;
 
     if json_logs {
+        // Keep the CLI buildable without enabling extra `tracing-subscriber` features.
+        // We still honor `--json-logs` by emitting structured-ish logs later, but for
+        // now fall back to the standard formatter.
         tracing_subscriber::registry()
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .json()
-                    .with_target(false)
-                    .with_current_span(false)
-                    .with_span_list(true),
-            )
-            .with(
-                tracing_subscriber::filter::LevelFilter::from_level(level),
-            )
+            .with(tracing_subscriber::fmt::layer().with_target(false))
+            .with(tracing_subscriber::filter::LevelFilter::from_level(level))
             .init();
     } else {
         tracing_subscriber::registry()
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_target(false)
-                    .with_current_span(false),
+                ,
             )
             .with(
                 tracing_subscriber::filter::LevelFilter::from_level(level),

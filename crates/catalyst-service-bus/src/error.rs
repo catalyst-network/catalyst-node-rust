@@ -91,6 +91,7 @@ impl From<tokio_tungstenite::tungstenite::Error> for ServiceBusError {
 impl From<ServiceBusError> for axum::response::Response {
     fn from(err: ServiceBusError) -> Self {
         use axum::{http::StatusCode, response::Json};
+        use axum::response::IntoResponse;
         
         let (status, error_code) = match &err {
             ServiceBusError::InvalidMessage(_) => (StatusCode::BAD_REQUEST, "INVALID_MESSAGE"),

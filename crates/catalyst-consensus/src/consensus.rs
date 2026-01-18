@@ -3,8 +3,8 @@ use crate::{
 };
 use catalyst_utils::{CatalystResult, Hash};
 use catalyst_utils::logging::{LogCategory, log_info, log_warn, log_error};
-use catalyst_utils::metrics::{increment_counter, observe_histogram, time_operation};
-use catalyst_network::{NetworkMessage, MessageEnvelope};
+use catalyst_utils::{increment_counter, observe_histogram, time_operation};
+use catalyst_utils::{NetworkMessage, MessageEnvelope};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -128,16 +128,20 @@ impl CollaborativeConsensus {
         transactions: Vec<TransactionEntry>,
     ) -> CatalystResult<Option<LedgerStateUpdate>> {
         // Phase 1: Construction
-        let construction_result = self.run_construction_phase(manager, transactions).await?;
-        
+        let quantity = self.run_construction_phase(manager, transactions).await?;
+
         // Phase 2: Campaigning
-        let campaigning_result = self.run_campaigning_phase(manager).await?;
-        
+        //
+        // NOTE: Networking collection is still WIP, but to make the node runnable (single
+        // producer) we always feed our own message forward. When networking is wired in,
+        // this should be replaced with the collected set from the network, plus our own.
+        let candidate = self.run_campaigning_phase(manager, vec![quantity.clone()]).await?;
+
         // Phase 3: Voting
-        let voting_result = self.run_voting_phase(manager).await?;
-        
+        let vote = self.run_voting_phase(manager, vec![candidate.clone()]).await?;
+
         // Phase 4: Synchronization
-        let final_result = self.run_synchronization_phase(manager).await?;
+        let final_result = self.run_synchronization_phase(manager, vec![vote.clone()]).await?;
         
         // Return the final ledger state update
         Ok(final_result)
@@ -175,12 +179,10 @@ impl CollaborativeConsensus {
     async fn run_campaigning_phase(
         &self,
         manager: &ProducerManager,
+        collected_quantities: Vec<ProducerQuantity>,
     ) -> CatalystResult<ProducerCandidate> {
         log_info!(LogCategory::Consensus, "Starting campaigning phase");
-        
-        // Collect quantities from previous phase (in practice, we'd use the actual collected data)
-        let collected_quantities = Vec::new(); // TODO: Use actual collected data
-        
+
         let phase_timeout = Duration::from_millis(self.config.campaigning_phase_ms);
         let campaigning_future = manager.execute_campaigning_phase(collected_quantities);
         
@@ -194,9 +196,7 @@ impl CollaborativeConsensus {
         // Broadcast our candidate
         self.broadcast_message(&candidate).await?;
         
-        // Collect candidates from other producers
-        let collection_timeout = Duration::from_millis(self.config.campaigning_phase_ms);
-        let _collected = self.collect_producer_candidates(collection_timeout).await?;
+        // TODO: Collect candidates from other producers via network and merge.
         
         Ok(candidate)
     }
@@ -205,12 +205,10 @@ impl CollaborativeConsensus {
     async fn run_voting_phase(
         &self,
         manager: &ProducerManager,
+        collected_candidates: Vec<ProducerCandidate>,
     ) -> CatalystResult<ProducerVote> {
         log_info!(LogCategory::Consensus, "Starting voting phase");
-        
-        // Collect candidates from previous phase
-        let collected_candidates = Vec::new(); // TODO: Use actual collected data
-        
+
         let phase_timeout = Duration::from_millis(self.config.voting_phase_ms);
         let voting_future = manager.execute_voting_phase(collected_candidates);
         
@@ -224,9 +222,7 @@ impl CollaborativeConsensus {
         // Broadcast our vote
         self.broadcast_message(&vote).await?;
         
-        // Collect votes from other producers
-        let collection_timeout = Duration::from_millis(self.config.voting_phase_ms);
-        let _collected = self.collect_producer_votes(collection_timeout).await?;
+        // TODO: Collect votes from other producers via network and merge.
         
         Ok(vote)
     }
@@ -235,12 +231,10 @@ impl CollaborativeConsensus {
     async fn run_synchronization_phase(
         &self,
         manager: &ProducerManager,
+        collected_votes: Vec<ProducerVote>,
     ) -> CatalystResult<Option<LedgerStateUpdate>> {
         log_info!(LogCategory::Consensus, "Starting synchronization phase");
-        
-        // Collect votes from previous phase
-        let collected_votes = Vec::new(); // TODO: Use actual collected data
-        
+
         let phase_timeout = Duration::from_millis(self.config.synchronization_phase_ms);
         let sync_future = manager.execute_synchronization_phase(collected_votes);
         
@@ -492,9 +486,9 @@ impl ProducerSelection {
 
     /// Create deterministic seed for producer selection
     fn create_selection_seed(cycle_number: CycleNumber, previous_state_hash: Hash) -> u64 {
-        use blake2::{Blake2b256, Digest};
+        use blake2::{Blake2b512, Digest};
         
-        let mut hasher = Blake2b256::new();
+        let mut hasher = Blake2b512::new();
         hasher.update(&cycle_number.to_be_bytes());
         hasher.update(&previous_state_hash);
         
@@ -506,9 +500,9 @@ impl ProducerSelection {
 
     /// Hash a producer ID to a deterministic value
     fn hash_producer_id(producer_id: &str) -> u64 {
-        use blake2::{Blake2b256, Digest};
+        use blake2::{Blake2b512, Digest};
         
-        let mut hasher = Blake2b256::new();
+        let mut hasher = Blake2b512::new();
         hasher.update(producer_id.as_bytes());
         
         let result = hasher.finalize();
@@ -527,7 +521,6 @@ impl ProducerSelection {
 mod tests {
     use super::*;
     use crate::producer::Producer;
-    use tokio_test;
 
     #[tokio::test]
     async fn test_consensus_creation() {

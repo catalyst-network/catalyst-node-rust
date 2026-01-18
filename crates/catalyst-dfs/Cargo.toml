@@ -10,37 +10,21 @@ keywords = ["blockchain", "ipfs", "distributed", "storage", "p2p"]
 categories = ["network-programming", "filesystem", "cryptography"]
 
 [dependencies]
-# Core Catalyst dependencies
-catalyst-core = { path = "../catalyst-core" }
+# Database and storage
+rocksdb = "0.22"
 
-# IPFS and content addressing
-cid = "0.10"
-multihash = "0.19"
+# IPFS and content addressing - with serde support
+cid = { version = "0.10", features = ["serde-codec"] }
+multihash = { version = "0.18", features = ["serde-codec"] }  # Match cid's multihash version
+sha2 = "0.10"
 
-# Networking with libp2p
-libp2p = { version = "0.53", features = [
-    "kad", 
-    "request-response", 
-    "gossipsub", 
-    "identify", 
-    "noise", 
-    "tcp", 
-    "yamux",
-    "async-std"
-] }
-
-# Async runtime
+# Async runtime and utilities
 tokio = { version = "1.0", features = ["full"] }
-tokio-util = { version = "0.7", features = ["codec"] }
-futures = "0.3"
 async-trait = "0.1"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
-# Database and storage
-rocksdb = "0.21"
 
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
@@ -57,24 +41,27 @@ uuid = { version = "1.0", features = ["v4"] }
 tempfile = "3.0"
 tokio-test = "0.4"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
-futures = "0.3"
 
 [features]
-default = ["full"]
-full = ["networking", "storage", "provider"]
-networking = []
+default = ["storage"]
 storage = []
-provider = []
+# Heavy integration tests (IPFS/network/provider flows). Not enabled by default.
+integration-tests = []
+# Networking features disabled for now due to libp2p compatibility issues
+# networking = []
+# provider = []
 
 [[bench]]
 name = "dfs_benchmarks"
 harness = false
 path = "benches/dfs_benchmarks.rs"
 
-[profile.release]
-lto = true
-codegen-units = 1
-panic = "abort"
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+required-features = ["integration-tests"]
 
-[profile.bench]
-debug = true
+[[example]]
+name = "basic_usage"
+path = "examples/basic_usage.rs"
+required-features = ["integration-tests"]

@@ -67,7 +67,7 @@ impl FilterEngine {
             )));
         }
         
-        let subscription = EventSubscription::new(filter);
+        let subscription = EventSubscription::new(filter, connection_id.clone());
         let subscription_id = subscription.id;
         
         // Create broadcast channel for this subscription
@@ -288,7 +288,7 @@ impl FilterEngine {
 }
 
 /// Filter engine statistics
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FilterEngineStats {
     pub total_subscriptions: usize,
     pub total_connections: usize,

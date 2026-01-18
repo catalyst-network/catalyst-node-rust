@@ -1,384 +1,210 @@
 use anyhow::Result;
 use std::sync::Arc;
-use tracing::{info, warn, error};
 use tokio::sync::RwLock;
+use tracing::info;
 
-use catalyst_core::{
-    CatalystModule, NetworkModule, StorageModule, ConsensusModule, 
-    RuntimeModule, ServiceBusModule, DfsModule, NodeId, NodeRole,
-    CatalystResult,
-};
-use catalyst_consensus::CatalystConsensus;
-use catalyst_network::LibP2PNetwork;
-use catalyst_storage::RocksDBStorage;
-use catalyst_runtime_evm::EVMRuntime;
-use catalyst_service_bus::WebSocketServiceBus;
-use catalyst_dfs::IPFSDistributedFileSystem;
-use catalyst_rpc::RPCServer;
+use catalyst_core::{NodeId, NodeRole, ResourceProof, WorkerPass};
+use catalyst_consensus::{CollaborativeConsensus, ConsensusConfig as ConsensusEngineConfig};
+use catalyst_consensus::producer::{Producer, ProducerManager};
 
 use crate::config::NodeConfig;
 
-/// Main Catalyst node implementation
+/// Main Catalyst node implementation.
+///
+/// Note: This crate currently provides a minimal, compile-safe node wrapper.
+/// The full networking/storage/consensus runtime wiring is still under active
+/// development across the workspace crates.
 pub struct CatalystNode {
     /// Node configuration
     config: NodeConfig,
-    
+
     /// Unique node identifier
     node_id: NodeId,
-    
+
     /// Current node role
     role: Arc<RwLock<NodeRole>>,
-    
-    /// Network module for P2P communication
-    network: Arc<LibP2PNetwork>,
-    
-    /// Storage module for persistence
-    storage: Arc<RocksDBStorage>,
-    
-    /// Consensus module
-    consensus: Arc<CatalystConsensus>,
-    
-    /// Runtime modules (can have multiple)
-    runtimes: Vec<Arc<dyn RuntimeModule>>,
-    
-    /// Service bus for Web2 integration
-    service_bus: Arc<WebSocketServiceBus>,
-    
-    /// Distributed file system
-    dfs: Arc<IPFSDistributedFileSystem>,
-    
-    /// RPC server (optional)
-    rpc_server: Option<Arc<RPCServer>>,
+
+    /// Background consensus loop handle
+    consensus_task: Option<tokio::task::JoinHandle<()>>,
+
+    /// Signal to stop background tasks
+    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 impl CatalystNode {
-    /// Create a new Catalyst node
+    /// Create a new Catalyst node.
     pub async fn new(config: NodeConfig) -> Result<Self> {
         info!("Initializing Catalyst node");
-        
-        // Generate or load node ID
-        let node_id = NodeId::new(); // In real implementation, this should be persistent
-        info!("Node ID: {}", node_id);
-        
-        // Determine initial role
+
+        // Generate a node ID (in a full implementation this should be persistent).
+        let node_id: NodeId = generate_node_id();
+        info!("Node ID: {}", hex_encode(&node_id));
+
+        // Determine initial role.
         let role = if config.validator {
-            // TODO: Implement resource proof generation
-            NodeRole::Worker { 
-                worker_pass: catalyst_core::WorkerPass {
+            NodeRole::Worker {
+                worker_pass: WorkerPass {
                     node_id,
-                    issued_at: chrono::Utc::now().timestamp() as u64,
-                    expires_at: chrono::Utc::now().timestamp() as u64 + 86400, // 24 hours
+                    issued_at: current_timestamp(),
+                    expires_at: current_timestamp() + 86400,
                     partition_id: None,
                 },
-                resource_proof: catalyst_core::ResourceProof {
-                    cpu_score: 1000, // Placeholder
+                resource_proof: ResourceProof {
+                    cpu_score: 1000,
                     memory_mb: 4096,
                     storage_gb: 100,
                     bandwidth_mbps: 100,
-                    timestamp: chrono::Utc::now().timestamp() as u64,
-                    signature: vec![], // TODO: Actual signature
-                }
+                    timestamp: current_timestamp(),
+                    signature: vec![],
+                },
             }
         } else {
             NodeRole::User
         };
-        
-        // Initialize storage
-        let storage = Arc::new(RocksDBStorage::new(&config.storage.data_dir).await?);
-        
-        // Initialize network
-        let network = Arc::new(LibP2PNetwork::new(
-            node_id,
-            config.network.clone(),
-        ).await?);
-        
-        // Initialize consensus
-        let consensus = Arc::new(CatalystConsensus::new(
-            node_id,
-            storage.clone() as Arc<dyn StorageModule>,
-            network.clone() as Arc<dyn NetworkModule>,
-        ));
-        
-        // Initialize runtimes
-        let mut runtimes: Vec<Arc<dyn RuntimeModule>> = Vec::new();
-        
-        // Always include EVM runtime
-        let evm_runtime = Arc::new(EVMRuntime::new(storage.clone()).await?);
-        runtimes.push(evm_runtime);
-        
-        // TODO: Add SVM runtime when ready
-        // if config.runtimes.svm_enabled {
-        //     let svm_runtime = Arc::new(SVMRuntime::new(storage.clone()).await?);
-        //     runtimes.push(svm_runtime);
-        // }
-        
-        // Initialize service bus
-        let service_bus = Arc::new(WebSocketServiceBus::new(
-            config.service_bus.clone(),
-        ).await?);
-        
-        // Initialize DFS
-        let dfs = Arc::new(IPFSDistributedFileSystem::new(
-            config.dfs.clone(),
-        ).await?);
-        
-        // Initialize RPC server if enabled
-        let rpc_server = if config.rpc.enabled {
-            Some(Arc::new(RPCServer::new(
-                config.rpc.clone(),
-                storage.clone(),
-                network.clone() as Arc<dyn NetworkModule>,
-                consensus.clone() as Arc<dyn ConsensusModule>,
-                runtimes.clone(),
-            ).await?))
-        } else {
-            None
-        };
-        
+
         Ok(Self {
             config,
             node_id,
             role: Arc::new(RwLock::new(role)),
-            network,
-            storage,
-            consensus,
-            runtimes,
-            service_bus,
-            dfs,
-            rpc_server,
+            consensus_task: None,
+            shutdown_tx: None,
         })
     }
-    
-    /// Start the node
+
+    /// Start the node.
     pub async fn start(&mut self) -> Result<()> {
-        info!("Starting Catalyst node {}", self.node_id);
-        
-        // Start storage module
-        self.storage.initialize().await?;
-        self.storage.start().await?;
-        info!("Storage module started");
-        
-        // Start network module
-        self.network.initialize().await?;
-        self.network.start().await?;
-        info!("Network module started");
-        
-        // Connect to bootstrap peers
-        for peer_addr in &self.config.network.bootstrap_peers {
-            match self.network.connect_peer(peer_addr).await {
-                Ok(peer_id) => {
-                    info!("Connected to bootstrap peer: {} ({})", peer_addr, peer_id);
+        info!("Starting Catalyst node");
+
+        // Ensure local directories exist (data dir, dfs cache, logs dir, etc.)
+        self.config.ensure_data_dir()?;
+
+        // For now, run a minimal single-node consensus loop. This makes `catalyst-cli start`
+        // actually do useful work while network/RPC/mempool wiring is still in progress.
+        //
+        // Next milestones:
+        // - Replace the empty tx list with a mempool feed.
+        // - Use real producer selection (worker pool + seed).
+        // - Broadcast/collect consensus messages over the network layer.
+
+        let producer_id = self.config.node.name.clone();
+        let public_key = self.node_id;
+
+        let engine_config = ConsensusEngineConfig {
+            cycle_duration_ms: (self.config.consensus.cycle_duration_seconds as u64) * 1000,
+            construction_phase_ms: (self.config.consensus.phase_timeouts.construction_timeout as u64) * 1000,
+            campaigning_phase_ms: (self.config.consensus.phase_timeouts.campaigning_timeout as u64) * 1000,
+            voting_phase_ms: (self.config.consensus.phase_timeouts.voting_timeout as u64) * 1000,
+            synchronization_phase_ms: (self.config.consensus.phase_timeouts.synchronization_timeout as u64) * 1000,
+            freeze_window_ms: (self.config.consensus.freeze_time_seconds as u64) * 1000,
+            // Single-node runnable defaults; multi-producer will be wired once networking collection exists.
+            min_producers: 1,
+            confidence_threshold: 0.6,
+        };
+
+        let mut consensus = CollaborativeConsensus::new(engine_config.clone());
+        let producer = Producer::new(producer_id.clone(), public_key, 0);
+        let manager = ProducerManager::new(producer, engine_config);
+        consensus.set_producer_manager(manager);
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        self.shutdown_tx = Some(shutdown_tx);
+
+        let cycle_ms = self.config.consensus.cycle_duration_seconds as u64 * 1000;
+        info!(
+            "Consensus loop enabled (single-producer). cycle={}ms producer_id={}",
+            cycle_ms, producer_id
+        );
+
+        self.consensus_task = Some(tokio::spawn(async move {
+            let mut cycle: u64 = 1;
+            loop {
+                if *shutdown_rx.borrow() {
+                    break;
                 }
-                Err(e) => {
-                    warn!("Failed to connect to bootstrap peer {}: {}", peer_addr, e);
+
+                let selected = vec![producer_id.clone()];
+                let transactions = Vec::new();
+
+                match consensus.start_cycle(cycle, selected, transactions).await {
+                    Ok(Some(update)) => {
+                        info!(
+                            "Cycle {} complete: LSU producers_ok={} voters_ok={} tx_entries={}",
+                            cycle,
+                            update.producer_list.len(),
+                            update.vote_list.len(),
+                            update.partial_update.transaction_entries.len()
+                        );
+                    }
+                    Ok(None) => {
+                        info!("Cycle {} complete: no LSU produced", cycle);
+                    }
+                    Err(e) => {
+                        info!("Cycle {} failed: {}", cycle, e);
+                    }
+                }
+
+                cycle += 1;
+
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(cycle_ms)) => {}
+                    _ = shutdown_rx.changed() => {}
                 }
             }
-        }
-        
-        // Start DFS module
-        self.dfs.initialize().await?;
-        self.dfs.start().await?;
-        info!("DFS module started");
-        
-        // Start runtime modules
-        for runtime in &mut self.runtimes {
-            // Note: This is a simplified version since we can't mutate through Arc
-            // In real implementation, we'd need interior mutability or different design
-            info!("Runtime module {} started", runtime.name());
-        }
-        
-        // Start service bus
-        self.service_bus.initialize().await?;
-        self.service_bus.start().await?;
-        info!("Service bus started");
-        
-        // Start consensus module
-        // self.consensus.initialize().await?;
-        // self.consensus.start().await?;
-        info!("Consensus module started");
-        
-        // Start RPC server if configured
-        if let Some(rpc_server) = &self.rpc_server {
-            rpc_server.start().await?;
-            info!("RPC server started on port {}", self.config.rpc.port);
-        }
-        
-        // Set up storage provision if enabled
-        if self.config.storage.enabled {
-            let capacity_bytes = self.config.storage.capacity_gb * 1024 * 1024 * 1024;
-            self.dfs.provide_storage(capacity_bytes).await?;
-            info!("Providing {} GB of storage to the network", self.config.storage.capacity_gb);
-            
-            // Update role to include storage
-            let mut role = self.role.write().await;
-            *role = NodeRole::Storage {
-                storage_capacity: capacity_bytes,
-                available_space: capacity_bytes, // Initially all available
-            };
-        }
-        
-        // Start background tasks
-        self.start_background_tasks().await?;
-        
-        info!("Catalyst node {} started successfully", self.node_id);
+        }));
+
         Ok(())
     }
-    
-    /// Stop the node gracefully
+
+    /// Stop the node gracefully.
     pub async fn stop(&mut self) -> Result<()> {
-        info!("Stopping Catalyst node {}", self.node_id);
-        
-        // Stop RPC server first
-        if let Some(rpc_server) = &self.rpc_server {
-            rpc_server.stop().await?;
-            info!("RPC server stopped");
+        info!("Stopping Catalyst node");
+
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(true);
         }
-        
-        // Stop consensus
-        // self.consensus.stop().await?;
-        info!("Consensus module stopped");
-        
-        // Stop service bus
-        self.service_bus.stop().await?;
-        info!("Service bus stopped");
-        
-        // Stop runtimes
-        for runtime in &self.runtimes {
-            info!("Runtime module {} stopped", runtime.name());
+
+        if let Some(handle) = self.consensus_task.take() {
+            handle.abort();
         }
-        
-        // Stop DFS
-        self.dfs.stop().await?;
-        info!("DFS module stopped");
-        
-        // Stop network
-        self.network.stop().await?;
-        info!("Network module stopped");
-        
-        // Stop storage last
-        self.storage.stop().await?;
-        info!("Storage module stopped");
-        
-        info!("Catalyst node {} stopped successfully", self.node_id);
+
         Ok(())
-    }
-    
-    /// Start background maintenance tasks
-    async fn start_background_tasks(&self) -> Result<()> {
-        let node_id = self.node_id;
-        let network = self.network.clone();
-        let storage = self.storage.clone();
-        let consensus = self.consensus.clone();
-        
-        // Heartbeat task
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                
-                // Send heartbeat to peers
-                if let Err(e) = Self::send_heartbeat(node_id, &network).await {
-                    warn!("Failed to send heartbeat: {}", e);
-                }
-            }
-        });
-        
-        // Health check task
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                
-                // Perform health checks
-                if let Err(e) = Self::perform_health_checks(&storage, &consensus).await {
-                    error!("Health check failed: {}", e);
-                }
-            }
-        });
-        
-        // Cleanup task
-        let storage_cleanup = self.storage.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600)); // 1 hour
-            loop {
-                interval.tick().await;
-                
-                // Perform cleanup operations
-                if let Err(e) = Self::perform_cleanup(&storage_cleanup).await {
-                    warn!("Cleanup failed: {}", e);
-                }
-            }
-        });
-        
-        Ok(())
-    }
-    
-    async fn send_heartbeat(
-        node_id: NodeId,
-        network: &Arc<LibP2PNetwork>,
-    ) -> CatalystResult<()> {
-        use catalyst_core::{NetworkMessage, PeerMessage};
-        
-        let heartbeat = NetworkMessage::Peer(PeerMessage::Heartbeat {
-            node_id,
-            timestamp: chrono::Utc::now().timestamp() as u64,
-        });
-        
-        network.broadcast(heartbeat).await?;
-        Ok(())
-    }
-    
-    async fn perform_health_checks(
-        storage: &Arc<RocksDBStorage>,
-        consensus: &Arc<CatalystConsensus>,
-    ) -> CatalystResult<()> {
-        // Check storage health
-        if !storage.health_check().await? {
-            error!("Storage health check failed");
-        }
-        
-        // Check consensus health
-        if !consensus.health_check().await? {
-            error!("Consensus health check failed");
-        }
-        
-        Ok(())
-    }
-    
-    async fn perform_cleanup(storage: &Arc<RocksDBStorage>) -> CatalystResult<()> {
-        // Perform storage cleanup
-        // This would include things like:
-        // - Removing old temporary files
-        // - Compacting database
-        // - Cleaning up logs
-        
-        info!("Performed routine cleanup");
-        Ok(())
-    }
-    
-    /// Get current node status
-    pub async fn get_status(&self) -> catalyst_core::NodeStatus {
-        let role = self.role.read().await.clone();
-        let latest_block = self.consensus.latest_block().await.unwrap_or(None);
-        
-        catalyst_core::NodeStatus {
-            node_id: self.node_id,
-            role,
-            sync_status: catalyst_core::SyncStatus::Synced, // Simplified
-            latest_block_height: latest_block.as_ref().map(|b| b.header.height).unwrap_or(0),
-            latest_block_hash: latest_block.as_ref().map(|b| b.header.hash.clone()).unwrap_or_default(),
-            metrics: catalyst_core::ResourceMetrics {
-                cpu_usage: 0.0, // TODO: Implement actual metrics
-                memory_usage: 0,
-                memory_available: 0,
-                disk_usage: 0,
-                disk_available: 0,
-                network_in_bps: 0,
-                network_out_bps: 0,
-                peer_count: 0,
-                uptime_seconds: 0,
-            },
-            active_modules: vec![], // TODO: Implement module status tracking
-        }
     }
 }
+
+fn current_timestamp() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn generate_node_id() -> NodeId {
+    // A lightweight, non-cryptographic node id generator to keep the CLI buildable
+    // without pulling in extra deps (important for GVFS/SMB mounts where Cargo.lock
+    // updates may fail).
+    let mut seed = current_timestamp() as u64;
+    seed ^= std::process::id() as u64;
+    seed ^= (seed << 13) ^ (seed >> 7) ^ (seed << 17);
+
+    let mut out = [0u8; 32];
+    let mut x = seed;
+    for chunk in out.chunks_mut(8) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        chunk.copy_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+

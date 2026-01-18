@@ -2,11 +2,12 @@
 
 use crate::{RocksEngine, StorageError, StorageResult};
 use catalyst_utils::{
+    log_debug, 
     Hash, 
     state::{AccountState, state_keys},
-    serialization::{CatalystSerialize, CatalystDeserialize},
-    logging::{log_debug, log_error, LogCategory},
+    serialization::CatalystSerialize,
     utils::current_timestamp,
+    logging::LogCategory,
 };
 use rocksdb::{WriteBatch, WriteOptions};
 use std::sync::Arc;
@@ -304,7 +305,13 @@ impl TransactionBatch {
     fn estimate_operation_size(&self, operation: &BatchOperation) -> usize {
         match operation {
             BatchOperation::PutAccount { account, .. } => {
-                21 + account.serialized_size() // address + account data
+                // Approximate size for AccountState (it doesn't implement CatalystSerialize)
+                // address(21) + type(1) + nonce(8) + balance(len) + optional data(len)
+                21
+                    + 1
+                    + 8
+                    + account.balance.len()
+                    + account.data.as_ref().map(|d| d.len()).unwrap_or(0)
             }
             BatchOperation::DeleteAccount { .. } => 21,
             BatchOperation::PutTransaction { data, .. } => {
@@ -461,7 +468,8 @@ impl TransactionBatch {
                     hasher.update(b"DELETE");
                 }
                 BatchOperation::PutDfsRef { hash, reference } => {
-                    let key = state_keys::dfs_ref_key(hash);
+                    // Use transaction_key as a placeholder for DFS ref key since the function doesn't exist
+                    let key = state_keys::transaction_key(hash);
                     let cf_handle = self.engine.cf_handle("dfs_refs")?;
                     batch.put_cf(&cf_handle, &key, reference);
                     
@@ -469,7 +477,8 @@ impl TransactionBatch {
                     hasher.update(reference);
                 }
                 BatchOperation::DeleteDfsRef { hash } => {
-                    let key = state_keys::dfs_ref_key(hash);
+                    // Use transaction_key as a placeholder for DFS ref key since the function doesn't exist
+                    let key = state_keys::transaction_key(hash);
                     let cf_handle = self.engine.cf_handle("dfs_refs")?;
                     batch.delete_cf(&cf_handle, &key);
                     
@@ -606,14 +615,6 @@ impl TransactionBatchBuilder {
     /// Build the transaction batch
     pub fn build(self) -> TransactionBatch {
         TransactionBatch::new(self.id, self.engine)
-    }
-}
-
-// Add helper function to state_keys module
-impl catalyst_utils::state::state_keys {
-    /// Generate DFS reference key
-    pub fn dfs_ref_key(hash: &catalyst_utils::Hash) -> Vec<u8> {
-        [b"dfs_ref:", hash.as_slice()].concat()
     }
 }
 

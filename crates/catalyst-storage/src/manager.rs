@@ -1,22 +1,36 @@
 //! Storage manager implementing the StateManager trait and providing high-level storage operations
 
-use crate::{
-    RocksEngine, StorageConfig, StorageError, StorageResult,
-    TransactionBatch, Snapshot, SnapshotManager, MigrationManager,
-};
+use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::RwLock as TokioRwLock;
+use parking_lot::RwLock as ParkingRwLock;
+
 use catalyst_utils::{
+    // Import all macros from root level
+    log_info, log_warn, log_error,
+    increment_counter, set_gauge, observe_histogram, time_operation,
+    
+    // Import types normally
     Hash, CatalystResult, CatalystError,
     state::{StateManager, AccountState, state_keys},
     serialization::{CatalystSerialize, CatalystDeserialize},
-    logging::{log_info, log_warn, log_error, LogCategory},
-    metrics::{increment_counter, set_gauge, observe_histogram, time_operation},
-    async_trait,
+    // Only import types from modules, not macros
+    logging::LogCategory,
+    utils::current_timestamp,
 };
-use std::sync::Arc;
-use std::collections::HashMap;
-use parking_lot::RwLock;
+
+use async_trait::async_trait;
+
+use crate::{
+    RocksEngine, StorageError, StorageResult,
+    config::StorageConfig,
+    transaction::TransactionBatch,
+    snapshot::{Snapshot, SnapshotManager},
+    migration::MigrationManager,
+};
+
 use tokio::sync::Semaphore;
-use rocksdb::{WriteBatch, WriteOptions};
 use sha2::{Sha256, Digest};
 
 /// High-level storage manager for Catalyst Network
@@ -25,8 +39,9 @@ pub struct StorageManager {
     snapshot_manager: SnapshotManager,
     migration_manager: MigrationManager,
     transaction_semaphore: Arc<Semaphore>,
-    pending_transactions: RwLock<HashMap<String, TransactionBatch>>,
-    current_state_root: RwLock<Option<Hash>>,
+    pending_transactions: ParkingRwLock<HashMap<String, TransactionBatch>>,
+    current_state_root: ParkingRwLock<Option<Hash>>,
+    next_tx_id: AtomicU64,
     metrics_enabled: bool,
 }
 
@@ -64,9 +79,10 @@ impl StorageManager {
             snapshot_manager,
             migration_manager,
             transaction_semaphore,
-            pending_transactions: RwLock::new(HashMap::new()),
-            current_state_root: RwLock::new(None),
-            metrics_enabled: true,
+            pending_transactions: ParkingRwLock::new(HashMap::new()),
+            current_state_root: ParkingRwLock::new(None),
+            next_tx_id: AtomicU64::new(1),
+            metrics_enabled: cfg!(feature = "metrics"),
         };
         
         // Initialize state root
@@ -324,8 +340,7 @@ impl StorageManager {
         let mut hasher = Sha256::new();
         
         // Hash all account states
-        let mut account_iter = self.engine.iterator("accounts")?;
-        account_iter.seek_to_first();
+        let account_iter = self.engine.iterator("accounts")?;
         
         for item in account_iter {
             let (key, value) = item
@@ -415,10 +430,10 @@ impl StorageManager {
     /// Backup database to directory
     pub async fn backup_to_directory(&self, backup_dir: &std::path::Path) -> StorageResult<()> {
         std::fs::create_dir_all(backup_dir)
-            .map_err(|e| StorageError::io(e))?;
+            .map_err(StorageError::from)?;
         
         // Create a snapshot first
-        let snapshot_name = format!("backup_{}", chrono::Utc::now().timestamp());
+        let snapshot_name = format!("backup_{}", current_timestamp());
         let snapshot = self.create_snapshot(&snapshot_name).await?;
         
         // Copy snapshot data to backup directory
@@ -435,7 +450,7 @@ impl StorageManager {
         }
         
         // Import snapshot from backup directory
-        let snapshot_name = format!("restore_{}", chrono::Utc::now().timestamp());
+        let snapshot_name = format!("restore_{}", current_timestamp());
         let snapshot = Snapshot::import_from_directory(&snapshot_name, backup_dir).await?;
         
         // Load the snapshot
@@ -472,6 +487,22 @@ impl StateManager for StorageManager {
             .put("accounts", key, &value)
             .map_err(|e| CatalystError::Storage(e.to_string()))
     }
+
+    async fn delete_state(&self, key: &[u8]) -> CatalystResult<bool> {
+        let existed = self
+            .engine
+            .get("accounts", key)
+            .map_err(|e| CatalystError::Storage(e.to_string()))?
+            .is_some();
+
+        if existed {
+            self.engine
+                .delete("accounts", key)
+                .map_err(|e| CatalystError::Storage(e.to_string()))?;
+        }
+
+        Ok(existed)
+    }
     
     async fn commit(&self) -> CatalystResult<Hash> {
         // Flush all changes to disk
@@ -486,71 +517,108 @@ impl StateManager for StorageManager {
             .await
             .map_err(|e| CatalystError::Storage(e.to_string()))
     }
-    
-    async fn get_account(&self, address: &[u8; 21]) -> CatalystResult<Option<AccountState>> {
-        self.get_account(address)
+
+    async fn get_state_root(&self) -> CatalystResult<Hash> {
+        if let Some(root) = *self.current_state_root.read() {
+            return Ok(root);
+        }
+        self.compute_state_root()
             .await
             .map_err(|e| CatalystError::Storage(e.to_string()))
     }
-    
-    async fn set_account(&self, address: &[u8; 21], account: &AccountState) -> CatalystResult<()> {
-        self.set_account(address, account)
-            .await
-            .map_err(|e| CatalystError::Storage(e.to_string()))
+
+    async fn begin_transaction(&self) -> CatalystResult<u64> {
+        let id = self.next_tx_id.fetch_add(1, Ordering::Relaxed);
+        let name = format!("tx_{}", id);
+        let _ = self
+            .create_transaction(name)
+            .map_err(|e| CatalystError::Storage(e.to_string()))?;
+        Ok(id)
     }
-    
-    async fn delete_account(&self, address: &[u8; 21]) -> CatalystResult<()> {
-        let key = state_keys::account_key(address);
-        self.engine
-            .delete("accounts", &key)
-            .map_err(|e| CatalystError::Storage(e.to_string()))
-    }
-    
-    async fn account_exists(&self, address: &[u8; 21]) -> CatalystResult<bool> {
-        let key = state_keys::account_key(address);
-        let exists = self.engine
-            .get("accounts", &key)
-            .map_err(|e| CatalystError::Storage(e.to_string()))?
-            .is_some();
-        Ok(exists)
-    }
-    
-    async fn get_transaction(&self, tx_hash: &Hash) -> CatalystResult<Option<Vec<u8>>> {
-        self.get_transaction(tx_hash)
-            .await
-            .map_err(|e| CatalystError::Storage(e.to_string()))
-    }
-    
-    async fn set_transaction(&self, tx_hash: &Hash, data: Vec<u8>) -> CatalystResult<()> {
-        self.set_transaction(tx_hash, &data)
-            .await
-            .map_err(|e| CatalystError::Storage(e.to_string()))
-    }
-    
-    async fn get_metadata(&self, key: &str) -> CatalystResult<Option<Vec<u8>>> {
-        self.get_metadata(key)
-            .await
-            .map_err(|e| CatalystError::Storage(e.to_string()))
-    }
-    
-    async fn set_metadata(&self, key: &str, value: Vec<u8>) -> CatalystResult<()> {
-        self.set_metadata(key, &value)
-            .await
-            .map_err(|e| CatalystError::Storage(e.to_string()))
-    }
-    
-    async fn create_snapshot(&self) -> CatalystResult<String> {
-        let snapshot_name = format!("auto_{}", chrono::Utc::now().timestamp());
-        self.create_snapshot(&snapshot_name)
+
+    async fn commit_transaction(&self, transaction_id: u64) -> CatalystResult<()> {
+        let name = format!("tx_{}", transaction_id);
+        let _ = self
+            .commit_transaction(&name)
             .await
             .map_err(|e| CatalystError::Storage(e.to_string()))?;
-        Ok(snapshot_name)
+        Ok(())
     }
-    
-    async fn restore_snapshot(&self, snapshot_id: &str) -> CatalystResult<()> {
-        self.load_snapshot(snapshot_id)
+
+    async fn rollback_transaction(&self, transaction_id: u64) -> CatalystResult<()> {
+        let name = format!("tx_{}", transaction_id);
+        self.rollback_transaction(&name)
             .await
-            .map_err(|e| CatalystError::Storage(e.to_string()))
+            .map_err(|e| CatalystError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn contains_key(&self, key: &[u8]) -> CatalystResult<bool> {
+        Ok(self.get_state(key).await?.is_some())
+    }
+
+    async fn get_many<'a>(
+        &self,
+        keys: impl Iterator<Item = &'a [u8]> + Send,
+    ) -> CatalystResult<Vec<Option<Vec<u8>>>> {
+        let mut out = Vec::new();
+        for key in keys {
+            out.push(self.get_state(key).await?);
+        }
+        Ok(out)
+    }
+
+    async fn set_many<'a>(
+        &self,
+        pairs: impl Iterator<Item = (&'a [u8], Vec<u8>)> + Send,
+    ) -> CatalystResult<()> {
+        for (key, value) in pairs {
+            self.set_state(key, value).await?;
+        }
+        Ok(())
+    }
+
+    async fn create_snapshot(&self) -> CatalystResult<Hash> {
+        let snapshot_name = format!("auto_{}", current_timestamp());
+        let snapshot = self
+            .create_snapshot(&snapshot_name)
+            .await
+            .map_err(|e| CatalystError::Storage(e.to_string()))?;
+
+        // Persist mapping snapshot_id -> name in metadata CF: key = b"snap:" + snapshot_id
+        let mut mapping_key = b"snap:".to_vec();
+        mapping_key.extend_from_slice(&snapshot.state_root());
+        self.engine
+            .put("metadata", &mapping_key, snapshot_name.as_bytes())
+            .map_err(|e| CatalystError::Storage(e.to_string()))?;
+
+        Ok(snapshot.state_root())
+    }
+
+    async fn restore_snapshot(&self, snapshot_id: &Hash) -> CatalystResult<()> {
+        let mut mapping_key = b"snap:".to_vec();
+        mapping_key.extend_from_slice(snapshot_id);
+
+        let snapshot_name_bytes = self
+            .engine
+            .get("metadata", &mapping_key)
+            .map_err(|e| CatalystError::Storage(e.to_string()))?
+            .ok_or_else(|| CatalystError::Storage("Snapshot id not found".to_string()))?;
+
+        let snapshot_name = String::from_utf8(snapshot_name_bytes)
+            .map_err(|e| CatalystError::Storage(format!("Invalid snapshot name bytes: {}", e)))?;
+
+        self.load_snapshot(&snapshot_name)
+            .await
+            .map_err(|e| CatalystError::Storage(e.to_string()))?;
+
+        // Refresh cached state root
+        let _ = self
+            .compute_state_root()
+            .await
+            .map_err(|e| CatalystError::Storage(e.to_string()))?;
+
+        Ok(())
     }
 }
 
@@ -590,7 +658,7 @@ mod tests {
         // Verify account exists
         let retrieved_account = manager.get_account(&address).await.unwrap();
         assert!(retrieved_account.is_some());
-        assert_eq!(retrieved_account.unwrap().account_type(), AccountType::NonConfidential);
+        assert_eq!(retrieved_account.unwrap().account_type, AccountType::NonConfidential);
     }
     
     #[tokio::test]
@@ -643,15 +711,14 @@ mod tests {
     #[tokio::test]
     async fn test_state_manager_trait() {
         let manager = create_test_manager().await;
-        let state_manager: &dyn StateManager = &manager;
         
         // Test basic state operations
-        state_manager.set_state(b"key1", b"value1".to_vec()).await.unwrap();
-        let value = state_manager.get_state(b"key1").await.unwrap();
+        manager.set_state(b"key1", b"value1".to_vec()).await.unwrap();
+        let value = manager.get_state(b"key1").await.unwrap();
         assert_eq!(value, Some(b"value1".to_vec()));
         
         // Test commit
-        let hash = state_manager.commit().await.unwrap();
+        let hash = manager.commit().await.unwrap();
         assert_ne!(hash, [0u8; 32]);
     }
     

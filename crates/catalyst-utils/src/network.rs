@@ -21,7 +21,7 @@ pub trait NetworkMessage: Send + Sync + Clone {
     
     /// Get the protocol version this message supports
     fn protocol_version(&self) -> u32 {
-        1 // Default to version 1
+        PROTOCOL_VERSION
     }
     
     /// Validate the message content
@@ -49,6 +49,12 @@ pub trait NetworkMessage: Send + Sync + Clone {
         self.serialize().map(|data| data.len()).unwrap_or(0)
     }
 }
+
+/// Canonical Catalyst protocol version for wire messages.
+///
+/// This version is embedded in `MessageEnvelope.version` and defaults to the same value
+/// for all `NetworkMessage` implementations unless overridden.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Message types used in the Catalyst network protocol
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -231,7 +237,7 @@ impl MessageEnvelope {
         Self {
             id: generate_message_id(),
             message_type,
-            version: 1,
+            version: PROTOCOL_VERSION,
             sender,
             target,
             timestamp: SystemTime::now()

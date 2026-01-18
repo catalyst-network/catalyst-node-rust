@@ -1,15 +1,26 @@
 //! Database migration system for schema evolution
 
-use crate::{RocksEngine, StorageError, StorageResult};
+use std::path::Path;
+
 use catalyst_utils::{
-    logging::{log_info, log_warn, log_error, LogCategory},
+    // Import macros from root level
+    log_info, log_warn, log_error,
+    
+    // Import types normally
+    Hash,
+    // Only import types from modules, not macros
+    logging::LogCategory,
     utils::current_timestamp,
 };
+
+use crate::{StorageError, StorageResult, RocksEngine};
+
 use std::sync::Arc;
-use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
+use async_trait::async_trait;
 
 /// Database migration trait
+#[async_trait]
 pub trait Migration: Send + Sync {
     /// Get migration version
     fn version(&self) -> u32;
@@ -189,7 +200,7 @@ impl MigrationManager {
         
         // Apply each migration
         for migration in pending_migrations {
-            self.apply_migration(migration).await?;
+            self.apply_migration(migration.as_ref()).await?;
         }
         
         log_info!(LogCategory::Storage, "All migrations applied successfully");
@@ -367,6 +378,7 @@ pub struct PendingMigration {
 /// Initial schema migration (v1)
 struct InitialSchemaV1;
 
+#[async_trait]
 impl Migration for InitialSchemaV1 {
     fn version(&self) -> u32 {
         1
@@ -521,6 +533,7 @@ mod tests {
     // Test custom migration
     struct TestMigration;
     
+    #[async_trait]
     impl Migration for TestMigration {
         fn version(&self) -> u32 {
             2

@@ -433,13 +433,17 @@ impl NodeConfig {
     /// Load configuration from file
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: NodeConfig = toml::from_str(&content)?;
+        // Prefer JSON parsing to avoid adding a new direct dependency on `toml` in this crate.
+        // The rest of the workspace can still use TOML where appropriate; this CLI will accept
+        // JSON configs for now.
+        let config: NodeConfig = serde_json::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("Failed to parse config as JSON: {e}"))?;
         Ok(config)
     }
     
     /// Save configuration to file
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let content = toml::to_string_pretty(self)?;
+        let content = serde_json::to_string_pretty(self)?;
         std::fs::write(path, content)?;
         Ok(())
     }

@@ -37,12 +37,13 @@ pub mod utils;
 
 // Re-exports
 pub use config::{StorageConfig, ColumnFamilyConfig};
-pub use engine::{RocksEngine, ColumnFamily};
+pub use engine::RocksEngine;
+pub use rocksdb::ColumnFamily;
 pub use error::{StorageError, StorageResult};
 pub use manager::StorageManager;
 pub use migration::{Migration, MigrationManager};
 pub use snapshot::{Snapshot, SnapshotManager};
-pub use transaction::{StorageTransaction, TransactionBatch};
+pub use transaction::TransactionBatch;
 
 // Metrics integration
 #[cfg(feature = "metrics")]

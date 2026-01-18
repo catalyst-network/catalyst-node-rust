@@ -9,8 +9,9 @@ license = "MIT OR Apache-2.0"
 # Core Catalyst dependencies
 catalyst-network = { path = "../catalyst-network" }
 catalyst-crypto = { path = "../catalyst-crypto" }
-# catalyst-utils = { path = "../catalyst-utils" }  # Add when available
-# catalyst-config = { path = "../catalyst-config" }  # Add when available
+catalyst-core = { path = "../catalyst-core" }
+catalyst-utils = { path = "../catalyst-utils" }
+catalyst-config = { path = "../catalyst-config" }
 
 # Async support
 tokio = { version = "1.0", features = ["full"] }
@@ -32,9 +33,38 @@ tracing = "0.1"
 uuid = { version = "1.0", features = ["v4"] }
 hex = "0.4"
 rand = "0.8"
+blake2 = "0.10"
+indexmap = "2.2"
 
 # Cryptography - only for examples, main code should use catalyst-crypto
 curve25519-dalek = { version = "4.1", features = ["rand_core"] }
 
 [dev-dependencies]
-tokio-test = "0.4"
+catalyst-core = { path = "../catalyst-core" }
+catalyst-utils = { path = "../catalyst-utils" }
+catalyst-crypto = { path = "../catalyst-crypto" }
+catalyst-config = { path = "../catalyst-config" }
+catalyst-storage = { path = "../catalyst-storage" }
+catalyst-network = { path = "../catalyst-network" }
+catalyst-runtime-evm = { path = "../catalyst-runtime-evm" }
+catalyst-dfs = { path = "../catalyst-dfs" }
+catalyst-service-bus = { path = "../catalyst-service-bus" }
+tokio = { version = "1.0", features = ["full"] }
+anyhow = "1.0"
+futures = "0.3"
+bincode = "1.3"
+
+[features]
+default = []
+# Build examples only when explicitly enabled (keeps `cargo test --workspace` green while APIs churn).
+examples = []
+
+[[example]]
+name = "basic_consensus"
+path = "examples/basic_consensus.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "simple_consensus"
+path = "examples/simple_consensus.rs"
+required-features = ["examples"]

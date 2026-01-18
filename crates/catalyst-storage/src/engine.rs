@@ -1,36 +1,20 @@
 //! RocksDB engine implementation for Catalyst storage
 
-use crate::{StorageConfig, StorageError, StorageResult, ColumnFamilyConfig};
-use rocksdb::{DB, Options, ColumnFamily, ColumnFamilyDescriptor, WriteBatch, ReadOptions, WriteOptions, Cache, BlockBasedOptions};
-use std::collections::HashMap;
+use crate::{ColumnFamilyConfig, StorageConfig, StorageError, StorageResult};
+use rocksdb::{
+    BlockBasedOptions, BoundColumnFamily, Cache, ColumnFamilyDescriptor, DBIteratorWithThreadMode,
+    DBWithThreadMode, MultiThreaded, Options, ReadOptions, WriteBatch, WriteOptions,
+};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
 use parking_lot::RwLock;
 
-/// Column family handle wrapper
-pub struct ColumnFamilyHandle {
-    name: String,
-    handle: Arc<ColumnFamily>,
-}
-
-impl ColumnFamilyHandle {
-    pub fn new(name: String, handle: Arc<ColumnFamily>) -> Self {
-        Self { name, handle }
-    }
-    
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-    
-    pub fn handle(&self) -> &ColumnFamily {
-        &self.handle
-    }
-}
+type Db = DBWithThreadMode<MultiThreaded>;
 
 /// RocksDB storage engine
 pub struct RocksEngine {
-    db: Arc<DB>,
-    column_families: RwLock<HashMap<String, ColumnFamilyHandle>>,
+    db: Db,
+    column_families: RwLock<HashSet<String>>,
     config: StorageConfig,
     block_cache: Option<Cache>,
     row_cache: Option<Cache>,
@@ -92,7 +76,8 @@ impl RocksEngine {
         }
         
         if config.performance.compaction_rate_limit > 0 {
-            db_opts.set_ratelimiter(config.performance.compaction_rate_limit as i64);
+            // (rate_bytes_per_sec, refill_period_us, fairness)
+            db_opts.set_ratelimiter(config.performance.compaction_rate_limit as i64, 100 * 1000, 10);
         }
         
         // Setup column family descriptors
@@ -112,21 +97,15 @@ impl RocksEngine {
             ));
         }
         
-        // Open database
-        let db = DB::open_cf_descriptors(&db_opts, &config.data_dir, cf_descriptors)
+        // Open database (MultiThreaded mode so create/drop CF work via &self)
+        let db = Db::open_cf_descriptors(&db_opts, &config.data_dir, cf_descriptors)
             .map_err(|e| StorageError::config(format!("Failed to open database: {}", e)))?;
-        
-        let db = Arc::new(db);
-        
-        // Build column family handles map
-        let mut column_families = HashMap::new();
-        for cf_name in db.cf_names() {
-            if let Some(cf_handle) = db.cf_handle(&cf_name) {
-                column_families.insert(
-                    cf_name.clone(),
-                    ColumnFamilyHandle::new(cf_name, cf_handle),
-                );
-            }
+
+        // Track column family names we expect to exist
+        let mut column_families = HashSet::new();
+        column_families.insert("default".to_string());
+        for name in config.column_families.keys() {
+            column_families.insert(name.clone());
         }
         
         Ok(Self {
@@ -156,7 +135,7 @@ impl RocksEngine {
         block_opts.set_cache_index_and_filter_blocks(config.cache_index_and_filter_blocks);
         
         if config.bloom_filter_enabled {
-            block_opts.set_bloom_filter(config.bloom_filter_bits_per_key, false);
+            block_opts.set_bloom_filter(config.bloom_filter_bits_per_key as f64, false);
         }
         
         if let Some(cache) = block_cache {
@@ -165,41 +144,34 @@ impl RocksEngine {
         
         opts.set_block_based_table_factory(&block_opts);
         
-        // Set TTL if specified
-        if config.ttl_seconds > 0 {
-            opts.set_ttl(config.ttl_seconds);
-        }
+        // TTL options are not supported in rocksdb crate version used by this workspace.
         
         Ok(opts)
     }
     
     /// Get a column family handle by name
-    pub fn cf_handle(&self, name: &str) -> StorageResult<Arc<ColumnFamily>> {
-        let cf_map = self.column_families.read();
-        cf_map
-            .get(name)
-            .map(|cf| cf.handle.clone())
+    pub fn cf_handle(&self, name: &str) -> StorageResult<std::sync::Arc<BoundColumnFamily<'_>>> {
+        self.db
+            .cf_handle(name)
             .ok_or_else(|| StorageError::ColumnFamilyNotFound(name.to_string()))
     }
     
     /// Get all column family names
     pub fn cf_names(&self) -> Vec<String> {
-        let cf_map = self.column_families.read();
-        cf_map.keys().cloned().collect()
+        let cf_set = self.column_families.read();
+        cf_set.iter().cloned().collect()
     }
     
     /// Create a new column family
     pub fn create_cf(&self, name: &str, config: &ColumnFamilyConfig) -> StorageResult<()> {
         let opts = Self::create_cf_options(config, &self.block_cache)?;
-        
-        let cf_handle = self.db.create_cf(name, &opts)
+
+        self.db
+            .create_cf(name, &opts)
             .map_err(|e| StorageError::config(format!("Failed to create column family {}: {}", name, e)))?;
-        
-        let mut cf_map = self.column_families.write();
-        cf_map.insert(
-            name.to_string(),
-            ColumnFamilyHandle::new(name.to_string(), cf_handle),
-        );
+
+        // Track name after successful creation
+        self.column_families.write().insert(name.to_string());
         
         Ok(())
     }
@@ -209,12 +181,12 @@ impl RocksEngine {
         if name == "default" {
             return Err(StorageError::config("Cannot drop default column family".to_string()));
         }
-        
-        self.db.drop_cf(name)
+
+        self.db
+            .drop_cf(name)
             .map_err(|e| StorageError::config(format!("Failed to drop column family {}: {}", name, e)))?;
-        
-        let mut cf_map = self.column_families.write();
-        cf_map.remove(name);
+
+        self.column_families.write().remove(name);
         
         Ok(())
     }
@@ -308,7 +280,7 @@ impl RocksEngine {
     }
     
     /// Create an iterator for a column family
-    pub fn iterator(&self, cf: &str) -> StorageResult<rocksdb::DBIterator> {
+    pub fn iterator(&self, cf: &str) -> StorageResult<DBIteratorWithThreadMode<'_, Db>> {
         let cf_handle = self.cf_handle(cf)?;
         Ok(self.db.iterator_cf(&cf_handle, rocksdb::IteratorMode::Start))
     }
@@ -319,7 +291,7 @@ impl RocksEngine {
         cf: &str,
         read_opts: ReadOptions,
         mode: rocksdb::IteratorMode,
-    ) -> StorageResult<rocksdb::DBIterator> {
+    ) -> StorageResult<DBIteratorWithThreadMode<'_, Db>> {
         let cf_handle = self.cf_handle(cf)?;
         Ok(self.db.iterator_cf_opt(&cf_handle, read_opts, mode))
     }
@@ -411,8 +383,7 @@ impl RocksEngine {
     
     /// Close the database (automatically handled by Drop)
     pub fn close(self) -> StorageResult<()> {
-        // RocksDB will be closed when Arc is dropped
-        drop(self.db);
+        // RocksDB will be closed when self is dropped
         Ok(())
     }
 }

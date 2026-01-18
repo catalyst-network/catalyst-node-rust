@@ -248,30 +248,176 @@ impl CatalystDeserialize for u64 {
     }
 }
 
-impl CatalystSerialize for Vec<u8> {
+impl CatalystSerialize for i64 {
     fn serialize(&self) -> CatalystResult<Vec<u8>> {
-        let mut result = Vec::with_capacity(4 + self.len());
-        self.serialize_to(&mut result)?;
-        Ok(result)
+        Ok(self.to_le_bytes().to_vec())
     }
-    
+
     fn serialize_to<W: Write>(&self, writer: &mut W) -> CatalystResult<()> {
-        utils::serialize_bytes(writer, self)
+        writer
+            .write_all(&self.to_le_bytes())
+            .map_err(|e| CatalystError::Serialization(format!("Failed to write i64: {}", e)))
     }
-    
+
     fn serialized_size(&self) -> usize {
-        4 + self.len() // length prefix + data
+        8
     }
 }
 
-impl CatalystDeserialize for Vec<u8> {
+impl CatalystDeserialize for i64 {
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        if data.len() < 8 {
+            return Err(CatalystError::Serialization("Insufficient data for i64".to_string()));
+        }
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&data[0..8]);
+        Ok(i64::from_le_bytes(bytes))
+    }
+
+    fn deserialize_from<R: Read>(reader: &mut R) -> CatalystResult<Self> {
+        let mut bytes = [0u8; 8];
+        reader
+            .read_exact(&mut bytes)
+            .map_err(|e| CatalystError::Serialization(format!("Failed to read i64: {}", e)))?;
+        Ok(i64::from_le_bytes(bytes))
+    }
+}
+
+impl CatalystSerialize for [u8; 32] {
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        Ok(self.to_vec())
+    }
+
+    fn serialize_to<W: Write>(&self, writer: &mut W) -> CatalystResult<()> {
+        writer
+            .write_all(self)
+            .map_err(|e| CatalystError::Serialization(format!("Failed to write [u8;32]: {}", e)))
+    }
+
+    fn serialized_size(&self) -> usize {
+        32
+    }
+}
+
+impl CatalystDeserialize for [u8; 32] {
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        if data.len() < 32 {
+            return Err(CatalystError::Serialization("Insufficient data for [u8;32]".to_string()));
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&data[0..32]);
+        Ok(out)
+    }
+
+    fn deserialize_from<R: Read>(reader: &mut R) -> CatalystResult<Self> {
+        let mut out = [0u8; 32];
+        reader
+            .read_exact(&mut out)
+            .map_err(|e| CatalystError::Serialization(format!("Failed to read [u8;32]: {}", e)))?;
+        Ok(out)
+    }
+}
+
+impl CatalystSerialize for [u8; 21] {
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        Ok(self.to_vec())
+    }
+
+    fn serialize_to<W: Write>(&self, writer: &mut W) -> CatalystResult<()> {
+        writer
+            .write_all(self)
+            .map_err(|e| CatalystError::Serialization(format!("Failed to write [u8;21]: {}", e)))
+    }
+
+    fn serialized_size(&self) -> usize {
+        21
+    }
+}
+
+impl CatalystDeserialize for [u8; 21] {
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        if data.len() < 21 {
+            return Err(CatalystError::Serialization("Insufficient data for [u8;21]".to_string()));
+        }
+        let mut out = [0u8; 21];
+        out.copy_from_slice(&data[0..21]);
+        Ok(out)
+    }
+
+    fn deserialize_from<R: Read>(reader: &mut R) -> CatalystResult<Self> {
+        let mut out = [0u8; 21];
+        reader
+            .read_exact(&mut out)
+            .map_err(|e| CatalystError::Serialization(format!("Failed to read [u8;21]: {}", e)))?;
+        Ok(out)
+    }
+}
+
+impl CatalystSerialize for [u8; 64] {
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        Ok(self.to_vec())
+    }
+
+    fn serialize_to<W: Write>(&self, writer: &mut W) -> CatalystResult<()> {
+        writer
+            .write_all(self)
+            .map_err(|e| CatalystError::Serialization(format!("Failed to write [u8;64]: {}", e)))
+    }
+
+    fn serialized_size(&self) -> usize {
+        64
+    }
+}
+
+impl CatalystDeserialize for [u8; 64] {
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        if data.len() < 64 {
+            return Err(CatalystError::Serialization("Insufficient data for [u8;64]".to_string()));
+        }
+        let mut out = [0u8; 64];
+        out.copy_from_slice(&data[0..64]);
+        Ok(out)
+    }
+
+    fn deserialize_from<R: Read>(reader: &mut R) -> CatalystResult<Self> {
+        let mut out = [0u8; 64];
+        reader
+            .read_exact(&mut out)
+            .map_err(|e| CatalystError::Serialization(format!("Failed to read [u8;64]: {}", e)))?;
+        Ok(out)
+    }
+}
+
+impl<T> CatalystSerialize for Vec<T>
+where
+    T: CatalystSerialize,
+{
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        let mut result = Vec::with_capacity(4 + self.len() * 4);
+        self.serialize_to(&mut result)?;
+        Ok(result)
+    }
+
+    fn serialize_to<W: Write>(&self, writer: &mut W) -> CatalystResult<()> {
+        utils::serialize_vec(writer, self)
+    }
+
+    fn serialized_size(&self) -> usize {
+        4 + self.iter().map(|x| x.serialized_size()).sum::<usize>()
+    }
+}
+
+impl<T> CatalystDeserialize for Vec<T>
+where
+    T: CatalystDeserialize,
+{
     fn deserialize(data: &[u8]) -> CatalystResult<Self> {
         let mut cursor = Cursor::new(data);
-        utils::deserialize_bytes(&mut cursor)
+        utils::deserialize_vec(&mut cursor)
     }
-    
+
     fn deserialize_from<R: Read>(reader: &mut R) -> CatalystResult<Self> {
-        utils::deserialize_bytes(reader)
+        utils::deserialize_vec(reader)
     }
 }
 

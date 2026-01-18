@@ -8,32 +8,31 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 # Error handling
 thiserror = "1.0"
+# Keep only prometheus for now (simplest metrics solution)
+prometheus = { version = "0.13", optional = true }
 
 # Async support - REQUIRED for your traits
 async-trait = "0.1"
-
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
 # Utilities
 hex = "0.4"
 rand = "0.8"
-
 # Logging (you're using both tracing and custom logging)
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Network and async runtime - make tokio non-optional for examples
-tokio = { version = "1.0", features = ["full"] }
-
+# Network and async runtime - align version with other crates
+tokio = { version = "1.35", features = ["full"] }
 # Additional dependencies used in your code
-libp2p = { version = "0.54", optional = true }
+libp2p = { version = "0.53", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
 
 [features]
 default = []
-full = ["libp2p"]
+full = ["libp2p", "metrics"]
 network = ["libp2p"]
+# Simple metrics feature with just prometheus
+metrics = ["prometheus"]

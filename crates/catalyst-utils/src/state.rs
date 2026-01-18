@@ -1,7 +1,9 @@
 // catalyst-utils/src/state.rs
 
-use crate::error::CatalystResult;
+use crate::error::{CatalystError, CatalystResult};
+use crate::serialization::{CatalystDeserialize, CatalystSerialize};
 use async_trait::async_trait;
+use std::io::{Cursor, Read, Write};
 
 // Define types locally since they're not in the main crate yet
 pub type Hash = [u8; 32];
@@ -155,6 +157,54 @@ pub enum AccountType {
     Contract,
 }
 
+impl CatalystSerialize for AccountType {
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        Ok(vec![match self {
+            AccountType::NonConfidential => 0,
+            AccountType::Confidential => 1,
+            AccountType::Contract => 2,
+        }])
+    }
+
+    fn serialize_to<W: Write>(&self, writer: &mut W) -> CatalystResult<()> {
+        let b = match self {
+            AccountType::NonConfidential => 0u8,
+            AccountType::Confidential => 1u8,
+            AccountType::Contract => 2u8,
+        };
+        writer
+            .write_all(&[b])
+            .map_err(|e| CatalystError::Serialization(format!("Failed to write AccountType: {}", e)))
+    }
+
+    fn serialized_size(&self) -> usize {
+        1
+    }
+}
+
+impl CatalystDeserialize for AccountType {
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        let mut cursor = Cursor::new(data);
+        Self::deserialize_from(&mut cursor)
+    }
+
+    fn deserialize_from<R: Read>(reader: &mut R) -> CatalystResult<Self> {
+        let mut b = [0u8; 1];
+        reader
+            .read_exact(&mut b)
+            .map_err(|e| CatalystError::Serialization(format!("Failed to read AccountType: {}", e)))?;
+        match b[0] {
+            0 => Ok(AccountType::NonConfidential),
+            1 => Ok(AccountType::Confidential),
+            2 => Ok(AccountType::Contract),
+            other => Err(CatalystError::Serialization(format!(
+                "Invalid AccountType tag: {}",
+                other
+            ))),
+        }
+    }
+}
+
 /// Account state structure
 #[derive(Debug, Clone)]
 pub struct AccountState {
@@ -168,6 +218,133 @@ pub struct AccountState {
     pub data: Option<Vec<u8>>,
     /// Nonce for transaction ordering
     pub nonce: u64,
+}
+
+impl CatalystSerialize for AccountState {
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        let mut out = Vec::with_capacity(self.serialized_size());
+        self.serialize_to(&mut out)?;
+        Ok(out)
+    }
+
+    fn serialize_to<W: Write>(&self, writer: &mut W) -> CatalystResult<()> {
+        writer
+            .write_all(&self.address)
+            .map_err(|e| CatalystError::Serialization(format!("Failed to write address: {}", e)))?;
+
+        self.account_type.serialize_to(writer)?;
+
+        let balance_len: u32 = self
+            .balance
+            .len()
+            .try_into()
+            .map_err(|_| CatalystError::Serialization("Balance too large".to_string()))?;
+        writer
+            .write_all(&balance_len.to_le_bytes())
+            .map_err(|e| CatalystError::Serialization(format!("Failed to write balance len: {}", e)))?;
+        writer
+            .write_all(&self.balance)
+            .map_err(|e| CatalystError::Serialization(format!("Failed to write balance: {}", e)))?;
+
+        match &self.data {
+            Some(data) => {
+                writer
+                    .write_all(&[1u8])
+                    .map_err(|e| CatalystError::Serialization(format!("Failed to write data flag: {}", e)))?;
+                let data_len: u32 = data
+                    .len()
+                    .try_into()
+                    .map_err(|_| CatalystError::Serialization("Account data too large".to_string()))?;
+                writer
+                    .write_all(&data_len.to_le_bytes())
+                    .map_err(|e| CatalystError::Serialization(format!("Failed to write data len: {}", e)))?;
+                writer
+                    .write_all(data)
+                    .map_err(|e| CatalystError::Serialization(format!("Failed to write data: {}", e)))?;
+            }
+            None => {
+                writer
+                    .write_all(&[0u8])
+                    .map_err(|e| CatalystError::Serialization(format!("Failed to write data flag: {}", e)))?;
+            }
+        }
+
+        writer
+            .write_all(&self.nonce.to_le_bytes())
+            .map_err(|e| CatalystError::Serialization(format!("Failed to write nonce: {}", e)))?;
+
+        Ok(())
+    }
+
+    fn serialized_size(&self) -> usize {
+        21 // address
+            + 1 // type
+            + 4 // balance len
+            + self.balance.len()
+            + 1 // data present
+            + self.data.as_ref().map(|d| 4 + d.len()).unwrap_or(0)
+            + 8 // nonce
+    }
+}
+
+impl CatalystDeserialize for AccountState {
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        let mut cursor = Cursor::new(data);
+        Self::deserialize_from(&mut cursor)
+    }
+
+    fn deserialize_from<R: Read>(reader: &mut R) -> CatalystResult<Self> {
+        let mut address = [0u8; 21];
+        reader
+            .read_exact(&mut address)
+            .map_err(|e| CatalystError::Serialization(format!("Failed to read address: {}", e)))?;
+
+        let account_type = AccountType::deserialize_from(reader)?;
+
+        let mut len_bytes = [0u8; 4];
+        reader
+            .read_exact(&mut len_bytes)
+            .map_err(|e| CatalystError::Serialization(format!("Failed to read balance len: {}", e)))?;
+        let balance_len = u32::from_le_bytes(len_bytes) as usize;
+
+        let mut balance = vec![0u8; balance_len];
+        reader
+            .read_exact(&mut balance)
+            .map_err(|e| CatalystError::Serialization(format!("Failed to read balance: {}", e)))?;
+
+        let mut flag = [0u8; 1];
+        reader
+            .read_exact(&mut flag)
+            .map_err(|e| CatalystError::Serialization(format!("Failed to read data flag: {}", e)))?;
+
+        let data = if flag[0] == 1 {
+            reader
+                .read_exact(&mut len_bytes)
+                .map_err(|e| CatalystError::Serialization(format!("Failed to read data len: {}", e)))?;
+            let data_len = u32::from_le_bytes(len_bytes) as usize;
+            let mut data = vec![0u8; data_len];
+            reader
+                .read_exact(&mut data)
+                .map_err(|e| CatalystError::Serialization(format!("Failed to read data: {}", e)))?;
+            Some(data)
+        } else {
+            None
+        };
+
+        let mut nonce_bytes = [0u8; 8];
+        reader
+            .read_exact(&mut nonce_bytes)
+            .map_err(|e| CatalystError::Serialization(format!("Failed to read nonce: {}", e)))?;
+        let nonce = u64::from_le_bytes(nonce_bytes);
+
+        Ok(AccountState {
+            address,
+            account_type,
+            balance,
+            data,
+            nonce,
+        })
+    }
 }
 
 impl AccountState {
