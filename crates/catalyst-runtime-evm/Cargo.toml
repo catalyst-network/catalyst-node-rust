@@ -13,18 +13,19 @@ categories = ["cryptography::cryptocurrencies", "development-tools"]
 
 [dependencies]
 # Core Catalyst dependencies
-catalyst-core = { path = "../catalyst-core" }
-catalyst-utils = { path = "../catalyst-utils" }
+catalyst-core = { path = "../catalyst-core", optional = true }
 
-# EVM implementation - use compatible versions
-revm = { version = "3.5", default-features = false, features = ["std", "serde"] }
-revm-primitives = { version = "1.3", default-features = false, features = ["std", "serde"] }
+# Use alloy primitives for Ethereum types
+alloy-primitives = { version = "1.2", features = ["serde"] }
 
 # Cryptographic functions
 sha3 = "0.10"
+sha2 = "0.10"
+keccak-hash = "0.10"
 
 # Async support
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.35", features = ["full"] }
+async-trait = "0.1"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -46,12 +47,9 @@ env_logger = "0.10"
 
 [features]
 default = ["std"]
-std = ["revm/std", "revm-primitives/std"]
-dev-examples = []
-integration-tests = []
+std = []
 
 # Optional features for advanced functionality
-optimism = ["revm/optimism"]
 ethereum-tests = []
 debug-mode = []
 
@@ -59,6 +57,19 @@ debug-mode = []
 cross-runtime = []
 confidential-tx = []
 dfs-integration = []
+catalyst-core-integration = ["catalyst-core"]
+
+[[bench]]
+name = "evm_execution"
+harness = false
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+required-features = ["ethereum-tests"]
+
+# Remove examples for now to avoid missing file errors
+# We'll add them back once the basic structure works
 
 [package.metadata.docs.rs]
 all-features = true
@@ -67,5 +78,19 @@ rustdoc-args = ["--cfg", "docsrs"]
 [[example]]
 name = "deploy_contract"
 path = "examples/deploy_contract.rs"
-test = false
-required-features = ["never-build-examples"] 
+required-features = ["ethereum-tests"]
+
+[[example]]
+name = "simple_transfer"
+path = "examples/simple_transfer.rs"
+required-features = ["ethereum-tests"]
+
+[[example]]
+name = "batch_execution"
+path = "examples/batch_execution.rs"
+required-features = ["ethereum-tests"]
+
+[[example]]
+name = "cross_runtime_call"
+path = "examples/cross_runtime_call.rs"
+required-features = ["ethereum-tests"]

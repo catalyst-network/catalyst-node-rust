@@ -2,34 +2,39 @@
 name = "catalyst-cli"
 version = "0.1.0"
 edition = "2021"
+authors = ["Catalyst Network Team"]
+description = "Command line interface for Catalyst Network"
+license = "MIT"
 
 [[bin]]
-name = "catalyst-node"
+name = "catalyst-cli"
 path = "src/main.rs"
 
 [dependencies]
-# CLI framework
-clap = { version = "4.0", features = ["derive"] }
-tokio = { version = "1.0", features = ["full"] }
-
-# Catalyst crates - only include what we actually use
+# Core Catalyst dependencies
 catalyst-core = { path = "../catalyst-core" }
 catalyst-config = { path = "../catalyst-config" }
-catalyst-node = { path = "../catalyst-node" }
+catalyst-consensus = { path = "../catalyst-consensus" }
+catalyst-network = { path = "../catalyst-network" }
 catalyst-rpc = { path = "../catalyst-rpc" }
+catalyst-storage = { path = "../catalyst-storage" }
+catalyst-crypto = { path = "../catalyst-crypto" }
+catalyst-utils = { path = "../catalyst-utils" }
 
-# HTTP client for status checks
-reqwest = { version = "0.11", features = ["json"] }
-serde_json = "1.0"
-
-# Error handling and serialization
-anyhow = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
-
-# Logging
+# CLI dependencies
+clap = { version = "4.0", features = ["derive"] }
+tokio = { version = "1.0", features = ["full"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+anyhow = "1.0"
+dirs = "5.0"
 
-[dev-dependencies]
-tempfile = "3"
+# Async runtime
+futures = "0.3"
+
+[features]
+default = []
+dev = []

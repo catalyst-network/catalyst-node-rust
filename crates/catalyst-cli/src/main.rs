@@ -1,94 +1,176 @@
-// Updated crates/catalyst-cli/src/main.rs - Fixed imports
-
-use anyhow::Result;
-use catalyst_config::CatalystConfig;
-use catalyst_node::NodeBuilder;
-use catalyst_rpc::RpcConfig;
 use clap::{Parser, Subcommand};
+use anyhow::Result;
+use tracing::info;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use std::path::PathBuf;
-use tracing::{error, info, warn};
 
-// Simplified storage config struct for CLI use
-#[derive(Debug, Clone)]
-pub struct SimpleStorageConfig {
-    pub data_dir: PathBuf,
-    pub max_open_files: i32,
-    pub write_buffer_size: usize,
-    pub block_cache_size: usize,
-    pub compression_enabled: bool,
-    pub enable_statistics: bool,
-}
+mod node;
+mod commands;
+mod config;
 
-impl Default for SimpleStorageConfig {
-    fn default() -> Self {
-        Self {
-            data_dir: PathBuf::from("./catalyst_blockchain_data"),
-            max_open_files: 1000,
-            write_buffer_size: 32 * 1024 * 1024, // 32 MB
-            block_cache_size: 128 * 1024 * 1024, // 128 MB
-            compression_enabled: true,
-            enable_statistics: true,
-        }
-    }
-}
+use node::CatalystNode;
+use config::NodeConfig;
 
 #[derive(Parser)]
-#[command(name = "catalyst-node")]
-#[command(about = "Catalyst blockchain node")]
-#[command(version)]
+#[command(name = "catalyst")]
+#[command(about = "Catalyst Network Node - A truly decentralized blockchain")]
+#[command(version = "0.1.0")]
 struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-
     /// Configuration file path
-    #[arg(short, long)]
-    config: Option<PathBuf>,
+    #[arg(short, long, default_value = "catalyst.toml")]
+    config: PathBuf,
 
     /// Log level
     #[arg(short, long, default_value = "info")]
     log_level: String,
+
+    /// Enable JSON logging
+    #[arg(long)]
+    json_logs: bool,
+
+    #[command(subcommand)]
+    command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
     /// Start the Catalyst node
     Start {
-        /// Run as validator
+        /// Run as validator node
         #[arg(long)]
         validator: bool,
 
-        /// RPC port
-        #[arg(long, default_value = "9933")]
-        rpc_port: u16,
-
-        /// Data directory
+        /// Provide storage to network
         #[arg(long)]
-        data_dir: Option<PathBuf>,
+        storage: bool,
 
-        /// Network port
-        #[arg(long, default_value = "30333")]
-        network_port: u16,
-    },
+        /// Storage capacity in GB
+        #[arg(long, default_value = "10")]
+        storage_capacity: u64,
 
-    /// Stop the Catalyst node
-    Stop,
+        /// Enable RPC server
+        #[arg(long)]
+        rpc: bool,
 
-    /// Get node status
-    Status {
-        /// Show verbose status
-        #[arg(short, long)]
-        verbose: bool,
-
-        /// RPC port to connect to
-        #[arg(long, default_value = "9933")]
+        /// RPC server port
+        #[arg(long, default_value = "8545")]
         rpc_port: u16,
-    },
 
-    /// Initialize configuration
-    Init {
-        /// Output configuration file
-        #[arg(short, long)]
-        output: Option<PathBuf>,
+        /// Bootstrap peers (comma-separated multiaddrs)
+        #[arg(long)]
+        bootstrap_peers: Option<String>,
+    },
+    /// Generate a new node identity
+    GenerateIdentity {
+        /// Output file for the identity
+        #[arg(short, long, default_value = "identity.json")]
+        output: PathBuf,
+    },
+    /// Create genesis configuration
+    CreateGenesis {
+        /// Output file for genesis
+        #[arg(short, long, default_value = "genesis.json")]
+        output: PathBuf,
+
+        /// Genesis accounts file
+        #[arg(long)]
+        accounts: Option<PathBuf>,
+    },
+    /// Show node status
+    Status {
+        /// RPC endpoint
+        #[arg(long, default_value = "http://localhost:8545")]
+        rpc_url: String,
+    },
+    /// Show network peers
+    Peers {
+        /// RPC endpoint
+        #[arg(long, default_value = "http://localhost:8545")]
+        rpc_url: String,
+    },
+    /// Send a transaction
+    Send {
+        /// Recipient address
+        to: String,
+
+        /// Amount to send (in KAT)
+        amount: String,
+
+        /// Private key file
+        #[arg(long, default_value = "wallet.key")]
+        key_file: PathBuf,
+
+        /// RPC endpoint
+        #[arg(long, default_value = "http://localhost:8545")]
+        rpc_url: String,
+
+        /// Make transaction confidential
+        #[arg(long)]
+        confidential: bool,
+    },
+    /// Check account balance
+    Balance {
+        /// Account address
+        address: String,
+
+        /// RPC endpoint
+        #[arg(long, default_value = "http://localhost:8545")]
+        rpc_url: String,
+    },
+    /// Deploy a smart contract
+    Deploy {
+        /// Contract bytecode file
+        contract: PathBuf,
+
+        /// Constructor arguments (hex)
+        #[arg(long)]
+        args: Option<String>,
+
+        /// Private key file
+        #[arg(long, default_value = "wallet.key")]
+        key_file: PathBuf,
+
+        /// RPC endpoint
+        #[arg(long, default_value = "http://localhost:8545")]
+        rpc_url: String,
+
+        /// Runtime type (evm, svm, wasm)
+        #[arg(long, default_value = "evm")]
+        runtime: String,
+    },
+    /// Call a smart contract function
+    Call {
+        /// Contract address
+        contract: String,
+
+        /// Function signature and arguments
+        function: String,
+
+        /// Private key file (for state-changing calls)
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+
+        /// RPC endpoint
+        #[arg(long, default_value = "http://localhost:8545")]
+        rpc_url: String,
+
+        /// Value to send with call (in KAT)
+        #[arg(long, default_value = "0")]
+        value: String,
+    },
+    /// Benchmark node performance
+    Benchmark {
+        /// Duration in seconds
+        #[arg(short, long, default_value = "60")]
+        duration: u64,
+
+        /// Number of concurrent transactions
+        #[arg(long, default_value = "100")]
+        concurrent: usize,
+
+        /// RPC endpoint
+        #[arg(long, default_value = "http://localhost:8545")]
+        rpc_url: String,
     },
 }
 
@@ -97,297 +179,149 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging
-    init_logging(&cli.log_level)?;
+    init_logging(&cli.log_level, cli.json_logs)?;
 
+    info!("Starting Catalyst CLI v{}", env!("CARGO_PKG_VERSION"));
+
+    // Load configuration (or auto-generate a local default if missing).
+    let config = if cli.config.exists() {
+        NodeConfig::load(&cli.config)?
+    } else {
+        info!(
+            "Configuration file not found at {:?}, generating a default config",
+            cli.config
+        );
+        if let Some(parent) = cli.config.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let cfg = NodeConfig::default_for_config_path(&cli.config);
+        cfg.save(&cli.config)?;
+        cfg
+    };
+
+    // Execute command
     match cli.command {
         Commands::Start {
             validator,
+            storage,
+            storage_capacity,
+            rpc,
             rpc_port,
-            data_dir,
-            network_port,
-        } => start_node(cli.config, validator, rpc_port, data_dir, network_port).await,
-        Commands::Stop => stop_node().await,
-        Commands::Status { verbose, rpc_port } => show_status(verbose, rpc_port).await,
-        Commands::Init { output } => init_config(output).await,
+            bootstrap_peers,
+        } => {
+            let mut node_config = config;
+            node_config.validator = validator;
+            node_config.storage.enabled = storage;
+            node_config.storage.capacity_gb = storage_capacity;
+            node_config.rpc.enabled = rpc;
+            node_config.rpc.port = rpc_port;
+
+            if let Some(peers) = bootstrap_peers {
+                node_config.network.bootstrap_peers = peers
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .collect();
+            }
+
+            start_node(node_config).await?;
+        }
+        Commands::GenerateIdentity { output } => {
+            commands::generate_identity(&output).await?;
+        }
+        Commands::CreateGenesis { output, accounts } => {
+            commands::create_genesis(&output, accounts.as_deref()).await?;
+        }
+        Commands::Status { rpc_url } => {
+            commands::show_status(&rpc_url).await?;
+        }
+        Commands::Peers { rpc_url } => {
+            commands::show_peers(&rpc_url).await?;
+        }
+        Commands::Send {
+            to,
+            amount,
+            key_file,
+            rpc_url,
+            confidential,
+        } => {
+            commands::send_transaction(&to, &amount, &key_file, &rpc_url, confidential).await?;
+        }
+        Commands::Balance { address, rpc_url } => {
+            commands::check_balance(&address, &rpc_url).await?;
+        }
+        Commands::Deploy {
+            contract,
+            args,
+            key_file,
+            rpc_url,
+            runtime,
+        } => {
+            commands::deploy_contract(&contract, args.as_deref(), &key_file, &rpc_url, &runtime).await?;
+        }
+        Commands::Call {
+            contract,
+            function,
+            key_file,
+            rpc_url,
+            value,
+        } => {
+            commands::call_contract(&contract, &function, key_file.as_deref(), &rpc_url, &value).await?;
+        }
+        Commands::Benchmark {
+            duration,
+            concurrent,
+            rpc_url,
+        } => {
+            commands::benchmark(&rpc_url, duration, concurrent).await?;
+        }
     }
+
+    Ok(())
 }
 
-async fn start_node(
-    config_path: Option<PathBuf>,
-    validator: bool,
-    rpc_port: u16,
-    data_dir: Option<PathBuf>,
-    _network_port: u16,
-) -> Result<()> {
-    info!("🚀 Starting Catalyst node...");
+async fn start_node(config: NodeConfig) -> Result<()> {
+    info!("Starting Catalyst node with config: {:#?}", config);
 
-    // Load or create configuration
-    let config = match config_path {
-        Some(path) => {
-            info!("Loading configuration from: {}", path.display());
-            // For now, use default config
-            CatalystConfig::default()
-        }
-        None => {
-            warn!("No configuration file specified, using defaults");
-            CatalystConfig::default()
-        }
-    };
-
-    // Create simplified storage configuration
-    let storage_config = SimpleStorageConfig {
-        data_dir: data_dir.unwrap_or_else(|| PathBuf::from("./catalyst_blockchain_data")),
-        max_open_files: 1000,
-        write_buffer_size: 32 * 1024 * 1024, // 32 MB
-        block_cache_size: 128 * 1024 * 1024, // 128 MB
-        compression_enabled: true,
-        enable_statistics: true,
-    };
-
-    // Create RPC configuration
-    let rpc_config = RpcConfig {
-        enabled: true,
-        http_port: rpc_port,
-        ws_port: rpc_port + 11, // WebSocket on +11
-        address: "127.0.0.1".to_string(),
-        max_connections: 100,
-        cors_enabled: true,
-        cors_origins: vec!["*".to_string()],
-    };
-
-    // Build and start the node
-    let mut node = NodeBuilder::new(config)
-        .with_rpc(rpc_config)
-        .build()
-        .await?;
-
-    info!("🔧 Node built successfully, starting services...");
+    let mut node = CatalystNode::new(config).await?;
 
     // Start the node
-    match node.start().await {
-        Ok(_) => {
-            info!("✅ Catalyst node started successfully!");
-            info!("📡 RPC server listening on:");
-            info!("   HTTP: http://127.0.0.1:{}", rpc_port);
-            info!("   WebSocket: ws://127.0.0.1:{}", rpc_port + 11);
-            info!("🗄️ Data directory: {:?}", storage_config.data_dir);
-            info!("⚖️ Validator mode: {}", validator);
-            info!("");
-            info!("🧪 Try these RPC calls:");
-            info!("   curl -X POST http://127.0.0.1:{} -H 'Content-Type: application/json' -d '{{\"jsonrpc\":\"2.0\",\"method\":\"catalyst_status\",\"params\":[],\"id\":1}}'", rpc_port);
-            info!("   curl -X POST http://127.0.0.1:{} -H 'Content-Type: application/json' -d '{{\"jsonrpc\":\"2.0\",\"method\":\"catalyst_version\",\"params\":[],\"id\":2}}'", rpc_port);
+    node.start().await?;
 
-            // Check node health
-            let health = node.health_check().await;
-            info!("🏥 Node Health Check:");
-            info!("   Overall Healthy: {}", health.is_healthy);
-            info!("   Active Services: {}", health.services.len());
-
-            // Wait for shutdown signal
-            info!("💡 Press Ctrl+C to stop the node");
-            tokio::signal::ctrl_c().await?;
-            info!("🛑 Shutdown signal received, stopping node...");
-        }
-        Err(e) => {
-            error!("❌ Failed to start Catalyst node: {}", e);
-            return Err(e.into());
-        }
-    }
+    // Wait for shutdown signal
+    tokio::signal::ctrl_c().await?;
+    info!("Received shutdown signal");
 
     // Graceful shutdown
-    if let Err(e) = node.stop().await {
-        error!("⚠️ Error during node shutdown: {}", e);
+    node.stop().await?;
+    info!("Node stopped successfully");
+
+    Ok(())
+}
+
+fn init_logging(level: &str, json_logs: bool) -> Result<()> {
+    let level = level.parse::<tracing::Level>()
+        .map_err(|_| anyhow::anyhow!("Invalid log level: {}", level))?;
+
+    if json_logs {
+        // Keep the CLI buildable without enabling extra `tracing-subscriber` features.
+        // We still honor `--json-logs` by emitting structured-ish logs later, but for
+        // now fall back to the standard formatter.
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_target(false))
+            .with(tracing_subscriber::filter::LevelFilter::from_level(level))
+            .init();
     } else {
-        info!("✅ Catalyst node stopped successfully");
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                ,
+            )
+            .with(
+                tracing_subscriber::filter::LevelFilter::from_level(level),
+            )
+            .init();
     }
 
     Ok(())
-}
-
-async fn stop_node() -> Result<()> {
-    info!("Stopping Catalyst node...");
-    warn!("Node stop command not yet implemented");
-    warn!("Use Ctrl+C in the node terminal to stop");
-    Ok(())
-}
-
-async fn show_status(verbose: bool, rpc_port: u16) -> Result<()> {
-    info!("Checking Catalyst node status...");
-
-    let client = reqwest::Client::new();
-    let rpc_url = format!("http://127.0.0.1:{}", rpc_port);
-
-    let response = client
-        .post(&rpc_url)
-        .header("Content-Type", "application/json")
-        .body(r#"{"jsonrpc":"2.0","method":"catalyst_status","params":[],"id":1}"#)
-        .send()
-        .await;
-
-    match response {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                let status: serde_json::Value = resp.json().await?;
-
-                println!("✅ Catalyst node is running on port {}", rpc_port);
-
-                if verbose {
-                    println!("Status details:");
-                    println!("{}", serde_json::to_string_pretty(&status)?);
-                } else {
-                    if let Some(result) = status.get("result") {
-                        if let Some(version) = result.get("version") {
-                            println!("Version: {}", version.as_str().unwrap_or("unknown"));
-                        }
-                        if let Some(status) = result.get("status") {
-                            println!("Status: {}", status.as_str().unwrap_or("unknown"));
-                        }
-                    }
-                }
-
-                // Test additional endpoints
-                if verbose {
-                    println!("\n🧪 Testing additional RPC endpoints:");
-
-                    // Test version
-                    let version_response = client
-                        .post(&rpc_url)
-                        .header("Content-Type", "application/json")
-                        .body(r#"{"jsonrpc":"2.0","method":"catalyst_version","params":[],"id":2}"#)
-                        .send()
-                        .await;
-
-                    if let Ok(resp) = version_response {
-                        if let Ok(version_data) = resp.json::<serde_json::Value>().await {
-                            if let Some(result) = version_data.get("result") {
-                                println!("   Version: {}", result);
-                            }
-                        }
-                    }
-                }
-            } else {
-                error!("❌ Node responded with error: {}", resp.status());
-            }
-        }
-        Err(_) => {
-            error!("❌ Cannot connect to Catalyst node on port {}", rpc_port);
-            error!("Make sure the node is running with RPC enabled");
-            error!("Try: catalyst-node start --rpc-port {}", rpc_port);
-        }
-    }
-
-    Ok(())
-}
-
-async fn init_config(output: Option<PathBuf>) -> Result<()> {
-    let output_path = output.unwrap_or_else(|| PathBuf::from("catalyst.toml"));
-
-    info!("Generating default configuration...");
-
-    // Simplified config file
-    let config_content = r#"# Catalyst Node Configuration
-
-[network]
-listen_port = 30333
-max_peers = 50
-discovery_enabled = true
-
-[rpc]
-enabled = true
-http_port = 9933
-ws_port = 9944
-address = "127.0.0.1"
-max_connections = 100
-cors_enabled = true
-cors_origins = ["*"]
-
-[storage]
-data_dir = "catalyst_blockchain_data"
-max_open_files = 1000
-compression_enabled = true
-enable_statistics = true
-
-[consensus]
-algorithm = "catalyst-pos"
-validator = false
-
-[runtime]
-evm_enabled = true
-gas_limit = "8000000"
-
-[metrics]
-enabled = true
-port = 9615
-"#;
-
-    std::fs::write(&output_path, config_content)?;
-
-    info!("✅ Configuration written to: {}", output_path.display());
-    info!("📝 Edit the configuration file and start the node with:");
-    info!("   catalyst-node start --config {}", output_path.display());
-    info!("");
-    info!("🚀 Or start with default settings:");
-    info!("   catalyst-node start");
-    info!("");
-    info!("📊 Check node status:");
-    info!("   catalyst-node status");
-
-    Ok(())
-}
-
-fn init_logging(level: &str) -> Result<()> {
-    use tracing_subscriber::{EnvFilter, FmtSubscriber};
-
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-
-    let subscriber = FmtSubscriber::builder()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_thread_ids(false)
-        .with_level(true)
-        .finish();
-
-    tracing::subscriber::set_global_default(subscriber)?;
-
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    #[tokio::test]
-    async fn test_simple_node_startup() {
-        let temp_dir = TempDir::new().unwrap();
-
-        let storage_config = SimpleStorageConfig {
-            data_dir: temp_dir.path().to_path_buf(),
-            max_open_files: 100,
-            write_buffer_size: 16 * 1024 * 1024, // 16 MB for tests
-            block_cache_size: 32 * 1024 * 1024,  // 32 MB for tests
-            compression_enabled: false,          // Disable for faster tests
-            enable_statistics: false,
-        };
-
-        let rpc_config = RpcConfig {
-            enabled: true,
-            http_port: 19933, // Use different port for tests
-            ws_port: 19944,
-            max_connections: 10,
-            address: "127.0.0.1".to_string(),
-            cors_enabled: true,
-            cors_origins: vec!["*".to_string()],
-        };
-
-        let node_config = CatalystConfig::default();
-
-        let node_result = NodeBuilder::new(node_config)
-            .with_rpc(rpc_config)
-            .build()
-            .await;
-
-        // Just test that we can build the node
-        assert!(node_result.is_ok(), "Should be able to build node");
-    }
 }

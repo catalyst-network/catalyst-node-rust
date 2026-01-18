@@ -272,7 +272,10 @@ async fn handle_client_message(
             })
         }
         Message::Ping(data) => {
-            sender.send(Message::Pong(data)).await?;
+            sender
+                .send(Message::Pong(data))
+                .await
+                .map_err(ServiceBusError::from)?;
             None
         }
         Message::Pong(_) => {
@@ -286,8 +289,11 @@ async fn handle_client_message(
     
     // Send response if any
     if let Some(response_msg) = response {
-        let response_json = serde_json::to_string(&response_msg)?;
-        sender.send(Message::Text(response_json)).await?;
+        let response_json = serde_json::to_string(&response_msg).map_err(ServiceBusError::from)?;
+        sender
+            .send(Message::Text(response_json))
+            .await
+            .map_err(ServiceBusError::from)?;
     }
     
     Ok(())
@@ -416,7 +422,7 @@ async fn handle_subscription_events(
             event,
         };
         
-        let message_json = serde_json::to_string(&ws_message)?;
+        let message_json = serde_json::to_string(&ws_message).map_err(ServiceBusError::from)?;
         
         if let Err(e) = sender.send(Message::Text(message_json)).await {
             catalyst_utils::logging::log_error!(
@@ -425,7 +431,7 @@ async fn handle_subscription_events(
                 connection.id,
                 e
             );
-            return Err(e.into());
+            return Err(ServiceBusError::from(e).into());
         }
     }
     

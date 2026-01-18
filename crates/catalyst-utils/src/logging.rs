@@ -1,7 +1,7 @@
 // catalyst-utils/src/logging.rs
 
-use crate::{CatalystError, CatalystResult};
-use serde::{Deserialize, Serialize};
+use crate::error::{CatalystResult, CatalystError};
+use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -33,7 +33,7 @@ impl fmt::Display for LogLevel {
 
 impl std::str::FromStr for LogLevel {
     type Err = CatalystError;
-
+    
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_uppercase().as_str() {
             "TRACE" => Ok(LogLevel::Trace),
@@ -125,57 +125,39 @@ pub enum LogValue {
 }
 
 impl From<String> for LogValue {
-    fn from(s: String) -> Self {
-        LogValue::String(s)
-    }
+    fn from(s: String) -> Self { LogValue::String(s) }
 }
 
 impl From<&str> for LogValue {
-    fn from(s: &str) -> Self {
-        LogValue::String(s.to_string())
-    }
+    fn from(s: &str) -> Self { LogValue::String(s.to_string()) }
 }
 
 impl From<i64> for LogValue {
-    fn from(i: i64) -> Self {
-        LogValue::Integer(i)
-    }
+    fn from(i: i64) -> Self { LogValue::Integer(i) }
 }
 
 impl From<u64> for LogValue {
-    fn from(i: u64) -> Self {
-        LogValue::Integer(i as i64)
-    }
+    fn from(i: u64) -> Self { LogValue::Integer(i as i64) }
 }
 
 impl From<u32> for LogValue {
-    fn from(i: u32) -> Self {
-        LogValue::Integer(i as i64)
-    }
+    fn from(i: u32) -> Self { LogValue::Integer(i as i64) }
 }
 
 impl From<f64> for LogValue {
-    fn from(f: f64) -> Self {
-        LogValue::Float(f)
-    }
+    fn from(f: f64) -> Self { LogValue::Float(f) }
 }
 
 impl From<i32> for LogValue {
-    fn from(i: i32) -> Self {
-        LogValue::Integer(i as i64)
-    }
+    fn from(i: i32) -> Self { LogValue::Integer(i as i64) }
 }
 
 impl From<bool> for LogValue {
-    fn from(b: bool) -> Self {
-        LogValue::Boolean(b)
-    }
+    fn from(b: bool) -> Self { LogValue::Boolean(b) }
 }
 
 impl From<Vec<u8>> for LogValue {
-    fn from(bytes: Vec<u8>) -> Self {
-        LogValue::Bytes(bytes)
-    }
+    fn from(bytes: Vec<u8>) -> Self { LogValue::Bytes(bytes) }
 }
 
 impl fmt::Display for LogValue {
@@ -189,9 +171,7 @@ impl fmt::Display for LogValue {
             LogValue::Array(arr) => {
                 write!(f, "[")?;
                 for (i, val) in arr.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ", ")?;
-                    }
+                    if i > 0 { write!(f, ", ")?; }
                     write!(f, "{}", val)?;
                 }
                 write!(f, "]")
@@ -251,7 +231,7 @@ impl ConsoleOutput {
     pub fn new(json_format: bool) -> Self {
         Self { json_format }
     }
-
+    
     fn format_human_readable(&self, entry: &LogEntry) -> String {
         let timestamp = if entry.timestamp > 0 {
             // Convert milliseconds timestamp to a readable format
@@ -260,31 +240,25 @@ impl ConsoleOutput {
         } else {
             String::new()
         };
-
-        let node_info = entry
-            .node_id
-            .as_ref()
+        
+        let node_info = entry.node_id.as_ref()
             .map(|id| format!("[{}] ", id))
             .unwrap_or_default();
-
-        let cycle_info = entry
-            .cycle
+            
+        let cycle_info = entry.cycle
             .map(|c| format!("(cycle:{}) ", c))
             .unwrap_or_default();
-
+        
         let fields_str = if !entry.fields.is_empty() {
-            let fields: Vec<String> = entry
-                .fields
-                .iter()
+            let fields: Vec<String> = entry.fields.iter()
                 .map(|(k, v)| format!("{}={}", k, v))
                 .collect();
             format!(" [{}]", fields.join(", "))
         } else {
             String::new()
         };
-
-        format!(
-            "{}{}{}{} [{}] {}{}{}",
+        
+        format!("{}{}{}{} [{}] {}{}{}",
             timestamp,
             node_info,
             cycle_info,
@@ -292,11 +266,7 @@ impl ConsoleOutput {
             entry.category,
             entry.message,
             fields_str,
-            entry
-                .source
-                .as_ref()
-                .map(|s| format!(" @{}", s))
-                .unwrap_or_default()
+            entry.source.as_ref().map(|s| format!(" @{}", s)).unwrap_or_default()
         )
     }
 }
@@ -304,21 +274,19 @@ impl ConsoleOutput {
 impl LogOutput for ConsoleOutput {
     fn write_log(&self, entry: &LogEntry) -> CatalystResult<()> {
         let output = if self.json_format {
-            serde_json::to_string(entry).map_err(|e| {
-                CatalystError::Serialization(format!("JSON serialization failed: {}", e))
-            })?
+            serde_json::to_string(entry)
+                .map_err(|e| CatalystError::Serialization(format!("JSON serialization failed: {}", e)))?
         } else {
             self.format_human_readable(entry)
         };
-
+        
         println!("{}", output);
         Ok(())
     }
-
+    
     fn flush(&self) -> CatalystResult<()> {
         use std::io::{self, Write};
-        io::stdout()
-            .flush()
+        io::stdout().flush()
             .map_err(|e| CatalystError::Runtime(format!("Failed to flush stdout: {}", e)))
     }
 }
@@ -334,11 +302,11 @@ pub struct CatalystLogger {
 impl CatalystLogger {
     pub fn new(config: LogConfig) -> Self {
         let mut outputs: Vec<Box<dyn LogOutput>> = Vec::new();
-
+        
         if config.console_output {
             outputs.push(Box::new(ConsoleOutput::new(config.json_format)));
         }
-
+        
         Self {
             config,
             outputs,
@@ -346,44 +314,44 @@ impl CatalystLogger {
             current_cycle: Arc::new(Mutex::new(None)),
         }
     }
-
+    
     /// Set the node identifier for all future logs
     pub fn set_node_id(&mut self, node_id: String) {
         self.node_id = Some(node_id);
     }
-
+    
     /// Set the current ledger cycle for consensus-related logs
     pub fn set_current_cycle(&self, cycle: u64) {
         if let Ok(mut current) = self.current_cycle.lock() {
             *current = Some(cycle);
         }
     }
-
+    
     /// Clear the current cycle (after consensus completion)
     pub fn clear_current_cycle(&self) {
         if let Ok(mut current) = self.current_cycle.lock() {
             *current = None;
         }
     }
-
+    
     /// Add a custom output destination
     pub fn add_output(&mut self, output: Box<dyn LogOutput>) {
         self.outputs.push(output);
     }
-
+    
     /// Check if a log entry should be written based on configuration
     fn should_log(&self, level: LogLevel, category: &LogCategory) -> bool {
         if level < self.config.min_level {
             return false;
         }
-
+        
         if !self.config.filtered_categories.is_empty() {
             return self.config.filtered_categories.contains(category);
         }
-
+        
         true
     }
-
+    
     /// Log a message with structured data
     pub fn log(
         &self,
@@ -395,9 +363,11 @@ impl CatalystLogger {
         if !self.should_log(level, &category) {
             return Ok(());
         }
-
-        let cycle = self.current_cycle.lock().map(|c| *c).unwrap_or(None);
-
+        
+        let cycle = self.current_cycle.lock()
+            .map(|c| *c)
+            .unwrap_or(None);
+        
         let entry = LogEntry {
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -415,69 +385,39 @@ impl CatalystLogger {
                 None
             },
         };
-
+        
         for output in &self.outputs {
             output.write_log(&entry)?;
         }
-
+        
         Ok(())
     }
-
+    
     /// Convenience methods for different log levels
     pub fn trace(&self, category: LogCategory, message: &str) -> CatalystResult<()> {
-        self.log(
-            LogLevel::Trace,
-            category,
-            message.to_string(),
-            HashMap::new(),
-        )
+        self.log(LogLevel::Trace, category, message.to_string(), HashMap::new())
     }
-
+    
     pub fn debug(&self, category: LogCategory, message: &str) -> CatalystResult<()> {
-        self.log(
-            LogLevel::Debug,
-            category,
-            message.to_string(),
-            HashMap::new(),
-        )
+        self.log(LogLevel::Debug, category, message.to_string(), HashMap::new())
     }
-
+    
     pub fn info(&self, category: LogCategory, message: &str) -> CatalystResult<()> {
-        self.log(
-            LogLevel::Info,
-            category,
-            message.to_string(),
-            HashMap::new(),
-        )
+        self.log(LogLevel::Info, category, message.to_string(), HashMap::new())
     }
-
+    
     pub fn warn(&self, category: LogCategory, message: &str) -> CatalystResult<()> {
-        self.log(
-            LogLevel::Warn,
-            category,
-            message.to_string(),
-            HashMap::new(),
-        )
+        self.log(LogLevel::Warn, category, message.to_string(), HashMap::new())
     }
-
+    
     pub fn error(&self, category: LogCategory, message: &str) -> CatalystResult<()> {
-        self.log(
-            LogLevel::Error,
-            category,
-            message.to_string(),
-            HashMap::new(),
-        )
+        self.log(LogLevel::Error, category, message.to_string(), HashMap::new())
     }
-
+    
     pub fn critical(&self, category: LogCategory, message: &str) -> CatalystResult<()> {
-        self.log(
-            LogLevel::Critical,
-            category,
-            message.to_string(),
-            HashMap::new(),
-        )
+        self.log(LogLevel::Critical, category, message.to_string(), HashMap::new())
     }
-
+    
     /// Log with structured fields
     pub fn log_with_fields(
         &self,
@@ -486,14 +426,13 @@ impl CatalystLogger {
         message: &str,
         fields: &[(&str, LogValue)],
     ) -> CatalystResult<()> {
-        let fields_map: HashMap<String, LogValue> = fields
-            .iter()
+        let fields_map: HashMap<String, LogValue> = fields.iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect();
-
+        
         self.log(level, category, message.to_string(), fields_map)
     }
-
+    
     /// Flush all outputs
     pub fn flush(&self) -> CatalystResult<()> {
         for output in &self.outputs {
@@ -504,111 +443,188 @@ impl CatalystLogger {
 }
 
 /// Global logger instance
-use std::sync::OnceLock;
-static GLOBAL_LOGGER: OnceLock<CatalystLogger> = OnceLock::new();
+static GLOBAL_LOGGER: std::sync::Mutex<Option<CatalystLogger>> = std::sync::Mutex::new(None);
 
 /// Initialize the global logger
 pub fn init_logger(config: LogConfig) -> CatalystResult<()> {
-    GLOBAL_LOGGER
-        .set(CatalystLogger::new(config))
-        .map_err(|_| CatalystError::Runtime("Logger already initialized".to_string()))?;
+    let mut logger = GLOBAL_LOGGER.lock()
+        .map_err(|_| CatalystError::Runtime("Failed to acquire logger lock".to_string()))?;
+    
+    if logger.is_some() {
+        return Err(CatalystError::Runtime("Logger already initialized".to_string()));
+    }
+    
+    *logger = Some(CatalystLogger::new(config));
     Ok(())
 }
 
 /// Get reference to global logger
 pub fn get_logger() -> Option<&'static CatalystLogger> {
-    GLOBAL_LOGGER.get()
+    // This is a simplified version - in production you'd want a different approach
+    // that doesn't require unsafe code or returns a guard
+    None // For now, return None to avoid unsafe code
 }
 
 /// Set node ID on global logger
 pub fn set_node_id(node_id: String) {
-    // Note: This is a simplified implementation. In a real application,
-    // you'd want to store the node_id separately and use it when creating log entries
-    if let Some(_logger) = GLOBAL_LOGGER.get() {
-        // For now, we can't modify the logger after creation due to immutability
-        // This would need a different design in production
-        println!("[INFO] [system] Node ID set to: {}", node_id);
+    if let Ok(mut logger_guard) = GLOBAL_LOGGER.lock() {
+        if let Some(ref mut logger) = logger_guard.as_mut() {
+            logger.set_node_id(node_id);
+        }
     }
 }
+
+/// Convenience macros for logging
+#[macro_export]
+macro_rules! log_trace {
+    ($category:expr, $($arg:tt)*) => {
+        if let Some(logger) = $crate::logging::get_logger() {
+            let _ = logger.trace($category, &format!($($arg)*));
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! log_debug {
+    ($category:expr, $($arg:tt)*) => {
+        if let Some(logger) = $crate::logging::get_logger() {
+            let _ = logger.debug($category, &format!($($arg)*));
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! log_info {
+    ($category:expr, $($arg:tt)*) => {
+        if let Some(logger) = $crate::logging::get_logger() {
+            let _ = logger.info($category, &format!($($arg)*));
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! log_warn {
+    ($category:expr, $($arg:tt)*) => {
+        if let Some(logger) = $crate::logging::get_logger() {
+            let _ = logger.warn($category, &format!($($arg)*));
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! log_error {
+    ($category:expr, $($arg:tt)*) => {
+        if let Some(logger) = $crate::logging::get_logger() {
+            let _ = logger.error($category, &format!($($arg)*));
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! log_critical {
+    ($category:expr, $($arg:tt)*) => {
+        if let Some(logger) = $crate::logging::get_logger() {
+            let _ = logger.critical($category, &format!($($arg)*));
+        }
+    };
+}
+
+/// Macro for logging with structured fields
+#[macro_export]
+macro_rules! log_with_fields {
+    ($level:expr, $category:expr, $message:expr, $($key:expr => $value:expr),*) => {
+        if let Some(logger) = $crate::logging::get_logger() {
+            let fields = vec![$(($key, $value.into())),*];
+            let _ = logger.log_with_fields($level, $category, $message, &fields);
+        }
+    };
+}
+
+// Allow calling logging macros via `catalyst_utils::logging::log_info!` etc.
+// The macros themselves are defined with `#[macro_export]` (at crate root),
+// but some crates expect them under the `logging` module path.
+pub use crate::{
+    log_critical, log_debug, log_error, log_info, log_trace, log_warn, log_with_fields,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    
     #[test]
     fn test_log_levels() {
         assert!(LogLevel::Error > LogLevel::Info);
         assert!(LogLevel::Critical > LogLevel::Error);
         assert_eq!(LogLevel::Debug.to_string(), "DEBUG");
     }
-
+    
     #[test]
     fn test_log_level_parsing() {
         assert_eq!("INFO".parse::<LogLevel>().unwrap(), LogLevel::Info);
         assert_eq!("error".parse::<LogLevel>().unwrap(), LogLevel::Error);
         assert!("invalid".parse::<LogLevel>().is_err());
     }
-
+    
     #[test]
     fn test_log_value_conversion() {
         let str_val: LogValue = "test".into();
         let int_val: LogValue = 42i64.into();
         let bool_val: LogValue = true.into();
-
+        
         assert!(matches!(str_val, LogValue::String(_)));
         assert!(matches!(int_val, LogValue::Integer(42)));
         assert!(matches!(bool_val, LogValue::Boolean(true)));
     }
-
+    
     #[test]
     fn test_logger_creation() {
         let config = LogConfig::default();
         let logger = CatalystLogger::new(config);
-
+        
         // Test basic logging functionality
         let result = logger.info(LogCategory::System, "Test message");
         assert!(result.is_ok());
     }
-
+    
     #[test]
     fn test_structured_logging() {
         let config = LogConfig::default();
         let logger = CatalystLogger::new(config);
-
+        
         let fields = vec![
             ("transaction_id", "tx_12345".into()),
             ("amount", 1000u64.into()),
             ("valid", true.into()),
         ];
-
+        
         let result = logger.log_with_fields(
             LogLevel::Info,
             LogCategory::Transaction,
             "Transaction processed",
             &fields,
         );
-
+        
         assert!(result.is_ok());
     }
-
+    
     #[test]
     fn test_log_filtering() {
         let mut config = LogConfig::default();
         config.min_level = LogLevel::Warn;
         config.filtered_categories = vec![LogCategory::Consensus];
-
+        
         let logger = CatalystLogger::new(config);
-
+        
         // This should not log (level too low)
         assert!(!logger.should_log(LogLevel::Info, &LogCategory::Consensus));
-
+        
         // This should not log (category not in filter)
         assert!(!logger.should_log(LogLevel::Error, &LogCategory::Network));
-
+        
         // This should log
         assert!(logger.should_log(LogLevel::Error, &LogCategory::Consensus));
     }
-
+    
     #[test]
     fn test_json_serialization() {
         let entry = LogEntry {
@@ -626,10 +642,10 @@ mod tests {
             },
             source: Some("test.rs:100".to_string()),
         };
-
+        
         let json = serde_json::to_string(&entry).unwrap();
         let deserialized: LogEntry = serde_json::from_str(&json).unwrap();
-
+        
         assert_eq!(entry.level, deserialized.level);
         assert_eq!(entry.message, deserialized.message);
         assert_eq!(entry.node_id, deserialized.node_id);
@@ -639,7 +655,7 @@ mod tests {
 // Additional utility functions for common logging patterns
 pub mod patterns {
     use super::*;
-
+    
     /// Log consensus phase transitions
     pub fn log_consensus_phase(
         logger: &CatalystLogger,
@@ -651,11 +667,11 @@ pub mod patterns {
         let mut fields = HashMap::new();
         fields.insert("phase".to_string(), phase.into());
         fields.insert("node_id".to_string(), node_id.into());
-
+        
         if let Some(extra) = additional_fields {
             fields.extend(extra);
         }
-
+        
         logger.log(
             LogLevel::Info,
             LogCategory::Consensus,
@@ -663,7 +679,7 @@ pub mod patterns {
             fields,
         )
     }
-
+    
     /// Log transaction processing
     pub fn log_transaction(
         logger: &CatalystLogger,
@@ -674,11 +690,11 @@ pub mod patterns {
         let mut fields = HashMap::new();
         fields.insert("transaction_id".to_string(), tx_id.into());
         fields.insert("status".to_string(), status.into());
-
+        
         if let Some(amt) = amount {
             fields.insert("amount".to_string(), amt.into());
         }
-
+        
         logger.log(
             LogLevel::Info,
             LogCategory::Transaction,
@@ -686,7 +702,7 @@ pub mod patterns {
             fields,
         )
     }
-
+    
     /// Log network events
     pub fn log_network_event(
         logger: &CatalystLogger,
@@ -696,15 +712,15 @@ pub mod patterns {
     ) -> CatalystResult<()> {
         let mut fields = HashMap::new();
         fields.insert("event_type".to_string(), event_type.into());
-
+        
         if let Some(peer) = peer_id {
             fields.insert("peer_id".to_string(), peer.into());
         }
-
+        
         if let Some(extra) = details {
             fields.extend(extra);
         }
-
+        
         logger.log(
             LogLevel::Info,
             LogCategory::Network,

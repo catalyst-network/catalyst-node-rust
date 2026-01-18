@@ -118,7 +118,6 @@ pub enum ConnectionState {
 }
 
 /// Internal client commands
-#[derive(Debug)]
 enum ClientCommand {
     Subscribe {
         filter: EventFilter,
@@ -368,10 +367,12 @@ impl ServiceBusClient {
             ServiceBusError::NetworkError(format!("Failed to build request: {}", e))
         })?;
         
-        timeout(config.connect_timeout, connect_async(request))
-            .await
-            .map_err(|_| ServiceBusError::NetworkError("Connection timeout".to_string()))?
-            .map_err(|e| ServiceBusError::NetworkError(format!("WebSocket connection failed: {}", e)))
+        Ok(
+            timeout(config.connect_timeout, connect_async(request))
+                .await
+                .map_err(|_| ServiceBusError::NetworkError("Connection timeout".to_string()))?
+                .map_err(|e| ServiceBusError::NetworkError(format!("WebSocket connection failed: {}", e)))?,
+        )
     }
     
     /// Handle an active WebSocket connection
@@ -537,8 +538,11 @@ impl ServiceBusClient {
             replay: Some(false),
         };
         
-        let json = serde_json::to_string(&subscribe_msg)?;
-        ws_sender.send(Message::Text(json)).await?;
+        let json = serde_json::to_string(&subscribe_msg).map_err(ServiceBusError::from)?;
+        ws_sender
+            .send(Message::Text(json))
+            .await
+            .map_err(ServiceBusError::from)?;
         
         // For simplicity, generate a client-side subscription ID
         // In a full implementation, you'd wait for the server response
@@ -556,8 +560,11 @@ impl ServiceBusClient {
     ) -> CatalystResult<()> {
         let unsubscribe_msg = WsMessage::Unsubscribe { subscription_id };
         
-        let json = serde_json::to_string(&unsubscribe_msg)?;
-        ws_sender.send(Message::Text(json)).await?;
+        let json = serde_json::to_string(&unsubscribe_msg).map_err(ServiceBusError::from)?;
+        ws_sender
+            .send(Message::Text(json))
+            .await
+            .map_err(ServiceBusError::from)?;
         
         subscriptions.write().await.remove(&subscription_id);
         
@@ -573,8 +580,11 @@ impl ServiceBusClient {
     ) -> CatalystResult<Vec<BlockchainEvent>> {
         let history_msg = WsMessage::GetHistory { filter, limit };
         
-        let json = serde_json::to_string(&history_msg)?;
-        ws_sender.send(Message::Text(json)).await?;
+        let json = serde_json::to_string(&history_msg).map_err(ServiceBusError::from)?;
+        ws_sender
+            .send(Message::Text(json))
+            .await
+            .map_err(ServiceBusError::from)?;
         
         // For simplicity, return empty vector
         // In a full implementation, you'd wait for the server response

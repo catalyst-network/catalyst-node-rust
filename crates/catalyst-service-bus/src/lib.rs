@@ -1,111 +1,74 @@
-//! Minimal Catalyst Service Bus implementation
-//! This is a placeholder implementation to get the build working
+//! # Catalyst Service Bus
+//!
+//! Web2 integration layer that bridges blockchain events to traditional applications
+//! through WebSocket connections and REST APIs. Designed to make blockchain accessible
+//! to developers without blockchain expertise.
 
-use catalyst_utils::CatalystResult;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use thiserror::Error;
+use catalyst_utils::{CatalystResult, logging::LogCategory};
 
-#[derive(Error, Debug)]
-pub enum ServiceBusError {
-    #[error("Service bus error: {0}")]
-    Generic(String),
+pub mod config;
+pub mod server;
+pub mod websocket;
+#[path = "reset.rs"]
+pub mod rest;
+pub mod events;
+pub mod filters;
+pub mod auth;
+pub mod client;
+pub mod error;
 
-    #[error("Connection error: {0}")]
-    Connection(String),
+pub use config::ServiceBusConfig;
+pub use server::ServiceBusServer;
+pub use events::{BlockchainEvent, EventFilter, EventType};
+pub use filters::FilterEngine;
+pub use config::AuthConfig;
+pub use auth::AuthToken;
+pub use client::ServiceBusClient;
+pub use error::ServiceBusError;
 
-    #[error("Invalid message: {0}")]
-    InvalidMessage(String),
+// Re-export commonly used types
+pub use serde::{Deserialize, Serialize};
+pub use uuid::Uuid;
+
+/// Initialize the service bus with the provided configuration
+pub async fn init_service_bus(config: ServiceBusConfig) -> CatalystResult<ServiceBusServer> {
+    catalyst_utils::logging::log_info!(
+        LogCategory::ServiceBus,
+        "Initializing Catalyst Service Bus on {}:{}",
+        config.host,
+        config.port
+    );
+
+    let server = ServiceBusServer::new(config).await?;
+    
+    catalyst_utils::logging::log_info!(
+        LogCategory::ServiceBus,
+        "Service Bus initialized successfully"
+    );
+
+    Ok(server)
 }
 
-impl From<ServiceBusError> for catalyst_utils::CatalystError {
-    fn from(err: ServiceBusError) -> Self {
-        catalyst_utils::CatalystError::Generic(err.to_string())
+/// Service Bus API version
+pub const API_VERSION: &str = "v1";
+
+/// Default WebSocket path
+pub const WS_PATH: &str = "/ws";
+
+/// Default REST API path prefix
+pub const API_PATH: &str = "/api/v1";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use catalyst_utils::utils;
+
+    #[tokio::test]
+    async fn test_service_bus_initialization() {
+        let config = ServiceBusConfig::default();
+        let result = init_service_bus(config).await;
+        
+        // Should initialize without errors
+        assert!(result.is_ok());
     }
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServiceBusConfig {
-    pub enabled: bool,
-    pub port: u16,
-    pub max_connections: u32,
-}
-
-impl Default for ServiceBusConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            port: 8080,
-            max_connections: 100,
-        }
-    }
-}
-
-/// Minimal service bus
-pub struct ServiceBus {
-    config: ServiceBusConfig,
-}
-
-impl ServiceBus {
-    pub fn new(config: ServiceBusConfig) -> Self {
-        Self { config }
-    }
-
-    pub async fn start(&self) -> Result<(), ServiceBusError> {
-        // Placeholder - no actual service
-        Ok(())
-    }
-
-    pub async fn stop(&self) -> Result<(), ServiceBusError> {
-        Ok(())
-    }
-
-    pub async fn send_event(&self, _event: &str) -> Result<(), ServiceBusError> {
-        Ok(())
-    }
-}
-
-// Placeholder event types
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Event {
-    pub id: String,
-    pub event_type: String,
-    pub data: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventFilter {
-    pub event_types: Vec<String>,
-    pub addresses: Vec<String>,
-}
-
-impl EventFilter {
-    pub fn new() -> Self {
-        Self {
-            event_types: Vec::new(),
-            addresses: Vec::new(),
-        }
-    }
-}
-
-impl Default for EventFilter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// Auth placeholder
-#[derive(Debug, Clone)]
-pub struct AuthToken {
-    pub token: String,
-}
-
-impl AuthToken {
-    pub fn new(token: String) -> Self {
-        Self { token }
-    }
-}
-
-// Export everything
-pub use ServiceBus as CatalystServiceBus;
-pub use ServiceBusError as CatalystServiceBusError;

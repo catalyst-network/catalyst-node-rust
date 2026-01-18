@@ -1,31 +1,31 @@
-use crate::error::{ConfigError, ConfigResult};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use crate::error::{ConfigError, ConfigResult};
 
 /// Logging configuration for the Catalyst Network
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
     /// Global logging level
     pub level: LogLevel,
-
+    
     /// Logging format
     pub format: LogFormat,
-
+    
     /// Output destinations
     pub outputs: Vec<LogOutput>,
-
+    
     /// Category-specific logging levels
     pub category_levels: Vec<CategoryLevel>,
-
+    
     /// Structured logging configuration
     pub structured: StructuredLoggingConfig,
-
+    
     /// Log rotation configuration
     pub rotation: LogRotationConfig,
-
+    
     /// Performance settings
     pub performance: LogPerformanceConfig,
-
+    
     /// Filtering configuration
     pub filtering: LogFilteringConfig,
 }
@@ -57,16 +57,16 @@ pub enum LogFormat {
 pub struct LogOutput {
     /// Output type
     pub output_type: OutputType,
-
+    
     /// Minimum level for this output
     pub min_level: LogLevel,
-
+    
     /// Format override for this output
     pub format_override: Option<LogFormat>,
-
+    
     /// Buffer size for this output
     pub buffer_size: Option<usize>,
-
+    
     /// Flush interval in milliseconds
     pub flush_interval_ms: Option<u64>,
 }
@@ -78,15 +78,9 @@ pub enum OutputType {
     /// File output
     File { path: PathBuf, append: bool },
     /// Syslog output
-    Syslog {
-        facility: String,
-        hostname: Option<String>,
-    },
+    Syslog { facility: String, hostname: Option<String> },
     /// Network logging (TCP/UDP)
-    Network {
-        endpoint: String,
-        protocol: NetworkProtocol,
-    },
+    Network { endpoint: String, protocol: NetworkProtocol },
     /// Distributed logging system
     Distributed { system: DistributedLoggingSystem },
 }
@@ -113,10 +107,10 @@ pub enum DistributedLoggingSystem {
 pub struct CategoryLevel {
     /// Log category name
     pub category: String,
-
+    
     /// Specific level for this category
     pub level: LogLevel,
-
+    
     /// Enable/disable this category
     pub enabled: bool,
 }
@@ -125,16 +119,16 @@ pub struct CategoryLevel {
 pub struct StructuredLoggingConfig {
     /// Enable structured logging
     pub enabled: bool,
-
+    
     /// Default fields to include in all log entries
     pub default_fields: Vec<DefaultField>,
-
+    
     /// Node identification in logs
     pub node_identification: NodeIdentificationConfig,
-
+    
     /// Context tracking
     pub context_tracking: ContextTrackingConfig,
-
+    
     /// Sensitive data handling
     pub sensitive_data: SensitiveDataConfig,
 }
@@ -143,10 +137,10 @@ pub struct StructuredLoggingConfig {
 pub struct DefaultField {
     /// Field name
     pub name: String,
-
+    
     /// Field value source
     pub source: FieldSource,
-
+    
     /// Whether field is required
     pub required: bool,
 }
@@ -186,13 +180,13 @@ pub enum NodeProperty {
 pub struct NodeIdentificationConfig {
     /// Include node ID in logs
     pub include_node_id: bool,
-
+    
     /// Include network name
     pub include_network_name: bool,
-
+    
     /// Include node type
     pub include_node_type: bool,
-
+    
     /// Include version information
     pub include_version: bool,
 }
@@ -201,19 +195,19 @@ pub struct NodeIdentificationConfig {
 pub struct ContextTrackingConfig {
     /// Enable context tracking
     pub enabled: bool,
-
+    
     /// Track consensus cycles
     pub track_consensus_cycles: bool,
-
+    
     /// Track transaction flows
     pub track_transaction_flows: bool,
-
+    
     /// Track network events
     pub track_network_events: bool,
-
+    
     /// Maximum context depth
     pub max_context_depth: usize,
-
+    
     /// Context retention time in seconds
     pub context_retention_seconds: u64,
 }
@@ -222,16 +216,16 @@ pub struct ContextTrackingConfig {
 pub struct SensitiveDataConfig {
     /// Enable sensitive data filtering
     pub filtering_enabled: bool,
-
+    
     /// Fields to redact
     pub redacted_fields: Vec<String>,
-
+    
     /// Patterns to redact (regex)
     pub redacted_patterns: Vec<String>,
-
+    
     /// Redaction replacement text
     pub redaction_text: String,
-
+    
     /// Enable IP address anonymization
     pub anonymize_ip_addresses: bool,
 }
@@ -240,19 +234,19 @@ pub struct SensitiveDataConfig {
 pub struct LogRotationConfig {
     /// Enable log rotation
     pub enabled: bool,
-
+    
     /// Rotation strategy
     pub strategy: RotationStrategy,
-
+    
     /// Maximum file size before rotation (bytes)
     pub max_file_size_bytes: u64,
-
+    
     /// Maximum number of archived files
     pub max_archived_files: usize,
-
+    
     /// Compression for archived files
     pub compress_archived: bool,
-
+    
     /// Rotation schedule
     pub schedule: Option<RotationSchedule>,
 }
@@ -273,13 +267,13 @@ pub enum RotationStrategy {
 pub struct RotationSchedule {
     /// Rotation frequency
     pub frequency: RotationFrequency,
-
+    
     /// Specific time for daily rotation (hour)
     pub daily_hour: Option<u8>,
-
+    
     /// Specific day for weekly rotation (0-6, Sunday=0)
     pub weekly_day: Option<u8>,
-
+    
     /// Specific day for monthly rotation (1-31)
     pub monthly_day: Option<u8>,
 }
@@ -297,19 +291,19 @@ pub enum RotationFrequency {
 pub struct LogPerformanceConfig {
     /// Enable asynchronous logging
     pub async_logging: bool,
-
+    
     /// Worker thread count for async logging
     pub async_worker_threads: usize,
-
+    
     /// Queue size for async logging
     pub async_queue_size: usize,
-
+    
     /// Batching configuration
     pub batching: BatchingConfig,
-
+    
     /// Buffer configuration
     pub buffering: BufferingConfig,
-
+    
     /// Sampling configuration for high-volume logs
     pub sampling: SamplingConfig,
 }
@@ -318,13 +312,13 @@ pub struct LogPerformanceConfig {
 pub struct BatchingConfig {
     /// Enable log batching
     pub enabled: bool,
-
+    
     /// Maximum batch size
     pub max_batch_size: usize,
-
+    
     /// Maximum batch wait time in milliseconds
     pub max_wait_time_ms: u64,
-
+    
     /// Batch compression
     pub compression_enabled: bool,
 }
@@ -333,13 +327,13 @@ pub struct BatchingConfig {
 pub struct BufferingConfig {
     /// Enable output buffering
     pub enabled: bool,
-
+    
     /// Buffer size in bytes
     pub buffer_size_bytes: usize,
-
+    
     /// Flush interval in milliseconds
     pub flush_interval_ms: u64,
-
+    
     /// Force flush on critical messages
     pub flush_on_critical: bool,
 }
@@ -348,10 +342,10 @@ pub struct BufferingConfig {
 pub struct SamplingConfig {
     /// Enable log sampling
     pub enabled: bool,
-
+    
     /// Sampling rules by category
     pub rules: Vec<SamplingRule>,
-
+    
     /// Default sampling rate (0.0 to 1.0)
     pub default_rate: f64,
 }
@@ -360,13 +354,13 @@ pub struct SamplingConfig {
 pub struct SamplingRule {
     /// Category pattern (supports wildcards)
     pub category_pattern: String,
-
+    
     /// Log level
     pub level: LogLevel,
-
+    
     /// Sampling rate (0.0 to 1.0)
     pub rate: f64,
-
+    
     /// Burst allowance
     pub burst_allowance: usize,
 }
@@ -375,10 +369,10 @@ pub struct SamplingRule {
 pub struct LogFilteringConfig {
     /// Enable log filtering
     pub enabled: bool,
-
+    
     /// Filtering rules
     pub rules: Vec<FilteringRule>,
-
+    
     /// Default action for unmatched logs
     pub default_action: FilterAction,
 }
@@ -387,19 +381,19 @@ pub struct LogFilteringConfig {
 pub struct FilteringRule {
     /// Rule name
     pub name: String,
-
+    
     /// Category filter (supports wildcards)
     pub category_filter: Option<String>,
-
+    
     /// Level filter
     pub level_filter: Option<LogLevel>,
-
+    
     /// Message content filter (regex)
     pub message_filter: Option<String>,
-
+    
     /// Field filters
     pub field_filters: Vec<FieldFilter>,
-
+    
     /// Action to take when rule matches
     pub action: FilterAction,
 }
@@ -408,10 +402,10 @@ pub struct FilteringRule {
 pub struct FieldFilter {
     /// Field name
     pub field_name: String,
-
+    
     /// Field value pattern (regex)
     pub value_pattern: String,
-
+    
     /// Whether pattern should match or not match
     pub should_match: bool,
 }
@@ -430,10 +424,10 @@ pub enum FilterAction {
 pub struct FieldModification {
     /// Field name to modify
     pub field_name: String,
-
+    
     /// Modification type
     pub modification_type: ModificationType,
-
+    
     /// New value (for Replace and Add)
     pub new_value: Option<String>,
 }
@@ -570,11 +564,11 @@ impl LoggingConfig {
             },
         }
     }
-
+    
     /// Create test network logging configuration
     pub fn testnet() -> Self {
         let mut config = Self::devnet();
-
+        
         // Override testnet-specific settings
         config.level = LogLevel::Info;
         config.outputs = vec![
@@ -596,34 +590,36 @@ impl LoggingConfig {
                 flush_interval_ms: Some(5000),
             },
         ];
-
+        
         config.structured.sensitive_data.filtering_enabled = true;
         config.structured.sensitive_data.redacted_fields = vec![
             "private_key".to_string(),
             "secret".to_string(),
             "password".to_string(),
         ];
-
+        
         config.rotation.max_file_size_bytes = 500 * 1024 * 1024; // 500MB
         config.rotation.max_archived_files = 10;
         config.rotation.compress_archived = true;
-
+        
         config.performance.batching.enabled = true;
         config.performance.sampling.enabled = true;
-        config.performance.sampling.rules = vec![SamplingRule {
-            category_pattern: "catalyst_network::gossip".to_string(),
-            level: LogLevel::Debug,
-            rate: 0.1, // Sample 10% of debug network gossip logs
-            burst_allowance: 10,
-        }];
-
+        config.performance.sampling.rules = vec![
+            SamplingRule {
+                category_pattern: "catalyst_network::gossip".to_string(),
+                level: LogLevel::Debug,
+                rate: 0.1, // Sample 10% of debug network gossip logs
+                burst_allowance: 10,
+            },
+        ];
+        
         config
     }
-
+    
     /// Create main network logging configuration (production)
     pub fn mainnet() -> Self {
         let mut config = Self::testnet();
-
+        
         // Override mainnet-specific settings
         config.level = LogLevel::Info;
         config.outputs = vec![
@@ -655,13 +651,13 @@ impl LoggingConfig {
                 flush_interval_ms: None,
             },
         ];
-
+        
         config.structured.sensitive_data.redacted_patterns = vec![
-            r"sk[a-fA-F0-9]{64}".to_string(),                 // Private keys
+            r"sk[a-fA-F0-9]{64}".to_string(), // Private keys
             r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b".to_string(), // IP addresses
         ];
         config.structured.sensitive_data.anonymize_ip_addresses = true;
-
+        
         config.rotation.strategy = RotationStrategy::SizeAndTime;
         config.rotation.max_file_size_bytes = 1024 * 1024 * 1024; // 1GB
         config.rotation.max_archived_files = 30;
@@ -671,13 +667,13 @@ impl LoggingConfig {
             weekly_day: None,
             monthly_day: None,
         });
-
+        
         config.performance.async_worker_threads = 4;
         config.performance.async_queue_size = 50000;
         config.performance.batching.enabled = true;
         config.performance.batching.max_batch_size = 1000;
         config.performance.batching.compression_enabled = true;
-
+        
         config.performance.sampling.rules = vec![
             SamplingRule {
                 category_pattern: "catalyst_network::gossip".to_string(),
@@ -692,102 +688,86 @@ impl LoggingConfig {
                 burst_allowance: 10,
             },
         ];
-
+        
         config.filtering.enabled = true;
-        config.filtering.rules = vec![FilteringRule {
-            name: "security_filter".to_string(),
-            category_filter: None,
-            level_filter: None,
-            message_filter: Some(r"(private_key|secret|password)".to_string()),
-            field_filters: vec![],
-            action: FilterAction::Modify(vec![FieldModification {
-                field_name: "message".to_string(),
-                modification_type: ModificationType::Redact,
-                new_value: None,
-            }]),
-        }];
-
+        config.filtering.rules = vec![
+            FilteringRule {
+                name: "security_filter".to_string(),
+                category_filter: None,
+                level_filter: None,
+                message_filter: Some(r"(private_key|secret|password)".to_string()),
+                field_filters: vec![],
+                action: FilterAction::Modify(vec![
+                    FieldModification {
+                        field_name: "message".to_string(),
+                        modification_type: ModificationType::Redact,
+                        new_value: None,
+                    },
+                ]),
+            },
+        ];
+        
         config
     }
-
+    
     /// Validate logging configuration
     pub fn validate(&self) -> ConfigResult<()> {
         // Validate that at least one output is configured
         if self.outputs.is_empty() {
-            return Err(ConfigError::ValidationFailed(
-                "At least one log output must be configured".to_string(),
-            ));
+            return Err(ConfigError::ValidationFailed("At least one log output must be configured".to_string()));
         }
-
+        
         // Validate file output paths
         for output in &self.outputs {
             if let OutputType::File { path, .. } = &output.output_type {
                 if path.as_os_str().is_empty() {
-                    return Err(ConfigError::ValidationFailed(
-                        "Log file path cannot be empty".to_string(),
-                    ));
+                    return Err(ConfigError::ValidationFailed("Log file path cannot be empty".to_string()));
                 }
             }
         }
-
+        
         // Validate rotation settings
         if self.rotation.enabled {
             if self.rotation.max_file_size_bytes == 0 {
-                return Err(ConfigError::ValidationFailed(
-                    "Max file size for rotation must be greater than 0".to_string(),
-                ));
+                return Err(ConfigError::ValidationFailed("Max file size for rotation must be greater than 0".to_string()));
             }
-
+            
             if self.rotation.max_archived_files == 0 {
-                return Err(ConfigError::ValidationFailed(
-                    "Max archived files must be greater than 0".to_string(),
-                ));
+                return Err(ConfigError::ValidationFailed("Max archived files must be greater than 0".to_string()));
             }
         }
-
+        
         // Validate performance settings
         if self.performance.async_logging {
             if self.performance.async_worker_threads == 0 {
-                return Err(ConfigError::ValidationFailed(
-                    "Async worker threads must be greater than 0".to_string(),
-                ));
+                return Err(ConfigError::ValidationFailed("Async worker threads must be greater than 0".to_string()));
             }
-
+            
             if self.performance.async_queue_size == 0 {
-                return Err(ConfigError::ValidationFailed(
-                    "Async queue size must be greater than 0".to_string(),
-                ));
+                return Err(ConfigError::ValidationFailed("Async queue size must be greater than 0".to_string()));
             }
         }
-
+        
         // Validate sampling rates
         if self.performance.sampling.enabled {
-            if self.performance.sampling.default_rate < 0.0
-                || self.performance.sampling.default_rate > 1.0
-            {
-                return Err(ConfigError::ValidationFailed(
-                    "Default sampling rate must be between 0.0 and 1.0".to_string(),
-                ));
+            if self.performance.sampling.default_rate < 0.0 || self.performance.sampling.default_rate > 1.0 {
+                return Err(ConfigError::ValidationFailed("Default sampling rate must be between 0.0 and 1.0".to_string()));
             }
-
+            
             for rule in &self.performance.sampling.rules {
                 if rule.rate < 0.0 || rule.rate > 1.0 {
-                    return Err(ConfigError::ValidationFailed(
-                        "Sampling rate must be between 0.0 and 1.0".to_string(),
-                    ));
+                    return Err(ConfigError::ValidationFailed("Sampling rate must be between 0.0 and 1.0".to_string()));
                 }
             }
         }
-
+        
         // Validate context tracking settings
         if self.structured.context_tracking.enabled {
             if self.structured.context_tracking.max_context_depth == 0 {
-                return Err(ConfigError::ValidationFailed(
-                    "Max context depth must be greater than 0".to_string(),
-                ));
+                return Err(ConfigError::ValidationFailed("Max context depth must be greater than 0".to_string()));
             }
         }
-
+        
         Ok(())
     }
 }
