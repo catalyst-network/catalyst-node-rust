@@ -420,14 +420,14 @@ impl Migration for InitialSchemaV1 {
     }
     
     async fn can_apply(&self, engine: &RocksEngine) -> StorageResult<bool> {
-        // Check if this is a fresh database or if we can safely apply
-        let existing_cfs = engine.cf_names();
-        
-        // If we already have the required column families, don't apply
-        let required_cfs = ["accounts", "transactions", "consensus", "metadata", "contracts", "dfs_refs"];
-        let has_all_cfs = required_cfs.iter().all(|cf| existing_cfs.contains(&cf.to_string()));
-        
-        Ok(!has_all_cfs)
+        // This migration is intentionally idempotent:
+        // - `up()` only creates missing column families
+        // - metadata keys are set to well-known initial values
+        //
+        // So it is always safe to "apply", even if the DB was created with the
+        // column families already present.
+        let _ = engine;
+        Ok(true)
     }
 }
 

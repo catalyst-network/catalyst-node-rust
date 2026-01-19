@@ -41,6 +41,11 @@ static STORAGE_METRICS: OnceLock<StorageMetrics> = OnceLock::new();
 #[cfg(feature = "metrics")]
 /// Register storage metrics with Prometheus
 pub fn register_storage_metrics() -> Result<(), Box<dyn std::error::Error>> {
+    // Avoid duplicate Prometheus collector registration across tests / multiple init paths.
+    if STORAGE_METRICS.get().is_some() {
+        return Ok(());
+    }
+
     let metrics = StorageMetrics {
         // Counters
         operations_total: register_int_counter!(

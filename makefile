@@ -239,27 +239,63 @@ update:
 # Local testnet
 testnet: build
 	@echo "Starting local testnet with 3 nodes..."
-	@mkdir -p testnet/{node1,node2,node3}
-	@# Node 1 (Bootstrap + Validator)
-	RUST_LOG=info $(CARGO_TARGET_DIR)/release/catalyst-cli --config testnet/node1/config.toml start \
-		--validator --rpc --rpc-port 8545 &
-	@sleep 2
-	@# Node 2 (Validator + Storage)
-	RUST_LOG=info $(CARGO_TARGET_DIR)/release/catalyst-cli --config testnet/node2/config.toml start \
-		--validator --storage --rpc-port 8546 \
-		--bootstrap-peers "/ip4/127.0.0.1/tcp/30333" &
-	@sleep 2
-	@# Node 3 (Storage only)
-	RUST_LOG=info $(CARGO_TARGET_DIR)/release/catalyst-cli --config testnet/node3/config.toml start \
-		--storage --rpc-port 8547 \
-		--bootstrap-peers "/ip4/127.0.0.1/tcp/30333" &
-	@echo "Testnet started! Nodes running on ports 8545, 8546, 8547"
-	@echo "Press Ctrl+C to stop all nodes"
-	@wait
+	@bash -lc 'set -euo pipefail; \
+		mkdir -p testnet/{node1,node2,node3}/{logs,data,dfs_cache}; \
+		echo "Starting node1 (bootstrap + validator)..." ; \
+		RUST_LOG=info stdbuf -oL -eL "$(CARGO_TARGET_DIR)/release/catalyst-cli" --config testnet/node1/config.toml start \
+			--validator --rpc --rpc-port 8545 --generate-txs --tx-interval-ms 1000 \
+			> testnet/node1/logs/stdout.log 2>&1 & \
+		echo $$! > testnet/node1/node.pid; \
+		sleep 2; \
+		echo "Starting node2 (validator + storage)..." ; \
+		RUST_LOG=info stdbuf -oL -eL "$(CARGO_TARGET_DIR)/release/catalyst-cli" --config testnet/node2/config.toml start \
+			--validator --storage --rpc-port 8546 \
+			--bootstrap-peers "/ip4/127.0.0.1/tcp/30333" \
+			> testnet/node2/logs/stdout.log 2>&1 & \
+		echo $$! > testnet/node2/node.pid; \
+		sleep 2; \
+		echo "Starting node3 (storage only)..." ; \
+		RUST_LOG=info stdbuf -oL -eL "$(CARGO_TARGET_DIR)/release/catalyst-cli" --config testnet/node3/config.toml start \
+			--storage --rpc-port 8547 \
+			--bootstrap-peers "/ip4/127.0.0.1/tcp/30333" \
+			> testnet/node3/logs/stdout.log 2>&1 & \
+		echo $$! > testnet/node3/node.pid; \
+		echo "Testnet started! Logs:"; \
+		echo "  - testnet/node1/logs/stdout.log"; \
+		echo "  - testnet/node2/logs/stdout.log"; \
+		echo "  - testnet/node3/logs/stdout.log"; \
+		echo "Stop with: make stop-testnet"; \
+		wait $$(cat testnet/node1/node.pid) $$(cat testnet/node2/node.pid) $$(cat testnet/node3/node.pid)'
 
 stop-testnet:
 	@echo "Stopping testnet..."
-	@pkill -f catalyst-cli || true
+	@bash -lc 'set -euo pipefail; \
+		for n in 1 2 3; do \
+			pidfile="testnet/node$${n}/node.pid"; \
+			if [ -f "$$pidfile" ]; then \
+				pid=$$(cat "$$pidfile" || true); \
+				if [ -n "$$pid" ] && kill -0 "$$pid" 2>/dev/null; then \
+					echo "Stopping node$${n} (pid $$pid)"; \
+					kill "$$pid" 2>/dev/null || true; \
+				fi; \
+			fi; \
+		done; \
+		pkill -f "catalyst-cli --config testnet/node" 2>/dev/null || true; \
+		pkill -f "target/release/catalyst-cli --config testnet/node" 2>/dev/null || true; \
+		sleep 1; \
+		for n in 1 2 3; do \
+			pidfile="testnet/node$${n}/node.pid"; \
+			if [ -f "$$pidfile" ]; then \
+				pid=$$(cat "$$pidfile" || true); \
+				if [ -n "$$pid" ] && kill -0 "$$pid" 2>/dev/null; then \
+					echo "Force killing node$${n} (pid $$pid)"; \
+					kill -9 "$$pid" 2>/dev/null || true; \
+				fi; \
+			fi; \
+		done; \
+		pkill -9 -f "catalyst-cli --config testnet/node" 2>/dev/null || true; \
+		pkill -9 -f "target/release/catalyst-cli --config testnet/node" 2>/dev/null || true; \
+		true'
 
 # Development helpers
 watch:

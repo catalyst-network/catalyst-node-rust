@@ -3,13 +3,22 @@ use anyhow::Result;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use std::path::PathBuf;
+use std::path::Path;
 
 mod node;
 mod commands;
 mod config;
+mod tx;
+mod sync;
+mod dfs_store;
 
 use node::CatalystNode;
 use config::NodeConfig;
+
+fn is_testnet_config_path(path: &Path) -> bool {
+    path.components()
+        .any(|c| c.as_os_str().to_string_lossy().eq_ignore_ascii_case("testnet"))
+}
 
 #[derive(Parser)]
 #[command(name = "catalyst")]
@@ -59,6 +68,14 @@ enum Commands {
         /// Bootstrap peers (comma-separated multiaddrs)
         #[arg(long)]
         bootstrap_peers: Option<String>,
+
+        /// Generate and gossip dummy transactions periodically (dev/testnet helper)
+        #[arg(long, default_value_t = false)]
+        generate_txs: bool,
+
+        /// Interval (ms) between generated transactions when --generate-txs is set
+        #[arg(long, default_value_t = 500)]
+        tx_interval_ms: u64,
     },
     /// Generate a new node identity
     GenerateIdentity {
@@ -184,7 +201,7 @@ async fn main() -> Result<()> {
     info!("Starting Catalyst CLI v{}", env!("CARGO_PKG_VERSION"));
 
     // Load configuration (or auto-generate a local default if missing).
-    let config = if cli.config.exists() {
+    let mut config = if cli.config.exists() {
         NodeConfig::load(&cli.config)?
     } else {
         info!(
@@ -199,6 +216,28 @@ async fn main() -> Result<()> {
         cfg
     };
 
+    // Testnet-only consensus speedup: keep dev/mainnet defaults intact, but make the local
+    // `make testnet` loop iterate quickly.
+    if is_testnet_config_path(&cli.config) {
+        // Testnet should iterate quickly but still be stable under local scheduling jitter.
+        // 20s cycle, 4s per phase (16s total), 1s freeze window.
+        config.consensus.cycle_duration_seconds = 20;
+        config.consensus.freeze_time_seconds = 1;
+        config.consensus.min_producer_count = 2;
+        config.consensus.phase_timeouts.construction_timeout = 4;
+        config.consensus.phase_timeouts.campaigning_timeout = 4;
+        config.consensus.phase_timeouts.voting_timeout = 4;
+        config.consensus.phase_timeouts.synchronization_timeout = 4;
+
+        // Testnet-only DFS: use a shared local DFS directory so CID fetch works across
+        // the 3 local processes even without a P2P DFS layer.
+        config.dfs.cache_dir = PathBuf::from("testnet/shared_dfs");
+
+        // Persist so the config dump/logs match runtime behavior.
+        config.save(&cli.config)?;
+        info!("Applied fast consensus timings for testnet config {:?}", cli.config);
+    }
+
     // Execute command
     match cli.command {
         Commands::Start {
@@ -208,6 +247,8 @@ async fn main() -> Result<()> {
             rpc,
             rpc_port,
             bootstrap_peers,
+            generate_txs,
+            tx_interval_ms,
         } => {
             let mut node_config = config;
             node_config.validator = validator;
@@ -223,7 +264,7 @@ async fn main() -> Result<()> {
                     .collect();
             }
 
-            start_node(node_config).await?;
+            start_node(node_config, generate_txs, tx_interval_ms).await?;
         }
         Commands::GenerateIdentity { output } => {
             commands::generate_identity(&output).await?;
@@ -279,10 +320,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn start_node(config: NodeConfig) -> Result<()> {
+async fn start_node(config: NodeConfig, generate_txs: bool, tx_interval_ms: u64) -> Result<()> {
     info!("Starting Catalyst node with config: {:#?}", config);
 
-    let mut node = CatalystNode::new(config).await?;
+    let mut node = CatalystNode::new(config, generate_txs, tx_interval_ms).await?;
 
     // Start the node
     node.start().await?;

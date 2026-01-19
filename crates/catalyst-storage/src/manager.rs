@@ -629,22 +629,33 @@ mod tests {
     use tempfile::TempDir;
     use catalyst_utils::state::AccountType;
     
-    async fn create_test_manager() -> StorageManager {
+    struct TestEnv {
+        manager: StorageManager,
+        // Keep temp dir alive until after StorageManager drop (RocksDB flushes on drop).
+        _temp_dir: TempDir,
+    }
+
+    async fn create_test_env() -> TestEnv {
         let temp_dir = TempDir::new().unwrap();
         let mut config = StorageConfig::default();
         config.data_dir = temp_dir.path().to_path_buf();
-        StorageManager::new(config).await.unwrap()
+        let manager = StorageManager::new(config).await.unwrap();
+        TestEnv {
+            manager,
+            _temp_dir: temp_dir,
+        }
     }
     
     #[tokio::test]
     async fn test_manager_creation() {
-        let manager = create_test_manager().await;
-        assert!(manager.is_healthy().await);
+        let env = create_test_env().await;
+        assert!(env.manager.is_healthy().await);
     }
     
     #[tokio::test]
     async fn test_account_operations() {
-        let manager = create_test_manager().await;
+        let env = create_test_env().await;
+        let manager = &env.manager;
         let address = [1u8; 21];
         
         // Test account doesn't exist initially
@@ -663,7 +674,8 @@ mod tests {
     
     #[tokio::test]
     async fn test_transaction_operations() {
-        let manager = create_test_manager().await;
+        let env = create_test_env().await;
+        let manager = &env.manager;
         let tx_hash = [2u8; 32];
         let tx_data = b"transaction_data".to_vec();
         
@@ -677,7 +689,8 @@ mod tests {
     
     #[tokio::test]
     async fn test_metadata_operations() {
-        let manager = create_test_manager().await;
+        let env = create_test_env().await;
+        let manager = &env.manager;
         
         // Set metadata
         manager.set_metadata("test_key", b"test_value").await.unwrap();
@@ -689,7 +702,8 @@ mod tests {
     
     #[tokio::test]
     async fn test_transaction_batch() {
-        let manager = create_test_manager().await;
+        let env = create_test_env().await;
+        let manager = &env.manager;
         
         // Create transaction
         let tx_batch = manager.create_transaction("test_tx".to_string()).unwrap();
@@ -710,7 +724,8 @@ mod tests {
     
     #[tokio::test]
     async fn test_state_manager_trait() {
-        let manager = create_test_manager().await;
+        let env = create_test_env().await;
+        let manager = &env.manager;
         
         // Test basic state operations
         manager.set_state(b"key1", b"value1".to_vec()).await.unwrap();
@@ -724,7 +739,8 @@ mod tests {
     
     #[tokio::test]
     async fn test_snapshots() {
-        let manager = create_test_manager().await;
+        let env = create_test_env().await;
+        let manager = &env.manager;
         
         // Add some data
         let address = [4u8; 21];
@@ -750,7 +766,8 @@ mod tests {
     
     #[tokio::test]
     async fn test_statistics() {
-        let manager = create_test_manager().await;
+        let env = create_test_env().await;
+        let manager = &env.manager;
         
         // Add some data
         for i in 0..10 {

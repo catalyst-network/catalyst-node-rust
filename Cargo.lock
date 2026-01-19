@@ -1053,10 +1053,13 @@ name = "catalyst-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
+ "blake2",
  "catalyst-config",
  "catalyst-consensus",
  "catalyst-core",
  "catalyst-crypto",
+ "catalyst-dfs",
  "catalyst-network",
  "catalyst-rpc",
  "catalyst-storage",
@@ -1281,6 +1284,7 @@ dependencies = [
  "futures",
  "governor",
  "jsonwebtoken",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",

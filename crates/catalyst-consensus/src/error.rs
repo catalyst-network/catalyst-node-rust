@@ -6,8 +6,8 @@ pub enum ConsensusError {
     #[error("Insufficient data collected: got {got}, required {required}")]
     InsufficientData { got: usize, required: usize },
     
-    #[error("No majority found: highest count {highest} below threshold {threshold}")]
-    NoMajority { highest: usize, threshold: usize },
+    #[error("No majority found: highest count {highest} below threshold {threshold}{details}")]
+    NoMajority { highest: usize, threshold: usize, details: String },
     
     #[error("Phase timeout: {phase} phase exceeded {duration_ms}ms")]
     PhaseTimeout { phase: String, duration_ms: u64 },
