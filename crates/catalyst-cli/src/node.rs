@@ -13,6 +13,7 @@ use catalyst_utils::{
     utils::current_timestamp_ms,
 };
 use catalyst_consensus::types::hash_data;
+use catalyst_utils::state::StateManager;
 
 use crate::config::NodeConfig;
 use crate::tx::{Mempool, ProtocolTxGossip, TxBatch, TxGossip};
@@ -21,6 +22,106 @@ use crate::sync::{LsuCidGossip, LsuGossip};
 use catalyst_dfs::ContentId;
 
 use crate::dfs_store::LocalContentStore;
+
+use catalyst_storage::{StorageConfig as StorageConfigLib, StorageManager};
+
+const FAUCET_PUBKEY: [u8; 32] = [0xFA; 32];
+const FAUCET_INITIAL_BALANCE: i64 = 1_000_000;
+
+fn balance_key_for_pubkey(pubkey: &[u8; 32]) -> Vec<u8> {
+    let mut k = b"bal:".to_vec();
+    k.extend_from_slice(pubkey);
+    k
+}
+
+fn decode_i64(bytes: &[u8]) -> Option<i64> {
+    if bytes.len() != 8 {
+        return None;
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(bytes);
+    Some(i64::from_le_bytes(b))
+}
+
+async fn get_balance_i64(store: &StorageManager, pubkey: &[u8; 32]) -> i64 {
+    let k = balance_key_for_pubkey(pubkey);
+    store
+        .get_state(&k)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|b| decode_i64(&b))
+        .unwrap_or(0)
+}
+
+async fn set_balance_i64(store: &StorageManager, pubkey: &[u8; 32], v: i64) -> Result<()> {
+    let k = balance_key_for_pubkey(pubkey);
+    store.set_state(&k, v.to_le_bytes().to_vec()).await?;
+    Ok(())
+}
+
+async fn apply_lsu_to_storage(
+    store: &StorageManager,
+    lsu: &catalyst_consensus::types::LedgerStateUpdate,
+) -> Result<()> {
+    // Idempotence: only apply if this LSU advances the applied head.
+    let already = store
+        .get_metadata("consensus:last_applied_cycle")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|b| {
+            if b.len() != 8 {
+                return None;
+            }
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&b);
+            Some(u64::from_le_bytes(arr))
+        })
+        .unwrap_or(0);
+
+    if lsu.cycle_number <= already {
+        return Ok(());
+    }
+
+    // Apply balance deltas from the LSU's ordered transaction entries.
+    for e in &lsu.partial_update.transaction_entries {
+        let k = balance_key_for_pubkey(&e.public_key);
+        let cur = store
+            .get_state(&k)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| decode_i64(&b))
+            .unwrap_or(0);
+
+        let next = cur.saturating_add(e.amount);
+        store.set_state(&k, next.to_le_bytes().to_vec()).await?;
+    }
+
+    // Flush + compute a state root that commits the applied balances.
+    let state_root = store.commit().await?;
+    let lsu_hash = hash_data(lsu).unwrap_or([0u8; 32]);
+
+    // Persist the applied head.
+    let _ = store
+        .set_metadata("consensus:last_applied_cycle", &lsu.cycle_number.to_le_bytes())
+        .await;
+    let _ = store
+        .set_metadata("consensus:last_applied_lsu_hash", &lsu_hash)
+        .await;
+    let _ = store
+        .set_metadata("consensus:last_applied_state_root", &state_root)
+        .await;
+
+    info!(
+        "Applied LSU to storage cycle={} state_root={}",
+        lsu.cycle_number,
+        hex_encode(&state_root)
+    );
+
+    Ok(())
+}
 
 /// Main Catalyst node implementation.
 ///
@@ -49,6 +150,9 @@ pub struct CatalystNode {
     /// Dev/testnet helper: generate and gossip dummy transactions periodically
     generate_txs: bool,
     tx_interval_ms: u64,
+
+    /// Optional JSON-RPC server handle (when enabled)
+    rpc_handle: Option<jsonrpsee::server::ServerHandle>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -116,6 +220,7 @@ impl CatalystNode {
             network_tasks: Vec::new(),
             generate_txs,
             tx_interval_ms: tx_interval_ms.max(50),
+            rpc_handle: None,
         })
     }
 
@@ -211,6 +316,55 @@ impl CatalystNode {
             None
         };
 
+        // Persistent storage (RocksDB) for consensus chain state.
+        // Even when "storage provisioning" is disabled, validators still benefit from persisting
+        // the latest LSU so restarts keep the same seed / last known chain state.
+        let storage = if self.config.validator || self.config.storage.enabled {
+            let mut cfg = StorageConfigLib::default();
+            cfg.data_dir = self.config.storage.data_dir.clone();
+            cfg.max_open_files = self.config.storage.max_open_files;
+            cfg.write_buffer_size = (self.config.storage.write_buffer_size_mb as usize) * 1024 * 1024;
+            cfg.block_cache_size = (self.config.storage.cache_size_mb as usize) * 1024 * 1024;
+            cfg.compression_enabled = self.config.storage.compression_enabled;
+            Some(Arc::new(
+                StorageManager::new(cfg)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("storage init failed: {e}"))?,
+            ))
+        } else {
+            None
+        };
+
+        // Initialize faucet (dev/testnet): create a deterministic funded account if missing.
+        if let Some(store) = &storage {
+            let existing = store.get_state(&balance_key_for_pubkey(&FAUCET_PUBKEY)).await.ok().flatten();
+            if existing.is_none() {
+                let _ = set_balance_i64(store.as_ref(), &FAUCET_PUBKEY, FAUCET_INITIAL_BALANCE).await;
+                let _ = store.commit().await;
+                info!(
+                    "Initialized faucet pubkey={} balance={}",
+                    hex_encode(&FAUCET_PUBKEY),
+                    FAUCET_INITIAL_BALANCE
+                );
+            }
+        }
+
+        // --- RPC (HTTP JSON-RPC) ---
+        if self.config.rpc.enabled {
+            if let Some(store) = storage.clone() {
+                let bind: std::net::SocketAddr = format!("{}:{}", self.config.rpc.address, self.config.rpc.port)
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid rpc bind addr: {e}"))?;
+                let handle = catalyst_rpc::start_rpc_http(bind, store, Some(network.clone()))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("rpc start failed: {e}"))?;
+                info!("RPC server listening on http://{}", bind);
+                self.rpc_handle = Some(handle);
+            } else {
+                info!("RPC enabled but storage not initialized; RPC not started");
+            }
+        }
+
         // Cycle-scoped tx batches (selected by a deterministic "leader" each cycle).
         let tx_batches: Arc<tokio::sync::RwLock<std::collections::HashMap<u64, Vec<catalyst_consensus::types::TransactionEntry>>>> =
             Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
@@ -265,6 +419,7 @@ impl CatalystNode {
             let mempool = mempool.clone();
             let tx_batches = tx_batches.clone();
             let dfs = dfs.clone();
+            let storage = storage.clone();
             let last_lsu: Arc<tokio::sync::RwLock<std::collections::HashMap<u64, catalyst_consensus::types::LedgerStateUpdate>>> =
                 Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
             let handle = tokio::spawn(async move {
@@ -311,11 +466,52 @@ impl CatalystNode {
                                             {
                                                 if let Ok(h) = catalyst_consensus::types::hash_data(&lsu) {
                                                     if h == ref_msg.lsu_hash {
+                                                        // Apply before caching.
+                                                        if let Some(store) = &storage {
+                                                            let _ = apply_lsu_to_storage(store.as_ref(), &lsu).await;
+                                                        }
+
                                                         last_lsu.write().await.insert(ref_msg.cycle, lsu);
                                                         info!(
                                                             "Synced LSU via CID cycle={} cid={}",
                                                             ref_msg.cycle, ref_msg.cid
                                                         );
+
+                                                        // Persist latest observed LSU.
+                                                        if let Some(store) = &storage {
+                                                            // Per-cycle history
+                                                            let _ = store
+                                                                .set_metadata(
+                                                                    &format!("consensus:lsu:{}", ref_msg.cycle),
+                                                                    &bytes,
+                                                                )
+                                                                .await;
+                                                            let _ = store
+                                                                .set_metadata(
+                                                                    &format!("consensus:lsu_hash:{}", ref_msg.cycle),
+                                                                    &ref_msg.lsu_hash,
+                                                                )
+                                                                .await;
+                                                            let _ = store
+                                                                .set_metadata(
+                                                                    &format!("consensus:lsu_cid:{}", ref_msg.cycle),
+                                                                    ref_msg.cid.as_bytes(),
+                                                                )
+                                                                .await;
+
+                                                            let _ = store
+                                                                .set_metadata("consensus:last_lsu", &bytes)
+                                                                .await;
+                                                            let _ = store
+                                                                .set_metadata("consensus:last_lsu_hash", &ref_msg.lsu_hash)
+                                                                .await;
+                                                            let _ = store
+                                                                .set_metadata("consensus:last_lsu_cycle", &ref_msg.cycle.to_le_bytes())
+                                                                .await;
+                                                            let _ = store
+                                                                .set_metadata("consensus:last_lsu_cid", ref_msg.cid.as_bytes())
+                                                                .await;
+                                                        }
                                                     }
                                                 }
                                             }
@@ -325,7 +521,38 @@ impl CatalystNode {
                             } else if let Ok(lsu_msg) = envelope.extract_message::<LsuGossip>() {
                                 if let Ok(h) = catalyst_consensus::types::hash_data(&lsu_msg.lsu) {
                                     if h == lsu_msg.lsu_hash {
-                                        last_lsu.write().await.insert(lsu_msg.cycle, lsu_msg.lsu);
+                                        let lsu = lsu_msg.lsu;
+                                        last_lsu.write().await.insert(lsu_msg.cycle, lsu.clone());
+
+                                        if let Some(store) = &storage {
+                                            let _ = apply_lsu_to_storage(store.as_ref(), &lsu).await;
+
+                                            if let Ok(bytes) = lsu.serialize() {
+                                                // Per-cycle history
+                                                let _ = store
+                                                    .set_metadata(
+                                                        &format!("consensus:lsu:{}", lsu_msg.cycle),
+                                                        &bytes,
+                                                    )
+                                                    .await;
+                                                let _ = store
+                                                    .set_metadata(
+                                                        &format!("consensus:lsu_hash:{}", lsu_msg.cycle),
+                                                        &lsu_msg.lsu_hash,
+                                                    )
+                                                    .await;
+
+                                                let _ = store
+                                                    .set_metadata("consensus:last_lsu", &bytes)
+                                                    .await;
+                                                let _ = store
+                                                    .set_metadata("consensus:last_lsu_hash", &lsu_msg.lsu_hash)
+                                                    .await;
+                                                let _ = store
+                                                    .set_metadata("consensus:last_lsu_cycle", &lsu_msg.cycle.to_le_bytes())
+                                                    .await;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -344,6 +571,7 @@ impl CatalystNode {
             let my_node_id = public_key;
             let interval_ms = self.tx_interval_ms;
             let mempool = mempool.clone();
+            let storage = storage.clone();
             let mut shutdown_rx2 = shutdown_rx.clone();
             let handle = tokio::spawn(async move {
                 let mut counter: u64 = 0;
@@ -355,16 +583,30 @@ impl CatalystNode {
                     counter = counter.wrapping_add(1);
 
                     // Protocol-shaped 2-entry transfer (lock_time = now_secs, immediate).
+                    //
+                    // Dev/testnet behavior: send from faucet -> this node, so querying your node's
+                    // pubkey shows a *non-decreasing* balance and avoids confusing negative values.
                     let now_secs = now / 1000;
-                    let mut recv_pk = [0u8; 32];
-                    recv_pk[0..8].copy_from_slice(&counter.to_le_bytes());
+                    let recv_pk = my_node_id;
+
+                    // Stop generating if faucet is out of funds (basic non-negative enforcement).
+                    if let Some(store) = &storage {
+                        let faucet_bal = get_balance_i64(store.as_ref(), &FAUCET_PUBKEY).await;
+                        if faucet_bal <= 0 {
+                            tokio::select! {
+                                _ = tokio::time::sleep(std::time::Duration::from_millis(interval_ms)) => {}
+                                _ = shutdown_rx2.changed() => {}
+                            }
+                            continue;
+                        }
+                    }
 
                     let tx = catalyst_core::protocol::Transaction {
                         core: catalyst_core::protocol::TransactionCore {
                             tx_type: catalyst_core::protocol::TransactionType::NonConfidentialTransfer,
                             entries: vec![
                                 catalyst_core::protocol::TransactionEntry {
-                                    public_key: my_node_id,
+                                    public_key: FAUCET_PUBKEY,
                                     amount: catalyst_core::protocol::EntryAmount::NonConfidential(-1),
                                 },
                                 catalyst_core::protocol::TransactionEntry {
@@ -416,6 +658,28 @@ impl CatalystNode {
                 // Seed for deterministic producer selection (paper uses previous LSU merkle root).
                 // We approximate with the hash of the most recent LSU we produced/observed.
                 let mut prev_seed: [u8; 32] = [0u8; 32];
+
+                // Load last persisted seed (prefer applied head).
+                if let Some(store) = &storage {
+                    let seed_bytes = match store.get_metadata("consensus:last_applied_lsu_hash").await {
+                        Ok(Some(b)) => Some(b),
+                        _ => match store.get_metadata("consensus:last_lsu_hash").await {
+                            Ok(Some(b)) => Some(b),
+                            _ => None,
+                        },
+                    };
+
+                    if let Some(bytes) = seed_bytes {
+                        if bytes.len() == 32 {
+                            prev_seed.copy_from_slice(&bytes[..32]);
+                            info!("Loaded prev_seed from storage: {}", hex_encode(&prev_seed));
+                        }
+                    }
+                }
+
+                // Discovery warmup: give nodes time to exchange NodeStatus so they agree on
+                // the initial producer set before the first cycle boundary.
+                tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
 
                 // Epoch-aligned cycle schedule so nodes start cycles together.
                 let now_ms = current_timestamp_ms();
@@ -518,6 +782,29 @@ impl CatalystNode {
                             if let Ok(h) = hash_data(&update) {
                                 prev_seed = h;
                             }
+
+                            // Persist latest LSU and seed.
+                            if let Some(store) = &storage {
+                                if let Ok(bytes) = update.serialize() {
+                                    // Per-cycle history
+                                    let _ = store
+                                        .set_metadata(&format!("consensus:lsu:{}", cycle), &bytes)
+                                        .await;
+                                    let _ = store
+                                        .set_metadata(&format!("consensus:lsu_hash:{}", cycle), &prev_seed)
+                                        .await;
+
+                                    let _ = store.set_metadata("consensus:last_lsu", &bytes).await;
+                                    let _ = store.set_metadata("consensus:last_lsu_hash", &prev_seed).await;
+                                    let _ = store
+                                        .set_metadata("consensus:last_lsu_cycle", &cycle.to_le_bytes())
+                                        .await;
+                                }
+
+                                // Apply to state
+                                let _ = apply_lsu_to_storage(store.as_ref(), &update).await;
+                            }
+
                             // DFS-backed LSU sync:
                             // - store LSU bytes in DFS (local content addressing)
                             // - gossip CID + expected LSU hash
@@ -532,6 +819,19 @@ impl CatalystNode {
                                                 let _ = network.broadcast_envelope(&env).await;
                                             }
                                             info!("Stored LSU in DFS and broadcast CID cycle={} cid={}", cycle, msg.cid);
+
+                                            if let Some(store) = &storage {
+                                                let _ = store
+                                                    .set_metadata("consensus:last_lsu_cid", msg.cid.as_bytes())
+                                                    .await;
+                                                // Per-cycle CID history
+                                                let _ = store
+                                                    .set_metadata(
+                                                        &format!("consensus:lsu_cid:{}", cycle),
+                                                        msg.cid.as_bytes(),
+                                                    )
+                                                    .await;
+                                            }
                                         } else if let Ok(msg) = LsuGossip::new(update.clone()) {
                                             if let Ok(env) = MessageEnvelope::from_message(&msg, "lsu".to_string(), None) {
                                                 let _ = network.broadcast_envelope(&env).await;
@@ -580,6 +880,10 @@ impl CatalystNode {
 
         for h in self.network_tasks.drain(..) {
             h.abort();
+        }
+
+        if let Some(handle) = self.rpc_handle.take() {
+            handle.stop().ok();
         }
 
         Ok(())

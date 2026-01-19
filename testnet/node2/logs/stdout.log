@@ -1,0 +1,268 @@
+2026-01-19T22:29:27.847886Z  INFO Starting Catalyst CLI v0.1.0
+2026-01-19T22:29:27.848464Z  INFO Applied fast consensus timings for testnet config "testnet/node2/config.toml"
+2026-01-19T22:29:27.848478Z  INFO Starting Catalyst node with config: NodeConfig {
+    node: NodeIdentityConfig {
+        name: "catalyst-node-2",
+        private_key_file: "node.key",
+        auto_generate_identity: true,
+    },
+    network: NetworkConfig {
+        listen_addresses: [
+            "/ip4/0.0.0.0/tcp/30334",
+            "/ip6/::/tcp/30334",
+        ],
+        bootstrap_peers: [
+            "/ip4/127.0.0.1/tcp/30333",
+        ],
+        max_peers: 50,
+        min_peers: 5,
+        protocol_version: "catalyst/1.0",
+        mdns_discovery: true,
+        dht_enabled: true,
+        timeouts: NetworkTimeouts {
+            connection_timeout: 30,
+            request_timeout: 10,
+            keep_alive_interval: 30,
+        },
+    },
+    storage: StorageConfig {
+        data_dir: "testnet/node2/data",
+        enabled: true,
+        capacity_gb: 10,
+        cache_size_mb: 256,
+        write_buffer_size_mb: 64,
+        max_open_files: 1000,
+        compression_enabled: true,
+    },
+    consensus: ConsensusConfig {
+        cycle_duration_seconds: 20,
+        freeze_time_seconds: 1,
+        max_transactions_per_block: 1000,
+        min_producer_count: 2,
+        max_producer_count: 100,
+        phase_timeouts: PhaseTimeouts {
+            construction_timeout: 4,
+            campaigning_timeout: 4,
+            voting_timeout: 4,
+            synchronization_timeout: 4,
+        },
+    },
+    runtimes: RuntimeConfig {
+        evm: EvmRuntimeConfig {
+            enabled: true,
+            gas_limit: 8000000,
+            gas_price: 1000000000,
+            max_code_size: 24576,
+            debug_enabled: false,
+        },
+        svm: SvmRuntimeConfig {
+            enabled: false,
+            compute_unit_limit: 200000,
+            max_account_data_size: 10485760,
+        },
+        wasm: WasmRuntimeConfig {
+            enabled: false,
+            max_memory_pages: 1024,
+            execution_timeout_ms: 5000,
+        },
+    },
+    service_bus: ServiceBusConfig {
+        enabled: true,
+        websocket_address: "0.0.0.0",
+        websocket_port: 8547,
+        max_connections: 1000,
+        event_buffer_size: 10000,
+        webhooks_enabled: true,
+        webhook_timeout: 30,
+        webhook_max_retries: 3,
+    },
+    dfs: DfsConfig {
+        enabled: true,
+        ipfs_api_url: "http://127.0.0.1:5001",
+        ipfs_gateway_url: "http://127.0.0.1:8080",
+        cache_dir: "testnet/shared_dfs",
+        cache_size_gb: 5,
+        pinning_enabled: true,
+        gc_enabled: true,
+        gc_interval_hours: 24,
+    },
+    rpc: RpcConfig {
+        enabled: false,
+        address: "127.0.0.1",
+        port: 8546,
+        cors_enabled: true,
+        cors_origins: [
+            "*",
+        ],
+        auth_enabled: false,
+        api_key: None,
+        rate_limit: 100,
+        request_timeout: 30,
+    },
+    logging: LoggingConfig {
+        level: "info",
+        format: "text",
+        file_enabled: true,
+        file_path: "testnet/node2/logs/catalyst.log",
+        max_file_size_mb: 100,
+        max_files: 10,
+        console_enabled: true,
+    },
+    validator: true,
+}
+2026-01-19T22:29:27.848586Z  INFO Initializing Catalyst node
+2026-01-19T22:29:27.848598Z  INFO Node ID: 4abc306ab9ae280cb28f269c7d7a3de02d6e1163fc523917b1672bbdb1f75a1b
+2026-01-19T22:29:27.848612Z  INFO Starting Catalyst node
+2026-01-19T22:29:27.884765Z  INFO Initialized faucet pubkey=fafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa balance=1000000
+2026-01-19T22:29:27.884790Z  INFO Consensus loop enabled. cycle=20000ms producer_id=catalyst-node-2 validator=true
+2026-01-19T22:29:27.884990Z  INFO Loaded prev_seed from storage: c20cb771bb24632bf75756d0bf094ff3070b07079e595f9b2d3f56e7bd7e0de5
+2026-01-19T22:29:40.002312Z  INFO Cycle 88443089 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:29:40.053690Z  INFO Cycle 88443089 tx batch follower=catalyst-node-2 got entries=30
+2026-01-19T22:29:52.027149Z  INFO Applied LSU to storage cycle=88443089 state_root=736e1f4f54dd8e85e207ce3aa86a1ee5db9ccccf22c3891e76dd6d5721a54e90
+2026-01-19T22:29:52.027172Z  INFO Synced LSU via CID cycle=88443089 cid=bafkreidgkrwuthljwpqhcd5awj5tolahy2utdjumswzlfjxbyfmj4ppwgy
+2026-01-19T22:29:52.058513Z  INFO Stored LSU in DFS and broadcast CID cycle=88443089 cid=bafkreidgkrwuthljwpqhcd5awj5tolahy2utdjumswzlfjxbyfmj4ppwgy
+2026-01-19T22:29:52.058598Z  INFO Cycle 88443089 complete: LSU producers_ok=2 voters_ok=2 tx_entries=30
+2026-01-19T22:30:00.001995Z  INFO Cycle 88443090 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:30:00.053556Z  INFO Cycle 88443090 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:30:12.029799Z  INFO Applied LSU to storage cycle=88443090 state_root=633a2d339b3d2fdf19572fe572f9d6d770a6f2ddfef51d3af72f418c08dc937a
+2026-01-19T22:30:12.029835Z  INFO Synced LSU via CID cycle=88443090 cid=bafkreifsikaq54kxnkkf4rwwmqfc5jspztl4fznods3c2j6gzcnhvd6gdi
+2026-01-19T22:30:12.058973Z  INFO Stored LSU in DFS and broadcast CID cycle=88443090 cid=bafkreifsikaq54kxnkkf4rwwmqfc5jspztl4fznods3c2j6gzcnhvd6gdi
+2026-01-19T22:30:12.059070Z  INFO Cycle 88443090 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:30:20.001900Z  INFO Cycle 88443091 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:30:20.053267Z  INFO Cycle 88443091 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:30:32.034249Z  INFO Applied LSU to storage cycle=88443091 state_root=66e47bba13ada73044df7c99b70732ea47262f7004583ef7e3fd7971e2bf7d14
+2026-01-19T22:30:32.034264Z  INFO Synced LSU via CID cycle=88443091 cid=bafkreiaqlhgod7e6fzvd23ez2jtmxffd2srup3zljaeoa6czkwwcpmikvy
+2026-01-19T22:30:32.057282Z  INFO Stored LSU in DFS and broadcast CID cycle=88443091 cid=bafkreiaqlhgod7e6fzvd23ez2jtmxffd2srup3zljaeoa6czkwwcpmikvy
+2026-01-19T22:30:32.057381Z  INFO Cycle 88443091 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:30:40.002013Z  INFO Cycle 88443092 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:30:40.002061Z  INFO Cycle 88443092 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:30:52.022616Z  INFO Applied LSU to storage cycle=88443092 state_root=474533dcf43c559b3ed239470554a4a58c4165096bddca1022b2da05fdc832cb
+2026-01-19T22:30:52.023196Z  INFO Stored LSU in DFS and broadcast CID cycle=88443092 cid=bafkreifznfiwdk6dutfemnh5jehlyt4zaunwyczy66lvnfcdk3eutv2xwq
+2026-01-19T22:30:52.023228Z  INFO Synced LSU via CID cycle=88443092 cid=bafkreifznfiwdk6dutfemnh5jehlyt4zaunwyczy66lvnfcdk3eutv2xwq
+2026-01-19T22:30:52.023414Z  INFO Cycle 88443092 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:31:00.001899Z  INFO Cycle 88443093 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:31:00.053666Z  INFO Cycle 88443093 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:31:12.034416Z  INFO Applied LSU to storage cycle=88443093 state_root=3466041ec43f3a2f65666045a7949a2122fe2ca1a4952044a75d98daefa1c3d0
+2026-01-19T22:31:12.034457Z  INFO Synced LSU via CID cycle=88443093 cid=bafkreid2abovawwax5dl3boxy36pmzjsjicdx4ypuw3jzb3bvo6swuo6jy
+2026-01-19T22:31:12.057849Z  INFO Stored LSU in DFS and broadcast CID cycle=88443093 cid=bafkreid2abovawwax5dl3boxy36pmzjsjicdx4ypuw3jzb3bvo6swuo6jy
+2026-01-19T22:31:12.057996Z  INFO Cycle 88443093 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:31:20.001873Z  INFO Cycle 88443094 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:31:20.053763Z  INFO Cycle 88443094 tx batch follower=catalyst-node-2 got entries=38
+2026-01-19T22:31:32.031560Z  INFO Applied LSU to storage cycle=88443094 state_root=872539b4aed970346700ddaf2216f2932cf42974cfe2d93ee777e6efd26a23a0
+2026-01-19T22:31:32.031591Z  INFO Synced LSU via CID cycle=88443094 cid=bafkreicnobbrnu556nvabqnuatiqcssoi4rz74fmrojj5upnprpyukk6rm
+2026-01-19T22:31:32.059248Z  INFO Stored LSU in DFS and broadcast CID cycle=88443094 cid=bafkreicnobbrnu556nvabqnuatiqcssoi4rz74fmrojj5upnprpyukk6rm
+2026-01-19T22:31:32.059392Z  INFO Cycle 88443094 complete: LSU producers_ok=2 voters_ok=2 tx_entries=38
+2026-01-19T22:31:40.002013Z  INFO Cycle 88443095 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:31:40.002051Z  INFO Cycle 88443095 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:31:52.022097Z  INFO Applied LSU to storage cycle=88443095 state_root=1d5eaae634a9180fe6fd6502c5f09663018758f7964d2afa576ff8016506b64e
+2026-01-19T22:31:52.022493Z  INFO Stored LSU in DFS and broadcast CID cycle=88443095 cid=bafkreigatp2k4ibnkqgdri4dqyfqdxc2im5x3l5alwkpaq6jtsmedbj5b4
+2026-01-19T22:31:52.022506Z  INFO Synced LSU via CID cycle=88443095 cid=bafkreigatp2k4ibnkqgdri4dqyfqdxc2im5x3l5alwkpaq6jtsmedbj5b4
+2026-01-19T22:31:52.022575Z  INFO Cycle 88443095 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:32:00.002089Z  INFO Cycle 88443096 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:32:00.053586Z  INFO Cycle 88443096 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:32:12.033517Z  INFO Applied LSU to storage cycle=88443096 state_root=70f1a82e5c1771e457e6e8814fe6dc5243356fea53f34364d55f62e7b6c78596
+2026-01-19T22:32:12.033549Z  INFO Synced LSU via CID cycle=88443096 cid=bafkreihyuqggtlio34fgocfsmdzdg7zln67alvnrnav5sbh3ehz7ge24fi
+2026-01-19T22:32:12.059730Z  INFO Stored LSU in DFS and broadcast CID cycle=88443096 cid=bafkreihyuqggtlio34fgocfsmdzdg7zln67alvnrnav5sbh3ehz7ge24fi
+2026-01-19T22:32:12.059844Z  INFO Cycle 88443096 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:32:20.001924Z  INFO Cycle 88443097 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:32:20.053529Z  INFO Cycle 88443097 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:32:32.032467Z  INFO Applied LSU to storage cycle=88443097 state_root=2b5bdd55bfc37c8a0353335e1ccc2e366474f68922082a815b9d0cd4ee779927
+2026-01-19T22:32:32.032506Z  INFO Synced LSU via CID cycle=88443097 cid=bafkreicp2qay3cdaajhx6o5qjxpntyyxv2vntglrcfb3rzfnlaecxsar5u
+2026-01-19T22:32:32.058493Z  INFO Stored LSU in DFS and broadcast CID cycle=88443097 cid=bafkreicp2qay3cdaajhx6o5qjxpntyyxv2vntglrcfb3rzfnlaecxsar5u
+2026-01-19T22:32:32.058584Z  INFO Cycle 88443097 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:32:40.002131Z  INFO Cycle 88443098 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:32:40.002174Z  INFO Cycle 88443098 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:32:52.039641Z  INFO Applied LSU to storage cycle=88443098 state_root=91b9c5a41f826240142ed520e0ba07e4bac83d9857d45b06720f6d8812ee847e
+2026-01-19T22:32:52.039925Z  INFO Stored LSU in DFS and broadcast CID cycle=88443098 cid=bafkreiaceex4xnttpeqgbbjjk7ugrytwjwrj5lihhay3fsicmrdplnpjqu
+2026-01-19T22:32:52.039965Z  INFO Cycle 88443098 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:32:52.040143Z  INFO Synced LSU via CID cycle=88443098 cid=bafkreiaceex4xnttpeqgbbjjk7ugrytwjwrj5lihhay3fsicmrdplnpjqu
+2026-01-19T22:33:00.001994Z  INFO Cycle 88443099 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:33:00.053582Z  INFO Cycle 88443099 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:33:12.035685Z  INFO Applied LSU to storage cycle=88443099 state_root=36090b70048fce74f14bfbb25f479821314753bd3194170faba60d4052ba0f17
+2026-01-19T22:33:12.035727Z  INFO Synced LSU via CID cycle=88443099 cid=bafkreiatgpfbovqrgeqb5ecab2wp74lwd6zzurjf3h3tr7zzyuo4pdjw7i
+2026-01-19T22:33:12.059465Z  INFO Stored LSU in DFS and broadcast CID cycle=88443099 cid=bafkreiatgpfbovqrgeqb5ecab2wp74lwd6zzurjf3h3tr7zzyuo4pdjw7i
+2026-01-19T22:33:12.059592Z  INFO Cycle 88443099 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:33:20.002226Z  INFO Cycle 88443100 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:33:20.053895Z  INFO Cycle 88443100 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:33:32.028659Z  INFO Applied LSU to storage cycle=88443100 state_root=536bb3052aac5ff142f509e5897a56ddfc03e87324642038e35a82ca86cf6b34
+2026-01-19T22:33:32.028693Z  INFO Synced LSU via CID cycle=88443100 cid=bafkreieply3rltdxyb2m2qhujx6hkeemxwx3tbn3sws6tqwmelx2twy2ua
+2026-01-19T22:33:32.058920Z  INFO Stored LSU in DFS and broadcast CID cycle=88443100 cid=bafkreieply3rltdxyb2m2qhujx6hkeemxwx3tbn3sws6tqwmelx2twy2ua
+2026-01-19T22:33:32.058997Z  INFO Cycle 88443100 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:33:40.002044Z  INFO Cycle 88443101 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:33:40.002075Z  INFO Cycle 88443101 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:33:52.018875Z  INFO Applied LSU to storage cycle=88443101 state_root=d2eb05c50faf6c84ade1bad3cbb403375538b59909e9ab058322bda82911e802
+2026-01-19T22:33:52.019368Z  INFO Stored LSU in DFS and broadcast CID cycle=88443101 cid=bafkreihsnqycrxkrvep3ok3357x2jjhf52hcfwhcyf4cu4unbxudmntj7e
+2026-01-19T22:33:52.019378Z  INFO Synced LSU via CID cycle=88443101 cid=bafkreihsnqycrxkrvep3ok3357x2jjhf52hcfwhcyf4cu4unbxudmntj7e
+2026-01-19T22:33:52.019484Z  INFO Cycle 88443101 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:34:00.001905Z  INFO Cycle 88443102 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:34:00.001927Z  INFO Cycle 88443102 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:34:12.018728Z  INFO Applied LSU to storage cycle=88443102 state_root=becdc938628a8f644e5a133e542a9bb9032507468aa0d4725bb7b7512a74dc19
+2026-01-19T22:34:12.019314Z  INFO Stored LSU in DFS and broadcast CID cycle=88443102 cid=bafkreiaemzm55zv3cnc3apypn5l5n5skk5b4key3bpahfun4sojbcdmwre
+2026-01-19T22:34:12.019383Z  INFO Cycle 88443102 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:34:12.021630Z  INFO Synced LSU via CID cycle=88443102 cid=bafkreiaemzm55zv3cnc3apypn5l5n5skk5b4key3bpahfun4sojbcdmwre
+2026-01-19T22:34:20.001996Z  INFO Cycle 88443103 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:34:20.053168Z  INFO Cycle 88443103 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:34:32.032021Z  INFO Applied LSU to storage cycle=88443103 state_root=72fb8531549abd0e8223122cc121c3d2dfaabacce23ba094dcb42051137e787d
+2026-01-19T22:34:32.032051Z  INFO Synced LSU via CID cycle=88443103 cid=bafkreidw663krdepjron5ggm5btbbg77kowgumckamiefow37gawpleghy
+2026-01-19T22:34:32.057276Z  INFO Stored LSU in DFS and broadcast CID cycle=88443103 cid=bafkreidw663krdepjron5ggm5btbbg77kowgumckamiefow37gawpleghy
+2026-01-19T22:34:32.057406Z  INFO Cycle 88443103 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:34:40.001890Z  INFO Cycle 88443104 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:34:40.001961Z  INFO Cycle 88443104 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:34:52.018457Z  INFO Applied LSU to storage cycle=88443104 state_root=517fbba57c0671fdc6358da13080ca3fb3e8e810d333d3d698d2945f14d92b13
+2026-01-19T22:34:52.019112Z  INFO Stored LSU in DFS and broadcast CID cycle=88443104 cid=bafkreig5ystmjrdsnvk2jhjleofau2myge5vcclgariry6k5rof4ijk46e
+2026-01-19T22:34:52.019166Z  INFO Cycle 88443104 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:34:52.021477Z  INFO Synced LSU via CID cycle=88443104 cid=bafkreig5ystmjrdsnvk2jhjleofau2myge5vcclgariry6k5rof4ijk46e
+2026-01-19T22:35:00.002144Z  INFO Cycle 88443105 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:35:00.053305Z  INFO Cycle 88443105 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:35:12.031899Z  INFO Applied LSU to storage cycle=88443105 state_root=8ccca73253f440c138874785d912e5d5a82167ed8826142ff68f9f968af514b1
+2026-01-19T22:35:12.031923Z  INFO Synced LSU via CID cycle=88443105 cid=bafkreicexgzrh6itguoum5irzti5inhbe32hicmnaptjxpcrvdcbryniz4
+2026-01-19T22:35:12.057925Z  INFO Stored LSU in DFS and broadcast CID cycle=88443105 cid=bafkreicexgzrh6itguoum5irzti5inhbe32hicmnaptjxpcrvdcbryniz4
+2026-01-19T22:35:12.058041Z  INFO Cycle 88443105 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:35:20.002223Z  INFO Cycle 88443106 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:35:20.053905Z  INFO Cycle 88443106 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:35:32.035184Z  INFO Applied LSU to storage cycle=88443106 state_root=5ee790d90150a8c0eed13f368faa55afed7c80b570e0c54e7f43531c3ff20504
+2026-01-19T22:35:32.035214Z  INFO Synced LSU via CID cycle=88443106 cid=bafkreidtclakm67cz7i47fm77tuc3drp5t7k3gabiqhj24uyvp46elb2dm
+2026-01-19T22:35:32.058529Z  INFO Stored LSU in DFS and broadcast CID cycle=88443106 cid=bafkreidtclakm67cz7i47fm77tuc3drp5t7k3gabiqhj24uyvp46elb2dm
+2026-01-19T22:35:32.058627Z  INFO Cycle 88443106 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:35:40.002144Z  INFO Cycle 88443107 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:35:40.053274Z  INFO Cycle 88443107 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:35:52.038111Z  INFO Applied LSU to storage cycle=88443107 state_root=c9c74f8ef7be9048e3142875d95745485ed66e0dd9f2321101260c0755f636bd
+2026-01-19T22:35:52.038140Z  INFO Synced LSU via CID cycle=88443107 cid=bafkreia2jbucua6n6qg4yh5kmz5ueiyxrru6s7lmdaioswgaupwui2v4ou
+2026-01-19T22:35:52.057035Z  INFO Stored LSU in DFS and broadcast CID cycle=88443107 cid=bafkreia2jbucua6n6qg4yh5kmz5ueiyxrru6s7lmdaioswgaupwui2v4ou
+2026-01-19T22:35:52.057135Z  INFO Cycle 88443107 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:36:00.002542Z  INFO Cycle 88443108 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:36:00.053120Z  INFO Cycle 88443108 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:36:12.035684Z  INFO Applied LSU to storage cycle=88443108 state_root=8c76e0d140156c18090cc72061ffd720f397e70542c392d1ae25de85ed390fd5
+2026-01-19T22:36:12.035719Z  INFO Synced LSU via CID cycle=88443108 cid=bafkreibssmyhmbykbsssiax26evn6m4eq76sid5gwwn4apruhry2romu44
+2026-01-19T22:36:12.057154Z  INFO Stored LSU in DFS and broadcast CID cycle=88443108 cid=bafkreibssmyhmbykbsssiax26evn6m4eq76sid5gwwn4apruhry2romu44
+2026-01-19T22:36:12.057259Z  INFO Cycle 88443108 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:36:20.002021Z  INFO Cycle 88443109 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:36:20.053519Z  INFO Cycle 88443109 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:36:32.034798Z  INFO Applied LSU to storage cycle=88443109 state_root=aa1bcfe2ad1cee3b37a4f096856813ecc785e665fa83945da54b4950ef73aac9
+2026-01-19T22:36:32.034824Z  INFO Synced LSU via CID cycle=88443109 cid=bafkreifc5yp2ftvcdx7ujybzwvg4ddbsqb7muqxc76frykvf6negme6ihe
+2026-01-19T22:36:32.057555Z  INFO Stored LSU in DFS and broadcast CID cycle=88443109 cid=bafkreifc5yp2ftvcdx7ujybzwvg4ddbsqb7muqxc76frykvf6negme6ihe
+2026-01-19T22:36:32.057639Z  INFO Cycle 88443109 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:36:40.002424Z  INFO Cycle 88443110 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:36:40.053157Z  INFO Cycle 88443110 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:36:52.034207Z  INFO Applied LSU to storage cycle=88443110 state_root=1365bbfbe32d60a919e349118e4fe36491722982d22316317dd2954d63fb1617
+2026-01-19T22:36:52.034247Z  INFO Synced LSU via CID cycle=88443110 cid=bafkreigk3fbhx7oq2bjvllzkloud5exndnezlkghbne2plr6sz2ipq3qgm
+2026-01-19T22:36:52.057237Z  INFO Stored LSU in DFS and broadcast CID cycle=88443110 cid=bafkreigk3fbhx7oq2bjvllzkloud5exndnezlkghbne2plr6sz2ipq3qgm
+2026-01-19T22:36:52.057393Z  INFO Cycle 88443110 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:37:00.002059Z  INFO Cycle 88443111 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:37:00.002104Z  INFO Cycle 88443111 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:37:12.019324Z  INFO Applied LSU to storage cycle=88443111 state_root=9e64b93a1cdbcfa96b7dc623f5d52850483f6bf2df84a8a14fea624d9304f09c
+2026-01-19T22:37:12.019902Z  INFO Stored LSU in DFS and broadcast CID cycle=88443111 cid=bafkreidzlmbi2ltatadwm6hrexyjqttc53kwmz2ggbxivw2vogbqjs3axi
+2026-01-19T22:37:12.020039Z  INFO Cycle 88443111 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:37:12.021843Z  INFO Synced LSU via CID cycle=88443111 cid=bafkreidzlmbi2ltatadwm6hrexyjqttc53kwmz2ggbxivw2vogbqjs3axi
+2026-01-19T22:37:20.002079Z  INFO Cycle 88443112 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:37:20.053296Z  INFO Cycle 88443112 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:37:32.186979Z  INFO Applied LSU to storage cycle=88443112 state_root=c9162b5ff994b42e8972a903babac6e9ecea19b47ef0d978fac10d94078f2b40
+2026-01-19T22:37:32.187192Z  INFO Stored LSU in DFS and broadcast CID cycle=88443112 cid=bafkreiemw5xhis3l75n5adbvh6vo7oh6msqsvrsaajvrjdl6pfpdw23rbe
+2026-01-19T22:37:32.187220Z  INFO Cycle 88443112 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:37:32.187305Z  INFO Synced LSU via CID cycle=88443112 cid=bafkreiemw5xhis3l75n5adbvh6vo7oh6msqsvrsaajvrjdl6pfpdw23rbe
+2026-01-19T22:37:40.002016Z  INFO Cycle 88443113 selected_producers=["catalyst-node-1", "catalyst-node-2"]
+2026-01-19T22:37:40.002056Z  INFO Cycle 88443113 tx batch follower=catalyst-node-2 got entries=40
+2026-01-19T22:37:52.157692Z  INFO Applied LSU to storage cycle=88443113 state_root=da7ffd153e7cf6f86dd7bc29e0c3443f1d62bea7eb9a5fbf5e9cf154e87b4fc0
+2026-01-19T22:37:52.158160Z  INFO Stored LSU in DFS and broadcast CID cycle=88443113 cid=bafkreihibuofs57laoshxfz4kbawqddeiaynezpyvt5ounuyvkw2z26sbe
+2026-01-19T22:37:52.158217Z  INFO Cycle 88443113 complete: LSU producers_ok=2 voters_ok=2 tx_entries=40
+2026-01-19T22:37:52.158312Z  INFO Synced LSU via CID cycle=88443113 cid=bafkreihibuofs57laoshxfz4kbawqddeiaynezpyvt5ounuyvkw2z26sbe

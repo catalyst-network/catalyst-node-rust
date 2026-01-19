@@ -200,44 +200,6 @@ async fn main() -> Result<()> {
 
     info!("Starting Catalyst CLI v{}", env!("CARGO_PKG_VERSION"));
 
-    // Load configuration (or auto-generate a local default if missing).
-    let mut config = if cli.config.exists() {
-        NodeConfig::load(&cli.config)?
-    } else {
-        info!(
-            "Configuration file not found at {:?}, generating a default config",
-            cli.config
-        );
-        if let Some(parent) = cli.config.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let cfg = NodeConfig::default_for_config_path(&cli.config);
-        cfg.save(&cli.config)?;
-        cfg
-    };
-
-    // Testnet-only consensus speedup: keep dev/mainnet defaults intact, but make the local
-    // `make testnet` loop iterate quickly.
-    if is_testnet_config_path(&cli.config) {
-        // Testnet should iterate quickly but still be stable under local scheduling jitter.
-        // 20s cycle, 4s per phase (16s total), 1s freeze window.
-        config.consensus.cycle_duration_seconds = 20;
-        config.consensus.freeze_time_seconds = 1;
-        config.consensus.min_producer_count = 2;
-        config.consensus.phase_timeouts.construction_timeout = 4;
-        config.consensus.phase_timeouts.campaigning_timeout = 4;
-        config.consensus.phase_timeouts.voting_timeout = 4;
-        config.consensus.phase_timeouts.synchronization_timeout = 4;
-
-        // Testnet-only DFS: use a shared local DFS directory so CID fetch works across
-        // the 3 local processes even without a P2P DFS layer.
-        config.dfs.cache_dir = PathBuf::from("testnet/shared_dfs");
-
-        // Persist so the config dump/logs match runtime behavior.
-        config.save(&cli.config)?;
-        info!("Applied fast consensus timings for testnet config {:?}", cli.config);
-    }
-
     // Execute command
     match cli.command {
         Commands::Start {
@@ -250,6 +212,44 @@ async fn main() -> Result<()> {
             generate_txs,
             tx_interval_ms,
         } => {
+            // Load configuration (or auto-generate a local default if missing).
+            let mut config = if cli.config.exists() {
+                NodeConfig::load(&cli.config)?
+            } else {
+                info!(
+                    "Configuration file not found at {:?}, generating a default config",
+                    cli.config
+                );
+                if let Some(parent) = cli.config.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let cfg = NodeConfig::default_for_config_path(&cli.config);
+                cfg.save(&cli.config)?;
+                cfg
+            };
+
+            // Testnet-only consensus speedup: keep dev/mainnet defaults intact, but make the local
+            // `make testnet` loop iterate quickly.
+            if is_testnet_config_path(&cli.config) {
+                // Testnet should iterate quickly but still be stable under local scheduling jitter.
+                // 20s cycle, 4s per phase (16s total), 1s freeze window.
+                config.consensus.cycle_duration_seconds = 20;
+                config.consensus.freeze_time_seconds = 1;
+                config.consensus.min_producer_count = 2;
+                config.consensus.phase_timeouts.construction_timeout = 4;
+                config.consensus.phase_timeouts.campaigning_timeout = 4;
+                config.consensus.phase_timeouts.voting_timeout = 4;
+                config.consensus.phase_timeouts.synchronization_timeout = 4;
+
+                // Testnet-only DFS: use a shared local DFS directory so CID fetch works across
+                // the 3 local processes even without a P2P DFS layer.
+                config.dfs.cache_dir = PathBuf::from("testnet/shared_dfs");
+
+                // Persist so the config dump/logs match runtime behavior.
+                config.save(&cli.config)?;
+                info!("Applied fast consensus timings for testnet config {:?}", cli.config);
+            }
+
             let mut node_config = config;
             node_config.validator = validator;
             node_config.storage.enabled = storage;

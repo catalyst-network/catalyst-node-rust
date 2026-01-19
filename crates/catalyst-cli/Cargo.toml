@@ -37,6 +37,7 @@ blake2 = "0.10"
 
 # Async runtime
 futures = "0.3"
+jsonrpsee = { version = "0.21", features = ["http-client"] }
 
 [features]
 default = []

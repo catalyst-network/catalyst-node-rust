@@ -12,7 +12,9 @@ use jsonrpsee::{
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use thiserror::Error;
+
 
 // Note: The initial scaffold referenced sub-modules (`methods`, `server`, `types`) that
 // aren't present yet. Keeping the RPC types and traits in this file for now so the
@@ -134,6 +136,19 @@ pub trait CatalystRpc {
     /// Get node version
     #[method(name = "catalyst_version")]
     async fn version(&self) -> RpcResult<String>;
+
+    /// Get applied head info (cycle/hash/state_root)
+    #[method(name = "catalyst_head")]
+    async fn head(&self) -> RpcResult<RpcHead>;
+}
+
+/// Minimal head info based on applied LSU/state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcHead {
+    pub applied_cycle: u64,
+    pub applied_lsu_hash: String,
+    pub applied_state_root: String,
+    pub last_lsu_cid: Option<String>,
 }
 
 /// RPC transaction request structure
@@ -230,6 +245,192 @@ pub trait RpcServer: Send + Sync {
     
     /// Get server statistics
     async fn stats(&self) -> Result<RpcServerStats, RpcServerError>;
+}
+
+fn parse_hex_32(s: &str) -> Result<[u8; 32], RpcServerError> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(s).map_err(|e| RpcServerError::InvalidParams(e.to_string()))?;
+    if bytes.len() != 32 {
+        return Err(RpcServerError::InvalidParams(
+            "Expected 32-byte hex (public key)".to_string(),
+        ));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn decode_i64(bytes: &[u8]) -> i64 {
+    if bytes.len() != 8 {
+        return 0;
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(bytes);
+    i64::from_le_bytes(b)
+}
+
+fn bal_key(pubkey: &[u8; 32]) -> Vec<u8> {
+    let mut k = b"bal:".to_vec();
+    k.extend_from_slice(pubkey);
+    k
+}
+
+fn decode_u64_le(bytes: &[u8]) -> u64 {
+    if bytes.len() != 8 {
+        return 0;
+    }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(bytes);
+    u64::from_le_bytes(b)
+}
+
+/// Minimal RPC implementation backed by `catalyst-storage`.
+pub struct CatalystRpcImpl {
+    storage: Arc<catalyst_storage::StorageManager>,
+    network: Option<Arc<catalyst_network::NetworkService>>,
+}
+
+impl CatalystRpcImpl {
+    pub fn new(
+        storage: Arc<catalyst_storage::StorageManager>,
+        network: Option<Arc<catalyst_network::NetworkService>>,
+    ) -> Self {
+        Self { storage, network }
+    }
+}
+
+#[async_trait]
+impl CatalystRpcServer for CatalystRpcImpl {
+    async fn block_number(&self) -> RpcResult<u64> {
+        let n = self
+            .storage
+            .get_metadata("consensus:last_applied_cycle")
+            .await
+            .ok()
+            .flatten()
+            .map(|b| decode_u64_le(&b))
+            .unwrap_or(0);
+        Ok(n)
+    }
+
+    async fn get_block_by_hash(&self, _hash: String, _full_transactions: bool) -> RpcResult<Option<RpcBlock>> {
+        Ok(None)
+    }
+
+    async fn get_block_by_number(&self, _number: u64, _full_transactions: bool) -> RpcResult<Option<RpcBlock>> {
+        Ok(None)
+    }
+
+    async fn get_transaction_by_hash(&self, _hash: String) -> RpcResult<Option<RpcTransaction>> {
+        Ok(None)
+    }
+
+    async fn get_balance(&self, address: String) -> RpcResult<String> {
+        let pk = parse_hex_32(&address).map_err(ErrorObjectOwned::from)?;
+        let key = bal_key(&pk);
+        let bal = self
+            .storage
+            .engine()
+            .get("accounts", &key)
+            .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())))?
+            .map(|b| decode_i64(&b))
+            .unwrap_or(0);
+        Ok(bal.to_string())
+    }
+
+    async fn get_account(&self, _address: String) -> RpcResult<Option<RpcAccount>> {
+        Ok(None)
+    }
+
+    async fn send_raw_transaction(&self, _data: String) -> RpcResult<String> {
+        Err(ErrorObjectOwned::from(RpcServerError::Server(
+            "sendRawTransaction not implemented".to_string(),
+        )))
+    }
+
+    async fn estimate_fee(&self, _transaction: RpcTransactionRequest) -> RpcResult<String> {
+        Ok("0".to_string())
+    }
+
+    async fn network_info(&self) -> RpcResult<RpcNetworkInfo> {
+        let peer_count = self.peer_count().await.unwrap_or(0);
+        Ok(RpcNetworkInfo {
+            chain_id: 0,
+            network_id: 0,
+            protocol_version: "catalyst/0".to_string(),
+            genesis_hash: "0x0".to_string(),
+            current_block: self.block_number().await?,
+            highest_block: self.block_number().await?,
+            peer_count,
+        })
+    }
+
+    async fn syncing(&self) -> RpcResult<RpcSyncStatus> {
+        Ok(RpcSyncStatus::Synced(true))
+    }
+
+    async fn peer_count(&self) -> RpcResult<u64> {
+        if let Some(net) = &self.network {
+            let st = net.get_stats().await;
+            return Ok(st.connected_peers as u64);
+        }
+        Ok(0)
+    }
+
+    async fn version(&self) -> RpcResult<String> {
+        Ok(format!("catalyst-rpc/{}", env!("CARGO_PKG_VERSION")))
+    }
+
+    async fn head(&self) -> RpcResult<RpcHead> {
+        let applied_cycle = self.block_number().await?;
+        let applied_lsu_hash = self
+            .storage
+            .get_metadata("consensus:last_applied_lsu_hash")
+            .await
+            .ok()
+            .flatten()
+            .map(|b| format!("0x{}", hex::encode(b)))
+            .unwrap_or_else(|| "0x0".to_string());
+        let applied_state_root = self
+            .storage
+            .get_metadata("consensus:last_applied_state_root")
+            .await
+            .ok()
+            .flatten()
+            .map(|b| format!("0x{}", hex::encode(b)))
+            .unwrap_or_else(|| "0x0".to_string());
+        let last_lsu_cid = self
+            .storage
+            .get_metadata("consensus:last_lsu_cid")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| String::from_utf8(b).ok());
+
+        Ok(RpcHead {
+            applied_cycle,
+            applied_lsu_hash,
+            applied_state_root,
+            last_lsu_cid,
+        })
+    }
+}
+
+/// Start a minimal HTTP JSON-RPC server on `bind_address`.
+pub async fn start_rpc_http(
+    bind_address: SocketAddr,
+    storage: Arc<catalyst_storage::StorageManager>,
+    network: Option<Arc<catalyst_network::NetworkService>>,
+) -> Result<ServerHandle, RpcServerError> {
+    let server = jsonrpsee::server::ServerBuilder::default()
+        .build(bind_address)
+        .await
+        .map_err(|e| RpcServerError::Server(e.to_string()))?;
+
+    let rpc = CatalystRpcImpl::new(storage, network).into_rpc();
+    let handle = server.start(rpc);
+
+    Ok(handle)
 }
 
 /// RPC server statistics
