@@ -1,16 +1,16 @@
 use crate::{
-    types::*, error::ConsensusError, Producer
+    types::*, error::ConsensusError, producer::Producer
 };
 use catalyst_utils::{CatalystResult, Hash};
 use catalyst_utils::logging::{LogCategory, log_info, log_warn, log_error};
-use catalyst_utils::metrics::{increment_counter, observe_histogram, time_operation};
-use std::collections::{HashMap, HashSet};
+use catalyst_utils::{increment_counter, observe_histogram, time_operation};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 use indexmap::IndexMap;
 
 /// Construction Phase Implementation
 pub struct ConstructionPhase {
-    producer: Producer,
+    pub(crate) producer: Producer,
 }
 
 impl ConstructionPhase {
@@ -43,9 +43,10 @@ impl ConstructionPhase {
         // Sort transactions by hash for deterministic ordering
         let mut sorted_entries = transactions;
         sorted_entries.sort_by_key(|entry| hash_data(entry).unwrap_or_default());
+        let entry_count = sorted_entries.len();
 
         // Create hash tree of transaction signatures
-        let signatures: Vec<_> = sorted_entries.iter().map(|e| e.signature).collect();
+        let signatures: Vec<Vec<u8>> = sorted_entries.iter().map(|e| e.signature.clone()).collect();
         let signatures_hash = self.compute_hash_tree(&signatures)?;
 
         // Calculate total fees
@@ -59,7 +60,9 @@ impl ConstructionPhase {
             transaction_entries: sorted_entries,
             transaction_signatures_hash: signatures_hash,
             total_fees,
-            timestamp: current_timestamp_ms(),
+            // Must be deterministic across producers for the same cycle; otherwise the
+            // partial update hash (first_hash) will never converge to a majority.
+            timestamp: self.producer.cycle_number,
         };
 
         // Hash the partial update
@@ -72,25 +75,26 @@ impl ConstructionPhase {
         // Create producer quantity
         let quantity = ProducerQuantity {
             first_hash,
+            cycle_number: self.producer.cycle_number,
             producer_id: self.producer.id.clone(),
             timestamp: current_timestamp_ms(),
         };
 
-        observe_histogram!("consensus_transaction_count", sorted_entries.len() as f64);
+        observe_histogram!("consensus_transaction_count", entry_count as f64);
         
         Ok(quantity)
     }
 
-    fn compute_hash_tree(&self, signatures: &[catalyst_crypto::Signature]) -> CatalystResult<Hash> {
-        use blake2::{Blake2b256, Digest};
+    fn compute_hash_tree(&self, signatures: &[Vec<u8>]) -> CatalystResult<Hash> {
+        use blake2::{Blake2b512, Digest};
         
         if signatures.is_empty() {
             return Ok([0u8; 32]);
         }
 
-        let mut hasher = Blake2b256::new();
-        for sig in signatures {
-            hasher.update(&sig.to_bytes());
+        let mut hasher = Blake2b512::new();
+        for sig_bytes in signatures {
+            hasher.update(sig_bytes);
         }
         
         let result = hasher.finalize();
@@ -102,7 +106,7 @@ impl ConstructionPhase {
 
 /// Campaigning Phase Implementation
 pub struct CampaigningPhase {
-    producer: Producer,
+    pub(crate) producer: Producer,
     collected_quantities: HashMap<String, ProducerQuantity>,
 }
 
@@ -149,8 +153,8 @@ impl CampaigningPhase {
             }.into());
         }
 
-        // Count occurrences of each first hash
-        let mut hash_counts: HashMap<Hash, Vec<String>> = HashMap::new();
+        // Count occurrences of each first hash (BTreeMap for deterministic iteration/logging)
+        let mut hash_counts: BTreeMap<Hash, Vec<String>> = BTreeMap::new();
         for (producer_id, quantity) in &self.collected_quantities {
             hash_counts.entry(quantity.first_hash)
                 .or_insert_with(Vec::new)
@@ -161,22 +165,45 @@ impl CampaigningPhase {
         let total_count = self.collected_quantities.len();
         let required_majority = (total_count as f64 * threshold).ceil() as usize;
         
-        let (majority_hash, producer_list) = hash_counts
-            .into_iter()
-            .max_by_key(|(_, producers)| producers.len())
-            .ok_or_else(|| ConsensusError::NoMajority {
+        let mut best_hash: Option<Hash> = None;
+        let mut best_list: Vec<String> = Vec::new();
+        for (h, producers) in hash_counts.iter() {
+            if producers.len() > best_list.len() {
+                best_hash = Some(*h);
+                best_list = producers.clone();
+            }
+        }
+        let Some(majority_hash) = best_hash else {
+            return Err(ConsensusError::NoMajority {
                 highest: 0,
                 threshold: required_majority,
-            })?;
+                details: format!(" (phase=campaigning cycle={})", self.producer.cycle_number),
+            }.into());
+        };
+        let producer_list = best_list;
 
         if producer_list.len() < required_majority {
+            log_warn!(
+                LogCategory::Consensus,
+                "No majority first_hash for cycle {}: need {} got {} counts={:?}",
+                self.producer.cycle_number,
+                required_majority,
+                producer_list.len(),
+                hash_counts.iter().map(|(h, ps)| (hex::encode(h), ps.len())).collect::<Vec<_>>()
+            );
             return Err(ConsensusError::NoMajority {
                 highest: producer_list.len(),
                 threshold: required_majority,
+                details: format!(
+                    " (phase=campaigning cycle={} first_hash_counts={:?})",
+                    self.producer.cycle_number,
+                    hash_counts.iter().map(|(h, ps)| (hex::encode(h), ps.len())).collect::<Vec<_>>()
+                ),
             }.into());
         }
 
         // Include self if we have the majority hash
+        let producer_list_len = producer_list.len();
         let mut final_producer_list = producer_list;
         if let Some(our_hash) = self.producer.first_hash {
             if our_hash == majority_hash && !final_producer_list.contains(&self.producer.id) {
@@ -193,22 +220,23 @@ impl CampaigningPhase {
         let candidate = ProducerCandidate {
             majority_hash,
             producer_list_hash,
+            cycle_number: self.producer.cycle_number,
             producer_id: self.producer.id.clone(),
             timestamp: current_timestamp_ms(),
         };
 
-        observe_histogram!("consensus_majority_size", producer_list.len() as f64);
+        observe_histogram!("consensus_majority_size", producer_list_len as f64);
         
         Ok(candidate)
     }
 
     fn hash_producer_list(&self, producer_list: &[String]) -> CatalystResult<Hash> {
-        use blake2::{Blake2b256, Digest};
+        use blake2::{Blake2b512, Digest};
         
         let mut sorted_list = producer_list.to_vec();
         sorted_list.sort();
         
-        let mut hasher = Blake2b256::new();
+        let mut hasher = Blake2b512::new();
         for producer_id in &sorted_list {
             hasher.update(producer_id.as_bytes());
         }
@@ -222,7 +250,7 @@ impl CampaigningPhase {
 
 /// Voting Phase Implementation
 pub struct VotingPhase {
-    producer: Producer,
+    pub(crate) producer: Producer,
     collected_candidates: HashMap<String, ProducerCandidate>,
 }
 
@@ -293,12 +321,14 @@ impl VotingPhase {
             .ok_or_else(|| ConsensusError::NoMajority {
                 highest: 0,
                 threshold: required_majority,
+                details: format!(" (phase=voting cycle={})", self.producer.cycle_number),
             })?;
 
         if voting_producers.len() < required_majority {
             return Err(ConsensusError::NoMajority {
                 highest: voting_producers.len(),
                 threshold: required_majority,
+                details: format!(" (phase=voting cycle={} candidate_majority_hash_counts=ambiguous)", self.producer.cycle_number),
             }.into());
         }
 
@@ -322,6 +352,13 @@ impl VotingPhase {
             })?
             .clone();
 
+        // Deterministic ordering is critical: this structure is hashed and becomes the vote value.
+        let mut final_producer_list = final_producer_list;
+        final_producer_list.sort();
+
+        let mut voting_producers = voting_producers.clone();
+        voting_producers.sort();
+
         let ledger_update = LedgerStateUpdate {
             partial_update,
             compensation_entries,
@@ -339,16 +376,18 @@ impl VotingPhase {
         // Create vote list hash
         let vote_list_hash = self.hash_producer_list(&voting_producers)?;
         
-        // Include self in vote list
+        // Include self in vote list (deterministic)
         let mut final_vote_list = voting_producers;
         if !final_vote_list.contains(&self.producer.id) {
             final_vote_list.push(self.producer.id.clone());
         }
+        final_vote_list.sort();
         self.producer.vote_list = Some(final_vote_list);
 
         let vote = ProducerVote {
             ledger_state_hash,
             vote_list_hash,
+            cycle_number: self.producer.cycle_number,
             producer_id: self.producer.id.clone(),
             timestamp: current_timestamp_ms(),
         };
@@ -358,7 +397,7 @@ impl VotingPhase {
 
     fn create_final_producer_list(&self, majority_hash: &Hash) -> CatalystResult<Vec<String>> {
         // Collect all producer lists from candidates with majority hash
-        let mut producer_counts: HashMap<String, usize> = HashMap::new();
+        let mut producer_counts: BTreeMap<String, usize> = BTreeMap::new();
         let mut total_candidates = 0;
 
         for candidate in self.collected_candidates.values() {
@@ -372,11 +411,12 @@ impl VotingPhase {
 
         // Include only producers that appear in at least P/2 lists
         let threshold = (total_candidates + 1) / 2;  // P/2 threshold
-        let final_list: Vec<String> = producer_counts
+        let mut final_list: Vec<String> = producer_counts
             .into_iter()
             .filter(|(_, count)| *count >= threshold)
             .map(|(producer_id, _)| producer_id)
             .collect();
+        final_list.sort();
 
         Ok(final_list)
     }
@@ -390,7 +430,10 @@ impl VotingPhase {
 
         let reward_per_producer = reward_config.producer_reward / producer_list.len() as u64;
         
-        for producer_id in producer_list {
+        // Deterministic ordering (this list is hashed as part of LSU).
+        let mut sorted = producer_list.to_vec();
+        sorted.sort();
+        for producer_id in &sorted {
             // In a real implementation, we'd look up the producer's public key
             // For now, we'll use a placeholder
             let public_key = [0u8; 32]; // Placeholder
@@ -402,16 +445,18 @@ impl VotingPhase {
             });
         }
 
+        // Ensure stable entry ordering (by producer id).
+        entries.sort_by(|a, b| a.producer_id.cmp(&b.producer_id));
         Ok(entries)
     }
 
     fn hash_producer_list(&self, producer_list: &[String]) -> CatalystResult<Hash> {
-        use blake2::{Blake2b256, Digest};
+        use blake2::{Blake2b512, Digest};
         
         let mut sorted_list = producer_list.to_vec();
         sorted_list.sort();
         
-        let mut hasher = Blake2b256::new();
+        let mut hasher = Blake2b512::new();
         for producer_id in &sorted_list {
             hasher.update(producer_id.as_bytes());
         }
@@ -425,7 +470,7 @@ impl VotingPhase {
 
 /// Synchronization Phase Implementation
 pub struct SynchronizationPhase {
-    producer: Producer,
+    pub(crate) producer: Producer,
     collected_votes: HashMap<String, ProducerVote>,
 }
 
@@ -489,12 +534,17 @@ impl SynchronizationPhase {
             .ok_or_else(|| ConsensusError::NoMajority {
                 highest: 0,
                 threshold: required_majority,
+                details: format!(" (phase=synchronization cycle={})", self.producer.cycle_number),
             })?;
 
         if vote_producers.len() < required_majority {
             return Err(ConsensusError::NoMajority {
                 highest: vote_producers.len(),
                 threshold: required_majority,
+                details: format!(
+                    " (phase=synchronization cycle={} ledger_state_hash_counts=ambiguous)",
+                    self.producer.cycle_number
+                ),
             }.into());
         }
 
@@ -523,6 +573,7 @@ impl SynchronizationPhase {
         let output = ProducerOutput {
             dfs_address,
             vote_list_hash,
+            cycle_number: self.producer.cycle_number,
             producer_id: self.producer.id.clone(),
             timestamp: current_timestamp_ms(),
         };
@@ -547,17 +598,21 @@ impl SynchronizationPhase {
         }
 
         // Include only producers that appear in at least Cn/2 vote lists
-        let cn = self.producer.producer_list.as_ref()
-            .map(|list| list.len())
+        let cn = self
+            .producer
+            .producer_list
+            .as_ref()
+            .map(|list: &Vec<String>| list.len())
             .unwrap_or(0);
         let threshold = (cn + 1) / 2;  // Cn/2 threshold
         
-        let final_list: Vec<String> = vote_counts
+        let mut final_list: Vec<String> = vote_counts
             .into_iter()
             .filter(|(_, count)| *count >= threshold)
             .map(|(producer_id, _)| producer_id)
             .collect();
 
+        final_list.sort();
         Ok(final_list)
     }
 
@@ -568,8 +623,8 @@ impl SynchronizationPhase {
         
         // In a real implementation, this would store to the distributed file system
         // For now, we'll create a content-based address using hash
-        use blake2::{Blake2b256, Digest};
-        let mut hasher = Blake2b256::new();
+        use blake2::{Blake2b512, Digest};
+        let mut hasher = Blake2b512::new();
         hasher.update(&serialized);
         let result = hasher.finalize();
         
@@ -583,12 +638,12 @@ impl SynchronizationPhase {
     }
 
     fn hash_producer_list(&self, producer_list: &[String]) -> CatalystResult<Hash> {
-        use blake2::{Blake2b256, Digest};
+        use blake2::{Blake2b512, Digest};
         
         let mut sorted_list = producer_list.to_vec();
         sorted_list.sort();
         
-        let mut hasher = Blake2b256::new();
+        let mut hasher = Blake2b512::new();
         for producer_id in &sorted_list {
             hasher.update(producer_id.as_bytes());
         }

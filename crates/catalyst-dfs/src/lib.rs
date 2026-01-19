@@ -1,376 +1,491 @@
-//! Catalyst DFS: local content-addressed store with optional IPFS HTTP backend.
-
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+//! Distributed File System for Catalyst Network
+//! 
+//! This is a simplified version that focuses on storage functionality
+//! without the networking components to avoid libp2p compatibility issues.
 
 use async_trait::async_trait;
-// NOTE: use cid's re-exported multihash to avoid version conflicts.
 use cid::Cid;
-use multihash_codetable::{Code, MultihashDigest};
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use thiserror::Error;
-use tokio::{fs, io::AsyncWriteExt};
 
-#[cfg(feature = "ipfs-http")]
-use {reqwest::Client, reqwest::Url};
+// Local type definitions
+pub type Hash = [u8; 32];
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerStateUpdate {
+    pub data: Vec<u8>,
+}
 
-/// Result alias
-pub type DfsResult<T> = Result<T, DfsError>;
+// Only include storage module for now
+pub mod storage;
+pub mod provider;
 
-/// DFS error type
-#[derive(Debug, Error)]
+pub use storage::LocalDfsStorage;
+pub use provider::{
+    DfsContentProvider, ProviderStats, ReplicationLevel
+};
+
+#[derive(Error, Debug)]
 pub enum DfsError {
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[cfg(feature = "ipfs-http")]
-    #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
-
-    #[error("not found: {0}")]
+    #[error("Network error: {0}")]
+    Network(String),
+    #[error("Storage error: {0}")]
+    Storage(String),
+    #[error("Not found: {0}")]
     NotFound(String),
-
-    #[error("invalid content id")]
-    InvalidContentId,
-
-    #[error("IPFS disabled")]
-    IpfsDisabled,
-
-    #[error("other: {0}")]
-    Other(String),
-}
-
-/// Replication levels for content
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash)]
-pub enum ReplicationLevel {
-    /// Keep only locally (no IPFS pin)
-    None,
-    /// Attempt single remote replica
-    Low,
-    /// Attempt a few replicas
-    Medium,
-    /// Aggressively replicate/pin
-    High,
-}
-
-impl Default for ReplicationLevel {
-    fn default() -> Self {
-        ReplicationLevel::Low
-    }
+    #[error("Invalid CID: {0}")]
+    InvalidCid(String),
+    #[error("Timeout: {0}")]
+    Timeout(String),
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// DFS configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DfsConfig {
-    /// Local directory for content-addressed files
-    pub local_dir: PathBuf,
-    /// Optional IPFS API endpoint (e.g. `http://127.0.0.1:5001`)
-    pub ipfs_api: Option<String>,
-    /// Desired replication policy
-    pub replication: ReplicationLevel,
+    /// Local storage directory
+    pub storage_dir: PathBuf,
+    /// Maximum storage size in bytes
+    pub max_storage_size: u64,
+    /// Enable garbage collection
+    pub enable_gc: bool,
+    /// Garbage collection interval in seconds
+    pub gc_interval: u64,
+    /// Enable content discovery
+    pub enable_discovery: bool,
+    /// Provider announcement interval
+    pub provider_interval: u64,
+    /// Replication factor for important data
+    pub replication_factor: usize,
+    /// Enable networking (currently disabled)
+    pub enable_networking: bool,
+    /// Network listen addresses
+    pub listen_addresses: Vec<String>,
+    /// Bootstrap peers for DHT
+    pub bootstrap_peers: Vec<String>,
 }
 
 impl Default for DfsConfig {
     fn default() -> Self {
         Self {
-            local_dir: PathBuf::from("./.catalyst/dfs"),
-            ipfs_api: None,
-            replication: ReplicationLevel::Low,
+            storage_dir: PathBuf::from("./dfs"),
+            max_storage_size: 100 * 1024 * 1024 * 1024, // 100GB
+            enable_gc: true,
+            gc_interval: 3600, // 1 hour
+            enable_discovery: true,
+            provider_interval: 900, // 15 minutes
+            replication_factor: 3,
+            enable_networking: false, // Disabled for now
+            listen_addresses: vec!["/ip4/0.0.0.0/tcp/0".to_string()],
+            bootstrap_peers: Vec::new(),
         }
     }
 }
 
-/// ContentId is a CIDv1 string over raw bytes (codec 0x55) using sha2-256 multihash.
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub struct ContentId(String);
+impl DfsConfig {
+    pub fn validate(&self) -> Result<(), DfsError> {
+        if !self.storage_dir.exists() {
+            std::fs::create_dir_all(&self.storage_dir)?;
+        }
+        
+        if self.max_storage_size == 0 {
+            return Err(DfsError::Storage("Max storage size cannot be zero".to_string()));
+        }
+        
+        if self.replication_factor == 0 {
+            return Err(DfsError::Storage("Replication factor cannot be zero".to_string()));
+        }
+        
+        Ok(())
+    }
+
+    /// Create a configuration for testing
+    pub fn test_config(storage_dir: PathBuf) -> Self {
+        Self {
+            storage_dir,
+            max_storage_size: 1024 * 1024 * 1024, // 1GB for testing
+            enable_networking: false, // Disabled for tests
+            ..Default::default()
+        }
+    }
+
+    /// Create a configuration for development
+    pub fn dev_config(storage_dir: PathBuf) -> Self {
+        Self {
+            storage_dir,
+            enable_gc: true,
+            gc_interval: 300, // 5 minutes for dev
+            provider_interval: 60, // 1 minute for dev
+            enable_networking: false, // Disabled for now
+            ..Default::default()
+        }
+    }
+}
+
+/// Content addressing types
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ContentId(pub Cid);
 
 impl ContentId {
-    /// Compute a CID from raw data.
-    pub fn from_data(data: &[u8]) -> DfsResult<Self> {
-        // Multicodec "raw" = 0x55
-        const RAW_CODEC: u64 = 0x55;
-        let mh = Code::Sha2_256.digest(data);
-        let cid = Cid::new_v1(RAW_CODEC, mh);
-        Ok(Self(cid.to_string()))
+    /// Create content ID from data
+    pub fn from_data(data: &[u8]) -> Result<Self, DfsError> {
+        use sha2::{Sha256, Digest};
+        
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let hash_bytes = hasher.finalize();
+        
+        // Create multihash using the compatible v0.18 API
+        use multihash::{Code, MultihashDigest};
+        let mh = Code::Sha2_256.digest(&hash_bytes);
+        
+        let cid = Cid::new_v1(0x55, mh); // 0x55 = raw codec
+        Ok(ContentId(cid))
+    }
+    
+    /// Get CID as string
+    pub fn to_string(&self) -> String {
+        self.0.to_string()
+    }
+    
+    /// Parse CID from string
+    pub fn from_string(s: &str) -> Result<Self, DfsError> {
+        let cid = s.parse::<Cid>()
+            .map_err(|e| DfsError::InvalidCid(e.to_string()))?;
+        Ok(ContentId(cid))
     }
 
-    pub fn as_str(&self) -> &str {
+    /// Get the underlying CID
+    pub fn cid(&self) -> &Cid {
         &self.0
     }
-
-    pub fn to_path_component(&self) -> &str {
-        &self.0
-    }
 }
 
-impl From<String> for ContentId {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-impl From<&str> for ContentId {
-    fn from(s: &str) -> Self {
-        Self(s.to_owned())
-    }
+/// DFS content metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentMetadata {
+    /// Content ID
+    pub cid: ContentId,
+    /// Content size in bytes
+    pub size: u64,
+    /// Content type/MIME type
+    pub content_type: Option<String>,
+    /// Creation timestamp
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Last accessed timestamp
+    pub accessed_at: chrono::DateTime<chrono::Utc>,
+    /// Number of times accessed
+    pub access_count: u64,
+    /// Pin status (prevents garbage collection)
+    pub pinned: bool,
 }
 
-impl std::fmt::Display for ContentId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
+/// Main DFS interface trait
+#[async_trait]
+pub trait DistributedFileSystem: Send {
+    /// Store data and return content ID
+    async fn put(&self, data: Vec<u8>) -> Result<ContentId, DfsError>;
+    
+    /// Retrieve data by content ID
+    async fn get(&self, cid: &ContentId) -> Result<Vec<u8>, DfsError>;
+    
+    /// Check if content exists locally
+    async fn has(&self, cid: &ContentId) -> Result<bool, DfsError>;
+    
+    /// Pin content to prevent garbage collection
+    async fn pin(&self, cid: &ContentId) -> Result<(), DfsError>;
+    
+    /// Unpin content
+    async fn unpin(&self, cid: &ContentId) -> Result<(), DfsError>;
+    
+    /// Get content metadata
+    async fn metadata(&self, cid: &ContentId) -> Result<ContentMetadata, DfsError>;
+    
+    /// List all stored content
+    async fn list(&self) -> Result<Vec<ContentMetadata>, DfsError>;
+    
+    /// Garbage collect unpinned content
+    async fn gc(&self) -> Result<GcResult, DfsError>;
+    
+    /// Get storage statistics
+    async fn stats(&self) -> Result<DfsStats, DfsError>;
 }
 
-/// Where content belongs for policy/retention
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash)]
+/// Garbage collection result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcResult {
+    /// Number of objects removed
+    pub objects_removed: u64,
+    /// Bytes freed
+    pub bytes_freed: u64,
+    /// Time taken for GC
+    pub duration_ms: u64,
+}
+
+/// DFS statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DfsStats {
+    /// Total objects stored
+    pub total_objects: u64,
+    /// Total bytes stored
+    pub total_bytes: u64,
+    /// Pinned objects count
+    pub pinned_objects: u64,
+    /// Available storage space
+    pub available_space: u64,
+    /// Hit rate for local requests
+    pub hit_rate: f64,
+    /// Network requests made
+    pub network_requests: u64,
+}
+
+/// Content provider for DFS network
+#[async_trait]
+pub trait ContentProvider: Send {
+    /// Announce that we provide content
+    async fn provide(&self, cid: &ContentId) -> Result<(), DfsError>;
+    
+    /// Stop providing content
+    async fn unprovide(&self, cid: &ContentId) -> Result<(), DfsError>;
+    
+    /// Find providers for content
+    async fn find_providers(&self, cid: &ContentId) -> Result<Vec<ProviderId>, DfsError>;
+}
+
+/// Provider identifier
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ProviderId(pub String);
+
+/// DFS content categories for organization
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ContentCategory {
-    Recent,
-    Hot,
-    Historical,
+    /// Ledger state updates
+    LedgerUpdate,
+    /// Smart contract bytecode
+    Contract,
+    /// Application data
+    AppData,
+    /// Media files
+    Media,
+    /// Generic files
+    File,
 }
 
-/// The generic DFS trait used across the node.
+/// Extended content storage with categorization
 #[async_trait]
-pub trait DistributedFileSystem: Send + Sync {
-    /// Store bytes, return a content id (CID).
-    async fn put(&self, data: Vec<u8>) -> DfsResult<ContentId>;
+pub trait CategorizedStorage: Send {
+    /// Store content with category
+    async fn put_categorized(
+        &self, 
+        data: Vec<u8>, 
+        category: ContentCategory
+    ) -> Result<ContentId, DfsError>;
+    
+    /// List content by category
+    async fn list_by_category(
+        &self, 
+        category: ContentCategory
+    ) -> Result<Vec<ContentMetadata>, DfsError>;
+    
+    /// Store ledger update
+    async fn store_ledger_update(
+        &self, 
+        update: &LedgerStateUpdate
+    ) -> Result<ContentId, DfsError>;
+    
+    /// Retrieve ledger update
+    async fn get_ledger_update(
+        &self, 
+        cid: &ContentId
+    ) -> Result<LedgerStateUpdate, DfsError>;
+}
 
-    /// Retrieve bytes for a given content id.
-    async fn get(&self, cid: &ContentId) -> DfsResult<Vec<u8>>;
+/// DFS factory for creating instances
+pub struct DfsFactory;
 
-    /// (Best-effort) pin content to prevent GC.
-    async fn pin(&self, _cid: &ContentId) -> DfsResult<()> {
-        Ok(())
+impl DfsFactory {
+    /// Create a new DFS instance (local storage only)
+    pub async fn create(config: &DfsConfig) -> Result<Box<dyn DistributedFileSystem>, DfsError> {
+        config.validate()?;
+        
+        let storage = LocalDfsStorage::new(config.clone()).await?;
+        Ok(Box::new(storage))
+    }
+    
+    /// Create a networked DFS instance (currently same as local)
+    pub async fn create_networked(
+        config: &DfsConfig,
+    ) -> Result<Box<dyn DistributedFileSystem>, DfsError> {
+        // For now, networking is disabled, so return local storage
+        log::warn!("Networking is currently disabled, falling back to local storage");
+        Self::create(config).await
     }
 
-    /// (Best-effort) unpin content.
-    async fn unpin(&self, _cid: &ContentId) -> DfsResult<()> {
-        Ok(())
+    /// Create a DFS instance with custom provider
+    pub async fn create_with_provider(
+        config: &DfsConfig,
+        _provider: Box<dyn ContentProvider>,
+    ) -> Result<Box<dyn DistributedFileSystem>, DfsError> {
+        // For now, just create a standard local instance
+        Self::create(config).await
     }
 }
 
-/// Alias used by existing tests/imports
-pub type DfsService = dyn DistributedFileSystem;
-
-/// A factory for creating DFS instances.
-pub trait DfsFactory: Send + Sync {
-    fn create(&self, cfg: &DfsConfig) -> Arc<dyn DistributedFileSystem>;
+/// DFS service manager for coordinating multiple components
+pub struct DfsService {
+    dfs: Box<dyn DistributedFileSystem>,
+    provider: Option<std::sync::Arc<DfsContentProvider>>,
+    config: DfsConfig,
 }
 
-/// IPFS+local implementation factory.
-#[derive(Debug, Default)]
-pub struct IpfsFactory;
+impl DfsService {
+    /// Create a new DFS service
+    pub async fn new(config: DfsConfig) -> Result<Self, DfsError> {
+        let dfs = DfsFactory::create(&config).await?;
 
-impl DfsFactory for IpfsFactory {
-    fn create(&self, cfg: &DfsConfig) -> Arc<dyn DistributedFileSystem> {
-        Arc::new(IpfsDfs::new(cfg.clone()))
-    }
-}
-
-/// Simple categorized wrapper that can route by `ContentCategory`.
-#[derive(Clone)]
-pub struct CategorizedStorage {
-    map: Arc<RwLock<HashMap<ContentCategory, Arc<dyn DistributedFileSystem>>>>,
-    default: Arc<dyn DistributedFileSystem>,
-}
-
-impl CategorizedStorage {
-    pub fn new(default: Arc<dyn DistributedFileSystem>) -> Self {
-        Self {
-            map: Arc::new(RwLock::new(HashMap::new())),
-            default,
-        }
-    }
-
-    pub fn with_backend(self, category: ContentCategory, backend: Arc<dyn DistributedFileSystem>) -> Self {
-        self.map.write().insert(category, backend);
-        self
-    }
-
-    pub fn for_category(&self, category: ContentCategory) -> Arc<dyn DistributedFileSystem> {
-        self.map
-            .read()
-            .get(&category)
-            .cloned()
-            .unwrap_or_else(|| self.default.clone())
-    }
-}
-
-/// Content provider discovery (stubbed for now).
-#[async_trait]
-pub trait ContentProvider: Send + Sync {
-    async fn announce(&self, _cid: &ContentId) -> DfsResult<()>;
-    async fn providers(&self, _cid: &ContentId) -> DfsResult<Vec<String>>;
-}
-
-/// DHT-based provider (no-op placeholder).
-#[derive(Debug, Default)]
-pub struct DhtContentProvider;
-
-#[async_trait]
-impl ContentProvider for DhtContentProvider {
-    async fn announce(&self, _cid: &ContentId) -> DfsResult<()> {
-        Ok(())
-    }
-    async fn providers(&self, _cid: &ContentId) -> DfsResult<Vec<String>> {
-        Ok(vec![])
-    }
-}
-
-/// Content replication controller (no-op placeholder).
-#[derive(Debug, Default)]
-pub struct ContentReplicator {
-    level: ReplicationLevel,
-}
-
-impl ContentReplicator {
-    pub fn new(level: ReplicationLevel) -> Self {
-        Self { level }
-    }
-
-    /// Best-effort pin/replicate according to desired level.
-    pub async fn replicate(&self, dfs: &dyn DistributedFileSystem, cid: &ContentId) -> DfsResult<()> {
-        match self.level {
-            ReplicationLevel::None => Ok(()),
-            _ => dfs.pin(cid).await,
-        }
-    }
-}
-
-/// Concrete DFS: local CAS + optional IPFS HTTP.
-#[derive(Clone)]
-pub struct IpfsDfs {
-    cfg: DfsConfig,
-    #[cfg(feature = "ipfs-http")]
-    client: Option<Client>,
-    #[cfg(feature = "ipfs-http")]
-    api_base: Option<Url>,
-}
-
-impl IpfsDfs {
-    pub fn new(cfg: DfsConfig) -> Self {
-        #[cfg(feature = "ipfs-http")]
-        {
-            let client = reqwest::Client::builder().tcp_nodelay(true).build().ok();
-            let api_base = cfg.ipfs_api.as_ref().and_then(|s| Url::parse(s).ok());
-            Self { cfg, client, api_base }
-        }
-        #[cfg(not(feature = "ipfs-http"))]
-        {
-            Self { cfg }
-        }
-    }
-
-    fn local_path_for(&self, cid: &ContentId) -> PathBuf {
-        self.cfg.local_dir.join(cid.to_path_component())
-    }
-
-    async fn ensure_local_dir<P: AsRef<Path>>(&self, p: P) -> DfsResult<()> {
-        fs::create_dir_all(p.as_ref()).await?;
-        Ok(())
-    }
-
-    #[cfg(feature = "ipfs-http")]
-    async fn ipfs_add(&self, data: &[u8]) -> DfsResult<String> {
-        let (client, base) = match (&self.client, &self.api_base) {
-            (Some(c), Some(b)) => (c, b),
-            _ => return Err(DfsError::IpfsDisabled),
+        let provider = if config.enable_discovery {
+            let provider = std::sync::Arc::new(DfsContentProvider::new());
+            Some(provider)
+        } else {
+            None
         };
 
-        let url = base
-            .join("api/v0/add")
-            .map_err(|e| DfsError::Other(format!("invalid URL: {e}")))?;
-        let part = reqwest::multipart::Part::bytes(data.to_vec()).file_name("data.bin");
-        let form = reqwest::multipart::Form::new().part("file", part);
-
-        let resp = client.post(url).query(&[("pin", "true")]).multipart(form).send().await?;
-
-        let v: serde_json::Value = resp.json().await?;
-        let Some(hash) = v.get("Hash").and_then(|h| h.as_str()) else {
-            return Err(DfsError::Other("IPFS add response missing Hash".into()));
-        };
-        Ok(hash.to_owned())
+        Ok(Self {
+            dfs,
+            provider,
+            config,
+        })
     }
 
-    #[cfg(feature = "ipfs-http")]
-    async fn ipfs_cat(&self, cid: &str) -> DfsResult<Vec<u8>> {
-        let (client, base) = match (&self.client, &self.api_base) {
-            (Some(c), Some(b)) => (c, b),
-            _ => return Err(DfsError::IpfsDisabled),
-        };
-        let url = base
-            .join("api/v0/cat")
-            .map_err(|e| DfsError::Other(format!("invalid URL: {e}")))?;
-        let resp = client.get(url).query(&[("arg", cid)]).send().await?;
-        let bytes = resp.bytes().await?;
-        Ok(bytes.to_vec())
+    /// Get the underlying DFS
+    pub fn dfs(&self) -> &dyn DistributedFileSystem {
+        self.dfs.as_ref()
     }
-}
 
-#[async_trait]
-impl DistributedFileSystem for IpfsDfs {
-    async fn put(&self, data: Vec<u8>) -> DfsResult<ContentId> {
-        self.ensure_local_dir(&self.cfg.local_dir).await?;
+    /// Get the content provider
+    pub fn provider(&self) -> Option<&std::sync::Arc<DfsContentProvider>> {
+        self.provider.as_ref()
+    }
 
-        // Always compute CID and write locally first.
-        let cid = ContentId::from_data(&data)?;
-        let path = self.local_path_for(&cid);
-        if !path.exists() {
-            let mut f = fs::File::create(&path).await?;
-            f.write_all(&data).await?;
-            f.flush().await?;
+    /// Store content with automatic provider announcement
+    pub async fn store_with_replication(&self, data: Vec<u8>) -> Result<ContentId, DfsError> {
+        let cid = self.dfs.put(data).await?;
+        
+        if let Some(provider) = &self.provider {
+            provider.provide(&cid).await?;
         }
-
-        // Optionally attempt to add to IPFS (best-effort).
-        #[cfg(feature = "ipfs-http")]
-        if self.api_base.is_some() {
-            let _ = self.ipfs_add(&data).await;
-        }
-
-        // Respect replication policy (best-effort pin)
-        if matches!(
-            self.cfg.replication,
-            ReplicationLevel::Low | ReplicationLevel::Medium | ReplicationLevel::High
-        ) {
-            let _ = self.pin(&cid).await;
-        }
-
+        
         Ok(cid)
     }
 
-    async fn get(&self, cid: &ContentId) -> DfsResult<Vec<u8>> {
-        let path = self.local_path_for(cid);
-        if path.exists() {
-            return Ok(fs::read(path).await?);
-        }
+    /// Get comprehensive storage statistics
+    pub async fn comprehensive_stats(&self) -> Result<ComprehensiveStats, DfsError> {
+        let dfs_stats = self.dfs.stats().await?;
+        
+        let provider_stats = if let Some(provider) = &self.provider {
+            Some(provider.provider_stats().await)
+        } else {
+            None
+        };
 
-        // Fallback to IPFS if available
-        #[cfg(feature = "ipfs-http")]
-        if self.api_base.is_some() {
-            if let Ok(bytes) = self.ipfs_cat(cid.as_str()).await {
-                // Cache locally
-                self.ensure_local_dir(&self.cfg.local_dir).await?;
-                let path = self.local_path_for(cid);
-                let mut f = fs::File::create(&path).await?;
-                f.write_all(&bytes).await?;
-                f.flush().await?;
-                return Ok(bytes);
-            }
-        }
+        Ok(ComprehensiveStats {
+            dfs: dfs_stats,
+            provider: provider_stats,
+            config: self.config.clone(),
+        })
+    }
+}
 
-        Err(DfsError::NotFound(cid.to_string()))
+/// Comprehensive statistics for DFS service
+#[derive(Debug, Clone)]
+pub struct ComprehensiveStats {
+    pub dfs: DfsStats,
+    pub provider: Option<ProviderStats>,
+    pub config: DfsConfig,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_content_id_creation() {
+        let data = b"hello world";
+        let cid = ContentId::from_data(data).unwrap();
+        
+        // Content ID should be deterministic
+        let cid2 = ContentId::from_data(data).unwrap();
+        assert_eq!(cid, cid2);
+        
+        // Different data should produce different CID
+        let cid3 = ContentId::from_data(b"different data").unwrap();
+        assert_ne!(cid, cid3);
     }
 
-    async fn pin(&self, _cid: &ContentId) -> DfsResult<()> {
-        // With local CAS, "pin" is implicit. If IPFS exists we could call `pin/add`,
-        // but `/api/v0/add?pin=true` already pins on upload. No-op here.
-        Ok(())
+    #[test]
+    fn test_content_id_string_conversion() {
+        let data = b"test data";
+        let cid = ContentId::from_data(data).unwrap();
+        
+        let cid_string = cid.to_string();
+        let parsed_cid = ContentId::from_string(&cid_string).unwrap();
+        
+        assert_eq!(cid, parsed_cid);
     }
 
-    async fn unpin(&self, _cid: &ContentId) -> DfsResult<()> {
-        Ok(())
+    #[tokio::test]
+    async fn test_dfs_factory_local() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = DfsConfig::test_config(temp_dir.path().to_path_buf());
+        
+        let dfs = DfsFactory::create(&config).await.unwrap();
+        
+        // Test basic operations
+        let data = b"test content".to_vec();
+        let cid = dfs.put(data.clone()).await.unwrap();
+        
+        let retrieved = dfs.get(&cid).await.unwrap();
+        assert_eq!(data, retrieved);
+        
+        assert!(dfs.has(&cid).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_dfs_service() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = DfsConfig::test_config(temp_dir.path().to_path_buf());
+        
+        let service = DfsService::new(config).await.unwrap();
+        
+        let data = b"service test".to_vec();
+        let cid = service.store_with_replication(data.clone()).await.unwrap();
+        
+        let retrieved = service.dfs().get(&cid).await.unwrap();
+        assert_eq!(data, retrieved);
+        
+        let stats = service.comprehensive_stats().await.unwrap();
+        assert!(stats.dfs.total_objects > 0);
+    }
+
+    #[test]
+    fn test_config_validation() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = DfsConfig::test_config(temp_dir.path().to_path_buf());
+        
+        // Valid config should pass
+        assert!(config.validate().is_ok());
+        
+        // Invalid max storage size
+        config.max_storage_size = 0;
+        assert!(config.validate().is_err());
+        
+        // Reset and test replication factor
+        config.max_storage_size = 1024;
+        config.replication_factor = 0;
+        assert!(config.validate().is_err());
     }
 }

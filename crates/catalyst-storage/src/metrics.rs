@@ -2,14 +2,10 @@
 
 #[cfg(feature = "metrics")]
 use prometheus::{
-    register_histogram,
-    register_int_counter,
-    register_int_gauge,
-    // Only import what's actually used
-    Histogram,
-    HistogramOpts,
-    IntCounter,
-    IntGauge,
+    Counter, Gauge, Histogram, IntCounter, IntGauge,
+    register_counter, register_gauge, register_histogram, 
+    register_int_counter, register_int_gauge,
+    HistogramOpts, Opts,
 };
 
 #[cfg(feature = "metrics")]
@@ -25,13 +21,13 @@ pub struct StorageMetrics {
     pub transactions_rolled_back_total: IntCounter,
     pub snapshots_created_total: IntCounter,
     pub migrations_applied_total: IntCounter,
-
+    
     // Gauges
     pub pending_transactions: IntGauge,
     pub active_snapshots: IntGauge,
     pub database_size_bytes: IntGauge,
     pub memory_usage_bytes: IntGauge,
-
+    
     // Histograms
     pub operation_duration: Histogram,
     pub transaction_size_bytes: Histogram,
@@ -45,93 +41,97 @@ static STORAGE_METRICS: OnceLock<StorageMetrics> = OnceLock::new();
 #[cfg(feature = "metrics")]
 /// Register storage metrics with Prometheus
 pub fn register_storage_metrics() -> Result<(), Box<dyn std::error::Error>> {
+    // Avoid duplicate Prometheus collector registration across tests / multiple init paths.
+    if STORAGE_METRICS.get().is_some() {
+        return Ok(());
+    }
+
     let metrics = StorageMetrics {
         // Counters
         operations_total: register_int_counter!(
             "catalyst_storage_operations_total",
             "Total number of storage operations performed"
         )?,
-
+        
         errors_total: register_int_counter!(
-            "catalyst_storage_errors_total",
+            "catalyst_storage_errors_total", 
             "Total number of storage errors encountered"
         )?,
-
+        
         transactions_committed_total: register_int_counter!(
             "catalyst_storage_transactions_committed_total",
             "Total number of transactions successfully committed"
         )?,
-
+        
         transactions_rolled_back_total: register_int_counter!(
             "catalyst_storage_transactions_rolled_back_total",
             "Total number of transactions rolled back"
         )?,
-
+        
         snapshots_created_total: register_int_counter!(
             "catalyst_storage_snapshots_created_total",
             "Total number of snapshots created"
         )?,
-
+        
         migrations_applied_total: register_int_counter!(
             "catalyst_storage_migrations_applied_total",
             "Total number of database migrations applied"
         )?,
-
+        
         // Gauges
         pending_transactions: register_int_gauge!(
             "catalyst_storage_pending_transactions",
             "Number of transactions currently pending"
         )?,
-
+        
         active_snapshots: register_int_gauge!(
             "catalyst_storage_active_snapshots",
             "Number of snapshots currently stored"
         )?,
-
+        
         database_size_bytes: register_int_gauge!(
             "catalyst_storage_database_size_bytes",
             "Total size of the database in bytes"
         )?,
-
+        
         memory_usage_bytes: register_int_gauge!(
             "catalyst_storage_memory_usage_bytes",
             "Memory usage of storage components in bytes"
         )?,
-
+        
         // Histograms
-        operation_duration: register_histogram!(HistogramOpts::new(
-            "catalyst_storage_operation_duration_seconds",
-            "Duration of storage operations in seconds"
-        )
-        .buckets(vec![
-            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0
-        ]))?,
-
-        transaction_size_bytes: register_histogram!(HistogramOpts::new(
-            "catalyst_storage_transaction_size_bytes",
-            "Size of transactions in bytes"
-        )
-        .buckets(vec![
-            100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0
-        ]))?,
-
-        transaction_duration: register_histogram!(HistogramOpts::new(
-            "catalyst_storage_transaction_duration_seconds",
-            "Duration of transaction commits in seconds"
-        )
-        .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]))?,
-
-        snapshot_creation_duration: register_histogram!(HistogramOpts::new(
-            "catalyst_storage_snapshot_creation_duration_seconds",
-            "Duration of snapshot creation in seconds"
-        )
-        .buckets(vec![0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0]))?,
+        operation_duration: register_histogram!(
+            HistogramOpts::new(
+                "catalyst_storage_operation_duration_seconds",
+                "Duration of storage operations in seconds"
+            ).buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0])
+        )?,
+        
+        transaction_size_bytes: register_histogram!(
+            HistogramOpts::new(
+                "catalyst_storage_transaction_size_bytes",
+                "Size of transactions in bytes"
+            ).buckets(vec![100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0])
+        )?,
+        
+        transaction_duration: register_histogram!(
+            HistogramOpts::new(
+                "catalyst_storage_transaction_duration_seconds",
+                "Duration of transaction commits in seconds"
+            ).buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0])
+        )?,
+        
+        snapshot_creation_duration: register_histogram!(
+            HistogramOpts::new(
+                "catalyst_storage_snapshot_creation_duration_seconds",
+                "Duration of snapshot creation in seconds"
+            ).buckets(vec![0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0])
+        )?,
     };
-
-    STORAGE_METRICS
-        .set(metrics)
+    
+    STORAGE_METRICS.set(metrics)
         .map_err(|_| "Storage metrics already initialized")?;
-
+    
     Ok(())
 }
 
@@ -245,7 +245,7 @@ impl OperationTimer {
             start_time: std::time::Instant::now(),
         }
     }
-
+    
     pub fn finish(self) {
         let duration = self.start_time.elapsed();
         record_operation_duration(duration.as_secs_f64());
@@ -306,7 +306,7 @@ impl OperationTimer {
     pub fn new() -> Self {
         Self
     }
-
+    
     pub fn finish(self) {}
 }
 
@@ -320,7 +320,7 @@ impl Default for OperationTimer {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    
     #[test]
     fn test_metrics_compilation() {
         // Test that metrics functions compile and don't panic
@@ -336,7 +336,7 @@ mod tests {
         update_memory_usage(512 * 1024);
         record_operation_duration(0.05);
     }
-
+    
     #[test]
     fn test_operation_timer() {
         let timer = OperationTimer::new();
@@ -344,7 +344,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1));
         timer.finish();
     }
-
+    
     #[cfg(feature = "metrics")]
     #[test]
     fn test_metrics_registration() {

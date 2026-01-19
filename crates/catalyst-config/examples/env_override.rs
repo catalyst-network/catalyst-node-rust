@@ -1,7 +1,7 @@
 use crate::error::ConfigResult;
 use crate::loader::ConfigLoader;
-use crate::networks::{Network, NetworkConfig};
-use catalyst_utils::{CatalystError, CatalystResult};
+use crate::networks::{NetworkConfig, Network};
+use catalyst_utils::{CatalystResult, CatalystError};
 use std::collections::HashMap;
 use std::env;
 
@@ -34,18 +34,17 @@ impl EnvOverride {
     /// Load all environment variables with the catalyst prefix
     pub fn load_env_vars(&mut self) -> ConfigResult<()> {
         self.overrides.clear();
-
+        
         for (key, value) in env::vars() {
             if key.starts_with(&self.prefix) {
-                let config_key = key
-                    .strip_prefix(&self.prefix)
+                let config_key = key.strip_prefix(&self.prefix)
                     .unwrap()
                     .to_lowercase()
                     .replace('_', ".");
                 self.overrides.insert(config_key, value);
             }
         }
-
+        
         Ok(())
     }
 
@@ -60,10 +59,9 @@ impl EnvOverride {
         if let Some(name) = self.overrides.get("network.name") {
             config.network.name = name.clone();
         }
-
+        
         if let Some(id) = self.overrides.get("network.id") {
-            config.network.id = id
-                .parse()
+            config.network.id = id.parse()
                 .map_err(|e| CatalystError::Config(format!("Invalid network.id: {}", e)))?;
         }
 
@@ -82,8 +80,7 @@ impl EnvOverride {
 
         // Network settings
         if let Some(port) = self.overrides.get("network.port") {
-            config.network.port = port
-                .parse()
+            config.network.port = port.parse()
                 .map_err(|e| CatalystError::Config(format!("Invalid network.port: {}", e)))?;
         }
 
@@ -92,8 +89,7 @@ impl EnvOverride {
         }
 
         if let Some(max_peers) = self.overrides.get("network.max_peers") {
-            config.network.max_peers = max_peers
-                .parse()
+            config.network.max_peers = max_peers.parse()
                 .map_err(|e| CatalystError::Config(format!("Invalid network.max_peers: {}", e)))?;
         }
 
@@ -108,21 +104,18 @@ impl EnvOverride {
 
         // Consensus settings
         if let Some(enabled) = self.overrides.get("consensus.enabled") {
-            config.consensus.enabled = enabled
-                .parse()
+            config.consensus.enabled = enabled.parse()
                 .map_err(|e| CatalystError::Config(format!("Invalid consensus.enabled: {}", e)))?;
         }
 
         if let Some(cycle_time) = self.overrides.get("consensus.cycle_time_ms") {
-            config.consensus.cycle_time_ms = cycle_time.parse().map_err(|e| {
-                CatalystError::Config(format!("Invalid consensus.cycle_time_ms: {}", e))
-            })?;
+            config.consensus.cycle_time_ms = cycle_time.parse()
+                .map_err(|e| CatalystError::Config(format!("Invalid consensus.cycle_time_ms: {}", e)))?;
         }
 
         if let Some(producers) = self.overrides.get("consensus.max_producers") {
-            config.consensus.max_producers = producers.parse().map_err(|e| {
-                CatalystError::Config(format!("Invalid consensus.max_producers: {}", e))
-            })?;
+            config.consensus.max_producers = producers.parse()
+                .map_err(|e| CatalystError::Config(format!("Invalid consensus.max_producers: {}", e)))?;
         }
 
         // Storage settings
@@ -131,21 +124,18 @@ impl EnvOverride {
         }
 
         if let Some(cache_size) = self.overrides.get("storage.cache_size_mb") {
-            config.storage.cache_size_mb = cache_size.parse().map_err(|e| {
-                CatalystError::Config(format!("Invalid storage.cache_size_mb: {}", e))
-            })?;
+            config.storage.cache_size_mb = cache_size.parse()
+                .map_err(|e| CatalystError::Config(format!("Invalid storage.cache_size_mb: {}", e)))?;
         }
 
         // RPC settings
         if let Some(enabled) = self.overrides.get("rpc.enabled") {
-            config.rpc.enabled = enabled
-                .parse()
+            config.rpc.enabled = enabled.parse()
                 .map_err(|e| CatalystError::Config(format!("Invalid rpc.enabled: {}", e)))?;
         }
 
         if let Some(port) = self.overrides.get("rpc.port") {
-            config.rpc.port = port
-                .parse()
+            config.rpc.port = port.parse()
                 .map_err(|e| CatalystError::Config(format!("Invalid rpc.port: {}", e)))?;
         }
 
@@ -155,15 +145,13 @@ impl EnvOverride {
 
         // Service Bus settings
         if let Some(enabled) = self.overrides.get("service_bus.enabled") {
-            config.service_bus.enabled = enabled.parse().map_err(|e| {
-                CatalystError::Config(format!("Invalid service_bus.enabled: {}", e))
-            })?;
+            config.service_bus.enabled = enabled.parse()
+                .map_err(|e| CatalystError::Config(format!("Invalid service_bus.enabled: {}", e)))?;
         }
 
         if let Some(port) = self.overrides.get("service_bus.ws_port") {
-            config.service_bus.ws_port = port.parse().map_err(|e| {
-                CatalystError::Config(format!("Invalid service_bus.ws_port: {}", e))
-            })?;
+            config.service_bus.ws_port = port.parse()
+                .map_err(|e| CatalystError::Config(format!("Invalid service_bus.ws_port: {}", e)))?;
         }
 
         Ok(())
@@ -203,11 +191,11 @@ pub fn load_config_with_env_overrides(
 ) -> ConfigResult<NetworkConfig> {
     let mut loader = ConfigLoader::new();
     let mut config = loader.load_network_config(network, config_path)?;
-
+    
     let mut env_override = EnvOverride::new();
     env_override.load_env_vars()?;
     env_override.apply_to_network_config(&mut config)?;
-
+    
     Ok(config)
 }
 
@@ -233,12 +221,9 @@ mod tests {
     fn test_manual_override() {
         let mut override_handler = EnvOverride::new();
         override_handler.add_override("node.id", "test_node");
-
+        
         assert!(override_handler.has_override("node.id"));
-        assert_eq!(
-            override_handler.get_override("node.id"),
-            Some(&"test_node".to_string())
-        );
+        assert_eq!(override_handler.get_override("node.id"), Some(&"test_node".to_string()));
     }
 
     #[test]
@@ -247,14 +232,14 @@ mod tests {
         env::set_var("CATALYST_NODE_ID", "env_test_node");
         env::set_var("CATALYST_NETWORK_PORT", "9876");
         env::set_var("NOT_CATALYST_VAR", "should_be_ignored");
-
+        
         let mut override_handler = EnvOverride::new();
         override_handler.load_env_vars().unwrap();
-
+        
         assert!(override_handler.has_override("node.id"));
         assert!(override_handler.has_override("network.port"));
         assert!(!override_handler.has_override("not.catalyst.var"));
-
+        
         // Clean up
         env::remove_var("CATALYST_NODE_ID");
         env::remove_var("CATALYST_NETWORK_PORT");
@@ -265,15 +250,13 @@ mod tests {
     fn test_apply_to_config() {
         let mut config = NetworkConfig::devnet();
         let mut override_handler = EnvOverride::new();
-
+        
         override_handler.add_override("node.id", "overridden_node");
         override_handler.add_override("network.port", "8765");
         override_handler.add_override("consensus.enabled", "false");
-
-        override_handler
-            .apply_to_network_config(&mut config)
-            .unwrap();
-
+        
+        override_handler.apply_to_network_config(&mut config).unwrap();
+        
         assert_eq!(config.node.id, "overridden_node");
         assert_eq!(config.network.port, 8765);
         assert!(!config.consensus.enabled);
@@ -283,9 +266,9 @@ mod tests {
     fn test_invalid_override_value() {
         let mut config = NetworkConfig::devnet();
         let mut override_handler = EnvOverride::new();
-
+        
         override_handler.add_override("network.port", "not_a_number");
-
+        
         let result = override_handler.apply_to_network_config(&mut config);
         assert!(result.is_err());
     }
@@ -294,23 +277,18 @@ mod tests {
     fn test_bootstrap_peers_override() {
         let mut config = NetworkConfig::devnet();
         let mut override_handler = EnvOverride::new();
-
+        
         override_handler.add_override("network.bootstrap_peers", "peer1,peer2,peer3");
-        override_handler
-            .apply_to_network_config(&mut config)
-            .unwrap();
-
-        assert_eq!(
-            config.network.bootstrap_peers,
-            vec!["peer1", "peer2", "peer3"]
-        );
+        override_handler.apply_to_network_config(&mut config).unwrap();
+        
+        assert_eq!(config.network.bootstrap_peers, vec!["peer1", "peer2", "peer3"]);
     }
 
     #[test]
     fn test_clear_overrides() {
         let mut override_handler = EnvOverride::new();
         override_handler.add_override("test.key", "test.value");
-
+        
         assert!(!override_handler.overrides.is_empty());
         override_handler.clear();
         assert!(override_handler.overrides.is_empty());

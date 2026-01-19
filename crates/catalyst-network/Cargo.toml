@@ -15,15 +15,19 @@ catalyst-utils = { path = "../catalyst-utils" }
 catalyst-crypto = { path = "../catalyst-crypto" }
 catalyst-config = { path = "../catalyst-config" }
 
-# Basic networking
-libp2p = { version = "0.53", features = ["tcp", "noise", "yamux"] }
+# Networking with libp2p (match workspace + enable tokio + macros)
+libp2p = { workspace = true, features = ["tokio", "macros"] }
 
 # Async runtime
-tokio = { version = "1.0", features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tokio-util = { workspace = true, features = ["codec"] }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
 toml = "0.8"
+bincode = { workspace = true }
 
 # Error handling
 thiserror = "1.0"
@@ -42,3 +46,5 @@ tempfile = "3.0"
 [features]
 default = ["metrics"]
 metrics = ["prometheus"]
+# Compile the full libp2p stack (currently WIP against the latest workspace traits/APIs).
+libp2p-full = []

@@ -42,9 +42,71 @@ DOCKER = docker
 PROJECT_NAME = catalyst-node
 RUST_LOG ?= info
 
+# Cargo target directory
+# When working from GVFS/SMB mounts, file locking can be unsupported which breaks
+# Cargo's `.cargo-lock` in `target/` (os error 95). Use a local target dir by default.
+PROJECT_ROOT := $(CURDIR)
+DEFAULT_CARGO_TARGET_DIR := $(PROJECT_ROOT)/target
+GVFS_CARGO_TARGET_DIR := $(HOME)/.cache/$(PROJECT_NAME)/cargo-target
+GVFS_WORKDIR := $(HOME)/.cache/$(PROJECT_NAME)/gvfs-workdir
+GVFS_MIRROR_DIR := $(GVFS_WORKDIR)/src
+
+ifeq (,$(findstring gvfs,$(PROJECT_ROOT)))
+  CARGO_TARGET_DIR ?= $(DEFAULT_CARGO_TARGET_DIR)
+  CARGO_MANIFEST_PATH ?= $(PROJECT_ROOT)/Cargo.toml
+else
+  CARGO_TARGET_DIR ?= $(GVFS_CARGO_TARGET_DIR)
+  # On GVFS/SMB mounts, Cargo may fail to lock/write Cargo.lock. Build from a local mirror.
+  CARGO_MANIFEST_PATH ?= $(GVFS_MIRROR_DIR)/Cargo.toml
+endif
+
+export CARGO_TARGET_DIR
+
+# Keep a local mirror of the source tree when building from GVFS/SMB.
+.PHONY: sync-gvfs-mirror
+sync-gvfs-mirror:
+ifeq (,$(findstring gvfs,$(PROJECT_ROOT)))
+	@true
+else
+	@mkdir -p "$(GVFS_MIRROR_DIR)"
+	@rsync -a --delete \
+		--exclude 'target' \
+		--exclude '.git' \
+		"$(PROJECT_ROOT)/" "$(GVFS_MIRROR_DIR)/"
+endif
+
+# System dependency checks
+.PHONY: check-system-deps
+check-system-deps:
+	@command -v cc >/dev/null 2>&1 || { \
+		echo "Missing C toolchain (cc). On Ubuntu/Debian: sudo apt install build-essential"; \
+		exit 1; \
+	}
+	@printf '#include <stddef.h>\n' | cc -E - >/dev/null 2>&1 || { \
+		echo "C standard headers not found (missing stddef.h). On Ubuntu/Debian: sudo apt install build-essential"; \
+		exit 1; \
+	}
+	@command -v pkg-config >/dev/null 2>&1 || { \
+		echo "Missing pkg-config. On Ubuntu/Debian: sudo apt install pkg-config"; \
+		exit 1; \
+	}
+	@pkg-config --exists openssl >/dev/null 2>&1 || { \
+		echo "Missing OpenSSL development headers (.pc not found). On Ubuntu/Debian: sudo apt install libssl-dev"; \
+		exit 1; \
+	}
+	@command -v clang >/dev/null 2>&1 || { \
+		echo "Missing clang (needed by bindgen). On Ubuntu/Debian: sudo apt install clang libclang-dev"; \
+		exit 1; \
+	}
+	@command -v cmake >/dev/null 2>&1 || { \
+		echo "Missing cmake (often required by native deps like RocksDB). On Ubuntu/Debian: sudo apt install cmake"; \
+		exit 1; \
+	}
+
 # Setup development environment
 setup:
 	@echo "Setting up Catalyst development environment..."
+	@$(MAKE) check-system-deps
 	rustup update
 	rustup component add rustfmt clippy
 	$(CARGO) install cargo-audit cargo-outdated
@@ -57,11 +119,15 @@ setup:
 # Build commands
 build:
 	@echo "Building Catalyst node (release)..."
-	$(CARGO) build --release --workspace
+	@$(MAKE) check-system-deps
+	@$(MAKE) sync-gvfs-mirror
+	$(CARGO) build --release --workspace --manifest-path "$(CARGO_MANIFEST_PATH)"
 
 dev:
 	@echo "Building Catalyst node (debug)..."
-	$(CARGO) build --workspace
+	@$(MAKE) check-system-deps
+	@$(MAKE) sync-gvfs-mirror
+	$(CARGO) build --workspace --manifest-path "$(CARGO_MANIFEST_PATH)"
 
 # Clean build artifacts
 clean:
@@ -84,41 +150,50 @@ clippy:
 # Testing
 test:
 	@echo "Running tests..."
-	RUST_LOG=debug $(CARGO) test --workspace --all-features
+	@$(MAKE) sync-gvfs-mirror
+	RUST_LOG=debug $(CARGO) test --workspace --manifest-path "$(CARGO_MANIFEST_PATH)"
+
+test-all-features:
+	@echo "Running tests (all features)..."
+	@$(MAKE) sync-gvfs-mirror
+	RUST_LOG=debug $(CARGO) test --workspace --all-features --manifest-path "$(CARGO_MANIFEST_PATH)"
 
 test-integration:
 	@echo "Running integration tests..."
-	RUST_LOG=debug $(CARGO) test --workspace --test integration_tests
+	@$(MAKE) sync-gvfs-mirror
+	RUST_LOG=debug $(CARGO) test --workspace --test integration_tests --manifest-path "$(CARGO_MANIFEST_PATH)"
 
 bench:
 	@echo "Running benchmarks..."
-	$(CARGO) bench --workspace
+	@$(MAKE) sync-gvfs-mirror
+	$(CARGO) bench --workspace --manifest-path "$(CARGO_MANIFEST_PATH)"
 
 # Documentation
 docs:
 	@echo "Generating documentation..."
-	$(CARGO) doc --workspace --all-features --no-deps --open
+	@$(MAKE) sync-gvfs-mirror
+	$(CARGO) doc --workspace --all-features --no-deps --open --manifest-path "$(CARGO_MANIFEST_PATH)"
 
 # Run commands
 run: build
 	@echo "Starting Catalyst node..."
-	RUST_LOG=$(RUST_LOG) ./target/release/catalyst-node start
+	RUST_LOG=$(RUST_LOG) $(CARGO_TARGET_DIR)/release/catalyst-cli start
 
 run-dev: dev
 	@echo "Starting Catalyst node (debug)..."
-	RUST_LOG=$(RUST_LOG) $(CARGO) run --bin catalyst-node -- start
+	RUST_LOG=$(RUST_LOG) $(CARGO) run --bin catalyst-cli -- start
 
 run-validator: build
 	@echo "Starting Catalyst validator node..."
-	RUST_LOG=$(RUST_LOG) ./target/release/catalyst-node start --validator --rpc
+	RUST_LOG=$(RUST_LOG) $(CARGO_TARGET_DIR)/release/catalyst-cli start --validator --rpc
 
 run-storage: build
 	@echo "Starting Catalyst storage node..."
-	RUST_LOG=$(RUST_LOG) ./target/release/catalyst-node start --storage --storage-capacity 50
+	RUST_LOG=$(RUST_LOG) $(CARGO_TARGET_DIR)/release/catalyst-cli start --storage --storage-capacity 50
 
 run-full: build
 	@echo "Starting full Catalyst node (validator + storage + RPC)..."
-	RUST_LOG=$(RUST_LOG) ./target/release/catalyst-node start --validator --storage --rpc
+	RUST_LOG=$(RUST_LOG) $(CARGO_TARGET_DIR)/release/catalyst-cli start --validator --storage --rpc
 
 # Docker commands
 docker-build:
@@ -135,16 +210,19 @@ docker-run:
 genesis:
 	@echo "Creating genesis configuration..."
 	mkdir -p configs
-	$(CARGO) run --bin catalyst-node -- create-genesis --output configs/genesis.json
+	@$(MAKE) sync-gvfs-mirror
+	$(CARGO) run --bin catalyst-cli --manifest-path "$(CARGO_MANIFEST_PATH)" -- create-genesis --output configs/genesis.json
 
 identity:
 	@echo "Generating node identity..."
-	$(CARGO) run --bin catalyst-node -- generate-identity --output identity.json
+	@$(MAKE) sync-gvfs-mirror
+	$(CARGO) run --bin catalyst-cli --manifest-path "$(CARGO_MANIFEST_PATH)" -- generate-identity --output identity.json
 
 # Development utilities
 check:
 	@echo "Running cargo check..."
-	$(CARGO) check --workspace --all-targets --all-features
+	@$(MAKE) sync-gvfs-mirror
+	$(CARGO) check --workspace --all-targets --all-features --manifest-path "$(CARGO_MANIFEST_PATH)"
 
 audit:
 	@echo "Running security audit..."
@@ -161,30 +239,63 @@ update:
 # Local testnet
 testnet: build
 	@echo "Starting local testnet with 3 nodes..."
-	@mkdir -p testnet/{node1,node2,node3}
-	@# Node 1 (Bootstrap + Validator)
-	RUST_LOG=info ./target/release/catalyst-cli start \
-		--config testnet/node1/config.toml \
-		--validator --rpc --rpc-port 8545 &
-	@sleep 2
-	@# Node 2 (Validator + Storage)
-	RUST_LOG=info ./target/release/catalyst-cli start \
-		--config testnet/node2/config.toml \
-		--validator --storage --rpc-port 8546 \
-		--bootstrap-peers "/ip4/127.0.0.1/tcp/30333" &
-	@sleep 2
-	@# Node 3 (Storage only)
-	RUST_LOG=info ./target/release/catalyst-cli start \
-		--config testnet/node3/config.toml \
-		--storage --rpc-port 8547 \
-		--bootstrap-peers "/ip4/127.0.0.1/tcp/30333" &
-	@echo "Testnet started! Nodes running on ports 8545, 8546, 8547"
-	@echo "Press Ctrl+C to stop all nodes"
-	@wait
+	@bash -lc 'set -euo pipefail; \
+		mkdir -p testnet/{node1,node2,node3}/{logs,data,dfs_cache}; \
+		echo "Starting node1 (bootstrap + validator)..." ; \
+		RUST_LOG=info stdbuf -oL -eL "$(CARGO_TARGET_DIR)/release/catalyst-cli" --config testnet/node1/config.toml start \
+			--validator --rpc --rpc-port 8545 --generate-txs --tx-interval-ms 1000 \
+			> testnet/node1/logs/stdout.log 2>&1 & \
+		echo $$! > testnet/node1/node.pid; \
+		sleep 2; \
+		echo "Starting node2 (validator + storage)..." ; \
+		RUST_LOG=info stdbuf -oL -eL "$(CARGO_TARGET_DIR)/release/catalyst-cli" --config testnet/node2/config.toml start \
+			--validator --storage --rpc-port 8546 \
+			--bootstrap-peers "/ip4/127.0.0.1/tcp/30333" \
+			> testnet/node2/logs/stdout.log 2>&1 & \
+		echo $$! > testnet/node2/node.pid; \
+		sleep 2; \
+		echo "Starting node3 (storage only)..." ; \
+		RUST_LOG=info stdbuf -oL -eL "$(CARGO_TARGET_DIR)/release/catalyst-cli" --config testnet/node3/config.toml start \
+			--storage --rpc-port 8547 \
+			--bootstrap-peers "/ip4/127.0.0.1/tcp/30333" \
+			> testnet/node3/logs/stdout.log 2>&1 & \
+		echo $$! > testnet/node3/node.pid; \
+		echo "Testnet started! Logs:"; \
+		echo "  - testnet/node1/logs/stdout.log"; \
+		echo "  - testnet/node2/logs/stdout.log"; \
+		echo "  - testnet/node3/logs/stdout.log"; \
+		echo "Stop with: make stop-testnet"; \
+		wait $$(cat testnet/node1/node.pid) $$(cat testnet/node2/node.pid) $$(cat testnet/node3/node.pid)'
 
 stop-testnet:
 	@echo "Stopping testnet..."
-	@pkill -f catalyst-cli || true
+	@bash -lc 'set -euo pipefail; \
+		for n in 1 2 3; do \
+			pidfile="testnet/node$${n}/node.pid"; \
+			if [ -f "$$pidfile" ]; then \
+				pid=$$(cat "$$pidfile" || true); \
+				if [ -n "$$pid" ] && kill -0 "$$pid" 2>/dev/null; then \
+					echo "Stopping node$${n} (pid $$pid)"; \
+					kill "$$pid" 2>/dev/null || true; \
+				fi; \
+			fi; \
+		done; \
+		pkill -f "catalyst-cli --config testnet/node" 2>/dev/null || true; \
+		pkill -f "target/release/catalyst-cli --config testnet/node" 2>/dev/null || true; \
+		sleep 1; \
+		for n in 1 2 3; do \
+			pidfile="testnet/node$${n}/node.pid"; \
+			if [ -f "$$pidfile" ]; then \
+				pid=$$(cat "$$pidfile" || true); \
+				if [ -n "$$pid" ] && kill -0 "$$pid" 2>/dev/null; then \
+					echo "Force killing node$${n} (pid $$pid)"; \
+					kill -9 "$$pid" 2>/dev/null || true; \
+				fi; \
+			fi; \
+		done; \
+		pkill -9 -f "catalyst-cli --config testnet/node" 2>/dev/null || true; \
+		pkill -9 -f "target/release/catalyst-cli --config testnet/node" 2>/dev/null || true; \
+		true'
 
 # Development helpers
 watch:
@@ -198,8 +309,9 @@ watch-test:
 # Performance profiling
 profile:
 	@echo "Building with profiling..."
-	$(CARGO) build --release --workspace
-	@echo "Run with: perf record ./target/release/catalyst-cli start"
+	@$(MAKE) sync-gvfs-mirror
+	$(CARGO) build --release --workspace --manifest-path "$(CARGO_MANIFEST_PATH)"
+	@echo "Run with: perf record $(CARGO_TARGET_DIR)/release/catalyst-cli start"
 
 # Release preparation
 pre-release: fmt clippy test audit

@@ -25,7 +25,7 @@ impl fmt::Display for TxHash {
 }
 
 /// Configuration for different node roles
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NodeRole {
     /// Basic user node - can create and relay transactions
     User,
@@ -46,30 +46,8 @@ pub enum NodeRole {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeStatus {
-    pub id: String,
-    pub uptime: u64,
-    pub sync_status: SyncStatus,
-    pub metrics: ResourceMetrics,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SyncStatus {
-    Synced,
-    Syncing { progress: f64 },
-    NotSynced,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceMetrics {
-    pub cpu_usage: f64,
-    pub memory_usage: u64,
-    pub disk_usage: u64,
-}
-
 /// Worker pass for participating in consensus
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerPass {
     pub node_id: [u8; 32], // Use consistent NodeId type
     pub issued_at: Timestamp,
@@ -107,7 +85,7 @@ impl ResourceEstimate {
 }
 
 // Resource proof for validation
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceProof {
     pub cpu_score: u32,      // CoreMark benchmark result
     pub memory_mb: u32,      // Available RAM in MB

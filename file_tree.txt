@@ -1,0 +1,222 @@
+.
+├── Cargo.lock
+├── Cargo.toml
+├── crates
+│   ├── catalyst-cli
+│   │   ├── Cargo.toml
+│   │   └── src
+│   │       ├── config.rs
+│   │       ├── main.rs
+│   │       └── node.rs
+│   ├── catalyst-config
+│   │   ├── Cargo.toml
+│   │   ├── configs
+│   │   │   ├── devnet.toml
+│   │   │   ├── example.toml
+│   │   │   ├── mainnet.toml
+│   │   │   └── testnet.toml
+│   │   ├── examples
+│   │   │   ├── basic_usage.rs
+│   │   │   ├── env_override.rs
+│   │   │   └── hot_reload.rs
+│   │   ├── README.md
+│   │   ├── src
+│   │   │   ├── config
+│   │   │   │   ├── catalyst.rs
+│   │   │   │   ├── consensus.rs
+│   │   │   │   ├── crypto.rs
+│   │   │   │   ├── logging.rs
+│   │   │   │   ├── metrics.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── network.rs
+│   │   │   │   ├── service_bus.rs
+│   │   │   │   └── storage.rs
+│   │   │   ├── error.rs
+│   │   │   ├── hot_reload
+│   │   │   │   ├── events.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── watcher.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── loader
+│   │   │   │   ├── env.rs
+│   │   │   │   ├── file.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── validation.rs
+│   │   │   ├── networks
+│   │   │   │   ├── devnet.rs
+│   │   │   │   ├── mainnet.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── testnet.rs
+│   │   │   └── utils.rs
+│   │   └── tests
+│   │       ├── integration_tests.rs
+│   │       ├── network_tests.rs
+│   │       └── validation_tests.rs
+│   ├── catalyst-consensus
+│   │   ├── Cargo.toml
+│   │   ├── examples
+│   │   │   ├── basic_consensus.rs
+│   │   │   └── simple_consensus.rs
+│   │   ├── README.md
+│   │   └── src
+│   │       ├── consensus.rs
+│   │       ├── error.rs
+│   │       ├── lib.rs
+│   │       ├── phases.rs
+│   │       ├── producer.rs
+│   │       ├── tests.rs
+│   │       └── types.rs
+│   ├── catalyst-core
+│   │   ├── Cargo.toml
+│   │   └── src
+│   │       ├── error.rs
+│   │       ├── events.rs
+│   │       ├── lib.rs
+│   │       ├── runtime
+│   │       │   └── mod.rs
+│   │       ├── traits.rs
+│   │       └── types.rs
+│   ├── catalyst-crypto
+│   │   ├── benches
+│   │   │   └── crypto_benchmarks.rs
+│   │   ├── Cargo.toml
+│   │   ├── examples
+│   │   │   └── basic_usage.rs
+│   │   ├── README.md
+│   │   ├── src
+│   │   │   ├── commitments.rs
+│   │   │   ├── errors.rs
+│   │   │   ├── hash.rs
+│   │   │   ├── keys.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── merkle.rs
+│   │   │   ├── proofs.rs
+│   │   │   ├── signatures.rs
+│   │   │   └── utils.rs
+│   │   └── tests
+│   │       └── integration_tests.rs
+│   ├── catalyst-dfs
+│   │   ├── benches
+│   │   │   └── dfs_benchmarks.rs
+│   │   ├── Cargo.toml
+│   │   ├── examples
+│   │   │   └── basic_usage.rs
+│   │   ├── README.md
+│   │   ├── src
+│   │   │   ├── ipfs.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── networked.rs
+│   │   │   ├── provider.rs
+│   │   │   ├── storage.rs
+│   │   │   └── swarm.rs
+│   │   └── tests
+│   │       └── integration.rs
+│   ├── catalyst-network
+│   │   ├── benches
+│   │   │   └── network_benchmarks.rs
+│   │   ├── Cargo.toml
+│   │   ├── README.md
+│   │   └── src
+│   │       ├── bandwidth.rs
+│   │       ├── config.rs
+│   │       ├── discovery.rs
+│   │       ├── error.rs
+│   │       ├── gossip.rs
+│   │       ├── lib.rs
+│   │       ├── messaging.rs
+│   │       ├── metrics.rs
+│   │       ├── monitoring.rs
+│   │       ├── reputation.rs
+│   │       ├── security.rs
+│   │       ├── service.rs
+│   │       └── swarm.rs
+│   ├── catalyst-rpc
+│   │   ├── Cargo.toml
+│   │   └── src
+│   │       └── lib.rs
+│   ├── catalyst-runtime-evm
+│   │   ├── benches
+│   │   │   └── evm_execution.rs
+│   │   ├── Cargo.toml
+│   │   ├── examples
+│   │   │   └── deploy_contract.rs
+│   │   ├── README.md
+│   │   ├── src
+│   │   │   ├── database.rs
+│   │   │   ├── execution.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── precompiles.rs
+│   │   │   └── types.rs
+│   │   └── tests
+│   │       └── integration.rs
+│   ├── catalyst-runtime-svm
+│   │   ├── Cargo.toml
+│   │   └── src
+│   │       ├── lib.rs
+│   │       ├── native.rs
+│   │       └── runtime.rs
+│   ├── catalyst-service-bus
+│   │   ├── Cargo.toml
+│   │   ├── examples
+│   │   │   ├── basic_client.rs
+│   │   │   └── server.rs
+│   │   ├── README.md
+│   │   └── src
+│   │       ├── auth.rs
+│   │       ├── client.rs
+│   │       ├── config.rs
+│   │       ├── error.rs
+│   │       ├── events.rs
+│   │       ├── filters.rs
+│   │       ├── lib.rs
+│   │       ├── reset.rs
+│   │       ├── server.rs
+│   │       └── websocket.rs
+│   ├── catalyst-storage
+│   │   ├── Cargo.toml
+│   │   ├── README.md
+│   │   └── src
+│   │       ├── benches
+│   │       │   └── storage_benchmarks.rs
+│   │       ├── config.rs
+│   │       ├── engine.rs
+│   │       ├── error.rs
+│   │       ├── lib.rs
+│   │       ├── manager.rs
+│   │       ├── metrics.rs
+│   │       ├── migration.rs
+│   │       ├── snapshot.rs
+│   │       ├── tests
+│   │       │   └── integration_tests.rs
+│   │       ├── transaction.rs
+│   │       └── utils.rs
+│   └── catalyst-utils
+│       ├── Cargo.toml
+│       ├── docs
+│       │   ├── API.md
+│       │   └── GETTING_STARTED.md
+│       ├── examples
+│       │   ├── basic_usage.rs
+│       │   ├── logging_example.rs
+│       │   ├── metrics_example.rs
+│       │   └── serialization_example.rs
+│       ├── README.md
+│       ├── src
+│       │   ├── error.rs
+│       │   ├── lib.rs
+│       │   ├── logging.rs
+│       │   ├── metrics.rs
+│       │   ├── network.rs
+│       │   ├── serialization.rs
+│       │   └── state.rs
+│       └── tests
+│           └── comprehensive_utils_tests.rs
+├── dockerfile
+├── file_tree.txt
+├── makefile
+├── README.md
+├── setup.sh
+└── src
+    └── main.rs
+
+54 directories, 166 files

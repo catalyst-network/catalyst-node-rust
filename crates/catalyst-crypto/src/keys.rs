@@ -1,10 +1,10 @@
-use crate::{blake2b_hash, CryptoError, CryptoResult};
+use crate::{CryptoError, CryptoResult, blake2b_hash};
 use curve25519_dalek::{
-    constants::RISTRETTO_BASEPOINT_POINT,
-    ristretto::{CompressedRistretto, RistrettoPoint},
     scalar::Scalar,
+    ristretto::{RistrettoPoint, CompressedRistretto},
+    constants::RISTRETTO_BASEPOINT_POINT,
 };
-use rand::{CryptoRng, RngCore};
+use rand::{RngCore, CryptoRng};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -24,27 +24,27 @@ impl PrivateKey {
     pub fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
         let mut bytes = [0u8; PRIVATE_KEY_SIZE];
         rng.fill_bytes(&mut bytes);
-
+        
         let scalar = Scalar::from_bytes_mod_order(bytes);
         Self { scalar, bytes }
     }
-
+    
     /// Create from existing bytes
     pub fn from_bytes(bytes: [u8; PRIVATE_KEY_SIZE]) -> Self {
         let scalar = Scalar::from_bytes_mod_order(bytes);
         Self { scalar, bytes }
     }
-
+    
     /// Get the scalar representation
     pub fn scalar(&self) -> &Scalar {
         &self.scalar
     }
-
+    
     /// Convert to bytes (use carefully - exposes private key)
     pub fn to_bytes(&self) -> [u8; PRIVATE_KEY_SIZE] {
         self.bytes
     }
-
+    
     /// Derive public key from this private key
     pub fn public_key(&self) -> PublicKey {
         let point = &self.scalar * &RISTRETTO_BASEPOINT_POINT;
@@ -69,26 +69,25 @@ impl PublicKey {
     pub fn from_point(point: RistrettoPoint) -> Self {
         Self { point }
     }
-
+    
     /// Create from compressed bytes
     pub fn from_bytes(bytes: [u8; PUBLIC_KEY_SIZE]) -> CryptoResult<Self> {
         let compressed = CompressedRistretto(bytes);
-        let point = compressed.decompress().ok_or(CryptoError::InvalidKey(
-            "Invalid public key encoding".to_string(),
-        ))?;
+        let point = compressed.decompress()
+            .ok_or(CryptoError::InvalidKey("Invalid public key encoding".to_string()))?;
         Ok(Self { point })
     }
-
+    
     /// Get the point representation
     pub fn point(&self) -> &RistrettoPoint {
         &self.point
     }
-
+    
     /// Convert to compressed bytes
     pub fn to_bytes(&self) -> [u8; PUBLIC_KEY_SIZE] {
         self.point.compress().0
     }
-
+    
     /// Generate address from public key (20 bytes from hash)
     pub fn to_address(&self) -> [u8; 20] {
         let hash = blake2b_hash(&self.to_bytes());
@@ -110,26 +109,20 @@ impl KeyPair {
     pub fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
         let private_key = PrivateKey::generate(rng);
         let public_key = private_key.public_key();
-        Self {
-            private_key,
-            public_key,
-        }
+        Self { private_key, public_key }
     }
-
+    
     /// Create from existing private key
     pub fn from_private_key(private_key: PrivateKey) -> Self {
         let public_key = private_key.public_key();
-        Self {
-            private_key,
-            public_key,
-        }
+        Self { private_key, public_key }
     }
-
+    
     /// Get the private key
     pub fn private_key(&self) -> &PrivateKey {
         &self.private_key
     }
-
+    
     /// Get the public key
     pub fn public_key(&self) -> &PublicKey {
         &self.public_key

@@ -1,8 +1,8 @@
 // catalyst-utils/src/metrics.rs
 
-use crate::logging::{get_logger, LogCategory, LogLevel, LogValue};
-use crate::{CatalystError, CatalystResult};
-use serde::{Deserialize, Serialize};
+use crate::error::{CatalystResult, CatalystError};
+use crate::logging::{LogCategory, LogLevel, get_logger, LogValue};
+use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -80,9 +80,7 @@ impl Default for HistogramConfig {
     fn default() -> Self {
         Self {
             // Default buckets: 1ms, 5ms, 10ms, 50ms, 100ms, 500ms, 1s, 5s, 10s, 30s, 60s
-            buckets: vec![
-                0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0,
-            ],
+            buckets: vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0],
             max_samples: 1000,
         }
     }
@@ -99,6 +97,7 @@ pub struct Histogram {
 }
 
 impl Histogram {
+
     // Add these public methods
     pub fn count(&self) -> u64 {
         self.count
@@ -107,7 +106,7 @@ impl Histogram {
     pub fn sum(&self) -> f64 {
         self.sum
     }
-
+    
     pub fn new(config: HistogramConfig) -> Self {
         let mut buckets = HashMap::new();
         for bucket in &config.buckets {
@@ -244,9 +243,7 @@ impl Metric {
         let value = match metric_type {
             MetricType::Counter => MetricValue::Counter(0),
             MetricType::Gauge => MetricValue::Gauge(0.0),
-            MetricType::Histogram => {
-                MetricValue::Histogram(Histogram::new(HistogramConfig::default()))
-            }
+            MetricType::Histogram => MetricValue::Histogram(Histogram::new(HistogramConfig::default())),
             MetricType::Timer => MetricValue::Timer(Histogram::new(HistogramConfig::default())),
             MetricType::Rate => MetricValue::Rate(RateMeter::new(Duration::from_secs(60))),
         };
@@ -344,7 +341,7 @@ impl Timer {
 
     pub fn stop(self) -> Duration {
         let duration = self.start.elapsed();
-
+        
         if let Ok(mut registry) = self.registry.lock() {
             let _ = registry.observe_timer(&self.metric_name, duration.as_secs_f64());
         }
@@ -356,7 +353,7 @@ impl Timer {
 impl Drop for Timer {
     fn drop(&mut self) {
         let duration = self.start.elapsed();
-
+        
         if let Ok(mut registry) = self.registry.lock() {
             let _ = registry.observe_timer(&self.metric_name, duration.as_secs_f64());
         }
@@ -392,10 +389,9 @@ impl MetricsRegistry {
     /// Register a new metric
     pub fn register_metric(&mut self, metric: Metric) -> CatalystResult<()> {
         if self.metrics.contains_key(&metric.name) {
-            return Err(CatalystError::Invalid(format!(
-                "Metric '{}' already registered",
-                metric.name
-            )));
+            return Err(CatalystError::Invalid(
+                format!("Metric '{}' already registered", metric.name),
+            ));
         }
 
         self.metrics.insert(metric.name.clone(), metric);
@@ -407,10 +403,7 @@ impl MetricsRegistry {
         if let Some(metric) = self.metrics.get_mut(name) {
             metric.increment_counter(value)
         } else {
-            Err(CatalystError::NotFound(format!(
-                "Metric '{}' not found",
-                name
-            )))
+            Err(CatalystError::NotFound(format!("Metric '{}' not found", name)))
         }
     }
 
@@ -419,10 +412,7 @@ impl MetricsRegistry {
         if let Some(metric) = self.metrics.get_mut(name) {
             metric.set_gauge(value)
         } else {
-            Err(CatalystError::NotFound(format!(
-                "Metric '{}' not found",
-                name
-            )))
+            Err(CatalystError::NotFound(format!("Metric '{}' not found", name)))
         }
     }
 
@@ -431,10 +421,7 @@ impl MetricsRegistry {
         if let Some(metric) = self.metrics.get_mut(name) {
             metric.observe_histogram(value)
         } else {
-            Err(CatalystError::NotFound(format!(
-                "Metric '{}' not found",
-                name
-            )))
+            Err(CatalystError::NotFound(format!("Metric '{}' not found", name)))
         }
     }
 
@@ -443,10 +430,7 @@ impl MetricsRegistry {
         if let Some(metric) = self.metrics.get_mut(name) {
             metric.observe_histogram(duration_seconds)
         } else {
-            Err(CatalystError::NotFound(format!(
-                "Metric '{}' not found",
-                name
-            )))
+            Err(CatalystError::NotFound(format!("Metric '{}' not found", name)))
         }
     }
 
@@ -455,10 +439,7 @@ impl MetricsRegistry {
         if let Some(metric) = self.metrics.get_mut(name) {
             metric.mark_rate(value)
         } else {
-            Err(CatalystError::NotFound(format!(
-                "Metric '{}' not found",
-                name
-            )))
+            Err(CatalystError::NotFound(format!("Metric '{}' not found", name)))
         }
     }
 
@@ -483,10 +464,7 @@ impl MetricsRegistry {
             for (name, metric) in &self.metrics {
                 let mut fields = vec![
                     ("metric_name", LogValue::String(name.clone())),
-                    (
-                        "metric_type",
-                        LogValue::String(format!("{:?}", metric.metric_type)),
-                    ),
+                    ("metric_type", LogValue::String(format!("{:?}", metric.metric_type))),
                     ("category", LogValue::String(metric.category.to_string())),
                 ];
 
@@ -540,21 +518,17 @@ impl MetricsRegistry {
 }
 
 /// Global metrics registry
-static GLOBAL_METRICS: std::sync::Mutex<Option<Arc<Mutex<MetricsRegistry>>>> =
-    std::sync::Mutex::new(None);
+static GLOBAL_METRICS: std::sync::Mutex<Option<Arc<Mutex<MetricsRegistry>>>> = std::sync::Mutex::new(None);
 
 /// Initialize the global metrics registry
 pub fn init_metrics() -> CatalystResult<()> {
-    let mut registry = GLOBAL_METRICS
-        .lock()
+    let mut registry = GLOBAL_METRICS.lock()
         .map_err(|_| CatalystError::Runtime("Failed to acquire metrics lock".to_string()))?;
-
+    
     if registry.is_some() {
-        return Err(CatalystError::Runtime(
-            "Metrics registry already initialized".to_string(),
-        ));
+        return Err(CatalystError::Runtime("Metrics registry already initialized".to_string()));
     }
-
+    
     *registry = Some(Arc::new(Mutex::new(MetricsRegistry::new())));
     Ok(())
 }
@@ -725,13 +699,13 @@ macro_rules! time_operation {
         let start = std::time::Instant::now();
         let result = $operation;
         let duration = start.elapsed().as_secs_f64();
-
+        
         if let Some(registry) = $crate::metrics::get_metrics_registry() {
             if let Ok(mut reg) = registry.lock() {
                 let _ = reg.observe_timer($name, duration);
             }
         }
-
+        
         result
     }};
 }
@@ -802,10 +776,10 @@ mod tests {
     #[test]
     fn test_rate_meter() {
         let mut rate = RateMeter::new(Duration::from_secs(60));
-
+        
         rate.mark(10.0);
         rate.mark(20.0);
-
+        
         let current_rate = rate.rate();
         assert!(current_rate > 0.0);
     }
@@ -813,7 +787,7 @@ mod tests {
     #[test]
     fn test_metrics_registry() {
         let mut registry = MetricsRegistry::new();
-
+        
         let metric = Metric::new(
             "test_metric".to_string(),
             MetricCategory::System,
@@ -823,7 +797,7 @@ mod tests {
 
         assert!(registry.register_metric(metric).is_ok());
         assert!(registry.increment_counter("test_metric", 5).is_ok());
-
+        
         // Test duplicate registration
         let duplicate = Metric::new(
             "test_metric".to_string(),
@@ -837,12 +811,12 @@ mod tests {
     #[test]
     fn test_histogram_percentiles() {
         let mut hist = Histogram::new(HistogramConfig::default());
-
+        
         // Add some test data
         for i in 1..=100 {
             hist.observe(i as f64);
         }
-
+        
         assert_eq!(hist.percentile(50.0), Some(50.0));
         assert_eq!(hist.percentile(99.0), Some(99.0));
         assert_eq!(hist.percentile(0.0), Some(1.0));

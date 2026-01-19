@@ -6,7 +6,6 @@ mod integration_tests {
     };
     use catalyst_utils::logging::{LogConfig, init_logger};
     use catalyst_utils::metrics::init_metrics;
-    use tokio_test;
     use std::time::Duration;
 
     async fn setup_test_environment() {
@@ -51,12 +50,12 @@ mod integration_tests {
             TransactionEntry {
                 public_key: [10u8; 32],
                 amount: -100,  // Spending
-                signature: [20u8; 64],
+                signature: vec![20u8; 64],
             },
             TransactionEntry {
                 public_key: [11u8; 32],
                 amount: 100,   // Receiving
-                signature: [21u8; 64],
+                signature: vec![21u8; 64],
             },
         ];
 
@@ -92,12 +91,12 @@ mod integration_tests {
             TransactionEntry {
                 public_key: [1u8; 32],
                 amount: -50,
-                signature: [10u8; 64],
+                signature: vec![10u8; 64],
             },
             TransactionEntry {
                 public_key: [2u8; 32],
                 amount: 50,
-                signature: [11u8; 64],
+                signature: vec![11u8; 64],
             },
         ];
 
@@ -128,6 +127,7 @@ mod integration_tests {
         for i in 0..3 {
             campaigning.add_quantity(ProducerQuantity {
                 first_hash: common_hash,
+                cycle_number: 1,
                 producer_id: format!("producer_{}", i),
                 timestamp: current_timestamp_ms(),
             });
@@ -136,6 +136,7 @@ mod integration_tests {
         // Add one minority vote
         campaigning.add_quantity(ProducerQuantity {
             first_hash: minority_hash,
+            cycle_number: 1,
             producer_id: "minority_producer".to_string(),
             timestamp: current_timestamp_ms(),
         });
@@ -281,10 +282,81 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_wire_roundtrip_consensus_messages() {
+        setup_test_environment().await;
+
+        use catalyst_utils::{MessageEnvelope, NetworkMessage};
+        use catalyst_utils::network::PROTOCOL_VERSION;
+
+        let sender = "node-A".to_string();
+
+        let q = ProducerQuantity {
+            first_hash: [1u8; 32],
+            cycle_number: 1,
+            producer_id: "p1".to_string(),
+            timestamp: current_timestamp_ms(),
+        };
+        let q_bytes = q.serialize().unwrap();
+        let q2 = ProducerQuantity::deserialize(&q_bytes).unwrap();
+        assert_eq!(q, q2);
+        let q_env = MessageEnvelope::from_message(&q, sender.clone(), None).unwrap();
+        assert_eq!(q_env.version, PROTOCOL_VERSION);
+        assert_eq!(q_env.message_type, q.message_type());
+        let q3: ProducerQuantity = q_env.extract_message().unwrap();
+        assert_eq!(q, q3);
+
+        let c = ProducerCandidate {
+            majority_hash: [2u8; 32],
+            producer_list_hash: [3u8; 32],
+            cycle_number: 1,
+            producer_id: "p2".to_string(),
+            timestamp: current_timestamp_ms(),
+        };
+        let c_bytes = c.serialize().unwrap();
+        let c2 = ProducerCandidate::deserialize(&c_bytes).unwrap();
+        assert_eq!(c, c2);
+        let c_env = MessageEnvelope::from_message(&c, sender.clone(), None).unwrap();
+        assert_eq!(c_env.version, PROTOCOL_VERSION);
+        let c3: ProducerCandidate = c_env.extract_message().unwrap();
+        assert_eq!(c, c3);
+
+        let v = ProducerVote {
+            ledger_state_hash: [4u8; 32],
+            vote_list_hash: [5u8; 32],
+            cycle_number: 1,
+            producer_id: "p3".to_string(),
+            timestamp: current_timestamp_ms(),
+        };
+        let v_bytes = v.serialize().unwrap();
+        let v2 = ProducerVote::deserialize(&v_bytes).unwrap();
+        assert_eq!(v, v2);
+        let v_env = MessageEnvelope::from_message(&v, sender.clone(), None).unwrap();
+        assert_eq!(v_env.version, PROTOCOL_VERSION);
+        let v3: ProducerVote = v_env.extract_message().unwrap();
+        assert_eq!(v, v3);
+
+        let o = ProducerOutput {
+            dfs_address: [9u8; 21],
+            vote_list_hash: [6u8; 32],
+            cycle_number: 1,
+            producer_id: "p4".to_string(),
+            timestamp: current_timestamp_ms(),
+        };
+        let o_bytes = o.serialize().unwrap();
+        let o2 = ProducerOutput::deserialize(&o_bytes).unwrap();
+        assert_eq!(o, o2);
+        let o_env = MessageEnvelope::from_message(&o, sender, None).unwrap();
+        assert_eq!(o_env.version, PROTOCOL_VERSION);
+        let o3: ProducerOutput = o_env.extract_message().unwrap();
+        assert_eq!(o, o3);
+    }
+
+    #[tokio::test]
     async fn test_message_serialization() {
         // Test ProducerQuantity serialization
         let quantity = ProducerQuantity {
             first_hash: [42u8; 32],
+            cycle_number: 1,
             producer_id: "test_producer".to_string(),
             timestamp: current_timestamp_ms(),
         };
@@ -297,6 +369,7 @@ mod integration_tests {
         let candidate = ProducerCandidate {
             majority_hash: [43u8; 32],
             producer_list_hash: [44u8; 32],
+            cycle_number: 1,
             producer_id: "test_producer".to_string(),
             timestamp: current_timestamp_ms(),
         };

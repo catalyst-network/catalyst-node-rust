@@ -1,129 +1,89 @@
-//! Minimal CLI commands implementation
-//! Create this as crates/catalyst-cli/src/commands.rs
+//! CLI subcommand implementations.
+//!
+//! The CLI is still evolving; these handlers are currently lightweight stubs
+//! to keep the workspace compiling while the RPC and node subsystems mature.
 
-use clap::Subcommand;
-use std::path::PathBuf;
+use anyhow::Result;
 use std::path::Path;
 
-pub async fn generate_identity(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Generating identity in: {}", output.display());
-    // Placeholder implementation
+pub async fn generate_identity(output: &Path) -> Result<()> {
+    let _ = output;
+    // TODO: implement persistent identity generation.
     Ok(())
 }
 
-pub async fn create_genesis(output: &Path, _accounts: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Creating genesis in: {}", output.display());
-    // Placeholder implementation
+pub async fn create_genesis(output: &Path, accounts: Option<&Path>) -> Result<()> {
+    let _ = (output, accounts);
+    // TODO: implement genesis creation.
     Ok(())
 }
 
-pub async fn show_status(rpc_url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Showing status from: {}", rpc_url);
-    // Placeholder implementation
+pub async fn get_status(rpc_url: &str) -> Result<()> {
+    let _ = rpc_url;
+    // TODO: implement status query over RPC.
     Ok(())
 }
 
-pub async fn show_peers(rpc_url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Showing peers from: {}", rpc_url);
-    // Placeholder implementation
+pub async fn get_peers(rpc_url: &str) -> Result<()> {
+    let _ = rpc_url;
+    // TODO: implement peer query over RPC.
     Ok(())
+}
+
+// Backwards-compatible names used by `main.rs`.
+pub async fn show_status(rpc_url: &str) -> Result<()> {
+    get_status(rpc_url).await
+}
+
+pub async fn show_peers(rpc_url: &str) -> Result<()> {
+    get_peers(rpc_url).await
 }
 
 pub async fn send_transaction(
-    _to: &str,
-    _amount: &str,
-    _key_file: &Path,
+    to: &str,
+    amount: &str,
+    key_file: &Path,
     rpc_url: &str,
-    _confidential: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Sending transaction via: {}", rpc_url);
-    // Placeholder implementation
+    confidential: bool,
+) -> Result<()> {
+    let _ = (to, amount, key_file, rpc_url, confidential);
+    // TODO: implement transaction submission.
     Ok(())
 }
 
-pub async fn check_balance(address: &str, rpc_url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Checking balance for {} via: {}", address, rpc_url);
-    // Placeholder implementation
+pub async fn check_balance(address: &str, rpc_url: &str) -> Result<()> {
+    let _ = (address, rpc_url);
+    // TODO: implement balance query.
     Ok(())
 }
 
 pub async fn deploy_contract(
-    _contract: &Path,
-    _args: Option<&str>,
-    _key_file: &Path,
+    contract: &Path,
+    args: Option<&str>,
+    key_file: &Path,
     rpc_url: &str,
-    _runtime: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Deploying contract via: {}", rpc_url);
-    // Placeholder implementation
+    runtime: &str,
+) -> Result<()> {
+    let _ = (contract, args, key_file, rpc_url, runtime);
+    // TODO: implement contract deployment.
     Ok(())
 }
 
 pub async fn call_contract(
-    _contract: &str,
-    _function: &str,
-    _key_file: Option<&Path>,
+    contract: &str,
+    function: &str,
+    key_file: Option<&Path>,
     rpc_url: &str,
-    _value: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Calling contract via: {}", rpc_url);
-    // Placeholder implementation
+    value: &str,
+) -> Result<()> {
+    let _ = (contract, function, key_file, rpc_url, value);
+    // TODO: implement contract call.
     Ok(())
 }
 
-pub async fn benchmark(
-    rpc_url: &str,
-    _duration: u64,
-    _concurrent: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Running benchmark against: {}", rpc_url);
-    // Placeholder implementation
+pub async fn benchmark(rpc_url: &str, duration_secs: u64, concurrent: usize) -> Result<()> {
+    let _ = (rpc_url, duration_secs, concurrent);
+    // TODO: implement benchmark runner.
     Ok(())
 }
 
-#[derive(Debug, Subcommand)]
-pub enum Commands {
-    /// Start a Catalyst node
-    Start {
-        /// Configuration file path
-        #[arg(short, long)]
-        config: Option<PathBuf>,
-    },
-    /// Stop a running node
-    Stop,
-    /// Show node status
-    Status,
-    /// Initialize a new node configuration
-    Init {
-        /// Output directory
-        #[arg(short, long, default_value = ".")]
-        output: PathBuf,
-    },
-}
-
-impl Commands {
-    pub async fn execute(self) -> Result<(), Box<dyn std::error::Error>> {
-        match self {
-            Commands::Start { config } => {
-                println!("Starting Catalyst node...");
-                if let Some(config_path) = config {
-                    println!("Using config: {}", config_path.display());
-                }
-                // Placeholder for actual node startup
-                Ok(())
-            }
-            Commands::Stop => {
-                println!("Stopping Catalyst node...");
-                Ok(())
-            }
-            Commands::Status => {
-                println!("Node status: Not implemented yet");
-                Ok(())
-            }
-            Commands::Init { output } => {
-                println!("Initializing node config in: {}", output.display());
-                Ok(())
-            }
-        }
-    }
-}

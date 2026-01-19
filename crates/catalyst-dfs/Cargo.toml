@@ -2,39 +2,66 @@
 name = "catalyst-dfs"
 version = "0.1.0"
 edition = "2021"
-
-# Prevent Cargo from auto-discovering & compiling examples/tests for this crate.
-autoexamples = false
-autotests    = false
-autobenches  = false
-
-[features]
-# Enable HTTP calls to an IPFS daemon (Kubo) at `DfsConfig.ipfs_api`.
-ipfs-http = ["dep:reqwest", "dep:serde_json"]
+description = "Distributed File System for Catalyst Network based on IPFS"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/catalyst-network/catalyst-dfs"
+documentation = "https://docs.rs/catalyst-dfs"
+keywords = ["blockchain", "ipfs", "distributed", "storage", "p2p"]
+categories = ["network-programming", "filesystem", "cryptography"]
 
 [dependencies]
-# Local crates
-catalyst-utils = { path = "../catalyst-utils" }
-catalyst-core  = { path = "../catalyst-core" }
+# Database and storage
+rocksdb = "0.22"
 
-# Core deps
+# IPFS and content addressing - with serde support
+cid = { version = "0.10", features = ["serde-codec"] }
+multihash = { version = "0.18", features = ["serde-codec"] }  # Match cid's multihash version
+sha2 = "0.10"
+
+# Async runtime and utilities
+tokio = { version = "1.0", features = ["full"] }
 async-trait = "0.1"
-bytes       = "1"
-parking_lot = "0.12"
-serde       = { version = "1", features = ["derive"] }
-thiserror   = "1"
-tokio       = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
 
-# Content addressing
-cid                  = "0.11.1"
-multihash            = "0.19.3"
-multihash-codetable  = { version = "0.1.3", features = ["sha2"] }
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
-# Optional HTTP client for ipfs-http feature
-reqwest    = { version = "0.11", features = ["json", "multipart", "stream"], optional = true }
-serde_json = { version = "1", optional = true }
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Utilities
+log = "0.4"
+uuid = { version = "1.0", features = ["v4"] }
 
 [dev-dependencies]
-futures  = "0.3"
-tempfile = "3"
-env_logger = "0.10"
+tempfile = "3.0"
+tokio-test = "0.4"
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+
+[features]
+default = ["storage"]
+storage = []
+# Heavy integration tests (IPFS/network/provider flows). Not enabled by default.
+integration-tests = []
+# Networking features disabled for now due to libp2p compatibility issues
+# networking = []
+# provider = []
+
+[[bench]]
+name = "dfs_benchmarks"
+harness = false
+path = "benches/dfs_benchmarks.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+required-features = ["integration-tests"]
+
+[[example]]
+name = "basic_usage"
+path = "examples/basic_usage.rs"
+required-features = ["integration-tests"]

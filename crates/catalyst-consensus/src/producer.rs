@@ -3,7 +3,7 @@ use crate::{
 };
 use catalyst_utils::{CatalystResult, Hash, PublicKey};
 use catalyst_utils::logging::{LogCategory, log_info, log_warn, log_error};
-use catalyst_utils::metrics::{increment_counter, set_gauge};
+use catalyst_utils::{increment_counter, set_gauge};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -96,11 +96,12 @@ impl ProducerManager {
         let mut campaigning = CampaigningPhase::new(producer.clone());
         
         // Add collected quantities
+        let collected_len = collected_quantities.len();
         for quantity in collected_quantities {
             campaigning.add_quantity(quantity);
         }
         
-        let min_data = self.calculate_min_data(collected_quantities.len());
+        let min_data = self.calculate_min_data(collected_len);
         let candidate = campaigning.execute(min_data, self.config.confidence_threshold).await?;
         
         // Update producer state
@@ -119,11 +120,12 @@ impl ProducerManager {
         let mut voting = VotingPhase::new(producer.clone());
         
         // Add collected candidates
+        let collected_len = collected_candidates.len();
         for candidate in collected_candidates {
             voting.add_candidate(candidate);
         }
         
-        let min_data = self.calculate_min_data(collected_candidates.len());
+        let min_data = self.calculate_min_data(collected_len);
         let vote = voting.execute(min_data, self.config.confidence_threshold, &self.reward_config).await?;
         
         // Update producer state
@@ -143,11 +145,12 @@ impl ProducerManager {
         let mut synchronization = SynchronizationPhase::new(producer);
         
         // Add collected votes
+        let collected_len = collected_votes.len();
         for vote in collected_votes {
             synchronization.add_vote(vote);
         }
         
-        let min_data = self.calculate_min_data(collected_votes.len());
+        let min_data = self.calculate_min_data(collected_len);
         let output = synchronization.execute(min_data, self.config.confidence_threshold).await?;
         
         Ok(output)
@@ -214,7 +217,6 @@ pub struct ConsensusStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_test;
 
     #[tokio::test]
     async fn test_producer_creation() {
