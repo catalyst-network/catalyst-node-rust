@@ -280,8 +280,6 @@ stop-testnet:
 				fi; \
 			fi; \
 		done; \
-		pkill -f "catalyst-cli --config testnet/node" 2>/dev/null || true; \
-		pkill -f "target/release/catalyst-cli --config testnet/node" 2>/dev/null || true; \
 		sleep 1; \
 		for n in 1 2 3; do \
 			pidfile="testnet/node$${n}/node.pid"; \
@@ -293,8 +291,6 @@ stop-testnet:
 				fi; \
 			fi; \
 		done; \
-		pkill -9 -f "catalyst-cli --config testnet/node" 2>/dev/null || true; \
-		pkill -9 -f "target/release/catalyst-cli --config testnet/node" 2>/dev/null || true; \
 		true'
 
 # Development helpers

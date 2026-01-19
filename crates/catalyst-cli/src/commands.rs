@@ -6,6 +6,9 @@
 use anyhow::Result;
 use std::path::Path;
 
+use jsonrpsee::http_client::HttpClientBuilder;
+use jsonrpsee::core::client::ClientT;
+
 pub async fn generate_identity(output: &Path) -> Result<()> {
     let _ = output;
     // TODO: implement persistent identity generation.
@@ -19,14 +22,27 @@ pub async fn create_genesis(output: &Path, accounts: Option<&Path>) -> Result<()
 }
 
 pub async fn get_status(rpc_url: &str) -> Result<()> {
-    let _ = rpc_url;
-    // TODO: implement status query over RPC.
+    let client = HttpClientBuilder::default().build(rpc_url)?;
+
+    let head: catalyst_rpc::RpcHead = client.request("catalyst_head", jsonrpsee::rpc_params![]).await?;
+    let block_number: u64 = client.request("catalyst_blockNumber", jsonrpsee::rpc_params![]).await?;
+    let version: String = client.request("catalyst_version", jsonrpsee::rpc_params![]).await?;
+
+    println!("version: {version}");
+    println!("applied_cycle: {}", head.applied_cycle);
+    println!("block_number: {block_number}");
+    println!("applied_lsu_hash: {}", head.applied_lsu_hash);
+    println!("applied_state_root: {}", head.applied_state_root);
+    if let Some(cid) = head.last_lsu_cid {
+        println!("last_lsu_cid: {cid}");
+    }
     Ok(())
 }
 
 pub async fn get_peers(rpc_url: &str) -> Result<()> {
-    let _ = rpc_url;
-    // TODO: implement peer query over RPC.
+    let client = HttpClientBuilder::default().build(rpc_url)?;
+    let peers: u64 = client.request("catalyst_peerCount", jsonrpsee::rpc_params![]).await?;
+    println!("peer_count: {peers}");
     Ok(())
 }
 
@@ -52,8 +68,9 @@ pub async fn send_transaction(
 }
 
 pub async fn check_balance(address: &str, rpc_url: &str) -> Result<()> {
-    let _ = (address, rpc_url);
-    // TODO: implement balance query.
+    let client = HttpClientBuilder::default().build(rpc_url)?;
+    let bal: String = client.request("catalyst_getBalance", jsonrpsee::rpc_params![address]).await?;
+    println!("balance: {bal}");
     Ok(())
 }
 
