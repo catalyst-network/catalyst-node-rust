@@ -31,6 +31,7 @@ pub mod engine;
 pub mod error;
 pub mod manager;
 pub mod migration;
+pub mod merkle;
 pub mod snapshot;
 pub mod transaction;
 pub mod utils;

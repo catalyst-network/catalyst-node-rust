@@ -4,6 +4,7 @@ use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use std::path::PathBuf;
 use std::path::Path;
+use serde::Deserialize;
 
 mod node;
 mod commands;
@@ -11,6 +12,7 @@ mod config;
 mod tx;
 mod sync;
 mod dfs_store;
+mod identity;
 
 use node::CatalystNode;
 use config::NodeConfig;
@@ -18,6 +20,12 @@ use config::NodeConfig;
 fn is_testnet_config_path(path: &Path) -> bool {
     path.components()
         .any(|c| c.as_os_str().to_string_lossy().eq_ignore_ascii_case("testnet"))
+}
+
+#[derive(Debug, Deserialize)]
+struct ValidatorsFile {
+    #[serde(default)]
+    validator_worker_ids: Vec<String>,
 }
 
 #[derive(Parser)]
@@ -82,6 +90,20 @@ enum Commands {
         /// Output file for the identity
         #[arg(short, long, default_value = "identity.json")]
         output: PathBuf,
+    },
+    /// Print the public key for a given 32-byte hex private key file
+    Pubkey {
+        /// Private key file (32 bytes hex)
+        #[arg(long)]
+        key_file: PathBuf,
+    },
+    /// Get a balance along with an inclusion proof (and verify it client-side)
+    BalanceProof {
+        /// Address (32-byte hex public key)
+        address: String,
+        /// RPC endpoint
+        #[arg(long, default_value = "http://localhost:8545")]
+        rpc_url: String,
     },
     /// Create genesis configuration
     CreateGenesis {
@@ -245,6 +267,30 @@ async fn main() -> Result<()> {
                 // the 3 local processes even without a P2P DFS layer.
                 config.dfs.cache_dir = PathBuf::from("testnet/shared_dfs");
 
+                // Ensure per-node identity is NOT shared across nodes when configs already exist.
+                // (Older configs may have `node.key`, which would collide in CWD.)
+                if let Some(dir) = cli.config.parent() {
+                    config.node.private_key_file = dir.join("node.key");
+                }
+
+                // Deterministic validator set for testnet: if present, load from `testnet/validators.toml`.
+                // This replaces the older NodeStatus-based ad-hoc discovery.
+                if config.consensus.validator_worker_ids.is_empty() {
+                    let validators_path = PathBuf::from("testnet/validators.toml");
+                    if let Ok(s) = std::fs::read_to_string(&validators_path) {
+                        if let Ok(vf) = toml::from_str::<ValidatorsFile>(&s) {
+                            if !vf.validator_worker_ids.is_empty() {
+                                config.consensus.validator_worker_ids = vf.validator_worker_ids;
+                                info!(
+                                    "Loaded testnet validator worker pool from {:?} (n={})",
+                                    validators_path,
+                                    config.consensus.validator_worker_ids.len()
+                                );
+                            }
+                        }
+                    }
+                }
+
                 // Persist so the config dump/logs match runtime behavior.
                 config.save(&cli.config)?;
                 info!("Applied fast consensus timings for testnet config {:?}", cli.config);
@@ -268,6 +314,14 @@ async fn main() -> Result<()> {
         }
         Commands::GenerateIdentity { output } => {
             commands::generate_identity(&output).await?;
+        }
+        Commands::Pubkey { key_file } => {
+            let sk = crate::identity::load_or_generate_private_key(&key_file, false)?;
+            let pk = crate::identity::public_key_bytes(&sk);
+            println!("{}", hex::encode(pk));
+        }
+        Commands::BalanceProof { address, rpc_url } => {
+            commands::balance_proof(&address, &rpc_url).await?;
         }
         Commands::CreateGenesis { output, accounts } => {
             commands::create_genesis(&output, accounts.as_deref()).await?;

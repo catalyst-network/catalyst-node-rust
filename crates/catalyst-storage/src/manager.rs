@@ -28,6 +28,7 @@ use crate::{
     transaction::TransactionBatch,
     snapshot::{Snapshot, SnapshotManager},
     migration::MigrationManager,
+    merkle,
 };
 
 use tokio::sync::Semaphore;
@@ -337,22 +338,55 @@ impl StorageManager {
     
     /// Compute current state root hash
     async fn compute_state_root(&self) -> StorageResult<Hash> {
-        let mut hasher = Sha256::new();
-        
-        // Hash all account states
+        // Authenticated state root: Merkle root over sorted key/value leaf hashes.
+        // RocksDB iterators are key-sorted, so this is deterministic.
+        let mut leaves: Vec<Hash> = Vec::new();
         let account_iter = self.engine.iterator("accounts")?;
-        
         for item in account_iter {
-            let (key, value) = item
-                .map_err(|e| StorageError::internal(format!("Iterator error: {}", e)))?;
-            hasher.update(&key);
-            hasher.update(&value);
+            let (key, value) =
+                item.map_err(|e| StorageError::internal(format!("Iterator error: {}", e)))?;
+            leaves.push(merkle::leaf_hash_for_kv(&key, &value));
         }
-        
-        let state_root: Hash = hasher.finalize().into();
+        let state_root: Hash = merkle::merkle_root(&leaves);
         *self.current_state_root.write() = Some(state_root);
         
         Ok(state_root)
+    }
+
+    /// Compute an inclusion proof for an `accounts` key against the current (or freshly computed) state root.
+    ///
+    /// Returns: (state_root, value, proof_steps)
+    pub async fn get_account_proof(
+        &self,
+        key: &[u8],
+    ) -> StorageResult<Option<(Hash, Vec<u8>, merkle::MerkleProof)>> {
+        // Build leaf list in iterator order and track target index.
+        let mut leaves: Vec<Hash> = Vec::new();
+        let mut target_idx: Option<usize> = None;
+        let mut target_value: Option<Vec<u8>> = None;
+
+        let account_iter = self.engine.iterator("accounts")?;
+        for (i, item) in account_iter.enumerate() {
+            let (k, v) =
+                item.map_err(|e| StorageError::internal(format!("Iterator error: {}", e)))?;
+            if k.as_ref() == key {
+                target_idx = Some(i);
+                target_value = Some(v.to_vec());
+            }
+            leaves.push(merkle::leaf_hash_for_kv(&k, &v));
+        }
+
+        let idx = match target_idx {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let value = target_value.unwrap_or_default();
+        let root = merkle::merkle_root(&leaves);
+        let proof = merkle::merkle_proof(&leaves, idx)?;
+
+        // Cache root for other callers.
+        *self.current_state_root.write() = Some(root);
+        Ok(Some((root, value, proof)))
     }
     
     /// Get current state root

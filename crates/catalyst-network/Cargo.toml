@@ -44,7 +44,7 @@ tokio-test = "0.4"
 tempfile = "3.0"
 
 [features]
-default = ["metrics"]
+default = ["metrics", "libp2p-full"]
 metrics = ["prometheus"]
-# Compile the full libp2p stack (currently WIP against the latest workspace traits/APIs).
+# Compile the full libp2p stack (gossipsub + mdns + identify + ping).
 libp2p-full = []

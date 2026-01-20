@@ -134,6 +134,13 @@ pub struct ConsensusConfig {
     
     /// Consensus timeouts for each phase
     pub phase_timeouts: PhaseTimeouts,
+
+    /// Deterministic validator worker pool for producer selection (32-byte hex public keys).
+    ///
+    /// This is used to derive the producer set without relying on ad-hoc gossip discovery messages.
+    /// For local testnet, it can be auto-populated from `testnet/validators.toml`.
+    #[serde(default)]
+    pub validator_worker_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -364,6 +371,7 @@ impl Default for NodeConfig {
                     voting_timeout: 15,
                     synchronization_timeout: 15,
                 },
+                validator_worker_ids: Vec::new(),
             },
             runtimes: RuntimeConfig {
                 evm: EvmRuntimeConfig {
@@ -473,6 +481,7 @@ impl NodeConfig {
             cfg.storage.data_dir = dir.join("data");
             cfg.dfs.cache_dir = dir.join("dfs_cache");
             cfg.logging.file_path = dir.join("logs").join("catalyst.log");
+            cfg.node.private_key_file = dir.join("node.key");
         }
 
         // If the path contains `nodeN` (e.g. testnet/node2/config.toml), derive unique ports.

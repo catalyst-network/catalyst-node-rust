@@ -112,6 +112,9 @@ impl ProtocolTxGossip {
 
     pub fn validate_basic(&self, now_secs: u64) -> Result<(), String> {
         self.tx.validate_basic()?;
+        if self.tx.core.nonce == 0 {
+            return Err("Transaction nonce must be > 0".to_string());
+        }
         // Interpret lock_time as unix seconds "not before".
         if (self.tx.core.lock_time as u64) > now_secs {
             return Err(format!(
@@ -140,6 +143,22 @@ impl ProtocolTxGossip {
             });
         }
         out
+    }
+
+    pub fn sender_pubkey(&self) -> Option<[u8; 32]> {
+        let mut sender: Option<[u8; 32]> = None;
+        for e in &self.tx.core.entries {
+            if let EntryAmount::NonConfidential(v) = e.amount {
+                if v < 0 {
+                    match sender {
+                        None => sender = Some(e.public_key),
+                        Some(pk) if pk == e.public_key => {}
+                        Some(_) => return None,
+                    }
+                }
+            }
+        }
+        sender
     }
 }
 
@@ -189,9 +208,70 @@ impl TxBatch {
     }
 }
 
+/// Protocol transaction batch (full signed transactions) for a specific cycle.
+///
+/// This is used to ensure Construction only includes transactions that can be validated
+/// (signature + nonce + lock_time + balance checks).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProtocolTxBatch {
+    pub cycle: u64,
+    pub batch_hash: Hash,
+    pub txs: Vec<corep::Transaction>,
+}
+
+impl NetworkMessage for ProtocolTxBatch {
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        bincode::serialize(self)
+            .map_err(|e| catalyst_utils::error::CatalystError::Serialization(e.to_string()))
+    }
+
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        bincode::deserialize(data)
+            .map_err(|e| catalyst_utils::error::CatalystError::Serialization(e.to_string()))
+    }
+
+    fn message_type(&self) -> MessageType {
+        MessageType::TransactionBatch
+    }
+
+    fn priority(&self) -> u8 {
+        MessagePriority::High as u8
+    }
+
+    fn ttl(&self) -> u32 {
+        30
+    }
+}
+
+impl ProtocolTxBatch {
+    pub fn new(cycle: u64, txs: Vec<corep::Transaction>) -> CatalystResult<Self> {
+        // Stable hash: hash bincode(txs)
+        let bytes = bincode::serialize(&txs)
+            .map_err(|e| catalyst_utils::error::CatalystError::Serialization(e.to_string()))?;
+        let mut hasher = blake2::Blake2b512::new();
+        hasher.update(&bytes);
+        let result = hasher.finalize();
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&result[..32]);
+        Ok(Self {
+            cycle,
+            batch_hash: h,
+            txs,
+        })
+    }
+
+    pub fn verify_hash(&self) -> CatalystResult<bool> {
+        let other = ProtocolTxBatch::new(self.cycle, self.txs.clone())?;
+        Ok(other.batch_hash == self.batch_hash)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MempoolItem {
     entries: Vec<TransactionEntry>,
+    sender_pubkey: Option<[u8; 32]>,
+    nonce: Option<u64>,
+    protocol_tx: Option<corep::Transaction>,
     inserted_at: Instant,
 }
 
@@ -225,6 +305,9 @@ impl Mempool {
             tx.tx_id,
             MempoolItem {
                 entries: tx.entries,
+                sender_pubkey: None,
+                nonce: None,
+                protocol_tx: None,
                 inserted_at: Instant::now(),
             },
         );
@@ -249,10 +332,25 @@ impl Mempool {
             tx.tx_id,
             MempoolItem {
                 entries: tx.to_consensus_entries(),
+                sender_pubkey: tx.sender_pubkey(),
+                nonce: Some(tx.tx.core.nonce),
+                protocol_tx: Some(tx.tx),
                 inserted_at: Instant::now(),
             },
         );
         true
+    }
+
+    pub fn max_nonce_for_sender(&self, sender: &[u8; 32]) -> Option<u64> {
+        let mut max: Option<u64> = None;
+        for item in self.by_id.values() {
+            if let (Some(pk), Some(nonce)) = (&item.sender_pubkey, item.nonce) {
+                if pk == sender {
+                    max = Some(max.map(|m| m.max(nonce)).unwrap_or(nonce));
+                }
+            }
+        }
+        max
     }
 
     pub fn evict_expired(&mut self) {
@@ -279,6 +377,29 @@ impl Mempool {
         }
 
         self.by_id.clear();
+        out
+    }
+
+    /// Snapshot protocol transactions for the next cycle (deterministic order by tx_id bytes).
+    ///
+    /// Note: does NOT remove them. Transactions remain pending until applied (nonce advances)
+    /// or TTL eviction. This prevents accidental loss if a cycle fails.
+    pub fn snapshot_protocol_txs(&mut self, max_txs: usize) -> Vec<corep::Transaction> {
+        self.evict_expired();
+        let mut keys: Vec<Hash> = self.by_id.keys().cloned().collect();
+        keys.sort();
+
+        let mut out: Vec<corep::Transaction> = Vec::new();
+        for k in keys {
+            if out.len() >= max_txs {
+                break;
+            }
+            if let Some(item) = self.by_id.get(&k) {
+                if let Some(tx) = &item.protocol_tx {
+                    out.push(tx.clone());
+                }
+            }
+        }
         out
     }
 

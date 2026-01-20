@@ -9,6 +9,57 @@ use std::path::Path;
 use jsonrpsee::http_client::HttpClientBuilder;
 use jsonrpsee::core::client::ClientT;
 
+use catalyst_crypto::signatures::{Signature, SignatureScheme};
+
+fn parse_hex_32(s: &str) -> anyhow::Result<[u8; 32]> {
+    let s = s.trim().strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(s)?;
+    anyhow::ensure!(bytes.len() == 32, "expected 32-byte hex");
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn hash_leaf(key: &[u8], value: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update([0u8]);
+    h.update((key.len() as u64).to_le_bytes());
+    h.update(key);
+    h.update((value.len() as u64).to_le_bytes());
+    h.update(value);
+    h.finalize().into()
+}
+
+fn hash_node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update([1u8]);
+    h.update(left);
+    h.update(right);
+    h.finalize().into()
+}
+
+fn verify_merkle_proof(root: &[u8; 32], leaf: &[u8; 32], steps: &[String]) -> anyhow::Result<bool> {
+    let mut cur = *leaf;
+    for s in steps {
+        let (dir, hexh) = s
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("bad proof step (expected L:0x.. or R:0x..): {s}"))?;
+        let hexh = hexh.strip_prefix("0x").unwrap_or(hexh);
+        let b = hex::decode(hexh)?;
+        anyhow::ensure!(b.len() == 32, "bad proof hash len");
+        let mut sib = [0u8; 32];
+        sib.copy_from_slice(&b);
+        cur = match dir {
+            "L" => hash_node(&sib, &cur),
+            "R" => hash_node(&cur, &sib),
+            _ => return Err(anyhow::anyhow!("bad proof direction: {dir}")),
+        };
+    }
+    Ok(&cur == root)
+}
+
 pub async fn generate_identity(output: &Path) -> Result<()> {
     let _ = output;
     // TODO: implement persistent identity generation.
@@ -46,6 +97,34 @@ pub async fn get_peers(rpc_url: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn balance_proof(address: &str, rpc_url: &str) -> Result<()> {
+    let client = HttpClientBuilder::default().build(rpc_url)?;
+    let p: catalyst_rpc::RpcBalanceProof =
+        client.request("catalyst_getBalanceProof", jsonrpsee::rpc_params![address]).await?;
+    println!("balance: {}", p.balance);
+    println!("state_root: {}", p.state_root);
+    println!("proof_len: {}", p.proof.len());
+
+    let pk = parse_hex_32(address)?;
+    let mut key = b"bal:".to_vec();
+    key.extend_from_slice(&pk);
+
+    let bal_i64: i64 = p.balance.parse().unwrap_or(0);
+    let leaf = hash_leaf(&key, &bal_i64.to_le_bytes());
+
+    let root_bytes = {
+        let b = hex::decode(p.state_root.trim().strip_prefix("0x").unwrap_or(&p.state_root))?;
+        anyhow::ensure!(b.len() == 32, "bad state_root len");
+        let mut r = [0u8; 32];
+        r.copy_from_slice(&b);
+        r
+    };
+
+    let ok = verify_merkle_proof(&root_bytes, &leaf, &p.proof)?;
+    println!("proof_ok: {}", ok);
+    Ok(())
+}
+
 // Backwards-compatible names used by `main.rs`.
 pub async fn show_status(rpc_url: &str) -> Result<()> {
     get_status(rpc_url).await
@@ -62,8 +141,83 @@ pub async fn send_transaction(
     rpc_url: &str,
     confidential: bool,
 ) -> Result<()> {
-    let _ = (to, amount, key_file, rpc_url, confidential);
-    // TODO: implement transaction submission.
+    let _ = confidential;
+    let client = HttpClientBuilder::default().build(rpc_url)?;
+
+    // Dev-only: treat `to` as a 32-byte pubkey hex string (node-id), and send from faucet.
+    let to_hex = to.strip_prefix("0x").unwrap_or(to);
+    let to_bytes = hex::decode(to_hex)?;
+    anyhow::ensure!(to_bytes.len() == 32, "to must be 32-byte hex pubkey");
+    let mut to_pk = [0u8; 32];
+    to_pk.copy_from_slice(&to_bytes);
+
+    // Load (or create) sender private key and derive sender public key.
+    let sk = crate::identity::load_or_generate_private_key(key_file, true)?;
+    let from_pk = crate::identity::public_key_bytes(&sk);
+
+    // Fetch current nonce for sender.
+    let from_hex = format!("0x{}", hex::encode(from_pk));
+    let cur_nonce: u64 = client
+        .request("catalyst_getNonce", jsonrpsee::rpc_params![from_hex])
+        .await
+        .unwrap_or(0);
+    let nonce = cur_nonce.saturating_add(1);
+    let nonce = std::env::var("CATALYST_FORCE_NONCE")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(nonce);
+
+    let amt: i64 = amount.parse()?;
+    anyhow::ensure!(amt > 0, "amount must be positive");
+
+    let now_ms = catalyst_utils::utils::current_timestamp_ms();
+    let now_secs = (now_ms / 1000) as u32;
+
+    let mut tx = catalyst_core::protocol::Transaction {
+        core: catalyst_core::protocol::TransactionCore {
+            tx_type: catalyst_core::protocol::TransactionType::NonConfidentialTransfer,
+            entries: vec![
+                catalyst_core::protocol::TransactionEntry {
+                    public_key: from_pk,
+                    amount: catalyst_core::protocol::EntryAmount::NonConfidential(-amt),
+                },
+                catalyst_core::protocol::TransactionEntry {
+                    public_key: to_pk,
+                    amount: catalyst_core::protocol::EntryAmount::NonConfidential(amt),
+                },
+            ],
+            nonce,
+            lock_time: now_secs,
+            fees: 0,
+            data: Vec::new(),
+        },
+        signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
+        timestamp: now_ms,
+    };
+
+    // Real signature: Schnorr over canonical payload.
+    let payload = tx.signing_payload().map_err(anyhow::Error::msg)?;
+    let mut rng = rand::rngs::OsRng;
+    let scheme = SignatureScheme::new();
+    let sig: Signature = scheme.sign(&mut rng, &sk, &payload)?;
+    tx.signature = catalyst_core::protocol::AggregatedSignature(sig.to_bytes().to_vec());
+
+    // Dev-only: allow easy end-to-end validation that signature checks are enforced.
+    // Example:
+    //   CATALYST_TAMPER_SIG=1 cargo run -p catalyst-cli -- send ... --rpc-url ...
+    if std::env::var("CATALYST_TAMPER_SIG").ok().as_deref() == Some("1") {
+        if let Some(b) = tx.signature.0.first_mut() {
+            *b ^= 0x01;
+        }
+    }
+
+    let bytes = bincode::serialize(&tx)?;
+    let hex_data = format!("0x{}", hex::encode(bytes));
+
+    let tx_id: String = client
+        .request("catalyst_sendRawTransaction", jsonrpsee::rpc_params![hex_data])
+        .await?;
+    println!("tx_id: {tx_id}");
     Ok(())
 }
 

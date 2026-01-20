@@ -12,9 +12,11 @@ pub struct LsuCidGossip {
     pub cycle: u64,
     pub lsu_hash: Hash,
     pub cid: String,
+    /// Authenticated state root after applying this LSU.
+    pub state_root: Hash,
 }
 
-impl_catalyst_serialize!(LsuCidGossip, cycle, lsu_hash, cid);
+impl_catalyst_serialize!(LsuCidGossip, cycle, lsu_hash, cid, state_root);
 
 impl NetworkMessage for LsuCidGossip {
     fn serialize(&self) -> CatalystResult<Vec<u8>> {
