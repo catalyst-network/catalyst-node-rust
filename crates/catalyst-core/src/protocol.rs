@@ -42,6 +42,8 @@ pub enum TransactionType {
     DataStorageRequest,
     DataStorageRetrieve,
     SmartContract,
+    /// Register the sender as an on-chain worker/validator candidate (minimal scaffold).
+    WorkerRegistration,
 }
 
 /// Amount component of an entry (§4.3).
@@ -100,8 +102,32 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn validate_basic(&self) -> Result<(), String> {
-        if self.core.entries.len() < 2 {
-            return Err("Transaction must contain at least 2 entries".to_string());
+        match self.core.tx_type {
+            TransactionType::WorkerRegistration => {
+                // Minimal: single entry identifying the worker pubkey with amount 0.
+                if self.core.entries.len() != 1 {
+                    return Err("WorkerRegistration must contain exactly 1 entry".to_string());
+                }
+                match self.core.entries[0].amount {
+                    EntryAmount::NonConfidential(v) if v == 0 => {}
+                    _ => return Err("WorkerRegistration entry amount must be NonConfidential(0)".to_string()),
+                }
+            }
+            TransactionType::SmartContract => {
+                // Minimal: single entry identifying the caller pubkey with amount 0.
+                if self.core.entries.len() != 1 {
+                    return Err("SmartContract must contain exactly 1 entry".to_string());
+                }
+                match self.core.entries[0].amount {
+                    EntryAmount::NonConfidential(v) if v == 0 => {}
+                    _ => return Err("SmartContract entry amount must be NonConfidential(0)".to_string()),
+                }
+            }
+            _ => {
+                if self.core.entries.len() < 2 {
+                    return Err("Transaction must contain at least 2 entries".to_string());
+                }
+            }
         }
         if self.core.nonce == 0 {
             return Err("Transaction nonce must be > 0".to_string());

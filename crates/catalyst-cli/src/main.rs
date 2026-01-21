@@ -13,6 +13,7 @@ mod tx;
 mod sync;
 mod dfs_store;
 mod identity;
+mod evm;
 
 use node::CatalystNode;
 use config::NodeConfig;
@@ -72,6 +73,10 @@ enum Commands {
         /// RPC server port
         #[arg(long, default_value = "8545")]
         rpc_port: u16,
+
+        /// RPC bind address (use 0.0.0.0 to expose externally)
+        #[arg(long, default_value = "127.0.0.1")]
+        rpc_address: String,
 
         /// Bootstrap peers (comma-separated multiaddrs)
         #[arg(long)]
@@ -146,6 +151,15 @@ enum Commands {
         /// Make transaction confidential
         #[arg(long)]
         confidential: bool,
+    },
+    /// Register this node as a worker/validator candidate (on-chain)
+    RegisterWorker {
+        /// Private key file
+        #[arg(long, default_value = "wallet.key")]
+        key_file: PathBuf,
+        /// RPC endpoint
+        #[arg(long, default_value = "http://localhost:8545")]
+        rpc_url: String,
     },
     /// Check account balance
     Balance {
@@ -230,6 +244,7 @@ async fn main() -> Result<()> {
             storage_capacity,
             rpc,
             rpc_port,
+            rpc_address,
             bootstrap_peers,
             generate_txs,
             tx_interval_ms,
@@ -302,6 +317,7 @@ async fn main() -> Result<()> {
             node_config.storage.capacity_gb = storage_capacity;
             node_config.rpc.enabled = rpc;
             node_config.rpc.port = rpc_port;
+            node_config.rpc.address = rpc_address;
 
             if let Some(peers) = bootstrap_peers {
                 node_config.network.bootstrap_peers = peers
@@ -340,6 +356,9 @@ async fn main() -> Result<()> {
             confidential,
         } => {
             commands::send_transaction(&to, &amount, &key_file, &rpc_url, confidential).await?;
+        }
+        Commands::RegisterWorker { key_file, rpc_url } => {
+            commands::register_worker(&key_file, &rpc_url).await?;
         }
         Commands::Balance { address, rpc_url } => {
             commands::check_balance(&address, &rpc_url).await?;

@@ -149,6 +149,14 @@ pub trait CatalystRpc {
     /// Get applied head info (cycle/hash/state_root)
     #[method(name = "catalyst_head")]
     async fn head(&self) -> RpcResult<RpcHead>;
+
+    /// Get EVM contract bytecode for a 20-byte hex address.
+    #[method(name = "catalyst_getCode")]
+    async fn get_code(&self, address: String) -> RpcResult<String>;
+
+    /// Get last call return data for a 20-byte hex address (dev placeholder).
+    #[method(name = "catalyst_getLastReturn")]
+    async fn get_last_return(&self, address: String) -> RpcResult<String>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,23 +314,60 @@ fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, RpcServerError> {
     hex::decode(s).map_err(|e| RpcServerError::InvalidParams(e.to_string()))
 }
 
+fn parse_hex_20(s: &str) -> Result<[u8; 20], RpcServerError> {
+    let b = parse_hex_bytes(s)?;
+    if b.len() != 20 {
+        return Err(RpcServerError::InvalidParams("expected 20-byte hex".to_string()));
+    }
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&b);
+    Ok(out)
+}
+
+fn evm_code_key(addr20: &[u8; 20]) -> Vec<u8> {
+    let mut k = b"evm:code:".to_vec();
+    k.extend_from_slice(addr20);
+    k
+}
+
+fn evm_last_return_key(addr20: &[u8; 20]) -> Vec<u8> {
+    let mut k = b"evm:last_return:".to_vec();
+    k.extend_from_slice(addr20);
+    k
+}
+
 fn verify_tx_signature(tx: &catalyst_core::protocol::Transaction) -> bool {
     use catalyst_crypto::signatures::SignatureScheme;
 
-    // Determine "sender" as the (single) pubkey with negative NonConfidential amount.
-    let mut sender: Option<[u8; 32]> = None;
-    for e in &tx.core.entries {
-        if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
-            if v < 0 {
-                match sender {
-                    None => sender = Some(e.public_key),
-                    Some(pk) if pk == e.public_key => {}
-                    Some(_) => return false,
+    // Determine sender:
+    // - transfers: (single) pubkey with negative NonConfidential amount
+    // - worker registration: entry[0].public_key
+    let sender_pk_bytes: [u8; 32] = match tx.core.tx_type {
+        catalyst_core::protocol::TransactionType::WorkerRegistration => {
+            let Some(e0) = tx.core.entries.get(0) else { return false };
+            e0.public_key
+        }
+        catalyst_core::protocol::TransactionType::SmartContract => {
+            let Some(e0) = tx.core.entries.get(0) else { return false };
+            e0.public_key
+        }
+        _ => {
+            let mut sender: Option<[u8; 32]> = None;
+            for e in &tx.core.entries {
+                if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
+                    if v < 0 {
+                        match sender {
+                            None => sender = Some(e.public_key),
+                            Some(pk) if pk == e.public_key => {}
+                            Some(_) => return false,
+                        }
+                    }
                 }
             }
+            let Some(sender) = sender else { return false };
+            sender
         }
-    }
-    let Some(sender_pk_bytes) = sender else { return false };
+    };
 
     if tx.signature.0.len() != 64 {
         return false;
@@ -345,19 +390,25 @@ fn verify_tx_signature(tx: &catalyst_core::protocol::Transaction) -> bool {
 }
 
 fn tx_sender_pubkey(tx: &catalyst_core::protocol::Transaction) -> Option<[u8; 32]> {
-    let mut sender: Option<[u8; 32]> = None;
-    for e in &tx.core.entries {
-        if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
-            if v < 0 {
-                match sender {
-                    None => sender = Some(e.public_key),
-                    Some(pk) if pk == e.public_key => {}
-                    Some(_) => return None,
+    match tx.core.tx_type {
+        catalyst_core::protocol::TransactionType::WorkerRegistration => tx.core.entries.get(0).map(|e| e.public_key),
+        catalyst_core::protocol::TransactionType::SmartContract => tx.core.entries.get(0).map(|e| e.public_key),
+        _ => {
+            let mut sender: Option<[u8; 32]> = None;
+            for e in &tx.core.entries {
+                if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
+                    if v < 0 {
+                        match sender {
+                            None => sender = Some(e.public_key),
+                            Some(pk) if pk == e.public_key => {}
+                            Some(_) => return None,
+                        }
+                    }
                 }
             }
+            sender
         }
     }
-    sender
 }
 
 /// Minimal RPC implementation backed by `catalyst-storage`.
@@ -588,6 +639,30 @@ impl CatalystRpcServer for CatalystRpcImpl {
             applied_state_root,
             last_lsu_cid,
         })
+    }
+
+    async fn get_code(&self, address: String) -> RpcResult<String> {
+        let addr20 = parse_hex_20(&address).map_err(ErrorObjectOwned::from)?;
+        let key = evm_code_key(&addr20);
+        let bytes = self
+            .storage
+            .engine()
+            .get("accounts", &key)
+            .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())))?
+            .unwrap_or_default();
+        Ok(format!("0x{}", hex::encode(bytes)))
+    }
+
+    async fn get_last_return(&self, address: String) -> RpcResult<String> {
+        let addr20 = parse_hex_20(&address).map_err(ErrorObjectOwned::from)?;
+        let key = evm_last_return_key(&addr20);
+        let bytes = self
+            .storage
+            .engine()
+            .get("accounts", &key)
+            .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())))?
+            .unwrap_or_default();
+        Ok(format!("0x{}", hex::encode(bytes)))
     }
 }
 

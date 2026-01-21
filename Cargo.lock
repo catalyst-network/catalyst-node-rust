@@ -852,6 +852,7 @@ checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 name = "catalyst-cli"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "anyhow",
  "bincode",
  "blake2",
@@ -862,6 +863,7 @@ dependencies = [
  "catalyst-dfs",
  "catalyst-network",
  "catalyst-rpc",
+ "catalyst-runtime-evm",
  "catalyst-storage",
  "catalyst-utils",
  "clap",

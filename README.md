@@ -101,6 +101,23 @@ Stop:
 make stop-testnet
 ```
 
+### Faster iteration helpers (non-blocking start + status + basic check)
+
+`make testnet` blocks (it waits on node processes). For day-to-day testing, use:
+
+```bash
+make testnet-up
+make testnet-status
+make testnet-basic-test
+make testnet-down
+```
+
+Tail logs:
+
+```bash
+make testnet-logs NODE=node1
+```
+
 ### Smoke test (single command)
 
 Runs an end-to-end test that:
@@ -179,6 +196,43 @@ make docker-build
 # Run with Docker
 make docker-run
 ```
+
+## Stable Devnet (invite others to connect)
+
+You can run a single-node “devnet” that:
+- listens on a public P2P port
+- exposes RPC externally (binds to `0.0.0.0`)
+- prints the bootstrap multiaddr + RPC URL to share
+
+Start (replace `HOST` with your public IP or DNS name):
+
+```bash
+make devnet-up HOST=<public_ip_or_dns> P2P_PORT=30333 RPC_PORT=8545
+```
+
+Stop:
+
+```bash
+make devnet-down
+```
+
+### How others connect
+
+On a remote machine, they run their node and point it at your bootstrap address:
+
+```bash
+cargo run -p catalyst-cli -- start \
+  --validator --rpc --rpc-address 127.0.0.1 --rpc-port 8545 \
+  --bootstrap-peers "/ip4/<HOST>/tcp/30333"
+```
+
+### Smart contract dev scaffolding (current state)
+
+This repo currently has a **scaffolded** SmartContract transaction flow:
+- `catalyst deploy <bytecode_file>` stores contract bytecode under `evm:code:<addr20>`
+- `catalyst_getCode` returns that stored bytecode
+- `catalyst call` is a placeholder (no real EVM bytecode execution yet)
+
 
 ## 📋 Usage
 

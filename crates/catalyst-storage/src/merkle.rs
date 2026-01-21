@@ -1,15 +1,16 @@
 use crate::{StorageError, StorageResult};
 use catalyst_utils::Hash;
 use sha2::{Digest, Sha256};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MerkleStep {
     /// true if sibling is on the left (i.e. sibling || current), false if on the right (current || sibling)
     pub sibling_is_left: bool,
     pub sibling: Hash,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MerkleProof {
     pub leaf: Hash,
     pub steps: Vec<MerkleStep>,

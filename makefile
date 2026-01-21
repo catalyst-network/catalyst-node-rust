@@ -325,6 +325,34 @@ smoke-testnet: build
 	@echo "Running local testnet smoke test..."
 	@bash scripts/smoke_testnet.sh
 
+.PHONY: testnet-up testnet-down testnet-status testnet-logs testnet-basic-test devnet-up devnet-down devnet-status
+testnet-up: build
+	@bash scripts/netctl.sh testnet up
+
+testnet-down:
+	@bash scripts/netctl.sh testnet down
+
+testnet-status:
+	@bash scripts/netctl.sh testnet status
+
+testnet-logs:
+	@bash scripts/netctl.sh testnet logs $(or $(NODE),node1)
+
+testnet-basic-test: build
+	@bash scripts/netctl.sh testnet test-basic
+
+# Public/stable devnet helpers (single node that exposes RPC externally).
+# Example:
+#   make devnet-up HOST=203.0.113.10 P2P_PORT=30333 RPC_PORT=8545
+devnet-up: build
+	@bash scripts/netctl.sh devnet up --host "$(HOST)" --p2p-port "$(or $(P2P_PORT),30333)" --rpc-port "$(or $(RPC_PORT),8545)"
+
+devnet-down:
+	@bash scripts/netctl.sh devnet down
+
+devnet-status:
+	@bash scripts/netctl.sh devnet status
+
 # Development helpers
 watch:
 	@echo "Watching for changes and rebuilding..."

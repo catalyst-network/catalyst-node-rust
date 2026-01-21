@@ -10,6 +10,8 @@ use jsonrpsee::http_client::HttpClientBuilder;
 use jsonrpsee::core::client::ClientT;
 
 use catalyst_crypto::signatures::{Signature, SignatureScheme};
+use crate::evm::EvmTxKind;
+use alloy_primitives::Address as EvmAddress;
 
 fn parse_hex_32(s: &str) -> anyhow::Result<[u8; 32]> {
     let s = s.trim().strip_prefix("0x").unwrap_or(s);
@@ -221,6 +223,56 @@ pub async fn send_transaction(
     Ok(())
 }
 
+pub async fn register_worker(key_file: &Path, rpc_url: &str) -> Result<()> {
+    let client = HttpClientBuilder::default().build(rpc_url)?;
+
+    // Load (or create) sender private key and derive sender public key.
+    let sk = crate::identity::load_or_generate_private_key(key_file, true)?;
+    let pk = crate::identity::public_key_bytes(&sk);
+
+    // Fetch current nonce for sender.
+    let pk_hex = format!("0x{}", hex::encode(pk));
+    let cur_nonce: u64 = client
+        .request("catalyst_getNonce", jsonrpsee::rpc_params![pk_hex])
+        .await
+        .unwrap_or(0);
+    let nonce = cur_nonce.saturating_add(1);
+
+    let now_ms = catalyst_utils::utils::current_timestamp_ms();
+    let now_secs = (now_ms / 1000) as u32;
+
+    let mut tx = catalyst_core::protocol::Transaction {
+        core: catalyst_core::protocol::TransactionCore {
+            tx_type: catalyst_core::protocol::TransactionType::WorkerRegistration,
+            entries: vec![catalyst_core::protocol::TransactionEntry {
+                public_key: pk,
+                amount: catalyst_core::protocol::EntryAmount::NonConfidential(0),
+            }],
+            nonce,
+            lock_time: now_secs,
+            fees: 0,
+            data: Vec::new(),
+        },
+        signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
+        timestamp: now_ms,
+    };
+
+    // Real signature: Schnorr over canonical payload.
+    let payload = tx.signing_payload().map_err(anyhow::Error::msg)?;
+    let mut rng = rand::rngs::OsRng;
+    let scheme = SignatureScheme::new();
+    let sig: Signature = scheme.sign(&mut rng, &sk, &payload)?;
+    tx.signature = catalyst_core::protocol::AggregatedSignature(sig.to_bytes().to_vec());
+
+    let bytes = bincode::serialize(&tx)?;
+    let hex_data = format!("0x{}", hex::encode(bytes));
+    let tx_id: String = client
+        .request("catalyst_sendRawTransaction", jsonrpsee::rpc_params![hex_data])
+        .await?;
+    println!("tx_id: {tx_id}");
+    Ok(())
+}
+
 pub async fn check_balance(address: &str, rpc_url: &str) -> Result<()> {
     let client = HttpClientBuilder::default().build(rpc_url)?;
     let bal: String = client.request("catalyst_getBalance", jsonrpsee::rpc_params![address]).await?;
@@ -235,8 +287,76 @@ pub async fn deploy_contract(
     rpc_url: &str,
     runtime: &str,
 ) -> Result<()> {
-    let _ = (contract, args, key_file, rpc_url, runtime);
-    // TODO: implement contract deployment.
+    let _ = (args, runtime);
+    let client = HttpClientBuilder::default().build(rpc_url)?;
+
+    // Load sender key
+    let sk = crate::identity::load_or_generate_private_key(key_file, true)?;
+    let from_pk = crate::identity::public_key_bytes(&sk);
+
+    // Nonce
+    let from_hex = format!("0x{}", hex::encode(from_pk));
+    let cur_nonce: u64 = client
+        .request("catalyst_getNonce", jsonrpsee::rpc_params![from_hex])
+        .await
+        .unwrap_or(0);
+    let nonce = cur_nonce.saturating_add(1);
+
+    // Read bytecode: accept a file containing hex (0x...) or raw bytes.
+    let raw = std::fs::read(contract)?;
+    let bytecode = if let Ok(s) = std::str::from_utf8(&raw) {
+        let s = s.trim();
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        if s.chars().all(|c| c.is_ascii_hexdigit()) && s.len() % 2 == 0 {
+            hex::decode(s)?
+        } else {
+            raw
+        }
+    } else {
+        raw
+    };
+
+    let now_ms = catalyst_utils::utils::current_timestamp_ms();
+    let now_secs = (now_ms / 1000) as u32;
+    let kind = EvmTxKind::Deploy { bytecode: bytecode.clone() };
+    let data = bincode::serialize(&kind)?;
+
+    let mut tx = catalyst_core::protocol::Transaction {
+        core: catalyst_core::protocol::TransactionCore {
+            tx_type: catalyst_core::protocol::TransactionType::SmartContract,
+            entries: vec![catalyst_core::protocol::TransactionEntry {
+                public_key: from_pk,
+                amount: catalyst_core::protocol::EntryAmount::NonConfidential(0),
+            }],
+            nonce,
+            lock_time: now_secs,
+            fees: 0,
+            data,
+        },
+        signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
+        timestamp: now_ms,
+    };
+
+    let payload = tx.signing_payload().map_err(anyhow::Error::msg)?;
+    let mut rng = rand::rngs::OsRng;
+    let scheme = SignatureScheme::new();
+    let sig: Signature = scheme.sign(&mut rng, &sk, &payload)?;
+    tx.signature = catalyst_core::protocol::AggregatedSignature(sig.to_bytes().to_vec());
+
+    let bytes = bincode::serialize(&tx)?;
+    let hex_data = format!("0x{}", hex::encode(bytes));
+    let tx_id: String = client
+        .request("catalyst_sendRawTransaction", jsonrpsee::rpc_params![hex_data])
+        .await?;
+
+    // Deterministic create address
+    let mut from20 = [0u8; 20];
+    from20.copy_from_slice(&from_pk[12..32]);
+    let from_addr = EvmAddress::from_slice(&from20);
+    let created = catalyst_runtime_evm::database::utils::calculate_create_address(&from_addr, nonce);
+
+    println!("tx_id: {tx_id}");
+    println!("contract_address: 0x{}", hex::encode(created.as_slice()));
     Ok(())
 }
 
@@ -247,8 +367,65 @@ pub async fn call_contract(
     rpc_url: &str,
     value: &str,
 ) -> Result<()> {
-    let _ = (contract, function, key_file, rpc_url, value);
-    // TODO: implement contract call.
+    let _ = value;
+    let client = HttpClientBuilder::default().build(rpc_url)?;
+
+    let to_hex = contract.trim().strip_prefix("0x").unwrap_or(contract.trim());
+    let to_bytes = hex::decode(to_hex)?;
+    anyhow::ensure!(to_bytes.len() == 20, "contract must be 20-byte hex address");
+    let mut to = [0u8; 20];
+    to.copy_from_slice(&to_bytes);
+
+    // Treat `function` as calldata hex for now.
+    let data_hex = function.trim().strip_prefix("0x").unwrap_or(function.trim());
+    let input = if data_hex.is_empty() { Vec::new() } else { hex::decode(data_hex)? };
+
+    // Load sender key
+    let key_file = key_file.unwrap_or_else(|| Path::new("wallet.key"));
+    let sk = crate::identity::load_or_generate_private_key(key_file, true)?;
+    let from_pk = crate::identity::public_key_bytes(&sk);
+
+    // Nonce
+    let from_hex = format!("0x{}", hex::encode(from_pk));
+    let cur_nonce: u64 = client
+        .request("catalyst_getNonce", jsonrpsee::rpc_params![from_hex])
+        .await
+        .unwrap_or(0);
+    let nonce = cur_nonce.saturating_add(1);
+
+    let now_ms = catalyst_utils::utils::current_timestamp_ms();
+    let now_secs = (now_ms / 1000) as u32;
+    let kind = EvmTxKind::Call { to, input };
+    let data = bincode::serialize(&kind)?;
+
+    let mut tx = catalyst_core::protocol::Transaction {
+        core: catalyst_core::protocol::TransactionCore {
+            tx_type: catalyst_core::protocol::TransactionType::SmartContract,
+            entries: vec![catalyst_core::protocol::TransactionEntry {
+                public_key: from_pk,
+                amount: catalyst_core::protocol::EntryAmount::NonConfidential(0),
+            }],
+            nonce,
+            lock_time: now_secs,
+            fees: 0,
+            data,
+        },
+        signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
+        timestamp: now_ms,
+    };
+
+    let payload = tx.signing_payload().map_err(anyhow::Error::msg)?;
+    let mut rng = rand::rngs::OsRng;
+    let scheme = SignatureScheme::new();
+    let sig: Signature = scheme.sign(&mut rng, &sk, &payload)?;
+    tx.signature = catalyst_core::protocol::AggregatedSignature(sig.to_bytes().to_vec());
+
+    let bytes = bincode::serialize(&tx)?;
+    let hex_data = format!("0x{}", hex::encode(bytes));
+    let tx_id: String = client
+        .request("catalyst_sendRawTransaction", jsonrpsee::rpc_params![hex_data])
+        .await?;
+    println!("tx_id: {tx_id}");
     Ok(())
 }
 

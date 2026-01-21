@@ -5,12 +5,15 @@ use catalyst_consensus::types::{hash_data, TransactionEntry};
 use catalyst_core::protocol as corep;
 use catalyst_core::protocol::EntryAmount;
 use blake2::Digest;
+use crate::evm::{encode_evm_marker, EvmTxKind, EvmTxPayload};
 use catalyst_utils::{
     impl_catalyst_serialize, CatalystDeserialize, CatalystResult, CatalystSerialize, Hash, MessageType,
     NetworkMessage,
 };
 use catalyst_utils::network::MessagePriority;
 use serde::{Deserialize, Serialize};
+
+// bring the crate module into scope for the binary crate build
 
 /// Lightweight transaction gossip message.
 ///
@@ -127,38 +130,76 @@ impl ProtocolTxGossip {
 
     pub fn to_consensus_entries(&self) -> Vec<TransactionEntry> {
         // Map protocol entries into consensus entries (temporary bridge).
+        //
+        // Special case:
+        // - WorkerRegistration is encoded as a marker entry that is carried in the LSU and applied
+        //   into on-chain state (workers:<pubkey>).
+        //
+        // Notes:
         // - Confidential amounts are skipped for now.
         // - Each entry signature gets the aggregated signature bytes (deterministic placeholder).
-        let sig = self.tx.signature.0.clone();
-        let mut out = Vec::new();
-        for e in &self.tx.core.entries {
-            let amount = match &e.amount {
-                EntryAmount::NonConfidential(v) => *v,
-                EntryAmount::Confidential { .. } => continue,
-            };
-            out.push(TransactionEntry {
-                public_key: e.public_key,
-                amount,
-                signature: sig.clone(),
-            });
+        match self.tx.core.tx_type {
+            corep::TransactionType::WorkerRegistration => {
+                let pk = self.tx.core.entries.get(0).map(|e| e.public_key).unwrap_or([0u8; 32]);
+                let mut sig = b"WRKREG1".to_vec();
+                sig.extend_from_slice(&self.tx.signature.0);
+                vec![TransactionEntry {
+                    public_key: pk,
+                    amount: 0,
+                    signature: sig,
+                }]
+            }
+            corep::TransactionType::SmartContract => {
+                let pk = self.tx.core.entries.get(0).map(|e| e.public_key).unwrap_or([0u8; 32]);
+                let kind = bincode::deserialize::<EvmTxKind>(&self.tx.core.data)
+                    .unwrap_or(EvmTxKind::Call { to: [0u8; 20], input: Vec::new() });
+                let payload = EvmTxPayload { nonce: self.tx.core.nonce, kind };
+                let marker = encode_evm_marker(&payload, &self.tx.signature.0).unwrap_or_else(|_| self.tx.signature.0.clone());
+                vec![TransactionEntry {
+                    public_key: pk,
+                    amount: 0,
+                    signature: marker,
+                }]
+            }
+            _ => {
+                let sig = self.tx.signature.0.clone();
+                let mut out = Vec::new();
+                for e in &self.tx.core.entries {
+                    let amount = match &e.amount {
+                        EntryAmount::NonConfidential(v) => *v,
+                        EntryAmount::Confidential { .. } => continue,
+                    };
+                    out.push(TransactionEntry {
+                        public_key: e.public_key,
+                        amount,
+                        signature: sig.clone(),
+                    });
+                }
+                out
+            }
         }
-        out
     }
 
     pub fn sender_pubkey(&self) -> Option<[u8; 32]> {
-        let mut sender: Option<[u8; 32]> = None;
-        for e in &self.tx.core.entries {
-            if let EntryAmount::NonConfidential(v) = e.amount {
-                if v < 0 {
-                    match sender {
-                        None => sender = Some(e.public_key),
-                        Some(pk) if pk == e.public_key => {}
-                        Some(_) => return None,
+        match self.tx.core.tx_type {
+            corep::TransactionType::WorkerRegistration => self.tx.core.entries.get(0).map(|e| e.public_key),
+            corep::TransactionType::SmartContract => self.tx.core.entries.get(0).map(|e| e.public_key),
+            _ => {
+                let mut sender: Option<[u8; 32]> = None;
+                for e in &self.tx.core.entries {
+                    if let EntryAmount::NonConfidential(v) = e.amount {
+                        if v < 0 {
+                            match sender {
+                                None => sender = Some(e.public_key),
+                                Some(pk) if pk == e.public_key => {}
+                                Some(_) => return None,
+                            }
+                        }
                     }
                 }
+                sender
             }
         }
-        sender
     }
 }
 

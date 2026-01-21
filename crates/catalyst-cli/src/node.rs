@@ -17,13 +17,16 @@ use catalyst_utils::state::StateManager;
 
 use crate::config::NodeConfig;
 use crate::tx::{Mempool, ProtocolTxBatch, ProtocolTxGossip, TxBatch, TxGossip};
-use crate::sync::{LsuCidGossip, LsuGossip};
+use crate::sync::{FileRequestMsg, FileResponseMsg, KeyProofChange, LsuCidGossip, LsuGossip, StateProofBundle};
+use crate::evm::{decode_evm_marker, encode_evm_marker, EvmTxKind, EvmTxPayload};
 
 use catalyst_dfs::ContentId;
 
 use crate::dfs_store::LocalContentStore;
 
 use catalyst_storage::{StorageConfig as StorageConfigLib, StorageManager};
+
+use alloy_primitives::Address as EvmAddress;
 
 // Dev/testnet faucet key (32-byte scalar); pubkey is derived and is a valid compressed Ristretto point.
 const FAUCET_PRIVATE_KEY_BYTES: [u8; 32] = [0xFA; 32];
@@ -35,6 +38,297 @@ fn balance_key_for_pubkey(pubkey: &[u8; 32]) -> Vec<u8> {
     k
 }
 
+fn worker_key_for_pubkey(pubkey: &[u8; 32]) -> Vec<u8> {
+    let mut k = b"workers:".to_vec();
+    k.extend_from_slice(pubkey);
+    k
+}
+
+fn is_worker_reg_marker(sig: &[u8]) -> bool {
+    sig.starts_with(b"WRKREG1")
+}
+
+fn is_evm_marker(sig: &[u8]) -> bool {
+    sig.starts_with(b"EVM1")
+}
+
+fn pubkey_to_evm_addr20(pk: &[u8; 32]) -> [u8; 20] {
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&pk[12..32]);
+    out
+}
+
+fn evm_code_key(addr20: &[u8; 20]) -> Vec<u8> {
+    let mut k = b"evm:code:".to_vec();
+    k.extend_from_slice(addr20);
+    k
+}
+
+fn evm_last_return_key(addr20: &[u8; 20]) -> Vec<u8> {
+    let mut k = b"evm:last_return:".to_vec();
+    k.extend_from_slice(addr20);
+    k
+}
+
+fn encode_i64(v: i64) -> Vec<u8> {
+    v.to_le_bytes().to_vec()
+}
+
+fn encode_u64(v: u64) -> Vec<u8> {
+    v.to_le_bytes().to_vec()
+}
+
+fn touched_keys_for_lsu(lsu: &catalyst_consensus::types::LedgerStateUpdate) -> Vec<Vec<u8>> {
+    use std::collections::BTreeSet;
+    let mut keys: BTreeSet<Vec<u8>> = BTreeSet::new();
+
+    // Balance keys (all entries, excluding worker reg / EVM markers)
+    for e in &lsu.partial_update.transaction_entries {
+        if is_worker_reg_marker(&e.signature) {
+            keys.insert(worker_key_for_pubkey(&e.public_key));
+        } else if is_evm_marker(&e.signature) {
+            if let Some((payload, _sig64)) = decode_evm_marker(&e.signature) {
+                match payload.kind {
+                    EvmTxKind::Deploy { .. } => {
+                        let from20 = pubkey_to_evm_addr20(&e.public_key);
+                        let from_addr = EvmAddress::from_slice(&from20);
+                        let created = catalyst_runtime_evm::database::utils::calculate_create_address(&from_addr, payload.nonce);
+                        let mut addr20 = [0u8; 20];
+                        addr20.copy_from_slice(created.as_slice());
+                        keys.insert(evm_code_key(&addr20));
+                    }
+                    EvmTxKind::Call { to, .. } => {
+                        keys.insert(evm_last_return_key(&to));
+                    }
+                }
+            }
+        } else {
+            keys.insert(balance_key_for_pubkey(&e.public_key));
+        }
+    }
+
+    // Nonce keys: one per "tx" boundary (signature group)
+    use std::collections::BTreeMap;
+    let mut by_sig: BTreeMap<&[u8], Vec<&catalyst_consensus::types::TransactionEntry>> = BTreeMap::new();
+    for e in &lsu.partial_update.transaction_entries {
+        by_sig.entry(&e.signature).or_default().push(e);
+    }
+    for (_sig, entries) in by_sig {
+        let mut sender: Option<[u8; 32]> = None;
+        for e in &entries {
+            if e.amount < 0 {
+                sender = Some(e.public_key);
+                break;
+            }
+        }
+        if sender.is_none() {
+            if let Some(e0) = entries.iter().find(|e| is_worker_reg_marker(&e.signature)) {
+                sender = Some(e0.public_key);
+            }
+        }
+        if sender.is_none() {
+            if let Some(e0) = entries.iter().find(|e| is_evm_marker(&e.signature)) {
+                sender = Some(e0.public_key);
+            }
+        }
+        if let Some(pk) = sender {
+            keys.insert(nonce_key_for_pubkey(&pk));
+        }
+    }
+
+    keys.into_iter().collect()
+}
+
+fn verify_state_transition_bundle(
+    lsu: &catalyst_consensus::types::LedgerStateUpdate,
+    bundle: &StateProofBundle,
+) -> bool {
+    // Verify Merkle proofs for old/new roots, and verify that the new values match applying LSU deltas.
+    if bundle.cycle != lsu.cycle_number {
+        return false;
+    }
+    if bundle.changes.is_empty() {
+        return false;
+    }
+
+    use std::collections::BTreeMap;
+    let mut old: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut new: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+
+    for c in &bundle.changes {
+        if !catalyst_storage::merkle::verify_proof(&bundle.prev_state_root, &c.old_proof) {
+            return false;
+        }
+        if !catalyst_storage::merkle::verify_proof(&bundle.new_state_root, &c.new_proof) {
+            return false;
+        }
+        old.insert(c.key.clone(), c.old_value.clone());
+        new.insert(c.key.clone(), c.new_value.clone());
+    }
+
+    // Apply LSU deltas to old map and compare with new map.
+    let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = old.clone();
+
+    for e in &lsu.partial_update.transaction_entries {
+        if is_worker_reg_marker(&e.signature) {
+            let k = worker_key_for_pubkey(&e.public_key);
+            expected.insert(k, vec![1u8]);
+            continue;
+        }
+        if is_evm_marker(&e.signature) {
+            if let Some((payload, _sig64)) = decode_evm_marker(&e.signature) {
+                match payload.kind {
+                    EvmTxKind::Deploy { bytecode } => {
+                        let from20 = pubkey_to_evm_addr20(&e.public_key);
+                        let from_addr = EvmAddress::from_slice(&from20);
+                        let created = catalyst_runtime_evm::database::utils::calculate_create_address(&from_addr, payload.nonce);
+                        let mut addr20 = [0u8; 20];
+                        addr20.copy_from_slice(created.as_slice());
+                        expected.insert(evm_code_key(&addr20), bytecode);
+                    }
+                    EvmTxKind::Call { to, .. } => {
+                        expected.insert(evm_last_return_key(&to), Vec::new());
+                    }
+                }
+            }
+            continue;
+        }
+
+        let k = balance_key_for_pubkey(&e.public_key);
+        let cur = expected.get(&k).and_then(|b| decode_i64(b)).unwrap_or(0);
+        let next = cur.saturating_add(e.amount);
+        expected.insert(k, encode_i64(next));
+    }
+
+    // Nonce increments per tx boundary.
+    use std::collections::BTreeMap as BT;
+    let mut by_sig: BT<Vec<u8>, Vec<&catalyst_consensus::types::TransactionEntry>> = BT::new();
+    for e in &lsu.partial_update.transaction_entries {
+        by_sig.entry(e.signature.clone()).or_default().push(e);
+    }
+    for (_sig, entries) in by_sig {
+        let mut sender: Option<[u8; 32]> = None;
+        for e in &entries {
+            if e.amount < 0 {
+                sender = Some(e.public_key);
+                break;
+            }
+        }
+        if sender.is_none() {
+            if let Some(e0) = entries.iter().find(|e| is_worker_reg_marker(&e.signature)) {
+                sender = Some(e0.public_key);
+            }
+        }
+        if sender.is_none() {
+            if let Some(e0) = entries.iter().find(|e| is_evm_marker(&e.signature)) {
+                sender = Some(e0.public_key);
+            }
+        }
+        if let Some(pk) = sender {
+            let k = nonce_key_for_pubkey(&pk);
+            let cur = expected.get(&k).and_then(|b| decode_u64(b)).unwrap_or(0);
+            expected.insert(k, encode_u64(cur.saturating_add(1)));
+        }
+    }
+
+    // Ensure all expected keys match bundle new values (bundle might contain extra keys; that's fine).
+    for (k, vexp) in expected {
+        if let Some(vnew) = new.get(&k) {
+            if vnew != &vexp {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+async fn apply_lsu_to_storage_without_root_check(
+    store: &StorageManager,
+    lsu: &catalyst_consensus::types::LedgerStateUpdate,
+    new_root: [u8; 32],
+) -> Result<()> {
+    // Apply balance / worker / EVM updates.
+    for e in &lsu.partial_update.transaction_entries {
+        if is_worker_reg_marker(&e.signature) {
+            let k = worker_key_for_pubkey(&e.public_key);
+            let _ = store.set_state(&k, vec![1u8]).await;
+            continue;
+        }
+        if is_evm_marker(&e.signature) {
+            if let Some((payload, _sig64)) = decode_evm_marker(&e.signature) {
+                match payload.kind {
+                    EvmTxKind::Deploy { bytecode } => {
+                        let from20 = pubkey_to_evm_addr20(&e.public_key);
+                        let from_addr = EvmAddress::from_slice(&from20);
+                        let created = catalyst_runtime_evm::database::utils::calculate_create_address(&from_addr, payload.nonce);
+                        let mut addr20 = [0u8; 20];
+                        addr20.copy_from_slice(created.as_slice());
+                        let k = evm_code_key(&addr20);
+                        let _ = store.set_state(&k, bytecode).await;
+                    }
+                    EvmTxKind::Call { to, .. } => {
+                        let k = evm_last_return_key(&to);
+                        let _ = store.set_state(&k, Vec::new()).await;
+                    }
+                }
+            }
+            continue;
+        }
+        let bal = get_balance_i64(store, &e.public_key).await;
+        let next = bal.saturating_add(e.amount);
+        let _ = set_balance_i64(store, &e.public_key, next).await;
+    }
+
+    // Nonce increments.
+    use std::collections::BTreeMap;
+    let mut by_sig: BTreeMap<Vec<u8>, Vec<&catalyst_consensus::types::TransactionEntry>> = BTreeMap::new();
+    for e in &lsu.partial_update.transaction_entries {
+        by_sig.entry(e.signature.clone()).or_default().push(e);
+    }
+    for (_sig, entries) in by_sig {
+        let mut sender: Option<[u8; 32]> = None;
+        for e in &entries {
+            if e.amount < 0 {
+                sender = Some(e.public_key);
+                break;
+            }
+        }
+        if sender.is_none() {
+            if let Some(e0) = entries.iter().find(|e| is_worker_reg_marker(&e.signature)) {
+                sender = Some(e0.public_key);
+            }
+        }
+        if sender.is_none() {
+            if let Some(e0) = entries.iter().find(|e| is_evm_marker(&e.signature)) {
+                sender = Some(e0.public_key);
+            }
+        }
+        if let Some(pk) = sender {
+            let cur = get_nonce_u64(store, &pk).await;
+            let _ = set_nonce_u64(store, &pk, cur.saturating_add(1)).await;
+        }
+    }
+
+    // Persist head metadata (trusted).
+    store.set_state_root_cache(new_root);
+    let _ = store
+        .set_metadata("consensus:last_applied_cycle", &lsu.cycle_number.to_le_bytes())
+        .await;
+    let _ = store
+        .set_metadata("consensus:last_applied_state_root", &new_root)
+        .await;
+    if let Ok(h) = catalyst_consensus::types::hash_data(lsu) {
+        let _ = store
+            .set_metadata("consensus:last_applied_lsu_hash", &h)
+            .await;
+    }
+
+    // Flush without recomputing.
+    for cf_name in store.engine().cf_names() {
+        let _ = store.engine().flush_cf(&cf_name);
+    }
+    Ok(())
+}
 fn nonce_key_for_pubkey(pubkey: &[u8; 32]) -> Vec<u8> {
     let mut k = b"nonce:".to_vec();
     k.extend_from_slice(pubkey);
@@ -68,20 +362,36 @@ fn faucet_pubkey_bytes() -> [u8; 32] {
 fn verify_protocol_tx_signature(tx: &catalyst_core::protocol::Transaction) -> bool {
     use catalyst_crypto::signatures::SignatureScheme;
 
-    // Determine "sender" as the (single) pubkey with negative NonConfidential amount.
-    let mut sender: Option<[u8; 32]> = None;
-    for e in &tx.core.entries {
-        if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
-            if v < 0 {
-                match sender {
-                    None => sender = Some(e.public_key),
-                    Some(pk) if pk == e.public_key => {}
-                    Some(_) => return false, // multi-sender not supported yet
+    // Determine sender:
+    // - transfers: the (single) pubkey with negative NonConfidential amount
+    // - worker registration: entry[0].public_key
+    // - smart contract: entry[0].public_key
+    let sender_pk_bytes: [u8; 32] = match tx.core.tx_type {
+        catalyst_core::protocol::TransactionType::WorkerRegistration => {
+            let Some(e0) = tx.core.entries.get(0) else { return false };
+            e0.public_key
+        }
+        catalyst_core::protocol::TransactionType::SmartContract => {
+            let Some(e0) = tx.core.entries.get(0) else { return false };
+            e0.public_key
+        }
+        _ => {
+            let mut sender: Option<[u8; 32]> = None;
+            for e in &tx.core.entries {
+                if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
+                    if v < 0 {
+                        match sender {
+                            None => sender = Some(e.public_key),
+                            Some(pk) if pk == e.public_key => {}
+                            Some(_) => return false, // multi-sender not supported yet
+                        }
+                    }
                 }
             }
+            let Some(sender) = sender else { return false };
+            sender
         }
-    }
-    let Some(sender_pk_bytes) = sender else { return false };
+    };
 
     // Signature bytes must be a valid Schnorr signature.
     if tx.signature.0.len() != 64 {
@@ -171,23 +481,81 @@ async fn tx_nonce_expected_next(
     max_seen.saturating_add(1)
 }
 
-fn tx_sender_pubkey(tx: &catalyst_core::protocol::Transaction) -> Option<[u8; 32]> {
-    let mut sender: Option<[u8; 32]> = None;
-    for e in &tx.core.entries {
-        if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
-            if v < 0 {
-                match sender {
-                    None => sender = Some(e.public_key),
-                    Some(pk) if pk == e.public_key => {}
-                    Some(_) => return None,
+fn load_workers_from_state(store: &StorageManager) -> Vec<[u8; 32]> {
+    let mut out: Vec<[u8; 32]> = Vec::new();
+    if let Ok(iter) = store.engine().iterator("accounts") {
+        for item in iter {
+            if let Ok((k, v)) = item {
+                if !k.starts_with(b"workers:") {
+                    continue;
                 }
+                if v.as_ref() != [1u8] {
+                    continue;
+                }
+                if k.len() != b"workers:".len() + 32 {
+                    continue;
+                }
+                let mut pk = [0u8; 32];
+                pk.copy_from_slice(&k[b"workers:".len()..]);
+                out.push(pk);
             }
         }
     }
-    sender
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn tx_sender_pubkey(tx: &catalyst_core::protocol::Transaction) -> Option<[u8; 32]> {
+    match tx.core.tx_type {
+        catalyst_core::protocol::TransactionType::WorkerRegistration => tx.core.entries.get(0).map(|e| e.public_key),
+        catalyst_core::protocol::TransactionType::SmartContract => tx.core.entries.get(0).map(|e| e.public_key),
+        _ => {
+            let mut sender: Option<[u8; 32]> = None;
+            for e in &tx.core.entries {
+                if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
+                    if v < 0 {
+                        match sender {
+                            None => sender = Some(e.public_key),
+                            Some(pk) if pk == e.public_key => {}
+                            Some(_) => return None,
+                        }
+                    }
+                }
+            }
+            sender
+        }
+    }
 }
 
 fn tx_to_consensus_entries(tx: &catalyst_core::protocol::Transaction) -> Vec<catalyst_consensus::types::TransactionEntry> {
+    if tx.core.tx_type == catalyst_core::protocol::TransactionType::WorkerRegistration {
+        let pk = tx.core.entries.get(0).map(|e| e.public_key).unwrap_or([0u8; 32]);
+        let mut sig = b"WRKREG1".to_vec();
+        sig.extend_from_slice(&tx.signature.0);
+        return vec![catalyst_consensus::types::TransactionEntry {
+            public_key: pk,
+            amount: 0,
+            signature: sig,
+        }];
+    }
+
+    if tx.core.tx_type == catalyst_core::protocol::TransactionType::SmartContract {
+        let pk = tx.core.entries.get(0).map(|e| e.public_key).unwrap_or([0u8; 32]);
+        let kind = bincode::deserialize::<EvmTxKind>(&tx.core.data)
+            .unwrap_or(EvmTxKind::Call { to: [0u8; 20], input: Vec::new() });
+        let payload = EvmTxPayload {
+            nonce: tx.core.nonce,
+            kind,
+        };
+        let marker = encode_evm_marker(&payload, &tx.signature.0).unwrap_or_else(|_| tx.signature.0.clone());
+        return vec![catalyst_consensus::types::TransactionEntry {
+            public_key: pk,
+            amount: 0,
+            signature: marker,
+        }];
+    }
+
     let sig = tx.signature.0.clone();
     let mut out = Vec::new();
     for e in &tx.core.entries {
@@ -510,7 +878,34 @@ async fn apply_lsu_to_storage(
     }
 
     // Apply balance deltas from the LSU's ordered transaction entries.
+    // Also apply worker registry markers into state under `workers:<pubkey>`.
     for e in &lsu.partial_update.transaction_entries {
+        if is_worker_reg_marker(&e.signature) {
+            // Register worker (idempotent).
+            let k = worker_key_for_pubkey(&e.public_key);
+            let _ = store.set_state(&k, vec![1u8]).await;
+            continue;
+        }
+        if is_evm_marker(&e.signature) {
+            if let Some((payload, _sig64)) = decode_evm_marker(&e.signature) {
+                match payload.kind {
+                    EvmTxKind::Deploy { bytecode } => {
+                        let from20 = pubkey_to_evm_addr20(&e.public_key);
+                        let from_addr = EvmAddress::from_slice(&from20);
+                        let created = catalyst_runtime_evm::database::utils::calculate_create_address(&from_addr, payload.nonce);
+                        let mut addr20 = [0u8; 20];
+                        addr20.copy_from_slice(created.as_slice());
+                        let k = evm_code_key(&addr20);
+                        let _ = store.set_state(&k, bytecode).await;
+                    }
+                    EvmTxKind::Call { to, .. } => {
+                        let k = evm_last_return_key(&to);
+                        let _ = store.set_state(&k, Vec::new()).await;
+                    }
+                }
+            }
+            continue;
+        }
         let k = balance_key_for_pubkey(&e.public_key);
         let cur = store
             .get_state(&k)
@@ -531,7 +926,9 @@ async fn apply_lsu_to_storage(
         by_sig.entry(e.signature.clone()).or_default().push(e);
     }
     for (_sig, entries) in by_sig {
-        // Sender = single pubkey with negative amount.
+        // Sender selection:
+        // - transfers: single pubkey with negative amount
+        // - worker registration: first marker entry pubkey
         let mut sender: Option<[u8; 32]> = None;
         for e in &entries {
             if e.amount < 0 {
@@ -543,6 +940,17 @@ async fn apply_lsu_to_storage(
                         break;
                     }
                 }
+            }
+        }
+        if sender.is_none() {
+            // WorkerRegistration marker tx: pick the marker entry pubkey.
+            if let Some(e0) = entries.iter().find(|e| is_worker_reg_marker(&e.signature)) {
+                sender = Some(e0.public_key);
+            }
+        }
+        if sender.is_none() {
+            if let Some(e0) = entries.iter().find(|e| is_evm_marker(&e.signature)) {
+                sender = Some(e0.public_key);
             }
         }
         if let Some(pk) = sender {
@@ -828,6 +1236,59 @@ impl CatalystNode {
             None
         };
 
+        // Auto-register as a worker (on-chain) for validator nodes.
+        if self.config.validator {
+            if let Some(store) = &storage {
+                let node_sk = crate::identity::load_or_generate_private_key(
+                    &self.config.node.private_key_file,
+                    self.config.node.auto_generate_identity,
+                )?;
+                let node_pk = crate::identity::public_key_bytes(&node_sk);
+                let wk = worker_key_for_pubkey(&node_pk);
+                let already = store.get_state(&wk).await.ok().flatten().is_some();
+                if !already {
+                    // Build a WorkerRegistration tx and inject it via the same gossip path.
+                    let committed_nonce = get_nonce_u64(store.as_ref(), &node_pk).await;
+                    let now_ms = current_timestamp_ms();
+                    let now_secs = (now_ms / 1000) as u32;
+                    let mut tx = catalyst_core::protocol::Transaction {
+                        core: catalyst_core::protocol::TransactionCore {
+                            tx_type: catalyst_core::protocol::TransactionType::WorkerRegistration,
+                            entries: vec![catalyst_core::protocol::TransactionEntry {
+                                public_key: node_pk,
+                                amount: catalyst_core::protocol::EntryAmount::NonConfidential(0),
+                            }],
+                            nonce: committed_nonce.saturating_add(1),
+                            lock_time: now_secs,
+                            fees: 0,
+                            data: Vec::new(),
+                        },
+                        signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
+                        timestamp: now_ms,
+                    };
+
+                    let payload = tx.signing_payload().map_err(anyhow::Error::msg)?;
+                    let scheme = catalyst_crypto::signatures::SignatureScheme::new();
+                    let mut rng = rand::rngs::OsRng;
+                    let sig: catalyst_crypto::signatures::Signature = scheme.sign(&mut rng, &node_sk, &payload)?;
+                    tx.signature = catalyst_core::protocol::AggregatedSignature(sig.to_bytes().to_vec());
+
+                    if let Ok(msg) = ProtocolTxGossip::new(tx, now_ms) {
+                        // Insert locally (mempool) so leader can include it.
+                        {
+                            let mut mp = mempool.write().await;
+                            let _ = mp.insert_protocol(msg.clone(), now_ms / 1000);
+                        }
+                        persist_mempool_tx(store.as_ref(), &msg.tx).await;
+                        if let Ok(env) = MessageEnvelope::from_message(&msg, "autoreg".to_string(), None) {
+                            let _ = network.broadcast_envelope(&env).await;
+                        }
+                        info!("Auto-submitted WorkerRegistration for {}", hex_encode(&node_pk));
+                    }
+                }
+            }
+        }
+
         // Rehydrate mempool from persisted txs (best-effort).
         if let Some(store) = &storage {
             rehydrate_mempool_from_storage(store.as_ref(), &mempool).await;
@@ -962,11 +1423,102 @@ impl CatalystNode {
         // Inbound: envelopes received from peers → update validator map / handle tx gossip / handle LSU gossip / forward consensus messages.
         {
             let mut events = network.subscribe_events().await;
+            let net = network.clone();
             let mempool = mempool.clone();
             let tx_batches = tx_batches.clone();
             let max_entries_per_cycle_cfg = max_entries_per_cycle_cfg;
             let dfs = dfs.clone();
             let storage = storage.clone();
+            let producer_id_self = producer_id.clone();
+            #[derive(Clone)]
+            struct PendingLsuFetch {
+                cycle: u64,
+                lsu_hash: [u8; 32],
+                prev_state_root: [u8; 32],
+                expected_state_root: [u8; 32],
+                proof_cid: String,
+                attempts: u32,
+                next_retry_at_ms: u64,
+            }
+            let pending_lsu_fetch: Arc<
+                tokio::sync::RwLock<std::collections::HashMap<String, PendingLsuFetch>>,
+            > = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+            let pending_lsu_fetch_retry = pending_lsu_fetch.clone();
+            let pending_lsu_fetch_inbound = pending_lsu_fetch.clone();
+            let net_retry = network.clone();
+            let dfs_retry = dfs.clone();
+            let producer_id_retry = producer_id_self.clone();
+            let mut shutdown_rx_retry = shutdown_rx.clone();
+
+            // Retry/backoff loop: if we don't have a CID locally, periodically request it over P2P.
+            // This makes sync resilient to packet loss / startup ordering.
+            let retry_handle = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {},
+                        _ = shutdown_rx_retry.changed() => {
+                            if *shutdown_rx_retry.borrow() { break; }
+                            continue;
+                        }
+                    }
+                    if *shutdown_rx_retry.borrow() {
+                        break;
+                    }
+
+                    // Avoid holding the lock across awaits.
+                    let now = current_timestamp_ms();
+                    let due: Vec<String> = {
+                        let m = pending_lsu_fetch_retry.read().await;
+                        m.iter()
+                            .filter_map(|(cid, info)| {
+                                if now >= info.next_retry_at_ms && info.attempts < 20 {
+                                    Some(cid.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    };
+
+                    for cid in due {
+                        // If it's already in local DFS now, stop retrying.
+                        if let Some(dfs) = &dfs_retry {
+                            if dfs.has(&cid).await {
+                                pending_lsu_fetch_retry.write().await.remove(&cid);
+                                continue;
+                            }
+                        }
+
+                        let delay_ms: u64;
+                        {
+                            let mut m = pending_lsu_fetch_retry.write().await;
+                            let Some(info) = m.get_mut(&cid) else { continue };
+                            info.attempts = info.attempts.saturating_add(1);
+                            // exponential backoff up to 5s
+                            delay_ms = (500u64.saturating_mul(2u64.saturating_pow(info.attempts.saturating_sub(1))))
+                                .min(5000);
+                            info.next_retry_at_ms = now.saturating_add(delay_ms);
+                        }
+
+                        let req = FileRequestMsg {
+                            requester: producer_id_retry.clone(),
+                            cid: cid.clone(),
+                        };
+                        if let Ok(env) = MessageEnvelope::from_message(&req, "file_req_retry".to_string(), None) {
+                            let _ = net_retry.broadcast_envelope(&env).await;
+                        }
+                    }
+
+                    // Drop items that have exceeded max attempts.
+                    let mut m = pending_lsu_fetch_retry.write().await;
+                    m.retain(|_cid, info| info.attempts < 20);
+                }
+            });
+            self.network_tasks.push(retry_handle);
+
             let last_lsu: Arc<tokio::sync::RwLock<std::collections::HashMap<u64, catalyst_consensus::types::LedgerStateUpdate>>> =
                 Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
             let handle = tokio::spawn(async move {
@@ -1042,31 +1594,84 @@ impl CatalystNode {
                                             {
                                                 if let Ok(h) = catalyst_consensus::types::hash_data(&lsu) {
                                                     if h == ref_msg.lsu_hash {
-                                                        // Apply only if it matches the expected authenticated state root.
                                                         if let Some(store) = &storage {
-                                                            match apply_lsu_with_root_check(
-                                                                store.as_ref(),
-                                                                &lsu,
-                                                                ref_msg.state_root,
-                                                            )
-                                                            .await
-                                                            {
-                                                                Ok(true) => {}
-                                                                Ok(false) => {
-                                                                    tracing::warn!(
-                                                                        "Rejected LSU via CID cycle={} (state_root mismatch) cid={}",
-                                                                        ref_msg.cycle,
-                                                                        ref_msg.cid
-                                                                    );
-                                                                    continue;
+                                                            // Ensure we're applying onto the expected previous root.
+                                                            let local_prev = store
+                                                                .get_metadata("consensus:last_applied_state_root")
+                                                                .await
+                                                                .ok()
+                                                                .flatten()
+                                                                .and_then(|b| if b.len() == 32 {
+                                                                    let mut r = [0u8; 32];
+                                                                    r.copy_from_slice(&b[..32]);
+                                                                    Some(r)
+                                                                } else {
+                                                                    None
+                                                                })
+                                                                .unwrap_or([0u8; 32]);
+
+                                                            if local_prev != ref_msg.prev_state_root && local_prev != [0u8; 32] {
+                                                                tracing::warn!(
+                                                                    "Skipping LSU cycle={} cid={} (prev_root mismatch local={} expected={})",
+                                                                    ref_msg.cycle,
+                                                                    ref_msg.cid,
+                                                                    hex_encode(&local_prev),
+                                                                    hex_encode(&ref_msg.prev_state_root)
+                                                                );
+                                                                continue;
+                                                            }
+
+                                                            // Proof-driven path: if we have a proof bundle CID locally, verify it and apply without recomputing root.
+                                                            let mut applied = false;
+                                                            if !ref_msg.proof_cid.is_empty() {
+                                                                if let Ok(pb) = dfs.get(&ref_msg.proof_cid).await {
+                                                                    if let Ok(bundle) = bincode::deserialize::<StateProofBundle>(&pb) {
+                                                                        if bundle.prev_state_root == ref_msg.prev_state_root
+                                                                            && bundle.new_state_root == ref_msg.state_root
+                                                                            && bundle.lsu_hash == ref_msg.lsu_hash
+                                                                            && verify_state_transition_bundle(&lsu, &bundle)
+                                                                        {
+                                                                            if apply_lsu_to_storage_without_root_check(
+                                                                                store.as_ref(),
+                                                                                &lsu,
+                                                                                bundle.new_state_root,
+                                                                            )
+                                                                            .await
+                                                                            .is_ok()
+                                                                            {
+                                                                                applied = true;
+                                                                            }
+                                                                        }
+                                                                    }
                                                                 }
-                                                                Err(e) => {
-                                                                    tracing::warn!(
-                                                                        "Failed to verify/apply LSU via CID cycle={} err={}",
-                                                                        ref_msg.cycle,
-                                                                        e
-                                                                    );
-                                                                    continue;
+                                                            }
+
+                                                            // Fallback: apply-then-check via snapshot/root recompute.
+                                                            if !applied {
+                                                                match apply_lsu_with_root_check(
+                                                                    store.as_ref(),
+                                                                    &lsu,
+                                                                    ref_msg.state_root,
+                                                                )
+                                                                .await
+                                                                {
+                                                                    Ok(true) => applied = true,
+                                                                    Ok(false) => {
+                                                                        tracing::warn!(
+                                                                            "Rejected LSU via CID cycle={} (state_root mismatch) cid={}",
+                                                                            ref_msg.cycle,
+                                                                            ref_msg.cid
+                                                                        );
+                                                                        continue;
+                                                                    }
+                                                                    Err(e) => {
+                                                                        tracing::warn!(
+                                                                            "Failed to verify/apply LSU via CID cycle={} err={}",
+                                                                            ref_msg.cycle,
+                                                                            e
+                                                                        );
+                                                                        continue;
+                                                                    }
                                                                 }
                                                             }
                                                         }
@@ -1124,6 +1729,29 @@ impl CatalystNode {
                                                     }
                                                 }
                                             }
+                                        } else {
+                                            // Not found locally: request bytes over P2P using FileRequest/FileResponse.
+                                            pending_lsu_fetch_inbound.write().await.insert(
+                                                ref_msg.cid.clone(),
+                                                PendingLsuFetch {
+                                                    cycle: ref_msg.cycle,
+                                                    lsu_hash: ref_msg.lsu_hash,
+                                                    prev_state_root: ref_msg.prev_state_root,
+                                                    expected_state_root: ref_msg.state_root,
+                                                    proof_cid: ref_msg.proof_cid.clone(),
+                                                    attempts: 0,
+                                                    next_retry_at_ms: 0,
+                                                },
+                                            );
+                                            let req = FileRequestMsg {
+                                                requester: producer_id_self.clone(),
+                                                cid: ref_msg.cid.clone(),
+                                            };
+                                            if let Ok(env) =
+                                                MessageEnvelope::from_message(&req, "file_req".to_string(), None)
+                                            {
+                                                let _ = net.broadcast_envelope(&env).await;
+                                            }
                                         }
                                     }
                                 }
@@ -1160,6 +1788,109 @@ impl CatalystNode {
                                                 let _ = store
                                                     .set_metadata("consensus:last_lsu_cycle", &lsu_msg.cycle.to_le_bytes())
                                                     .await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if envelope.message_type == MessageType::FileRequest {
+                            if let Ok(req) = envelope.extract_message::<FileRequestMsg>() {
+                                if let Some(dfs) = &dfs {
+                                    if let Ok(bytes) = dfs.get(&req.cid).await {
+                                        let resp = FileResponseMsg {
+                                            requester: req.requester,
+                                            cid: req.cid,
+                                            bytes,
+                                        };
+                                        if let Ok(env) = MessageEnvelope::from_message(
+                                            &resp,
+                                            "file_resp".to_string(),
+                                            None,
+                                        ) {
+                                            let _ = net.broadcast_envelope(&env).await;
+                                        }
+                                    }
+                                }
+                            }
+                        } else if envelope.message_type == MessageType::FileResponse {
+                            if let Ok(resp) = envelope.extract_message::<FileResponseMsg>() {
+                                if resp.requester != producer_id_self {
+                                    continue;
+                                }
+                                let Some(info) = pending_lsu_fetch_inbound.write().await.remove(&resp.cid) else {
+                                    continue;
+                                };
+
+                                if let Some(dfs) = &dfs {
+                                    let _ = dfs.put(resp.bytes.clone()).await;
+                                }
+
+                                if let Ok(lsu) =
+                                    catalyst_consensus::types::LedgerStateUpdate::deserialize(&resp.bytes)
+                                {
+                                    if let Ok(h) = catalyst_consensus::types::hash_data(&lsu) {
+                                        if h != info.lsu_hash {
+                                            continue;
+                                        }
+                                        if let Some(store) = &storage {
+                                            // Ensure we're applying onto the expected previous root.
+                                            let local_prev = store
+                                                .get_metadata("consensus:last_applied_state_root")
+                                                .await
+                                                .ok()
+                                                .flatten()
+                                                .and_then(|b| if b.len() == 32 {
+                                                    let mut r = [0u8; 32];
+                                                    r.copy_from_slice(&b[..32]);
+                                                    Some(r)
+                                                } else {
+                                                    None
+                                                })
+                                                .unwrap_or([0u8; 32]);
+                                            if local_prev != info.prev_state_root && local_prev != [0u8; 32] {
+                                                continue;
+                                            }
+
+                                            // Proof-driven path if proof bundle is present locally.
+                                            let mut ok = false;
+                                            if let Some(dfs) = &dfs {
+                                                if !info.proof_cid.is_empty() {
+                                                    if let Ok(pb) = dfs.get(&info.proof_cid).await {
+                                                    if let Ok(bundle) = bincode::deserialize::<StateProofBundle>(&pb) {
+                                                        if bundle.prev_state_root == info.prev_state_root
+                                                            && bundle.new_state_root == info.expected_state_root
+                                                            && bundle.lsu_hash == info.lsu_hash
+                                                            && verify_state_transition_bundle(&lsu, &bundle)
+                                                        {
+                                                            ok = apply_lsu_to_storage_without_root_check(
+                                                                store.as_ref(),
+                                                                &lsu,
+                                                                bundle.new_state_root,
+                                                            )
+                                                            .await
+                                                            .is_ok();
+                                                        }
+                                                    }
+                                                    }
+                                                }
+                                            }
+
+                                            // Fallback to apply-then-check.
+                                            if !ok {
+                                                ok = apply_lsu_with_root_check(
+                                                    store.as_ref(),
+                                                    &lsu,
+                                                    info.expected_state_root,
+                                                )
+                                                .await
+                                                .unwrap_or(false);
+                                            }
+                                            if ok {
+                                                last_lsu.write().await.insert(info.cycle, lsu);
+                                                info!(
+                                                    "Synced LSU via P2P FileResponse cycle={} cid={}",
+                                                    info.cycle, resp.cid
+                                                );
                                             }
                                         }
                                     }
@@ -1288,9 +2019,7 @@ impl CatalystNode {
         // Only validator nodes should run consensus cycles. Non-validator nodes still participate
         // in networking and can be upgraded later to observer mode.
         if self.config.validator {
-            let self_is_validator = self.config.validator;
             let validator_worker_ids_hex = validator_worker_ids_hex.clone();
-            let min_producer_count = self.config.consensus.min_producer_count as usize;
             let max_entries_per_cycle = self.config.consensus.max_transactions_per_block as usize;
             self.consensus_task = Some(tokio::spawn(async move {
                 // Seed for deterministic producer selection (paper uses previous LSU merkle root).
@@ -1348,14 +2077,25 @@ impl CatalystNode {
                     // Deterministic producer selection (protocol function) based on:
                     // - worker pool: configured validator set (worker ids)
                     // - seed: prev cycle LSU hash (approx)
-                    // - producer_count: config min_producer_count (bounded by pool size)
-                    let mut worker_pool: Vec<NodeId> = validator_worker_ids_hex
-                        .iter()
-                        .filter_map(|s| parse_hex_32(s))
-                        .collect();
-                    // Always include self (validators only).
-                    if self_is_validator {
-                        worker_pool.push(public_key);
+                    // - producer_count: all active workers for this cycle (membership-driven)
+                    let mut worker_pool: Vec<NodeId> = Vec::new();
+                    if let Some(store) = &storage {
+                        worker_pool.extend(load_workers_from_state(store.as_ref()));
+                    }
+                    // Bootstrap fallback: config file may carry an initial worker pool for brand-new networks.
+                    if worker_pool.is_empty() {
+                        info!(
+                            "Cycle {} membership=bootstrap (no on-chain workers). Using config validator_worker_ids (n={}).",
+                            cycle,
+                            validator_worker_ids_hex.len()
+                        );
+                        worker_pool.extend(validator_worker_ids_hex.iter().filter_map(|s| parse_hex_32(s)));
+                    } else {
+                        info!(
+                            "Cycle {} membership=onchain workers={}",
+                            cycle,
+                            worker_pool.len()
+                        );
                     }
                     worker_pool.sort();
                     worker_pool.dedup();
@@ -1365,7 +2105,14 @@ impl CatalystNode {
                         id_map.insert(*id, hex_encode(id));
                     }
 
-                    let producer_count = std::cmp::max(1, min_producer_count);
+                    let producer_count = worker_pool.len().max(1);
+                    let required_majority = (producer_count / 2) + 1;
+                    info!(
+                        "Cycle {} expected_producers={} required_majority={}",
+                        cycle,
+                        producer_count,
+                        required_majority
+                    );
                     let selected_worker_ids =
                         select_producers_for_next_cycle(&worker_pool, &prev_seed, producer_count);
                     let mut selected: Vec<String> = selected_worker_ids
@@ -1438,6 +2185,11 @@ impl CatalystNode {
                                 prev_seed = h;
                             }
 
+                            // Proof-driven sync (step 4): bundle old/new proofs for touched keys.
+                            // These are best-effort; followers fall back to apply-then-check if unavailable.
+                            let mut prev_state_root_for_msg: [u8; 32] = [0u8; 32];
+                            let mut proof_cid_for_msg: String = String::new();
+
                             // Persist latest LSU and seed.
                             if let Some(store) = &storage {
                                 if let Ok(bytes) = update.serialize() {
@@ -1456,8 +2208,64 @@ impl CatalystNode {
                                         .await;
                                 }
 
-                                // Apply to state
-                                let _ = apply_lsu_to_storage(store.as_ref(), &update).await;
+                                // Pre/post proofs for proof-driven sync bundle.
+                                let touched = touched_keys_for_lsu(&update);
+                                let (prev_root, prev_proofs) = store
+                                    .get_account_proofs_for_keys_with_absence(&touched)
+                                    .await
+                                    .unwrap_or(([0u8; 32], Vec::new()));
+                                prev_state_root_for_msg = prev_root;
+
+                                // Apply to state (leader path).
+                                let new_root = apply_lsu_to_storage(store.as_ref(), &update)
+                                    .await
+                                    .unwrap_or([0u8; 32]);
+
+                                let (post_root, post_proofs) = store
+                                    .get_account_proofs_for_keys_with_absence(&touched)
+                                    .await
+                                    .unwrap_or(([0u8; 32], Vec::new()));
+
+                                // Best-effort: build a proof bundle. If it fails, followers fall back.
+                                if let Some(dfs) = &dfs {
+                                    if let Ok(lsu_hash) = catalyst_consensus::types::hash_data(&update) {
+                                        if prev_root != [0u8; 32] && post_root == new_root && !prev_proofs.is_empty() {
+                                            let mut by_key_old: std::collections::BTreeMap<Vec<u8>, (Option<Vec<u8>>, catalyst_storage::merkle::MerkleProof)> =
+                                                std::collections::BTreeMap::new();
+                                            for (k, v, p) in prev_proofs {
+                                                by_key_old.insert(k, (v, p));
+                                            }
+                                            let mut by_key_new: std::collections::BTreeMap<Vec<u8>, (Option<Vec<u8>>, catalyst_storage::merkle::MerkleProof)> =
+                                                std::collections::BTreeMap::new();
+                                            for (k, v, p) in post_proofs {
+                                                by_key_new.insert(k, (v, p));
+                                            }
+
+                                            let mut changes: Vec<KeyProofChange> = Vec::new();
+                                            for (k, (ov, op)) in by_key_old {
+                                                if let Some((nv, np)) = by_key_new.get(&k).cloned() {
+                                                    changes.push(KeyProofChange {
+                                                        key: k,
+                                                        old_value: ov.unwrap_or_default(),
+                                                        old_proof: op,
+                                                        new_value: nv.unwrap_or_default(),
+                                                        new_proof: np,
+                                                    });
+                                                }
+                                            }
+                                            let bundle = StateProofBundle {
+                                                cycle,
+                                                lsu_hash,
+                                                prev_state_root: prev_root,
+                                                new_state_root: new_root,
+                                                changes,
+                                            };
+                                            if let Ok(b) = bincode::serialize(&bundle) {
+                                                proof_cid_for_msg = dfs.put(b).await.ok().unwrap_or_default();
+                                            }
+                                        }
+                                    }
+                                }
                             }
 
                             // DFS-backed LSU sync:
@@ -1478,7 +2286,9 @@ impl CatalystNode {
                                                 cycle,
                                                 lsu_hash,
                                                 cid,
+                                                prev_state_root: prev_state_root_for_msg,
                                                 state_root,
+                                                proof_cid: proof_cid_for_msg,
                                             };
                                             if let Ok(env) = MessageEnvelope::from_message(&msg, "lsu_cid".to_string(), None) {
                                                 let _ = network.broadcast_envelope(&env).await;
