@@ -1,0 +1,16 @@
+[network]
+name = "testnet"
+p2p_port = 7000
+api_port = 8080
+max_peers = 100
+
+[consensus]
+cycle_duration_ms = 30000  # 30 seconds
+construction_phase_ms = 7500
+campaigning_phase_ms = 7500
+voting_phase_ms = 7500
+synchronization_phase_ms = 7500
+producer_count = 50  # Medium size
+supermajority_threshold = 0.67
+
+# ... etc
