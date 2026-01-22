@@ -484,20 +484,22 @@ impl CatalystRpcServer for CatalystRpcImpl {
         let pk = parse_hex_32(&address).map_err(ErrorObjectOwned::from)?;
         let key = bal_key(&pk);
 
-        let Some((root, value_bytes, proof)) = self
+        let (root, proofs) = self
             .storage
-            .get_account_proof(&key)
+            .get_account_proofs_for_keys_with_absence(&vec![key.clone()])
             .await
-            .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())))?
-        else {
-            return Ok(RpcBalanceProof {
-                balance: "0".to_string(),
-                state_root: format!("0x{}", hex::encode([0u8; 32])),
-                proof: Vec::new(),
-            });
-        };
+            .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())))?;
 
-        let bal = decode_i64(&value_bytes).to_string();
+        let (_k, maybe_value, proof) = proofs
+            .into_iter()
+            .next()
+            .expect("one proof entry");
+
+        let bal = maybe_value
+            .as_ref()
+            .map(|b| decode_i64(b).to_string())
+            .unwrap_or_else(|| "0".to_string());
+
         let mut steps: Vec<String> = Vec::with_capacity(proof.steps.len());
         for s in proof.steps {
             let tag = if s.sibling_is_left { "L" } else { "R" };
@@ -813,4 +815,56 @@ mod tests {
         let deserialized: RpcAccount = serde_json::from_str(&json).unwrap();
         assert_eq!(account.address, deserialized.address);
     }
+    #[tokio::test]
+    async fn test_balance_proof_verifies() {
+        use catalyst_storage::{StorageConfig, StorageManager};
+        use tempfile::tempdir;
+
+        // Create isolated storage.
+        let dir = tempdir().unwrap();
+        let mut cfg = StorageConfig::default();
+        cfg.data_dir = dir.path().join("db");
+        let storage = StorageManager::new(cfg).await.unwrap();
+
+        // Write a balance entry using the canonical key format.
+        let pk = [7u8; 32];
+        let key = bal_key(&pk);
+        storage.engine().put("accounts", &key, &(123i64).to_le_bytes()).unwrap();
+
+        // Call RPC method directly.
+        let rpc = CatalystRpcImpl::new(
+            std::sync::Arc::new(storage),
+            None,
+            None,
+        );
+        let proof = rpc.get_balance_proof(format!("0x{}", hex::encode(pk))).await.unwrap();
+        assert_eq!(proof.balance, "123");
+
+        // Verify proof against root (ignore L/R tags; ordering is derived from key path).
+        let root = parse_hex_32(&proof.state_root).unwrap();
+        let siblings: Vec<[u8; 32]> = proof
+            .proof
+            .iter()
+            .map(|s| {
+                let parts: Vec<&str> = s.split(":").collect();
+                let hx = if parts.len() == 2 { parts[1] } else { parts[0] };
+                parse_hex_32(hx).unwrap()
+            })
+            .collect();
+
+        let merkle_proof = catalyst_storage::merkle::MerkleProof {
+            leaf: [0u8; 32], // unused by verify_proof_for_key_value
+            steps: siblings
+                .into_iter()
+                .map(|sib| catalyst_storage::merkle::MerkleStep { sibling_is_left: false, sibling: sib })
+                .collect(),
+        };
+        assert!(catalyst_storage::sparse_merkle::verify_proof_for_key_value(
+            &root,
+            &key,
+            Some(&(123i64).to_le_bytes()),
+            &merkle_proof,
+        ));
+    }
+
 }

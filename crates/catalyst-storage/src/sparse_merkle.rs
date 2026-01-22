@@ -1,14 +1,15 @@
 use crate::merkle::{leaf_hash_for_kv, MerkleProof, MerkleStep};
 use crate::{StorageError, StorageResult};
 use catalyst_utils::Hash;
-use sha2::{Digest, Sha256};
+use blake2::Blake2b;
+use blake2::digest::{consts::U32, Digest};
 use std::collections::{BTreeMap, BTreeSet};
 
 const TREE_DEPTH: usize = 256;
 
 fn h_node(left: &Hash, right: &Hash) -> Hash {
     // Domain-separated internal node hash: H(0x01 || left || right)
-    let mut h = Sha256::new();
+    let mut h = Blake2b::<U32>::new();
     h.update([1u8]);
     h.update(left);
     h.update(right);
@@ -17,7 +18,7 @@ fn h_node(left: &Hash, right: &Hash) -> Hash {
 
 fn h_empty_leaf() -> Hash {
     // Domain-separated empty leaf hash: H(0x02)
-    let mut h = Sha256::new();
+    let mut h = Blake2b::<U32>::new();
     h.update([2u8]);
     h.finalize().into()
 }
@@ -27,8 +28,9 @@ pub fn empty_leaf_hash() -> Hash {
 }
 
 fn key_path(key: &[u8]) -> [u8; 32] {
-    // 256-bit path = sha256(key)
-    let mut h = Sha256::new();
+    // 256-bit path = blake2b-256(0x03 || key)
+    let mut h = Blake2b::<U32>::new();
+    h.update([3u8]);
     h.update(key);
     h.finalize().into()
 }
@@ -229,3 +231,71 @@ where
     Ok((root, out))
 }
 
+
+
+/// Verify a sparse merkle proof against the canonical key path.
+///
+/// Important: callers MUST NOT trust `proof.steps[*].sibling_is_left` as input from an untrusted party.
+/// We recompute left/right ordering from the key path bits.
+pub fn verify_proof_for_key_value(
+    root: &Hash,
+    key: &[u8],
+    value: Option<&[u8]>,
+    proof: &MerkleProof,
+) -> bool {
+    if proof.steps.len() != TREE_DEPTH {
+        return false;
+    }
+
+    let mut cur: Hash = match value {
+        Some(v) => leaf_hash_for_kv(key, v),
+        None => h_empty_leaf(),
+    };
+
+    let mut idx = key_path(key);
+    for step in &proof.steps {
+        // Derive direction from key path bit.
+        let is_right = idx_lsb(&idx) == 1;
+        cur = if is_right {
+            h_node(&step.sibling, &cur)
+        } else {
+            h_node(&cur, &step.sibling)
+        };
+        idx = idx_shr1(&idx);
+    }
+
+    &cur == root
+}
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proof_verifies_for_present_key() {
+        let items: Vec<(Box<[u8]>, Box<[u8]>)> = vec![
+            (b"a".to_vec().into_boxed_slice(), b"1".to_vec().into_boxed_slice()),
+            (b"b".to_vec().into_boxed_slice(), b"2".to_vec().into_boxed_slice()),
+        ];
+        let key = b"b";
+        let Some((root, value, proof)) = compute_root_and_proof_from_iter(items, key).unwrap() else {
+            panic!("expected present proof");
+        };
+        assert!(verify_proof_for_key_value(&root, key, Some(&value), &proof));
+    }
+
+    #[test]
+    fn proof_verifies_for_absent_key() {
+        let items: Vec<(Box<[u8]>, Box<[u8]>)> = vec![
+            (b"a".to_vec().into_boxed_slice(), b"1".to_vec().into_boxed_slice()),
+            (b"b".to_vec().into_boxed_slice(), b"2".to_vec().into_boxed_slice()),
+        ];
+        let key = b"missing".to_vec();
+        let (root, proofs) = compute_root_and_multi_proofs_from_iter(items, &[key.clone()]).unwrap();
+        let (_k, maybe_value, proof) = proofs.into_iter().next().unwrap();
+        assert!(maybe_value.is_none());
+        assert!(verify_proof_for_key_value(&root, &key, None, &proof));
+    }
+}

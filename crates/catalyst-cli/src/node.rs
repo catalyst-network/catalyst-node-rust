@@ -167,10 +167,10 @@ fn verify_state_transition_bundle(
     let mut new: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
     for c in &bundle.changes {
-        if !catalyst_storage::merkle::verify_proof(&bundle.prev_state_root, &c.old_proof) {
+        if !catalyst_storage::sparse_merkle::verify_proof_for_key_value(&bundle.prev_state_root, &c.key, Some(&c.old_value), &c.old_proof) {
             return false;
         }
-        if !catalyst_storage::merkle::verify_proof(&bundle.new_state_root, &c.new_proof) {
+        if !catalyst_storage::sparse_merkle::verify_proof_for_key_value(&bundle.new_state_root, &c.key, Some(&c.new_value), &c.new_proof) {
             return false;
         }
         old.insert(c.key.clone(), c.old_value.clone());

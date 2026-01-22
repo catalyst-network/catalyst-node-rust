@@ -1,6 +1,7 @@
 use crate::{StorageError, StorageResult};
 use catalyst_utils::Hash;
-use sha2::{Digest, Sha256};
+use blake2::Blake2b;
+use blake2::digest::{consts::U32, Digest};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,7 +19,7 @@ pub struct MerkleProof {
 
 fn h_leaf(key: &[u8], value: &[u8]) -> Hash {
     // Domain-separated leaf hash: H(0x00 || key_len || key || value_len || value)
-    let mut h = Sha256::new();
+    let mut h = Blake2b::<U32>::new();
     h.update([0u8]);
     h.update((key.len() as u64).to_le_bytes());
     h.update(key);
@@ -29,7 +30,7 @@ fn h_leaf(key: &[u8], value: &[u8]) -> Hash {
 
 fn h_node(left: &Hash, right: &Hash) -> Hash {
     // Domain-separated internal node hash: H(0x01 || left || right)
-    let mut h = Sha256::new();
+    let mut h = Blake2b::<U32>::new();
     h.update([1u8]);
     h.update(left);
     h.update(right);
