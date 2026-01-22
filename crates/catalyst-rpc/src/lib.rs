@@ -700,14 +700,21 @@ impl CatalystRpcServer for CatalystRpcImpl {
             .flatten()
             .map(|b| format!("0x{}", hex::encode(b)))
             .unwrap_or_else(|| "0x0".to_string());
-        let applied_state_root = self
+        let applied_state_root = match self
             .storage
             .get_metadata("consensus:last_applied_state_root")
             .await
             .ok()
             .flatten()
-            .map(|b| format!("0x{}", hex::encode(b)))
-            .unwrap_or_else(|| "0x0".to_string());
+        {
+            Some(b) if b.len() == 32 => format!("0x{}", hex::encode(b)),
+            // Fallback: compute root from current `accounts` state so `catalyst_head`
+            // still returns an authenticated root even if metadata isn't set yet.
+            _ => match self.storage.get_account_proofs_for_keys_with_absence(&[]).await {
+                Ok((root, _)) => format!("0x{}", hex::encode(root)),
+                Err(_) => "0x0".to_string(),
+            },
+        };
         let last_lsu_cid = self
             .storage
             .get_metadata("consensus:last_lsu_cid")
@@ -829,7 +836,21 @@ mod tests {
         // Write a balance entry using the canonical key format.
         let pk = [7u8; 32];
         let key = bal_key(&pk);
-        storage.engine().put("accounts", &key, &(123i64).to_le_bytes()).unwrap();
+        storage
+            .engine()
+            .put("accounts", &key, &(123i64).to_le_bytes())
+            .unwrap();
+
+        // Persist a realistic "applied head" root so `catalyst_head` and proofs match.
+        let (root, _) = storage.get_account_proofs_for_keys_with_absence(&[]).await.unwrap();
+        storage
+            .set_metadata("consensus:last_applied_state_root", &root)
+            .await
+            .unwrap();
+        storage
+            .set_metadata("consensus:last_applied_cycle", &1u64.to_le_bytes())
+            .await
+            .unwrap();
 
         // Call RPC method directly.
         let rpc = CatalystRpcImpl::new(
@@ -837,8 +858,10 @@ mod tests {
             None,
             None,
         );
+        let head = rpc.head().await.unwrap();
         let proof = rpc.get_balance_proof(format!("0x{}", hex::encode(pk))).await.unwrap();
         assert_eq!(proof.balance, "123");
+        assert_eq!(proof.state_root, head.applied_state_root);
 
         // Verify proof against root (ignore L/R tags; ordering is derived from key path).
         let root = parse_hex_32(&proof.state_root).unwrap();
