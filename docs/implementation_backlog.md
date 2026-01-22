@@ -8,6 +8,54 @@ This repo now **builds all crates** on Linux and has a **spec-shaped core** to b
 
 The remaining work is to replace stubs/scaffolds with protocol-faithful behavior and harden it with tests.
 
+## Public Testnet Readiness (MVP) — “stable + safe + observable”
+
+This section turns the spec-aligned milestones below into a **public-testnet-ready** checklist. The local 3‑node harness (`make testnet`, `scripts/netctl.sh`, `scripts/smoke_testnet.sh`) is a great functional baseline, but public testnet needs stronger correctness, resilience, and ops defaults.
+
+### Inputs we need from the spec (please confirm)
+
+- **Consensus spec version(s)**: link + revision/date (paper references currently say “v1.2”).
+- **Hashing / PRNG**: exact hash functions and any domain separation for \(r_{n+1}\) (producer selection) and Merkle roots.
+- **Wire encoding**: canonical encoding/versioning (bincode/protobuf/custom) and hashing preimages.
+- **Transaction semantics**: fees, lock-time semantics, signature scheme/aggregation timeline, confidential transfer validation hooks.
+- **State semantics**: exact account model, nonce rules, LSU application ordering, and state root definition.
+
+### MVP acceptance criteria (public testnet)
+
+- **Safety**: nodes reject invalid txs/LSUs (signature/nonce/state-root continuity); no “accept anything” paths on the public surface.
+- **Determinism**: for the same cycle membership + tx set, producers converge on the same `first_hash` and LSU hash.
+- **Sync**: a fresh node can join, fetch recent LSUs via DFS/CID or peer fallback, and reach the same state root.
+- **Persistence**: restart does not lose pending txs; applied head/state root persisted and served over RPC.
+- **Observability**: logs + basic metrics for cycle/phase timings, peer count, mempool size, and apply failures.
+- **Operational defaults**: safe RPC bind defaults, rate limits, sane config templates, and documented ports.
+
+### Immediate “ticket-sized” work items (seed list)
+
+- **Unify protocol transaction flow end-to-end**
+  - **What**: ensure consensus consumes protocol-shaped txs (or a deterministic, spec-defined projection), not ad-hoc `TransactionEntry` lists.
+  - **Where**: `crates/catalyst-core/src/protocol.rs`, `crates/catalyst-consensus/src/*`, `crates/catalyst-cli/src/tx.rs`, `crates/catalyst-cli/src/node.rs`, `crates/catalyst-rpc/src/lib.rs`
+  - **Acceptance**: network gossips a canonical tx object; Construction uses a deterministic, spec-defined derivation of `dn` and sorted entries.
+
+- **Replace placeholder fee/majority/witness logic with spec-faithful rules**
+  - **What**: implement the paper’s exact definitions for fee extraction, majority conditions, `Ln(prod)`, `Ln(vote)`, and witness generation/verification.
+  - **Where**: `crates/catalyst-consensus/src/phases.rs`
+  - **Acceptance**: 3-node testnet converges without leader “batch crutch” (or leader mechanism is explicitly in spec as a temporary testnet rule).
+
+- **DFS integration hardening**
+  - **What**: make LSU storage/retrieval/content addressing match the DFS spec and be robust to packet loss/startup ordering.
+  - **Where**: `crates/catalyst-dfs`, `crates/catalyst-cli/src/dfs_store.rs`, `crates/catalyst-cli/src/node.rs`
+  - **Acceptance**: node joining late can fetch LSU by CID and verify hash/state-root continuity.
+
+- **State root / proof semantics**
+  - **What**: define/lock the state root algorithm and proof format; ensure `catalyst_getBalanceProof` is stable and verifiable.
+  - **Where**: `crates/catalyst-storage/src/{merkle.rs,sparse_merkle.rs,manager.rs}`, `crates/catalyst-rpc/src/lib.rs`, `crates/catalyst-cli/src/commands.rs`
+  - **Acceptance**: proof verifies client-side and matches the root returned by `catalyst_head`.
+
+- **Public testnet configuration + runbook**
+  - **What**: provide a minimal “public testnet node” config, documented ports, bootstrap procedure, and safe RPC defaults.
+  - **Where**: `catalyst.toml`, `scripts/netctl.sh`, `README.md`, `crates/catalyst-config/configs/*`
+  - **Acceptance**: a new operator can run a node, connect to bootstrap peers, and query head/peers via RPC.
+
 ## Milestone 0 — Protocol primitives and boundaries (foundation)
 
 - **Protocol types (done starter)**

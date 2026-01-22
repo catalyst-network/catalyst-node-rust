@@ -12,9 +12,17 @@ pub struct LsuCidGossip {
     pub cycle: u64,
     pub lsu_hash: Hash,
     pub cid: String,
+    /// State root BEFORE applying this LSU (i.e., the expected prev-applied root).
+    pub prev_state_root: Hash,
+    /// Authenticated state root after applying this LSU.
+    pub state_root: Hash,
+    /// CID of a proof bundle that allows verifying the LSU transition without apply-then-check.
+    ///
+    /// NOTE: `impl_catalyst_serialize!` doesn't support `Option<T>`, so we encode "none" as "".
+    pub proof_cid: String,
 }
 
-impl_catalyst_serialize!(LsuCidGossip, cycle, lsu_hash, cid);
+impl_catalyst_serialize!(LsuCidGossip, cycle, lsu_hash, cid, prev_state_root, state_root, proof_cid);
 
 impl NetworkMessage for LsuCidGossip {
     fn serialize(&self) -> CatalystResult<Vec<u8>> {
@@ -35,6 +43,89 @@ impl NetworkMessage for LsuCidGossip {
 
     fn ttl(&self) -> u32 {
         300
+    }
+}
+
+/// Proof bundle for a single LSU state transition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateProofBundle {
+    pub cycle: u64,
+    pub lsu_hash: Hash,
+    pub prev_state_root: Hash,
+    pub new_state_root: Hash,
+    pub changes: Vec<KeyProofChange>,
+}
+
+/// Proof for one touched key: old and new value proofs against prev/new roots.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyProofChange {
+    pub key: Vec<u8>,
+    pub old_value: Vec<u8>,
+    pub old_proof: catalyst_storage::merkle::MerkleProof,
+    pub new_value: Vec<u8>,
+    pub new_proof: catalyst_storage::merkle::MerkleProof,
+}
+
+/// Generic content request (used to fetch LSU bytes by CID over P2P).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileRequestMsg {
+    pub requester: String,
+    pub cid: String,
+}
+
+impl_catalyst_serialize!(FileRequestMsg, requester, cid);
+
+impl NetworkMessage for FileRequestMsg {
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        CatalystSerialize::serialize(self)
+    }
+
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        CatalystDeserialize::deserialize(data)
+    }
+
+    fn message_type(&self) -> MessageType {
+        MessageType::FileRequest
+    }
+
+    fn priority(&self) -> u8 {
+        MessagePriority::High as u8
+    }
+
+    fn ttl(&self) -> u32 {
+        30
+    }
+}
+
+/// Generic content response (CID -> raw bytes).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileResponseMsg {
+    pub requester: String,
+    pub cid: String,
+    pub bytes: Vec<u8>,
+}
+
+impl_catalyst_serialize!(FileResponseMsg, requester, cid, bytes);
+
+impl NetworkMessage for FileResponseMsg {
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        CatalystSerialize::serialize(self)
+    }
+
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        CatalystDeserialize::deserialize(data)
+    }
+
+    fn message_type(&self) -> MessageType {
+        MessageType::FileResponse
+    }
+
+    fn priority(&self) -> u8 {
+        MessagePriority::High as u8
+    }
+
+    fn ttl(&self) -> u32 {
+        30
     }
 }
 

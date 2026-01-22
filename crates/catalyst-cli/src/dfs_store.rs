@@ -50,5 +50,10 @@ impl LocalContentStore {
             .await
             .map_err(|e| format!("Failed to read DFS object {cid}: {e}"))
     }
+
+    pub async fn has(&self, cid: &str) -> bool {
+        let path = self.content_path_for(cid);
+        fs::metadata(&path).await.is_ok()
+    }
 }
 

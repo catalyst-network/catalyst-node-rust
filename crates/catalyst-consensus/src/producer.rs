@@ -13,6 +13,8 @@ pub struct Producer {
     pub id: ProducerId,
     pub public_key: PublicKey,
     pub cycle_number: CycleNumber,
+    /// Expected number of producers selected for this cycle.
+    pub expected_producers: usize,
     pub partial_update: Option<PartialLedgerStateUpdate>,
     pub ledger_update: Option<LedgerStateUpdate>,
     pub first_hash: Option<Hash>,
@@ -26,6 +28,7 @@ impl Producer {
             id,
             public_key,
             cycle_number,
+            expected_producers: 1,
             partial_update: None,
             ledger_update: None,
             first_hash: None,
@@ -35,8 +38,9 @@ impl Producer {
     }
 
     /// Reset producer state for new cycle
-    pub fn reset_for_cycle(&mut self, cycle_number: CycleNumber) {
+    pub fn reset_for_cycle(&mut self, cycle_number: CycleNumber, expected_producers: usize) {
         self.cycle_number = cycle_number;
+        self.expected_producers = expected_producers.max(1);
         self.partial_update = None;
         self.ledger_update = None;
         self.first_hash = None;
@@ -96,13 +100,13 @@ impl ProducerManager {
         let mut campaigning = CampaigningPhase::new(producer.clone());
         
         // Add collected quantities
-        let collected_len = collected_quantities.len();
+        let _collected_len = collected_quantities.len();
         for quantity in collected_quantities {
             campaigning.add_quantity(quantity);
         }
         
-        let min_data = self.calculate_min_data(collected_len);
-        let candidate = campaigning.execute(min_data, self.config.confidence_threshold).await?;
+        let required = (producer.expected_producers / 2) + 1;
+        let candidate = campaigning.execute(required).await?;
         
         // Update producer state
         let mut producer_guard = self.producer.write().await;
@@ -120,13 +124,13 @@ impl ProducerManager {
         let mut voting = VotingPhase::new(producer.clone());
         
         // Add collected candidates
-        let collected_len = collected_candidates.len();
+        let _collected_len = collected_candidates.len();
         for candidate in collected_candidates {
             voting.add_candidate(candidate);
         }
         
-        let min_data = self.calculate_min_data(collected_len);
-        let vote = voting.execute(min_data, self.config.confidence_threshold, &self.reward_config).await?;
+        let required = (producer.expected_producers / 2) + 1;
+        let vote = voting.execute(required, &self.reward_config).await?;
         
         // Update producer state
         let mut producer_guard = self.producer.write().await;
@@ -142,16 +146,16 @@ impl ProducerManager {
         collected_votes: Vec<ProducerVote>,
     ) -> CatalystResult<ProducerOutput> {
         let producer = self.producer.read().await.clone();
+        let required = (producer.expected_producers / 2) + 1;
         let mut synchronization = SynchronizationPhase::new(producer);
         
         // Add collected votes
-        let collected_len = collected_votes.len();
+        let _collected_len = collected_votes.len();
         for vote in collected_votes {
             synchronization.add_vote(vote);
         }
         
-        let min_data = self.calculate_min_data(collected_len);
-        let output = synchronization.execute(min_data, self.config.confidence_threshold).await?;
+        let output = synchronization.execute(required).await?;
         
         Ok(output)
     }
@@ -162,20 +166,11 @@ impl ProducerManager {
     }
 
     /// Reset for new cycle
-    pub async fn reset_for_cycle(&self, cycle_number: CycleNumber) {
+    pub async fn reset_for_cycle(&self, cycle_number: CycleNumber, expected_producers: usize) {
         let mut producer = self.producer.write().await;
-        producer.reset_for_cycle(cycle_number);
+        producer.reset_for_cycle(cycle_number, expected_producers);
         
         log_info!(LogCategory::Consensus, "Producer {} reset for cycle {}", producer.id, cycle_number);
-    }
-
-    /// Calculate minimum data requirement based on total expected producers
-    fn calculate_min_data(&self, collected: usize) -> usize {
-        // Use 75% of collected data as minimum, but at least the configured minimum
-        std::cmp::max(
-            (collected as f64 * 0.75) as usize,
-            self.config.min_producers,
-        )
     }
 
     /// Validate producer is eligible for current cycle
@@ -244,7 +239,7 @@ mod tests {
         producer.producer_list = Some(vec!["p1".to_string()]);
         
         // Reset for new cycle
-        producer.reset_for_cycle(2);
+        producer.reset_for_cycle(2, 1);
         
         assert_eq!(producer.cycle_number, 2);
         assert!(producer.first_hash.is_none());

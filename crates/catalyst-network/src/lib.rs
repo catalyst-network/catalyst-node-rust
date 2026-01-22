@@ -7,33 +7,23 @@ pub mod config;
 pub mod error;
 pub mod simple;
 
-// Full libp2p implementation is present but not yet API/trait-aligned with the rest of the workspace.
-// Gate it behind a feature so we can keep the workspace buildable while we wire consensus end-to-end.
-#[cfg(feature = "libp2p-full")]
-pub mod bandwidth;
-#[cfg(feature = "libp2p-full")]
-pub mod discovery;
-#[cfg(feature = "libp2p-full")]
-pub mod gossip;
-#[cfg(feature = "libp2p-full")]
-pub mod messaging;
-#[cfg(feature = "libp2p-full")]
-pub mod metrics;
-#[cfg(feature = "libp2p-full")]
-pub mod monitoring;
-#[cfg(feature = "libp2p-full")]
-pub mod reputation;
-#[cfg(feature = "libp2p-full")]
-pub mod security;
+// Full libp2p implementation (gated). We keep the public API aligned with the
+// default (simple TCP) implementation so downstream crates can keep using the
+// same `MessageEnvelope` plumbing.
 #[cfg(feature = "libp2p-full")]
 pub mod service;
-#[cfg(feature = "libp2p-full")]
-pub mod swarm;
 
 // Common re-exports for downstream crates.
 pub use config::NetworkConfig;
 pub use error::{NetworkError, NetworkResult};
+
+// Default: simple TCP service.
+#[cfg(not(feature = "libp2p-full"))]
 pub use simple::{NetworkEvent, NetworkService, NetworkStats};
+
+// When enabled: libp2p service.
+#[cfg(feature = "libp2p-full")]
+pub use service::{NetworkEvent, NetworkService, NetworkStats};
 
 // Convenience alias used across the workspace.
 pub type Network = NetworkService;

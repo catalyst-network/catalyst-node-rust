@@ -94,7 +94,7 @@ impl CollaborativeConsensus {
                 let producer = manager.get_producer().await;
                 if selected_producers.contains(&producer.id) {
                     log_info!(LogCategory::Consensus, "Participating as producer in cycle {}", cycle_number);
-                    manager.reset_for_cycle(cycle_number).await;
+                    manager.reset_for_cycle(cycle_number, selected_producers.len()).await;
                     Some(manager)
                 } else {
                     log_info!(LogCategory::Consensus, "Not selected as producer for cycle {}, observing only", cycle_number);
@@ -845,7 +845,7 @@ mod tests {
         
         let result = consensus.start_cycle(1, selected_producers, transactions).await;
         
-        // Should fail due to missing network setup, but validates the flow
-        assert!(result.is_err());
+        // Single-producer cycle should succeed without network wiring.
+        assert!(result.is_ok());
     }
 }

@@ -77,6 +77,126 @@ make run-validator
 make run-storage
 ```
 
+## Local Testnet (recommended for validating current functionality)
+
+This repo includes a working local testnet harness that runs **3 nodes** with:
+- deterministic faucet funding
+- RPC enabled on node1 (`http://127.0.0.1:8545`)
+- signature + nonce validation
+- LSU application into RocksDB state
+- DFS-backed LSU sync (CID gossip + local content store)
+- persistent mempool with deterministic re-broadcast on restart
+
+### Start / stop
+
+Start:
+
+```bash
+make testnet
+```
+
+Stop:
+
+```bash
+make stop-testnet
+```
+
+### Faster iteration helpers (non-blocking start + status + basic check)
+
+`make testnet` blocks (it waits on node processes). For day-to-day testing, use:
+
+```bash
+make testnet-up
+make testnet-status
+make testnet-basic-test
+make testnet-down
+```
+
+Tail logs:
+
+```bash
+make testnet-logs NODE=node1
+```
+
+### Contract sanity check (EVM execution)
+
+This uses a deterministic initcode fixture (`testdata/evm/return_2a_initcode.hex`) that deploys a contract which returns `0x2a` on empty calldata.
+
+```bash
+make testnet-up
+make testnet-contract-test
+make testnet-down
+```
+
+### Smoke test (single command)
+
+Runs an end-to-end test that:
+- starts the 3-node testnet
+- submits a faucet transaction to node1
+- restarts node1 to test mempool persistence + rehydrate + deterministic re-broadcast
+- verifies node1 balance increases
+- stops the testnet
+
+```bash
+make smoke-testnet
+```
+
+Logs:
+- `testnet/node1/logs/stdout.log`
+- `testnet/node2/logs/stdout.log`
+- `testnet/node3/logs/stdout.log`
+
+### Send a transaction (faucet → node1)
+
+Get node1 public key (used as the “address” in this scaffold):
+
+```bash
+NODE1_PUBKEY=$(grep -a "Node ID:" -m1 testnet/node1/logs/stdout.log | awk '{print $NF}')
+echo "node1_pubkey=$NODE1_PUBKEY"
+```
+
+Send 25 units from the faucet:
+
+```bash
+cargo run -p catalyst-cli -- send $NODE1_PUBKEY 25 --key-file testnet/faucet.key --rpc-url http://127.0.0.1:8545
+```
+
+Check node1 balance:
+
+```bash
+cargo run -p catalyst-cli -- balance $NODE1_PUBKEY --rpc-url http://127.0.0.1:8545
+```
+
+### Query peers / chain head / nonce
+
+Peers:
+
+```bash
+cargo run -p catalyst-cli -- peers --rpc-url http://127.0.0.1:8545
+```
+
+Head:
+
+```bash
+cargo run -p catalyst-cli -- status --rpc-url http://127.0.0.1:8545
+```
+
+Nonce (faucet):
+
+```bash
+FAUCET_PUBKEY=$(python3 -c 'print("fa"*32)')
+curl -s -X POST http://127.0.0.1:8545 -H 'content-type: application/json' \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"catalyst_getNonce\",\"params\":[\"0x${FAUCET_PUBKEY}\"]}"
+echo
+```
+
+### Mempool persistence + deterministic re-broadcast
+
+Pending protocol transactions are persisted in RocksDB and reloaded on startup. On restart, node1 will:
+- rehydrate the mempool from persisted txs (after revalidation)
+- deterministically rebroadcast them periodically (stable txid order)
+- prune them once their sender nonce is applied (LSU application)
+
 ### Docker
 
 ```bash
@@ -86,6 +206,43 @@ make docker-build
 # Run with Docker
 make docker-run
 ```
+
+## Stable Devnet (invite others to connect)
+
+You can run a single-node “devnet” that:
+- listens on a public P2P port
+- exposes RPC externally (binds to `0.0.0.0`)
+- prints the bootstrap multiaddr + RPC URL to share
+
+Start (replace `HOST` with your public IP or DNS name):
+
+```bash
+make devnet-up HOST=<public_ip_or_dns> P2P_PORT=30333 RPC_PORT=8545
+```
+
+Stop:
+
+```bash
+make devnet-down
+```
+
+### How others connect
+
+On a remote machine, they run their node and point it at your bootstrap address:
+
+```bash
+cargo run -p catalyst-cli -- start \
+  --validator --rpc --rpc-address 127.0.0.1 --rpc-port 8545 \
+  --bootstrap-peers "/ip4/<HOST>/tcp/30333"
+```
+
+### Smart contract dev scaffolding (current state)
+
+This repo currently has a **scaffolded** SmartContract transaction flow:
+- `catalyst deploy <bytecode_file>` stores contract bytecode under `evm:code:<addr20>`
+- `catalyst_getCode` returns that stored bytecode
+- `catalyst call` is a placeholder (no real EVM bytecode execution yet)
+
 
 ## 📋 Usage
 

@@ -39,14 +39,17 @@ multihash = "0.19"
 
 # Networking with libp2p
 libp2p = { version = "0.53", features = [
-    "kad", 
-    "request-response", 
-    "gossipsub", 
-    "identify", 
-    "noise", 
-    "tcp", 
+    "kad",
+    "request-response",
+    "gossipsub",
+    "identify",
+    "noise",
+    "tcp",
     "yamux",
-    "async-std"
+    "mdns",
+    "ping",
+    "tokio",
+    "macros"
 ] }
 
 # Time handling

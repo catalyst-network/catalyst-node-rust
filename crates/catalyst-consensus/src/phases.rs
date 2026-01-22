@@ -124,12 +124,12 @@ impl CampaigningPhase {
     }
 
     /// Execute campaigning phase
-    pub async fn execute(&mut self, min_data: usize, threshold: f64) -> CatalystResult<ProducerCandidate> {
+    pub async fn execute(&mut self, required_majority: usize) -> CatalystResult<ProducerCandidate> {
         log_info!(LogCategory::Consensus, "Starting campaigning phase for cycle {}", self.producer.cycle_number);
         increment_counter!("consensus_campaigning_phase_total", 1);
         
         let result = time_operation!("consensus_campaigning_phase_duration", {
-            self.find_majority_candidate(min_data, threshold).await
+            self.find_majority_candidate(required_majority).await
         });
         
         match result {
@@ -144,12 +144,16 @@ impl CampaigningPhase {
         }
     }
 
-    async fn find_majority_candidate(&mut self, min_data: usize, threshold: f64) -> CatalystResult<ProducerCandidate> {
+    pub fn expected_producers(&self) -> usize {
+        self.producer.expected_producers
+    }
+
+    async fn find_majority_candidate(&mut self, required_majority: usize) -> CatalystResult<ProducerCandidate> {
         // Check minimum data requirement
-        if self.collected_quantities.len() < min_data {
+        if self.collected_quantities.len() < required_majority {
             return Err(ConsensusError::InsufficientData {
                 got: self.collected_quantities.len(),
-                required: min_data,
+                required: required_majority,
             }.into());
         }
 
@@ -161,10 +165,7 @@ impl CampaigningPhase {
                 .push(producer_id.clone());
         }
 
-        // Find majority hash
-        let total_count = self.collected_quantities.len();
-        let required_majority = (total_count as f64 * threshold).ceil() as usize;
-        
+        // Find majority hash (required_majority is derived from membership, not from received count)
         let mut best_hash: Option<Hash> = None;
         let mut best_list: Vec<String> = Vec::new();
         for (h, producers) in hash_counts.iter() {
@@ -268,12 +269,12 @@ impl VotingPhase {
     }
 
     /// Execute voting phase
-    pub async fn execute(&mut self, min_data: usize, threshold: f64, reward_config: &RewardConfig) -> CatalystResult<ProducerVote> {
+    pub async fn execute(&mut self, required_majority: usize, reward_config: &RewardConfig) -> CatalystResult<ProducerVote> {
         log_info!(LogCategory::Consensus, "Starting voting phase for cycle {}", self.producer.cycle_number);
         increment_counter!("consensus_voting_phase_total", 1);
         
         let result = time_operation!("consensus_voting_phase_duration", {
-            self.create_final_ledger_update(min_data, threshold, reward_config).await
+            self.create_final_ledger_update(required_majority, reward_config).await
         });
         
         match result {
@@ -288,7 +289,11 @@ impl VotingPhase {
         }
     }
 
-    async fn create_final_ledger_update(&mut self, min_data: usize, threshold: f64, reward_config: &RewardConfig) -> CatalystResult<ProducerVote> {
+    pub fn expected_producers(&self) -> usize {
+        self.producer.expected_producers
+    }
+
+    async fn create_final_ledger_update(&mut self, required_majority: usize, reward_config: &RewardConfig) -> CatalystResult<ProducerVote> {
         // Check if we can participate (must have correct hash)
         let our_hash = self.producer.first_hash.ok_or_else(|| {
             ConsensusError::ConsensusFailed {
@@ -297,10 +302,10 @@ impl VotingPhase {
         })?;
 
         // Verify minimum data and find majority
-        if self.collected_candidates.len() < min_data {
+        if self.collected_candidates.len() < required_majority {
             return Err(ConsensusError::InsufficientData {
                 got: self.collected_candidates.len(),
-                required: min_data,
+                required: required_majority,
             }.into());
         }
 
@@ -312,9 +317,7 @@ impl VotingPhase {
                 .push(producer_id.clone());
         }
 
-        let total_count = self.collected_candidates.len();
-        let required_majority = (total_count as f64 * threshold).ceil() as usize;
-        
+        // required_majority is derived from membership, not from received count
         let (majority_hash, voting_producers) = hash_counts
             .into_iter()
             .max_by_key(|(_, producers)| producers.len())
@@ -488,12 +491,12 @@ impl SynchronizationPhase {
     }
 
     /// Execute synchronization phase
-    pub async fn execute(&mut self, min_data: usize, threshold: f64) -> CatalystResult<ProducerOutput> {
+    pub async fn execute(&mut self, required_majority: usize) -> CatalystResult<ProducerOutput> {
         log_info!(LogCategory::Consensus, "Starting synchronization phase for cycle {}", self.producer.cycle_number);
         increment_counter!("consensus_synchronization_phase_total", 1);
         
         let result = time_operation!("consensus_synchronization_phase_duration", {
-            self.finalize_ledger_update(min_data, threshold).await
+            self.finalize_ledger_update(required_majority).await
         });
         
         match result {
@@ -508,12 +511,16 @@ impl SynchronizationPhase {
         }
     }
 
-    async fn finalize_ledger_update(&mut self, min_data: usize, threshold: f64) -> CatalystResult<ProducerOutput> {
+    pub fn expected_producers(&self) -> usize {
+        self.producer.expected_producers
+    }
+
+    async fn finalize_ledger_update(&mut self, required_majority: usize) -> CatalystResult<ProducerOutput> {
         // Check minimum data requirement
-        if self.collected_votes.len() < min_data {
+        if self.collected_votes.len() < required_majority {
             return Err(ConsensusError::InsufficientData {
                 got: self.collected_votes.len(),
-                required: min_data,
+                required: required_majority,
             }.into());
         }
 
@@ -525,9 +532,7 @@ impl SynchronizationPhase {
                 .push(producer_id.clone());
         }
 
-        let total_count = self.collected_votes.len();
-        let required_majority = (total_count as f64 * threshold).ceil() as usize;
-        
+        // required_majority is derived from membership, not from received count
         let (final_hash, vote_producers) = hash_counts
             .into_iter()
             .max_by_key(|(_, producers)| producers.len())

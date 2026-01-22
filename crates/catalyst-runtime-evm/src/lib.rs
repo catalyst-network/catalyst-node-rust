@@ -432,6 +432,76 @@ pub mod utils {
         Address::from_slice(&hash[12..])
     }
 
+    /// Calculate contract address for CREATE (Ethereum canonical RLP(sender, nonce) scheme).
+    ///
+    /// This matches how the EVM derives addresses (and what REVM uses).
+    pub fn calculate_ethereum_create_address(sender: &Address, nonce: u64) -> Address {
+        fn rlp_encode_bytes(raw: &[u8]) -> Vec<u8> {
+            match raw.len() {
+                0 => vec![0x80],
+                1 if raw[0] <= 0x7f => vec![raw[0]],
+                len if len <= 55 => {
+                    let mut out = Vec::with_capacity(1 + len);
+                    out.push(0x80 + (len as u8));
+                    out.extend_from_slice(raw);
+                    out
+                }
+                len => {
+                    let mut len_bytes = Vec::new();
+                    let mut l = len;
+                    while l > 0 {
+                        len_bytes.push((l & 0xff) as u8);
+                        l >>= 8;
+                    }
+                    len_bytes.reverse();
+                    let mut out = Vec::with_capacity(1 + len_bytes.len() + len);
+                    out.push(0xb7 + (len_bytes.len() as u8));
+                    out.extend_from_slice(&len_bytes);
+                    out.extend_from_slice(raw);
+                    out
+                }
+            }
+        }
+
+        fn rlp_encode_u64(n: u64) -> Vec<u8> {
+            if n == 0 {
+                return vec![0x80];
+            }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&n.to_be_bytes());
+            let first = buf.iter().position(|b| *b != 0).unwrap_or(7);
+            rlp_encode_bytes(&buf[first..])
+        }
+
+        fn rlp_encode_list(items: &[Vec<u8>]) -> Vec<u8> {
+            let payload_len: usize = items.iter().map(|i| i.len()).sum();
+            let mut out = Vec::new();
+            if payload_len <= 55 {
+                out.push(0xc0 + (payload_len as u8));
+            } else {
+                let mut len_bytes = Vec::new();
+                let mut l = payload_len;
+                while l > 0 {
+                    len_bytes.push((l & 0xff) as u8);
+                    l >>= 8;
+                }
+                len_bytes.reverse();
+                out.push(0xf7 + (len_bytes.len() as u8));
+                out.extend_from_slice(&len_bytes);
+            }
+            for i in items {
+                out.extend_from_slice(i);
+            }
+            out
+        }
+
+        let enc_sender = rlp_encode_bytes(sender.as_slice());
+        let enc_nonce = rlp_encode_u64(nonce);
+        let rlp = rlp_encode_list(&[enc_sender, enc_nonce]);
+        let hash = keccak(&rlp);
+        Address::from_slice(&hash[12..])
+    }
+
     /// Encode function call data
     pub fn encode_function_call(selector: [u8; 4], params: &[u8]) -> Bytes {
         let mut data = Vec::with_capacity(4 + params.len());

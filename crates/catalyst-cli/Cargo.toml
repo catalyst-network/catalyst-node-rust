@@ -21,6 +21,10 @@ catalyst-storage = { path = "../catalyst-storage" }
 catalyst-crypto = { path = "../catalyst-crypto" }
 catalyst-utils = { path = "../catalyst-utils" }
 catalyst-dfs = { path = "../catalyst-dfs" }
+catalyst-runtime-evm = { path = "../catalyst-runtime-evm" }
+alloy-primitives = { version = "1.2", features = ["serde"] }
+revm = { version = "27", default-features = true }
+thiserror = "1.0"
 
 # CLI dependencies
 clap = { version = "4.0", features = ["derive"] }
@@ -34,6 +38,9 @@ anyhow = "1.0"
 dirs = "5.0"
 bincode = "1.3"
 blake2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+sha2 = "0.10"
 
 # Async runtime
 futures = "0.3"

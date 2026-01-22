@@ -240,7 +240,23 @@ update:
 testnet: build
 	@echo "Starting local testnet with 3 nodes..."
 	@bash -lc 'set -euo pipefail; \
-		mkdir -p testnet/{node1,node2,node3}/{logs,data,dfs_cache}; \
+		# Write a deterministic, pre-funded faucet key for dev/testnet usage. \
+		# Matches FAUCET_PRIVATE_KEY_BYTES ([0xFA;32]) embedded in the node. \
+		python3 -c "print(\"fa\"*32)" > testnet/faucet.key; \
+		for n in 1 2 3; do \
+			mkdir -p "testnet/node$${n}/logs" "testnet/node$${n}/data" "testnet/node$${n}/dfs_cache"; \
+		done; \
+		# Pre-generate per-node identities so we can build a deterministic validator set before startup. \
+		for n in 1 2 3; do \
+			key="testnet/node$${n}/node.key"; \
+			if [ ! -f "$$key" ]; then \
+				python3 -c "import os,binascii; print(binascii.hexlify(os.urandom(32)).decode())" > "$$key"; \
+			fi; \
+		done; \
+		# Validator set (node1 + node2): used for protocol producer selection without NodeStatus gossip. \
+		PK1=$$("$(CARGO_TARGET_DIR)/release/catalyst-cli" --log-level error pubkey --key-file testnet/node1/node.key | tail -n 1); \
+		PK2=$$("$(CARGO_TARGET_DIR)/release/catalyst-cli" --log-level error pubkey --key-file testnet/node2/node.key | tail -n 1); \
+		printf "validator_worker_ids = [\"%s\", \"%s\"]\n" "$$PK1" "$$PK2" > testnet/validators.toml; \
 		echo "Starting node1 (bootstrap + validator)..." ; \
 		RUST_LOG=info stdbuf -oL -eL "$(CARGO_TARGET_DIR)/release/catalyst-cli" --config testnet/node1/config.toml start \
 			--validator --rpc --rpc-port 8545 --generate-txs --tx-interval-ms 1000 \
@@ -264,12 +280,15 @@ testnet: build
 		echo "  - testnet/node1/logs/stdout.log"; \
 		echo "  - testnet/node2/logs/stdout.log"; \
 		echo "  - testnet/node3/logs/stdout.log"; \
+		echo "Faucet key written to: testnet/faucet.key"; \
+		echo "Example send: cargo run -p catalyst-cli -- send <NODE_PUBKEY_HEX> 25 --key-file testnet/faucet.key --rpc-url http://127.0.0.1:8545"; \
 		echo "Stop with: make stop-testnet"; \
 		wait $$(cat testnet/node1/node.pid) $$(cat testnet/node2/node.pid) $$(cat testnet/node3/node.pid)'
 
 stop-testnet:
 	@echo "Stopping testnet..."
 	@bash -lc 'set -euo pipefail; \
+		# Primary: stop via pidfiles (normal path) \
 		for n in 1 2 3; do \
 			pidfile="testnet/node$${n}/node.pid"; \
 			if [ -f "$$pidfile" ]; then \
@@ -291,7 +310,56 @@ stop-testnet:
 				fi; \
 			fi; \
 		done; \
+		# Fallback: if pidfiles were never created (older broken testnet runs), stop by exact cmdline match. \
+		for n in 1 2 3; do \
+			pids=$$(pgrep -f "$(CARGO_TARGET_DIR)/release/catalyst-cli --config testnet/node$${n}/config.toml start" || true); \
+			if [ -n "$$pids" ]; then \
+				echo "Stopping node$${n} by pgrep fallback (pids $$pids)"; \
+				kill $$pids 2>/dev/null || true; \
+			fi; \
+		done; \
 		true'
+
+.PHONY: smoke-testnet
+smoke-testnet: build
+	@echo "Running local testnet smoke test..."
+	@bash scripts/smoke_testnet.sh
+
+.PHONY: testnet-up testnet-down testnet-status testnet-logs testnet-basic-test devnet-up devnet-down devnet-status
+testnet-up: build
+	@bash scripts/netctl.sh testnet up
+
+.PHONY: testnet-up-clean
+testnet-up-clean: build
+	@bash scripts/netctl.sh testnet up --clean
+
+testnet-down:
+	@bash scripts/netctl.sh testnet down
+
+testnet-status:
+	@bash scripts/netctl.sh testnet status
+
+testnet-logs:
+	@bash scripts/netctl.sh testnet logs $(or $(NODE),node1)
+
+testnet-basic-test: build
+	@bash scripts/netctl.sh testnet test-basic
+
+.PHONY: testnet-contract-test
+testnet-contract-test: build
+	@bash scripts/netctl.sh testnet test-contract
+
+# Public/stable devnet helpers (single node that exposes RPC externally).
+# Example:
+#   make devnet-up HOST=203.0.113.10 P2P_PORT=30333 RPC_PORT=8545
+devnet-up: build
+	@bash scripts/netctl.sh devnet up --host "$(HOST)" --p2p-port "$(or $(P2P_PORT),30333)" --rpc-port "$(or $(RPC_PORT),8545)"
+
+devnet-down:
+	@bash scripts/netctl.sh devnet down
+
+devnet-status:
+	@bash scripts/netctl.sh devnet status
 
 # Development helpers
 watch:
