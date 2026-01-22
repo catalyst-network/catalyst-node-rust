@@ -243,7 +243,7 @@ pub fn select_producers_for_next_cycle(
     prev_cycle_merkle_root: &BlockHash,
     producer_count: usize,
 ) -> Vec<WorkerId> {
-    let r = prng_32(prev_cycle_merkle_root);
+    let r = producer_selection_r_n_plus_1(prev_cycle_merkle_root);
 
     let mut scored: Vec<(Hash32, WorkerId)> = worker_pool
         .iter()
@@ -287,15 +287,24 @@ mod tests {
     }
 
     #[test]
-    fn prng_32_uses_blake2b_truncated_and_is_stable() {
+    fn producer_selection_r_is_domain_separated_and_stable() {
         // Fixed test vector to prevent accidental hash algorithm drift.
-        // Computed as: blake2b_512(seed || "catalyst-prng-32") truncated to 32 bytes.
+        // Computed as: blake2b_512(seed || PRODUCER_SELECTION_DOMAIN_TAG) truncated to 32 bytes.
         let seed: BlockHash = [42u8; 32];
-        let r = prng_32(&seed);
+        let r = producer_selection_r_n_plus_1(&seed);
         assert_eq!(
             hex::encode(r),
-            "f9dbd93cdbff4cc030123a892ca9115ea14ef85f68db8dd6ae039668aefca48a"
+            "aa206f69386f0622bcae8aca302c10e7b8bd6b238b512f8180d98248267123ac"
         );
+    }
+
+    #[test]
+    fn producer_selection_r_differs_from_legacy_prng() {
+        // Ensure domain separation is effective (and we don't accidentally use the legacy tag).
+        let seed: BlockHash = [42u8; 32];
+        let a = producer_selection_r_n_plus_1(&seed);
+        let b = prng_32(&seed);
+        assert_ne!(a, b);
     }
 }
 
@@ -305,6 +314,33 @@ fn xor32(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
         out[i] = a[i] ^ b[i];
     }
     out
+}
+
+/// Domain separation tag for producer selection randomness derivation.
+///
+/// This is part of "Wire v1" consensus-critical hashing rules.
+const PRODUCER_SELECTION_DOMAIN_TAG: &[u8] = b"catalyst:producer_selection:r_n_plus_1:v1";
+
+/// Deterministically derive `r_{n+1}` (32 bytes) from a 32-byte previous-cycle commitment.
+///
+/// Spec intent (Consensus v1.2 §2.2.1):
+/// - seed should be derived from the previous cycle’s commitment (paper mentions Merkle root)
+///
+/// Current implementation contract:
+/// - caller supplies a 32-byte commitment (for now we accept the previous LSU hash/state commitment
+///   as the available 32-byte value in the node; later we should switch to the paper’s exact root
+///   once implemented in storage/consensus).
+/// - `r_{n+1} = blake2b_256(seed || DOMAIN_TAG)` where `blake2b_256` means truncation of Blake2b-512.
+fn producer_selection_r_n_plus_1(seed: &[u8; 32]) -> [u8; 32] {
+    use blake2::{Blake2b512, Digest};
+
+    let mut h = Blake2b512::new();
+    h.update(seed);
+    h.update(PRODUCER_SELECTION_DOMAIN_TAG);
+    let out = h.finalize();
+    let mut r = [0u8; 32];
+    r.copy_from_slice(&out[..32]);
+    r
 }
 
 /// Simple deterministic PRNG to derive 32 bytes from a 32-byte seed.
@@ -318,8 +354,7 @@ fn prng_32(seed: &[u8; 32]) -> [u8; 32] {
     // For now we follow the same convention used elsewhere in the repo:
     // `blake2b_256(x) := first_32_bytes(blake2b_512(x))`
     //
-    // Domain separation tag:
-    // - Keep the same tag string as the previous placeholder implementation so the intent remains clear.
+    // Domain separation tag (legacy placeholder).
     let mut h = Blake2b512::new();
     h.update(seed);
     h.update(b"catalyst-prng-32");
