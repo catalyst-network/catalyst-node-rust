@@ -194,7 +194,7 @@ mod integration_tests {
             total_new_tokens: 10000,
         };
 
-        let result = voting.execute(2, 0.6, &reward_config).await;
+        let result = voting.execute(2, &reward_config).await;
         assert!(result.is_ok());
 
         let vote = result.unwrap();
