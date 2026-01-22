@@ -120,6 +120,8 @@ impl_catalyst_serialize!(ProducerQuantity, first_hash, cycle_number, producer_id
 pub struct ProducerCandidate {
     pub majority_hash: Hash,
     pub producer_list_hash: Hash,
+    /// Witness producer list for the majority hash (deterministic ordering required).
+    pub producer_list: Vec<ProducerId>,
     pub cycle_number: CycleNumber,
     pub producer_id: ProducerId,
     pub timestamp: u64,
@@ -143,7 +145,7 @@ impl NetworkMessage for ProducerCandidate {
     }
 }
 
-impl_catalyst_serialize!(ProducerCandidate, majority_hash, producer_list_hash, cycle_number, producer_id, timestamp);
+impl_catalyst_serialize!(ProducerCandidate, majority_hash, producer_list_hash, producer_list, cycle_number, producer_id, timestamp);
 
 /// Producer vote (Voting phase)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -251,6 +253,7 @@ mod wire_roundtrip_tests {
         let msg = ProducerCandidate {
             majority_hash: [2u8; 32],
             producer_list_hash: [3u8; 32],
+            producer_list: vec!["producer_b".to_string()],
             cycle_number: 42,
             producer_id: "producer_b".to_string(),
             timestamp: 123456,
