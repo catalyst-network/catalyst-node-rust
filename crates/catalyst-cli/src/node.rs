@@ -1426,7 +1426,28 @@ impl CatalystNode {
                 let bind: std::net::SocketAddr = format!("{}:{}", self.config.rpc.address, self.config.rpc.port)
                     .parse()
                     .map_err(|e| anyhow::anyhow!("invalid rpc bind addr: {e}"))?;
-                let handle = catalyst_rpc::start_rpc_http(bind, store.clone(), Some(network.clone()), Some(rpc_tx))
+                // Safety: do not allow public bind or wildcard CORS without explicit opt-in.
+                if !bind.ip().is_loopback() && !self.config.rpc.allow_unsafe_exposure {
+                    return Err(anyhow::anyhow!(
+                        "refusing to start RPC on non-loopback address {} without rpc.allow_unsafe_exposure=true",
+                        bind
+                    ));
+                }
+                if self.config.rpc.cors_enabled
+                    && self.config.rpc.cors_origins.iter().any(|o| o == "*")
+                    && !self.config.rpc.allow_unsafe_exposure
+                {
+                    return Err(anyhow::anyhow!(
+                        "refusing to start RPC with wildcard CORS without rpc.allow_unsafe_exposure=true"
+                    ));
+                }
+                let handle = catalyst_rpc::start_rpc_http(
+                    bind,
+                    store.clone(),
+                    Some(network.clone()),
+                    Some(rpc_tx),
+                    self.config.rpc.rate_limit,
+                )
                     .await
                     .map_err(|e| anyhow::anyhow!("rpc start failed: {e}"))?;
                 info!("RPC server listening on http://{}", bind);

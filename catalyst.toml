@@ -86,10 +86,11 @@ enabled = false
 address = "127.0.0.1"
 port = 8545
 cors_enabled = true
-cors_origins = ["*"]
+cors_origins = ["http://localhost", "http://127.0.0.1"]
 auth_enabled = false
 rate_limit = 100
 request_timeout = 30
+allow_unsafe_exposure = false
 
 [logging]
 level = "info"

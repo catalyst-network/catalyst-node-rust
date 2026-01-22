@@ -15,6 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 
 
 // Note: The initial scaffold referenced sub-modules (`methods`, `server`, `types`) that
@@ -35,6 +36,8 @@ pub enum RpcServerError {
     AccountNotFound(String),
     #[error("Network error: {0}")]
     Network(String),
+    #[error("Rate limited")]
+    RateLimited,
 }
 
 impl From<RpcServerError> for ErrorObjectOwned {
@@ -50,6 +53,9 @@ impl From<RpcServerError> for ErrorObjectOwned {
             RpcServerError::TransactionNotFound(_) |
             RpcServerError::BlockNotFound(_) |
             RpcServerError::AccountNotFound(_) => {
+                ErrorObjectOwned::owned(CALL_EXECUTION_FAILED_CODE, err.to_string(), None::<()>)
+            }
+            RpcServerError::RateLimited => {
                 ErrorObjectOwned::owned(CALL_EXECUTION_FAILED_CODE, err.to_string(), None::<()>)
             }
             _ => ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, err.to_string(), None::<()>),
@@ -81,7 +87,10 @@ impl Default for RpcConfig {
             max_connections: 100,
             enable_http: true,
             enable_ws: true,
-            cors_origins: vec!["*".to_string()],
+            cors_origins: vec![
+                "http://localhost".to_string(),
+                "http://127.0.0.1".to_string(),
+            ],
             request_timeout: 30,
         }
     }
@@ -425,6 +434,14 @@ pub struct CatalystRpcImpl {
     storage: Arc<catalyst_storage::StorageManager>,
     network: Option<Arc<catalyst_network::NetworkService>>,
     tx_submit: Option<mpsc::UnboundedSender<catalyst_core::protocol::Transaction>>,
+    rate_limiter: Option<Arc<Mutex<RateLimiterState>>>,
+}
+
+#[derive(Debug, Clone)]
+struct RateLimiterState {
+    limit_per_minute: u32,
+    window_start_secs: u64,
+    count: u32,
 }
 
 impl CatalystRpcImpl {
@@ -432,42 +449,87 @@ impl CatalystRpcImpl {
         storage: Arc<catalyst_storage::StorageManager>,
         network: Option<Arc<catalyst_network::NetworkService>>,
         tx_submit: Option<mpsc::UnboundedSender<catalyst_core::protocol::Transaction>>,
+        rate_limit_per_minute: u32,
     ) -> Self {
         Self {
             storage,
             network,
             tx_submit,
+            rate_limiter: if rate_limit_per_minute == 0 {
+                None
+            } else {
+                Some(Arc::new(Mutex::new(RateLimiterState {
+                    limit_per_minute: rate_limit_per_minute,
+                    window_start_secs: 0,
+                    count: 0,
+                })))
+            },
         }
+    }
+
+    async fn enforce_rate_limit(&self) -> Result<(), ErrorObjectOwned> {
+        let Some(rl) = &self.rate_limiter else { return Ok(()) };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut st = rl.lock().await;
+        if st.window_start_secs == 0 || now.saturating_sub(st.window_start_secs) >= 60 {
+            st.window_start_secs = now;
+            st.count = 0;
+        }
+        if st.count >= st.limit_per_minute {
+            return Err(ErrorObjectOwned::from(RpcServerError::RateLimited));
+        }
+        st.count = st.count.saturating_add(1);
+        Ok(())
+    }
+
+    async fn block_number_inner(&self) -> u64 {
+        self.storage
+            .get_metadata("consensus:last_applied_cycle")
+            .await
+            .ok()
+            .flatten()
+            .map(|b| decode_u64_le(&b))
+            .unwrap_or(0)
+    }
+
+    async fn peer_count_inner(&self) -> u64 {
+        if let Some(net) = &self.network {
+            let st = net.get_stats().await;
+            return st.connected_peers as u64;
+        }
+        0
     }
 }
 
 #[async_trait]
 impl CatalystRpcServer for CatalystRpcImpl {
     async fn block_number(&self) -> RpcResult<u64> {
-        let n = self
-            .storage
-            .get_metadata("consensus:last_applied_cycle")
-            .await
-            .ok()
-            .flatten()
-            .map(|b| decode_u64_le(&b))
-            .unwrap_or(0);
-        Ok(n)
+        self.enforce_rate_limit().await?;
+        Ok(self.block_number_inner().await)
     }
 
     async fn get_block_by_hash(&self, _hash: String, _full_transactions: bool) -> RpcResult<Option<RpcBlock>> {
+        self.enforce_rate_limit().await?;
         Ok(None)
     }
 
     async fn get_block_by_number(&self, _number: u64, _full_transactions: bool) -> RpcResult<Option<RpcBlock>> {
+        self.enforce_rate_limit().await?;
         Ok(None)
     }
 
     async fn get_transaction_by_hash(&self, _hash: String) -> RpcResult<Option<RpcTransaction>> {
+        self.enforce_rate_limit().await?;
         Ok(None)
     }
 
     async fn get_balance(&self, address: String) -> RpcResult<String> {
+        self.enforce_rate_limit().await?;
         let pk = parse_hex_32(&address).map_err(ErrorObjectOwned::from)?;
         let key = bal_key(&pk);
         let bal = self
@@ -481,6 +543,7 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn get_balance_proof(&self, address: String) -> RpcResult<RpcBalanceProof> {
+        self.enforce_rate_limit().await?;
         let pk = parse_hex_32(&address).map_err(ErrorObjectOwned::from)?;
         let key = bal_key(&pk);
 
@@ -514,6 +577,7 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn get_nonce(&self, address: String) -> RpcResult<u64> {
+        self.enforce_rate_limit().await?;
         let pk = parse_hex_32(&address).map_err(ErrorObjectOwned::from)?;
         let mut k = b"nonce:".to_vec();
         k.extend_from_slice(&pk);
@@ -528,10 +592,12 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn get_account(&self, _address: String) -> RpcResult<Option<RpcAccount>> {
+        self.enforce_rate_limit().await?;
         Ok(None)
     }
 
     async fn get_workers(&self) -> RpcResult<Vec<String>> {
+        self.enforce_rate_limit().await?;
         let mut out: Vec<[u8; 32]> = Vec::new();
         if let Ok(iter) = self.storage.engine().iterator("accounts") {
             for item in iter {
@@ -560,6 +626,7 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn send_raw_transaction(&self, _data: String) -> RpcResult<String> {
+        self.enforce_rate_limit().await?;
         // Accept hex-encoded bincode(Transaction) for now (dev transport).
         let bytes = parse_hex_bytes(&_data).map_err(ErrorObjectOwned::from)?;
         let tx: catalyst_core::protocol::Transaction = bincode::deserialize(&bytes).map_err(
@@ -658,40 +725,43 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn estimate_fee(&self, _transaction: RpcTransactionRequest) -> RpcResult<String> {
+        self.enforce_rate_limit().await?;
         Ok("0".to_string())
     }
 
     async fn network_info(&self) -> RpcResult<RpcNetworkInfo> {
-        let peer_count = self.peer_count().await.unwrap_or(0);
+        self.enforce_rate_limit().await?;
+        let peer_count = self.peer_count_inner().await;
+        let current_block = self.block_number_inner().await;
         Ok(RpcNetworkInfo {
             chain_id: 0,
             network_id: 0,
             protocol_version: "catalyst/0".to_string(),
             genesis_hash: "0x0".to_string(),
-            current_block: self.block_number().await?,
-            highest_block: self.block_number().await?,
+            current_block,
+            highest_block: current_block,
             peer_count,
         })
     }
 
     async fn syncing(&self) -> RpcResult<RpcSyncStatus> {
+        self.enforce_rate_limit().await?;
         Ok(RpcSyncStatus::Synced(true))
     }
 
     async fn peer_count(&self) -> RpcResult<u64> {
-        if let Some(net) = &self.network {
-            let st = net.get_stats().await;
-            return Ok(st.connected_peers as u64);
-        }
-        Ok(0)
+        self.enforce_rate_limit().await?;
+        Ok(self.peer_count_inner().await)
     }
 
     async fn version(&self) -> RpcResult<String> {
+        self.enforce_rate_limit().await?;
         Ok(format!("catalyst-rpc/{}", env!("CARGO_PKG_VERSION")))
     }
 
     async fn head(&self) -> RpcResult<RpcHead> {
-        let applied_cycle = self.block_number().await?;
+        self.enforce_rate_limit().await?;
+        let applied_cycle = self.block_number_inner().await;
         let applied_lsu_hash = self
             .storage
             .get_metadata("consensus:last_applied_lsu_hash")
@@ -732,6 +802,7 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn get_code(&self, address: String) -> RpcResult<String> {
+        self.enforce_rate_limit().await?;
         let addr20 = parse_hex_20(&address).map_err(ErrorObjectOwned::from)?;
         let key = evm_code_key(&addr20);
         let bytes = self
@@ -744,6 +815,7 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn get_last_return(&self, address: String) -> RpcResult<String> {
+        self.enforce_rate_limit().await?;
         let addr20 = parse_hex_20(&address).map_err(ErrorObjectOwned::from)?;
         let key = evm_last_return_key(&addr20);
         let bytes = self
@@ -756,6 +828,7 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn get_storage_at(&self, address: String, slot: String) -> RpcResult<String> {
+        self.enforce_rate_limit().await?;
         let addr20 = parse_hex_20(&address).map_err(ErrorObjectOwned::from)?;
         let slot32 = parse_hex_32bytes(&slot).map_err(ErrorObjectOwned::from)?;
         let key = evm_storage_key(&addr20, &slot32);
@@ -775,13 +848,14 @@ pub async fn start_rpc_http(
     storage: Arc<catalyst_storage::StorageManager>,
     network: Option<Arc<catalyst_network::NetworkService>>,
     tx_submit: Option<mpsc::UnboundedSender<catalyst_core::protocol::Transaction>>,
+    rate_limit_per_minute: u32,
 ) -> Result<ServerHandle, RpcServerError> {
     let server = jsonrpsee::server::ServerBuilder::default()
         .build(bind_address)
         .await
         .map_err(|e| RpcServerError::Server(e.to_string()))?;
 
-    let rpc = CatalystRpcImpl::new(storage, network, tx_submit).into_rpc();
+    let rpc = CatalystRpcImpl::new(storage, network, tx_submit, rate_limit_per_minute).into_rpc();
     let handle = server.start(rpc);
 
     Ok(handle)
@@ -853,11 +927,7 @@ mod tests {
             .unwrap();
 
         // Call RPC method directly.
-        let rpc = CatalystRpcImpl::new(
-            std::sync::Arc::new(storage),
-            None,
-            None,
-        );
+        let rpc = CatalystRpcImpl::new(std::sync::Arc::new(storage), None, None, 1000);
         let head = rpc.head().await.unwrap();
         let proof = rpc.get_balance_proof(format!("0x{}", hex::encode(pk))).await.unwrap();
         assert_eq!(proof.balance, "123");

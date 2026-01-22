@@ -16,6 +16,8 @@
 - If enabling RPC:
   - keep `rpc.address = "127.0.0.1"` by default
   - tighten `cors_origins` (do not use `"*"` on public infrastructure)
+  - if you bind to a non-loopback address (e.g. `0.0.0.0`), you must explicitly set:
+    - `allow_unsafe_exposure = true`
 
 ### Bootstrap procedure
 - Obtain a bootstrap peer multiaddr (example placeholder):
