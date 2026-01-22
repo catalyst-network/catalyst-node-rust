@@ -285,6 +285,18 @@ mod tests {
         let all = select_producers_for_next_cycle(&workers, &seed, 999);
         assert_eq!(all.len(), workers.len());
     }
+
+    #[test]
+    fn prng_32_uses_blake2b_truncated_and_is_stable() {
+        // Fixed test vector to prevent accidental hash algorithm drift.
+        // Computed as: blake2b_512(seed || "catalyst-prng-32") truncated to 32 bytes.
+        let seed: BlockHash = [42u8; 32];
+        let r = prng_32(&seed);
+        assert_eq!(
+            hex::encode(r),
+            "f9dbd93cdbff4cc030123a892ca9115ea14ef85f68db8dd6ae039668aefca48a"
+        );
+    }
 }
 
 fn xor32(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
@@ -300,8 +312,15 @@ fn xor32(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
 /// NOTE: Replace with the paper’s full hashing/PRNG approach once the crypto crate
 /// defines it. This is stable and deterministic for tests.
 fn prng_32(seed: &[u8; 32]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
+    use blake2::{Blake2b512, Digest};
+
+    // NOTE: Consensus paper v1.2 §1.2 specifies Blake2b as the hashing choice.
+    // For now we follow the same convention used elsewhere in the repo:
+    // `blake2b_256(x) := first_32_bytes(blake2b_512(x))`
+    //
+    // Domain separation tag:
+    // - Keep the same tag string as the previous placeholder implementation so the intent remains clear.
+    let mut h = Blake2b512::new();
     h.update(seed);
     h.update(b"catalyst-prng-32");
     let out = h.finalize();
