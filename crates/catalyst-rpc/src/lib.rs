@@ -574,12 +574,10 @@ impl CatalystRpcServer for CatalystRpcImpl {
             }
         }
 
-        // tx_id = sha256(bincode(tx))
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(&bytes);
-        let out = h.finalize();
-        let tx_id = format!("0x{}", hex::encode(out));
+        // Canonical tx id (must match P2P/mempool tx ids).
+        let h = catalyst_core::protocol::transaction_id(&tx)
+            .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e)))?;
+        let tx_id = format!("0x{}", hex::encode(h));
 
         if let Some(sender) = &self.tx_submit {
             sender.send(tx).map_err(|_| {

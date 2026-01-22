@@ -101,14 +101,9 @@ impl NetworkMessage for ProtocolTxGossip {
 
 impl ProtocolTxGossip {
     pub fn new(tx: corep::Transaction, received_at_ms: u64) -> CatalystResult<Self> {
-        // Stable tx id for deduplication: hash bincode(tx)
-        let bytes = bincode::serialize(&tx)
-            .map_err(|e| catalyst_utils::error::CatalystError::Serialization(e.to_string()))?;
-        let mut hasher = blake2::Blake2b512::new();
-        hasher.update(&bytes);
-        let result = hasher.finalize();
-        let mut tx_id = [0u8; 32];
-        tx_id.copy_from_slice(&result[..32]);
+        // Stable tx id for deduplication: use canonical protocol tx id.
+        let tx_id = corep::transaction_id(&tx)
+            .map_err(|e| catalyst_utils::error::CatalystError::Serialization(e))?;
 
         Ok(Self { tx_id, tx, received_at_ms })
     }

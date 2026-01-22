@@ -12,6 +12,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{BlockHash, NodeId, Timestamp};
 
+/// Canonical transaction id used for mempool/network deduplication.
+///
+/// Current definition (stable for dev/testnet):
+/// - `tx_id = blake2b_256(bincode(Transaction))`
+///
+/// This MUST remain consistent across:
+/// - RPC `catalyst_sendRawTransaction` return values
+/// - P2P tx gossip ids / mempool persistence keys
+pub fn transaction_id(tx: &Transaction) -> Result<Hash32, String> {
+    use blake2::{Blake2b512, Digest};
+    let bytes = bincode::serialize(tx).map_err(|e| format!("serialize tx: {e}"))?;
+    let mut hasher = Blake2b512::new();
+    hasher.update(&bytes);
+    let out = hasher.finalize();
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&out[..32]);
+    Ok(h)
+}
+
 /// Canonical signing payload for a transaction: `bincode(TransactionCore) || timestamp_le`.
 ///
 /// This is a temporary “real signature validation” step while aggregated signatures and
