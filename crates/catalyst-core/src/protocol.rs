@@ -162,6 +162,58 @@ impl Transaction {
     }
 }
 
+/// Determine the canonical sender public key for a transaction (current single-sender rule).
+///
+/// Rules (scaffold, aligned with current node/RPC expectations):
+/// - `WorkerRegistration` / `SmartContract`: sender is `entries[0].public_key`
+/// - transfers: sender is the (single) pubkey with a negative `NonConfidential` amount
+///
+/// Returns `None` if:
+/// - there is no identifiable sender
+/// - multiple distinct negative-amount senders are present (multi-sender unsupported for now)
+pub fn transaction_sender_pubkey(tx: &Transaction) -> Option<[u8; 32]> {
+    match tx.core.tx_type {
+        TransactionType::WorkerRegistration | TransactionType::SmartContract => {
+            tx.core.entries.get(0).map(|e| e.public_key)
+        }
+        _ => {
+            let mut sender: Option<[u8; 32]> = None;
+            for e in &tx.core.entries {
+                if let EntryAmount::NonConfidential(v) = e.amount {
+                    if v < 0 {
+                        match sender {
+                            None => sender = Some(e.public_key),
+                            Some(pk) if pk == e.public_key => {}
+                            Some(_) => return None,
+                        }
+                    }
+                }
+            }
+            sender
+        }
+    }
+}
+
+/// Check whether `tx.core.lock_time` (treated as unix seconds) is unlocked at `now_secs`.
+pub fn transaction_is_unlocked(tx: &Transaction, now_secs: u64) -> bool {
+    (tx.core.lock_time as u64) <= now_secs
+}
+
+/// Validate basic structural rules plus lock-time at `now_secs`.
+pub fn validate_basic_and_unlocked(tx: &Transaction, now_secs: u64) -> Result<(), String> {
+    tx.validate_basic()?;
+    if tx.core.nonce == 0 {
+        return Err("Transaction nonce must be > 0".to_string());
+    }
+    if !transaction_is_unlocked(tx, now_secs) {
+        return Err(format!(
+            "Transaction not yet unlocked: lock_time={} now={}",
+            tx.core.lock_time, now_secs
+        ));
+    }
+    Ok(())
+}
+
 /// Partial ledger state update `ΔLn,j` (§5.2.1): sorted entries + tx-signature hash tree root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartialLedgerStateUpdate {
@@ -305,6 +357,62 @@ mod tests {
         let a = producer_selection_r_n_plus_1(&seed);
         let b = prng_32(&seed);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn tx_sender_pubkey_is_determined_for_single_sender_transfer() {
+        let from = [1u8; 32];
+        let to = [2u8; 32];
+        let tx = Transaction {
+            core: TransactionCore {
+                tx_type: TransactionType::NonConfidentialTransfer,
+                entries: vec![
+                    TransactionEntry {
+                        public_key: from,
+                        amount: EntryAmount::NonConfidential(-1),
+                    },
+                    TransactionEntry {
+                        public_key: to,
+                        amount: EntryAmount::NonConfidential(1),
+                    },
+                ],
+                nonce: 1,
+                lock_time: 0,
+                fees: 0,
+                data: Vec::new(),
+            },
+            signature: AggregatedSignature(vec![0u8; 64]),
+            timestamp: 0,
+        };
+        assert_eq!(transaction_sender_pubkey(&tx), Some(from));
+    }
+
+    #[test]
+    fn tx_sender_pubkey_is_none_for_multi_sender_negative_entries() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let tx = Transaction {
+            core: TransactionCore {
+                tx_type: TransactionType::NonConfidentialTransfer,
+                entries: vec![
+                    TransactionEntry {
+                        public_key: a,
+                        amount: EntryAmount::NonConfidential(-1),
+                    },
+                    TransactionEntry {
+                        public_key: b,
+                        amount: EntryAmount::NonConfidential(-1),
+                    },
+                ],
+                nonce: 1,
+                lock_time: 0,
+                fees: 0,
+                data: Vec::new(),
+            },
+            signature: AggregatedSignature(vec![0u8; 64]),
+            timestamp: 0,
+        };
+        assert_eq!(transaction_sender_pubkey(&tx), None);
     }
 }
 

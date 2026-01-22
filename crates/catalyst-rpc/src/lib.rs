@@ -411,25 +411,7 @@ fn verify_tx_signature(tx: &catalyst_core::protocol::Transaction) -> bool {
 }
 
 fn tx_sender_pubkey(tx: &catalyst_core::protocol::Transaction) -> Option<[u8; 32]> {
-    match tx.core.tx_type {
-        catalyst_core::protocol::TransactionType::WorkerRegistration => tx.core.entries.get(0).map(|e| e.public_key),
-        catalyst_core::protocol::TransactionType::SmartContract => tx.core.entries.get(0).map(|e| e.public_key),
-        _ => {
-            let mut sender: Option<[u8; 32]> = None;
-            for e in &tx.core.entries {
-                if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
-                    if v < 0 {
-                        match sender {
-                            None => sender = Some(e.public_key),
-                            Some(pk) if pk == e.public_key => {}
-                            Some(_) => return None,
-                        }
-                    }
-                }
-            }
-            sender
-        }
-    }
+    catalyst_core::protocol::transaction_sender_pubkey(tx)
 }
 
 /// Minimal RPC implementation backed by `catalyst-storage`.
