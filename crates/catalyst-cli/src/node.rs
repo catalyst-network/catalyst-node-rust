@@ -12,6 +12,7 @@ use catalyst_utils::{
     CatalystDeserialize, CatalystSerialize, MessageType, MessageEnvelope,
     utils::current_timestamp_ms,
 };
+use catalyst_utils::{increment_counter, observe_histogram, set_gauge};
 use catalyst_consensus::types::hash_data;
 use catalyst_utils::state::StateManager;
 
@@ -1062,7 +1063,7 @@ async fn apply_lsu_with_root_check(
     store: &StorageManager,
     lsu: &catalyst_consensus::types::LedgerStateUpdate,
     expected_state_root: [u8; 32],
-) -> Result<bool> {
+) -> Result<()> {
     // Capture prev root so we can restore the cache if we revert.
     let prev_root = store
         .get_metadata("consensus:last_applied_state_root")
@@ -1088,7 +1089,7 @@ async fn apply_lsu_with_root_check(
 
     let got = apply_lsu_to_storage(store, lsu).await?;
     if got == expected_state_root {
-        return Ok(true);
+        return Ok(());
     }
 
     // Revert
@@ -1098,7 +1099,11 @@ async fn apply_lsu_with_root_check(
         .map_err(|e| anyhow::anyhow!("snapshot revert failed: {e}"))?;
     // Restore cached root to match reverted state.
     store.set_state_root_cache(prev_root);
-    Ok(false)
+    Err(anyhow::anyhow!(
+        "state_root mismatch expected={} got={}",
+        hex_encode(&expected_state_root),
+        hex_encode(&got)
+    ))
 }
 
 /// Main Catalyst node implementation.
@@ -1394,6 +1399,60 @@ impl CatalystNode {
         // Rehydrate mempool from persisted txs (best-effort).
         if let Some(store) = &storage {
             rehydrate_mempool_from_storage(store.as_ref(), &mempool).await;
+        }
+
+        // --- Observability loop (logs + gauges) ---
+        // Export operator-relevant signals without requiring external infra.
+        {
+            let net = network.clone();
+            let mempool = mempool.clone();
+            let store = storage.clone();
+            let node_id = producer_id.clone();
+            let mut shutdown_rx_obs = shutdown_rx.clone();
+            let handle = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {},
+                        _ = shutdown_rx_obs.changed() => {
+                            if *shutdown_rx_obs.borrow() { break; }
+                            continue;
+                        }
+                    }
+                    if *shutdown_rx_obs.borrow() { break; }
+
+                    let peers = net.get_stats().await.connected_peers as u64;
+                    let mp_len = mempool.read().await.len() as u64;
+                    set_gauge!("network_peers_connected", peers as f64);
+                    set_gauge!("mempool_size", mp_len as f64);
+
+                    let applied_cycle = if let Some(store) = &store {
+                        store.get_metadata("consensus:last_applied_cycle")
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|b| {
+                                if b.len() != 8 { return None; }
+                                let mut a = [0u8; 8];
+                                a.copy_from_slice(&b);
+                                Some(u64::from_le_bytes(a))
+                            })
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+
+                    info!(
+                        "OBS node={} peers={} mempool={} applied_cycle={}",
+                        node_id,
+                        peers,
+                        mp_len,
+                        applied_cycle
+                    );
+                }
+            });
+            self.network_tasks.push(handle);
         }
 
         // Initialize faucet (dev/testnet): create a deterministic funded account if missing.
@@ -1824,19 +1883,13 @@ impl CatalystNode {
                                                                 )
                                                                 .await
                                                                 {
-                                                                    Ok(true) => applied = true,
-                                                                    Ok(false) => {
-                                                                        tracing::warn!(
-                                                                            "Rejected LSU via CID cycle={} (state_root mismatch) cid={}",
-                                                                            ref_msg.cycle,
-                                                                            ref_msg.cid
-                                                                        );
-                                                                        continue;
-                                                                    }
+                                                                    Ok(()) => applied = true,
                                                                     Err(e) => {
                                                                         tracing::warn!(
-                                                                            "Failed to verify/apply LSU via CID cycle={} err={}",
+                                                                            "Rejected LSU via CID cycle={} cid={} expected_root={} err={}",
                                                                             ref_msg.cycle,
+                                                                            ref_msg.cid,
+                                                                            hex_encode(&ref_msg.state_root),
                                                                             e
                                                                         );
                                                                         continue;
@@ -2077,6 +2130,7 @@ impl CatalystNode {
                                                     info.expected_state_root,
                                                 )
                                                 .await
+                                                .map(|_| true)
                                                 .unwrap_or(false);
                                             }
                                             if ok {
