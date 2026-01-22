@@ -357,7 +357,7 @@ impl CollaborativeConsensus {
         // First, consume any previously buffered messages of this type.
         for env in self.drain_pending_by_type(MessageType::ProducerQuantity).await {
             if let Ok(q) = env.extract_message::<ProducerQuantity>() {
-                if q.cycle_number == self.current_cycle {
+                if q.cycle_number == self.current_cycle && self.selected_producers.contains(&q.producer_id) {
                     out.insert(q.producer_id.clone(), q);
                 }
             }
@@ -375,7 +375,7 @@ impl CollaborativeConsensus {
                 Ok(Some(env)) => {
                     if env.message_type == MessageType::ProducerQuantity {
                         if let Ok(q) = env.extract_message::<ProducerQuantity>() {
-                            if q.cycle_number == self.current_cycle {
+                            if q.cycle_number == self.current_cycle && self.selected_producers.contains(&q.producer_id) {
                                 out.insert(q.producer_id.clone(), q);
                             }
                         }
@@ -407,7 +407,7 @@ impl CollaborativeConsensus {
 
         for env in self.drain_pending_by_type(MessageType::ProducerCandidate).await {
             if let Ok(c) = env.extract_message::<ProducerCandidate>() {
-                if c.cycle_number == self.current_cycle {
+                if c.cycle_number == self.current_cycle && self.selected_producers.contains(&c.producer_id) {
                     out.insert(c.producer_id.clone(), c);
                 }
             }
@@ -425,7 +425,7 @@ impl CollaborativeConsensus {
                 Ok(Some(env)) => {
                     if env.message_type == MessageType::ProducerCandidate {
                         if let Ok(c) = env.extract_message::<ProducerCandidate>() {
-                            if c.cycle_number == self.current_cycle {
+                            if c.cycle_number == self.current_cycle && self.selected_producers.contains(&c.producer_id) {
                                 out.insert(c.producer_id.clone(), c);
                             }
                         }
@@ -456,7 +456,7 @@ impl CollaborativeConsensus {
 
         for env in self.drain_pending_by_type(MessageType::ProducerVote).await {
             if let Ok(v) = env.extract_message::<ProducerVote>() {
-                if v.cycle_number == self.current_cycle {
+                if v.cycle_number == self.current_cycle && self.selected_producers.contains(&v.producer_id) {
                     out.insert(v.producer_id.clone(), v);
                 }
             }
@@ -474,7 +474,7 @@ impl CollaborativeConsensus {
                 Ok(Some(env)) => {
                     if env.message_type == MessageType::ProducerVote {
                         if let Ok(v) = env.extract_message::<ProducerVote>() {
-                            if v.cycle_number == self.current_cycle {
+                            if v.cycle_number == self.current_cycle && self.selected_producers.contains(&v.producer_id) {
                                 out.insert(v.producer_id.clone(), v);
                             }
                         }

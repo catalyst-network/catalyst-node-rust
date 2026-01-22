@@ -90,7 +90,7 @@ impl ConstructionPhase {
 
 }
 
-fn blake2b_256_tagged(tag: &'static [u8], parts: &[&[u8]]) -> Hash {
+pub(crate) fn blake2b_256_tagged(tag: &'static [u8], parts: &[&[u8]]) -> Hash {
     use blake2::{Blake2b512, Digest};
     let mut hasher = Blake2b512::new();
     hasher.update(tag);
@@ -101,6 +101,15 @@ fn blake2b_256_tagged(tag: &'static [u8], parts: &[&[u8]]) -> Hash {
     let mut out = [0u8; 32];
     out.copy_from_slice(&result[..32]);
     out
+}
+
+pub(crate) fn hash_id_list_tagged(tag: &'static [u8], ids: &[String]) -> Hash {
+    // Caller must ensure ids are already deterministic (sorted/deduped).
+    let mut parts: Vec<&[u8]> = Vec::with_capacity(ids.len());
+    for id in ids {
+        parts.push(id.as_bytes());
+    }
+    blake2b_256_tagged(tag, &parts)
 }
 
 /// Deterministic Merkle root over a list of signature byte strings.
@@ -172,6 +181,13 @@ impl CampaigningPhase {
 
     /// Add a collected producer quantity
     pub fn add_quantity(&mut self, quantity: ProducerQuantity) {
+        // Basic validation: ignore wrong-cycle or empty-producer messages.
+        if quantity.cycle_number != self.producer.cycle_number {
+            return;
+        }
+        if quantity.producer_id.is_empty() {
+            return;
+        }
         self.collected_quantities.insert(quantity.producer_id.clone(), quantity);
     }
 
@@ -209,21 +225,23 @@ impl CampaigningPhase {
             }.into());
         }
 
-        // Count occurrences of each first hash (BTreeMap for deterministic iteration/logging)
-        let mut hash_counts: BTreeMap<Hash, Vec<String>> = BTreeMap::new();
-        for (producer_id, quantity) in &self.collected_quantities {
-            hash_counts.entry(quantity.first_hash)
-                .or_insert_with(Vec::new)
-                .push(producer_id.clone());
+        // Count occurrences of each first hash (BTreeMap for deterministic tie-breaking).
+        let mut hash_counts: BTreeMap<Hash, BTreeMap<String, ()>> = BTreeMap::new();
+        for q in self.collected_quantities.values() {
+            hash_counts
+                .entry(q.first_hash)
+                .or_insert_with(BTreeMap::new)
+                .insert(q.producer_id.clone(), ());
         }
 
-        // Find majority hash (required_majority is derived from membership, not from received count)
+        // Find the hash with the highest count; ties resolve by hash ordering (BTreeMap).
         let mut best_hash: Option<Hash> = None;
-        let mut best_list: Vec<String> = Vec::new();
+        let mut best_count: usize = 0;
         for (h, producers) in hash_counts.iter() {
-            if producers.len() > best_list.len() {
+            let n = producers.len();
+            if n > best_count {
                 best_hash = Some(*h);
-                best_list = producers.clone();
+                best_count = n;
             }
         }
         let Some(majority_hash) = best_hash else {
@@ -233,7 +251,10 @@ impl CampaigningPhase {
                 details: format!(" (phase=campaigning cycle={})", self.producer.cycle_number),
             }.into());
         };
-        let producer_list = best_list;
+        let producer_list = hash_counts
+            .get(&majority_hash)
+            .map(|m| m.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
 
         if producer_list.len() < required_majority {
             log_warn!(
@@ -255,7 +276,7 @@ impl CampaigningPhase {
             }.into());
         }
 
-        // Include self if we have the majority hash
+        // Deterministic witness list: sorted + dedup; include self if we have the majority hash.
         let producer_list_len = producer_list.len();
         let mut final_producer_list = producer_list;
         if let Some(our_hash) = self.producer.first_hash {
@@ -263,16 +284,19 @@ impl CampaigningPhase {
                 final_producer_list.push(self.producer.id.clone());
             }
         }
+        final_producer_list.sort();
+        final_producer_list.dedup();
 
         // Create hash of producer list for verification
         let producer_list_hash = self.hash_producer_list(&final_producer_list)?;
         
         // Store producer list
-        self.producer.producer_list = Some(final_producer_list);
+        self.producer.producer_list = Some(final_producer_list.clone());
 
         let candidate = ProducerCandidate {
             majority_hash,
             producer_list_hash,
+            producer_list: final_producer_list,
             cycle_number: self.producer.cycle_number,
             producer_id: self.producer.id.clone(),
             timestamp: current_timestamp_ms(),
@@ -284,20 +308,9 @@ impl CampaigningPhase {
     }
 
     fn hash_producer_list(&self, producer_list: &[String]) -> CatalystResult<Hash> {
-        use blake2::{Blake2b512, Digest};
-        
-        let mut sorted_list = producer_list.to_vec();
-        sorted_list.sort();
-        
-        let mut hasher = Blake2b512::new();
-        for producer_id in &sorted_list {
-            hasher.update(producer_id.as_bytes());
-        }
-        
-        let result = hasher.finalize();
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&result[..32]);
-        Ok(hash)
+        // Domain-separated list hashing; list must already be deterministic (sorted/deduped).
+        const TAG: &[u8] = b"catalyst:campaigning:producer_list:v1";
+        Ok(hash_id_list_tagged(TAG, producer_list))
     }
 }
 
@@ -317,6 +330,22 @@ impl VotingPhase {
 
     /// Add a collected producer candidate
     pub fn add_candidate(&mut self, candidate: ProducerCandidate) {
+        // Basic validation: ignore wrong-cycle candidates.
+        if candidate.cycle_number != self.producer.cycle_number {
+            return;
+        }
+        // Verify producer_list_hash matches the provided producer_list.
+        let mut list = candidate.producer_list.clone();
+        list.sort();
+        list.dedup();
+        const TAG: &[u8] = b"catalyst:campaigning:producer_list:v1";
+        let expected = hash_id_list_tagged(TAG, &list);
+        if expected != candidate.producer_list_hash {
+            return;
+        }
+        // Store normalized list (sorted/deduped) to ensure deterministic downstream behavior.
+        let mut candidate = candidate;
+        candidate.producer_list = list;
         self.collected_candidates.insert(candidate.producer_id.clone(), candidate);
     }
 
@@ -451,28 +480,29 @@ impl VotingPhase {
     }
 
     fn create_final_producer_list(&self, majority_hash: &Hash) -> CatalystResult<Vec<String>> {
-        // Collect all producer lists from candidates with majority hash
+        // Collect all witness lists from candidates with majority hash and count producer occurrences.
         let mut producer_counts: BTreeMap<String, usize> = BTreeMap::new();
-        let mut total_candidates = 0;
+        let mut total_candidates = 0usize;
 
         for candidate in self.collected_candidates.values() {
-            if candidate.majority_hash == *majority_hash {
-                total_candidates += 1;
-                // In a real implementation, we'd need to decode the producer list from the hash
-                // For now, we'll use the producer who submitted the candidate
-                *producer_counts.entry(candidate.producer_id.clone()).or_insert(0) += 1;
+            if candidate.majority_hash != *majority_hash {
+                continue;
+            }
+            total_candidates += 1;
+            for pid in &candidate.producer_list {
+                *producer_counts.entry(pid.clone()).or_insert(0) += 1;
             }
         }
 
-        // Include only producers that appear in at least P/2 lists
-        let threshold = (total_candidates + 1) / 2;  // P/2 threshold
+        // Include only producers that appear in at least P/2 witness lists.
+        let threshold = (total_candidates + 1) / 2;
         let mut final_list: Vec<String> = producer_counts
             .into_iter()
             .filter(|(_, count)| *count >= threshold)
             .map(|(producer_id, _)| producer_id)
             .collect();
         final_list.sort();
-
+        final_list.dedup();
         Ok(final_list)
     }
 
@@ -506,20 +536,9 @@ impl VotingPhase {
     }
 
     fn hash_producer_list(&self, producer_list: &[String]) -> CatalystResult<Hash> {
-        use blake2::{Blake2b512, Digest};
-        
-        let mut sorted_list = producer_list.to_vec();
-        sorted_list.sort();
-        
-        let mut hasher = Blake2b512::new();
-        for producer_id in &sorted_list {
-            hasher.update(producer_id.as_bytes());
-        }
-        
-        let result = hasher.finalize();
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&result[..32]);
-        Ok(hash)
+        // Domain-separated vote list hashing; list must already be deterministic (sorted/deduped).
+        const TAG: &[u8] = b"catalyst:voting:vote_list:v1";
+        Ok(hash_id_list_tagged(TAG, producer_list))
     }
 }
 
@@ -695,20 +714,9 @@ impl SynchronizationPhase {
     }
 
     fn hash_producer_list(&self, producer_list: &[String]) -> CatalystResult<Hash> {
-        use blake2::{Blake2b512, Digest};
-        
-        let mut sorted_list = producer_list.to_vec();
-        sorted_list.sort();
-        
-        let mut hasher = Blake2b512::new();
-        for producer_id in &sorted_list {
-            hasher.update(producer_id.as_bytes());
-        }
-        
-        let result = hasher.finalize();
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&result[..32]);
-        Ok(hash)
+        // Must match VotingPhase vote_list hashing.
+        const TAG: &[u8] = b"catalyst:voting:vote_list:v1";
+        Ok(hash_id_list_tagged(TAG, producer_list))
     }
 }
 
