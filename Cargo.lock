@@ -1416,6 +1416,7 @@ name = "catalyst-utils"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bincode",
  "hex",
  "libp2p",
  "prometheus",
