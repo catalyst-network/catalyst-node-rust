@@ -109,18 +109,7 @@ impl ProtocolTxGossip {
     }
 
     pub fn validate_basic(&self, now_secs: u64) -> Result<(), String> {
-        self.tx.validate_basic()?;
-        if self.tx.core.nonce == 0 {
-            return Err("Transaction nonce must be > 0".to_string());
-        }
-        // Interpret lock_time as unix seconds "not before".
-        if (self.tx.core.lock_time as u64) > now_secs {
-            return Err(format!(
-                "Transaction not yet unlocked: lock_time={} now={}",
-                self.tx.core.lock_time, now_secs
-            ));
-        }
-        Ok(())
+        corep::validate_basic_and_unlocked(&self.tx, now_secs)
     }
 
     pub fn to_consensus_entries(&self) -> Vec<TransactionEntry> {
@@ -176,25 +165,7 @@ impl ProtocolTxGossip {
     }
 
     pub fn sender_pubkey(&self) -> Option<[u8; 32]> {
-        match self.tx.core.tx_type {
-            corep::TransactionType::WorkerRegistration => self.tx.core.entries.get(0).map(|e| e.public_key),
-            corep::TransactionType::SmartContract => self.tx.core.entries.get(0).map(|e| e.public_key),
-            _ => {
-                let mut sender: Option<[u8; 32]> = None;
-                for e in &self.tx.core.entries {
-                    if let EntryAmount::NonConfidential(v) = e.amount {
-                        if v < 0 {
-                            match sender {
-                                None => sender = Some(e.public_key),
-                                Some(pk) if pk == e.public_key => {}
-                                Some(_) => return None,
-                            }
-                        }
-                    }
-                }
-                sender
-            }
-        }
+        corep::transaction_sender_pubkey(&self.tx)
     }
 }
 
