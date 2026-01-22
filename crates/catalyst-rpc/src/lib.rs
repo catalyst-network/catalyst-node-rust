@@ -150,6 +150,12 @@ pub trait CatalystRpc {
     #[method(name = "catalyst_head")]
     async fn head(&self) -> RpcResult<RpcHead>;
 
+    /// Get the current worker pool derived from on-chain state (`workers:<pubkey>` markers).
+    ///
+    /// Returns a sorted list of 32-byte hex public keys (0x-prefixed).
+    #[method(name = "catalyst_getWorkers")]
+    async fn get_workers(&self) -> RpcResult<Vec<String>>;
+
     /// Get EVM contract bytecode for a 20-byte hex address.
     #[method(name = "catalyst_getCode")]
     async fn get_code(&self, address: String) -> RpcResult<String>;
@@ -521,6 +527,34 @@ impl CatalystRpcServer for CatalystRpcImpl {
 
     async fn get_account(&self, _address: String) -> RpcResult<Option<RpcAccount>> {
         Ok(None)
+    }
+
+    async fn get_workers(&self) -> RpcResult<Vec<String>> {
+        let mut out: Vec<[u8; 32]> = Vec::new();
+        if let Ok(iter) = self.storage.engine().iterator("accounts") {
+            for item in iter {
+                if let Ok((k, v)) = item {
+                    if !k.starts_with(b"workers:") {
+                        continue;
+                    }
+                    if v.as_ref() != [1u8] {
+                        continue;
+                    }
+                    if k.len() != b"workers:".len() + 32 {
+                        continue;
+                    }
+                    let mut pk = [0u8; 32];
+                    pk.copy_from_slice(&k[b"workers:".len()..]);
+                    out.push(pk);
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out
+            .into_iter()
+            .map(|pk| format!("0x{}", hex::encode(pk)))
+            .collect())
     }
 
     async fn send_raw_transaction(&self, _data: String) -> RpcResult<String> {
