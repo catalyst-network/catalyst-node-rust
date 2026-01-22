@@ -214,6 +214,58 @@ pub fn validate_basic_and_unlocked(tx: &Transaction, now_secs: u64) -> Result<()
     Ok(())
 }
 
+/// Validate transaction semantics required for mempool admission (pure checks, no state access).
+///
+/// This intentionally does NOT verify signatures or balances; those require crypto/state.
+///
+/// Current MVP rules:
+/// - fees must be 0 (fees are not yet implemented in the runtime/state machine)
+/// - only non-confidential amounts are supported
+/// - non-confidential transfers must conserve value (sum == 0) and have a single sender
+pub fn validate_tx_semantics_for_mempool(tx: &Transaction) -> Result<(), String> {
+    if tx.core.fees != 0 {
+        return Err("Fees not supported (expected fees=0)".to_string());
+    }
+
+    match tx.core.tx_type {
+        TransactionType::WorkerRegistration | TransactionType::SmartContract => {
+            // validate_basic already enforces the 1-entry + amount==0 scaffold for these types.
+            Ok(())
+        }
+        TransactionType::NonConfidentialTransfer => {
+            // Ensure all entries are non-confidential and conserve value.
+            let mut sum: i64 = 0;
+            let mut saw_negative = false;
+            for e in &tx.core.entries {
+                match e.amount {
+                    EntryAmount::NonConfidential(v) => {
+                        sum = sum.saturating_add(v);
+                        if v < 0 {
+                            saw_negative = true;
+                        }
+                    }
+                    EntryAmount::Confidential { .. } => {
+                        return Err("Confidential amounts not supported yet".to_string());
+                    }
+                }
+            }
+            if !saw_negative {
+                return Err("Transfer must include a negative sender entry".to_string());
+            }
+            if sum != 0 {
+                return Err("Transfer entries must conserve value (sum must be 0)".to_string());
+            }
+            if transaction_sender_pubkey(tx).is_none() {
+                return Err("Multi-sender transactions not supported yet".to_string());
+            }
+            Ok(())
+        }
+        TransactionType::ConfidentialTransfer
+        | TransactionType::DataStorageRequest
+        | TransactionType::DataStorageRetrieve => Err("Transaction type not supported yet".to_string()),
+    }
+}
+
 /// Partial ledger state update `ΔLn,j` (§5.2.1): sorted entries + tx-signature hash tree root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartialLedgerStateUpdate {
@@ -413,6 +465,58 @@ mod tests {
             timestamp: 0,
         };
         assert_eq!(transaction_sender_pubkey(&tx), None);
+    }
+
+    #[test]
+    fn mempool_semantics_reject_nonzero_fees() {
+        let tx = Transaction {
+            core: TransactionCore {
+                tx_type: TransactionType::NonConfidentialTransfer,
+                entries: vec![
+                    TransactionEntry {
+                        public_key: [1u8; 32],
+                        amount: EntryAmount::NonConfidential(-1),
+                    },
+                    TransactionEntry {
+                        public_key: [2u8; 32],
+                        amount: EntryAmount::NonConfidential(1),
+                    },
+                ],
+                nonce: 1,
+                lock_time: 0,
+                fees: 1,
+                data: Vec::new(),
+            },
+            signature: AggregatedSignature(vec![0u8; 64]),
+            timestamp: 0,
+        };
+        assert!(validate_tx_semantics_for_mempool(&tx).is_err());
+    }
+
+    #[test]
+    fn mempool_semantics_reject_non_conserving_transfer() {
+        let tx = Transaction {
+            core: TransactionCore {
+                tx_type: TransactionType::NonConfidentialTransfer,
+                entries: vec![
+                    TransactionEntry {
+                        public_key: [1u8; 32],
+                        amount: EntryAmount::NonConfidential(-1),
+                    },
+                    TransactionEntry {
+                        public_key: [2u8; 32],
+                        amount: EntryAmount::NonConfidential(2),
+                    },
+                ],
+                nonce: 1,
+                lock_time: 0,
+                fees: 0,
+                data: Vec::new(),
+            },
+            signature: AggregatedSignature(vec![0u8; 64]),
+            timestamp: 0,
+        };
+        assert!(validate_tx_semantics_for_mempool(&tx).is_err());
     }
 }
 

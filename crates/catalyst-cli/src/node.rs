@@ -468,12 +468,53 @@ fn tx_is_sane(entries: &[catalyst_consensus::types::TransactionEntry]) -> bool {
 }
 
 async fn tx_is_funded(store: &StorageManager, entries: &[catalyst_consensus::types::TransactionEntry]) -> bool {
-    // Minimal sufficient-funds check:
-    // if an entry is negative, ensure balance + delta >= 0 for that pubkey.
+    // Sufficient-funds check with aggregation:
+    // for each pubkey, ensure (balance + sum(deltas)) >= 0.
+    use std::collections::BTreeMap;
+    let mut deltas: BTreeMap<[u8; 32], i64> = BTreeMap::new();
     for e in entries {
-        if e.amount < 0 {
-            let bal = get_balance_i64(store, &e.public_key).await;
-            if bal.saturating_add(e.amount) < 0 {
+        *deltas.entry(e.public_key).or_insert(0) = deltas
+            .get(&e.public_key)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(e.amount);
+    }
+    for (pk, delta) in deltas {
+        if delta < 0 {
+            let bal = get_balance_i64(store, &pk).await;
+            if bal.saturating_add(delta) < 0 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+async fn tx_is_funded_protocol(store: &StorageManager, tx: &catalyst_core::protocol::Transaction) -> bool {
+    use catalyst_core::protocol::{EntryAmount, TransactionType};
+    use std::collections::BTreeMap;
+
+    match tx.core.tx_type {
+        TransactionType::NonConfidentialTransfer => {}
+        // No balance impact (for now) for these scaffolded tx types.
+        TransactionType::WorkerRegistration | TransactionType::SmartContract => return true,
+        _ => return false,
+    }
+
+    let mut deltas: BTreeMap<[u8; 32], i64> = BTreeMap::new();
+    for e in &tx.core.entries {
+        let v = match e.amount {
+            EntryAmount::NonConfidential(v) => v,
+            EntryAmount::Confidential { .. } => return false,
+        };
+        *deltas.entry(e.public_key).or_insert(0) =
+            deltas.get(&e.public_key).copied().unwrap_or(0).saturating_add(v);
+    }
+
+    for (pk, delta) in deltas {
+        if delta < 0 {
+            let bal = get_balance_i64(store, &pk).await;
+            if bal.saturating_add(delta) < 0 {
                 return false;
             }
         }
@@ -1539,7 +1580,29 @@ impl CatalystNode {
                             // Prefer protocol-shaped txs; fall back to legacy TxGossip.
                             let now_secs = current_timestamp_ms() / 1000;
                             if let Ok(tx) = envelope.extract_message::<ProtocolTxGossip>() {
+                                // Reject if tx_id does not match canonical tx id for the embedded tx.
+                                if let Ok(expected) = catalyst_core::protocol::transaction_id(&tx.tx) {
+                                    if expected != tx.tx_id {
+                                        tracing::warn!("reject_tx: bad_txid");
+                                        continue;
+                                    }
+                                } else {
+                                    tracing::warn!("reject_tx: txid_compute_failed");
+                                    continue;
+                                }
+
+                                // Basic format + lock-time.
+                                if catalyst_core::protocol::validate_basic_and_unlocked(&tx.tx, now_secs).is_err() {
+                                    tracing::warn!("reject_tx: basic_or_locktime");
+                                    continue;
+                                }
+                                // Pure semantics (fees/conservation/type support).
+                                if catalyst_core::protocol::validate_tx_semantics_for_mempool(&tx.tx).is_err() {
+                                    tracing::warn!("reject_tx: semantics");
+                                    continue;
+                                }
                                 if !verify_protocol_tx_signature(&tx.tx) {
+                                    tracing::warn!("reject_tx: bad_signature");
                                     continue;
                                 }
                                 // Nonce check (single-sender only, requires storage).
@@ -1552,17 +1615,19 @@ impl CatalystNode {
                                     let expected =
                                         tx_nonce_expected_next(store.as_ref(), &sender_pk, pending_max).await;
                                     if tx.tx.core.nonce != expected {
+                                        tracing::warn!("reject_tx: bad_nonce expected={} got={}", expected, tx.tx.core.nonce);
                                         continue;
                                     }
                                 }
                                 // Enforce basic sufficient-funds using current storage.
                                 if let Some(store) = &storage {
-                                    let entries = tx.to_consensus_entries();
-                                    if tx_is_sane(&entries) && tx_is_funded(store.as_ref(), &entries).await {
+                                    if tx_is_funded_protocol(store.as_ref(), &tx.tx).await {
                                         let mut mp = mempool.write().await;
                                         if mp.insert_protocol(tx.clone(), now_secs) {
                                             persist_mempool_tx(store.as_ref(), &tx.tx).await;
                                         }
+                                    } else {
+                                        tracing::warn!("reject_tx: insufficient_funds");
                                     }
                                 } else {
                                     let mut mp = mempool.write().await;
