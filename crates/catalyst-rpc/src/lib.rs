@@ -530,6 +530,22 @@ impl CatalystRpcServer for CatalystRpcImpl {
             |e: bincode::Error| ErrorObjectOwned::from(RpcServerError::InvalidParams(e.to_string())),
         )?;
 
+        // Basic structural validation + lock-time gate at the RPC boundary.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Err(e) = catalyst_core::protocol::validate_basic_and_unlocked(&tx, now_secs) {
+            return Err(ErrorObjectOwned::from(RpcServerError::InvalidParams(format!(
+                "TX_REJECT:BASIC_OR_LOCKTIME:{e}"
+            ))));
+        }
+        if let Err(e) = catalyst_core::protocol::validate_tx_semantics_for_mempool(&tx) {
+            return Err(ErrorObjectOwned::from(RpcServerError::InvalidParams(format!(
+                "TX_REJECT:SEMANTICS:{e}"
+            ))));
+        }
+
         if !verify_tx_signature(&tx) {
             return Err(ErrorObjectOwned::from(RpcServerError::InvalidParams(
                 "Invalid transaction signature".to_string(),
@@ -553,6 +569,36 @@ impl CatalystRpcServer for CatalystRpcImpl {
                 return Err(ErrorObjectOwned::from(RpcServerError::InvalidParams(
                     "Nonce too low".to_string(),
                 )));
+            }
+
+            // Sufficient-funds check against committed state (does not account for pending txs).
+            // This is a minimal RPC-side guardrail; the node/mempool will enforce full sequencing.
+            if tx.core.tx_type == catalyst_core::protocol::TransactionType::NonConfidentialTransfer {
+                use std::collections::BTreeMap;
+                let mut deltas: BTreeMap<[u8; 32], i64> = BTreeMap::new();
+                for e in &tx.core.entries {
+                    if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
+                        *deltas.entry(e.public_key).or_insert(0) =
+                            deltas.get(&e.public_key).copied().unwrap_or(0).saturating_add(v);
+                    }
+                }
+                for (pk, delta) in deltas {
+                    if delta < 0 {
+                        let key = bal_key(&pk);
+                        let bal = self
+                            .storage
+                            .engine()
+                            .get("accounts", &key)
+                            .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())))?
+                            .map(|b| decode_i64(&b))
+                            .unwrap_or(0);
+                        if bal.saturating_add(delta) < 0 {
+                            return Err(ErrorObjectOwned::from(RpcServerError::InvalidParams(
+                                "TX_REJECT:INSUFFICIENT_FUNDS".to_string(),
+                            )));
+                        }
+                    }
+                }
             }
         }
 
