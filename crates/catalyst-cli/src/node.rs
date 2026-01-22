@@ -17,7 +17,7 @@ use catalyst_utils::state::StateManager;
 
 use crate::config::NodeConfig;
 use crate::tx::{Mempool, ProtocolTxBatch, ProtocolTxGossip, TxBatch, TxGossip};
-use crate::sync::{FileRequestMsg, FileResponseMsg, KeyProofChange, LsuCidGossip, LsuGossip, StateProofBundle};
+use crate::sync::{FileRequestMsg, FileResponseMsg, KeyProofChange, LsuCidGossip, LsuGossip, LsuMetaRequest, StateProofBundle};
 use crate::evm::{decode_evm_marker, encode_evm_marker, EvmTxKind, EvmTxPayload};
 use crate::evm_revm::{execute_call_and_persist, execute_deploy_and_persist};
 
@@ -1669,7 +1669,19 @@ impl CatalystNode {
                             }
                         } else if envelope.message_type == MessageType::ConsensusSync {
                             // Prefer CID-based LSU sync; fallback to full LSU gossip.
-                            if let Ok(ref_msg) = envelope.extract_message::<LsuCidGossip>() {
+                            if let Ok(req) = envelope.extract_message::<LsuMetaRequest>() {
+                                // Best-effort: respond with stored metadata for this CID, if we have it.
+                                if let Some(store) = &storage {
+                                    let key = format!("consensus:cid_meta:{}", req.cid);
+                                    if let Ok(Some(b)) = store.get_metadata(&key).await {
+                                        if let Ok(meta) = bincode::deserialize::<LsuCidGossip>(&b) {
+                                            if let Ok(env) = MessageEnvelope::from_message(&meta, "lsu_meta".to_string(), None) {
+                                                let _ = net.broadcast_envelope(&env).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if let Ok(ref_msg) = envelope.extract_message::<LsuCidGossip>() {
                                 if let Some(dfs) = &dfs {
                                     if let Ok(_cid) = ContentId::from_string(&ref_msg.cid) {
                                         if let Ok(bytes) = dfs.get(&ref_msg.cid).await {
@@ -1695,6 +1707,16 @@ impl CatalystNode {
                                                                 .unwrap_or([0u8; 32]);
 
                                                             if local_prev != ref_msg.prev_state_root && local_prev != [0u8; 32] {
+                                                                if !ref_msg.prev_cid.is_empty() {
+                                                                    // Request metadata for the previous CID to enable backfill.
+                                                                    let req = LsuMetaRequest {
+                                                                        requester: producer_id_self.clone(),
+                                                                        cid: ref_msg.prev_cid.clone(),
+                                                                    };
+                                                                    if let Ok(env) = MessageEnvelope::from_message(&req, "lsu_meta_req".to_string(), None) {
+                                                                        let _ = net.broadcast_envelope(&env).await;
+                                                                    }
+                                                                }
                                                                 tracing::warn!(
                                                                     "Skipping LSU cycle={} cid={} (prev_root mismatch local={} expected={})",
                                                                     ref_msg.cycle,
@@ -1819,6 +1841,11 @@ impl CatalystNode {
                                                             let _ = store
                                                                 .set_metadata("consensus:last_lsu_state_root", &ref_msg.state_root)
                                                                 .await;
+                                                            if let Ok(b) = bincode::serialize(&ref_msg) {
+                                                                let _ = store
+                                                                    .set_metadata(&format!("consensus:cid_meta:{}", ref_msg.cid), &b)
+                                                                    .await;
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -2317,10 +2344,17 @@ impl CatalystNode {
                             // Proof-driven sync (step 4): bundle old/new proofs for touched keys.
                             // These are best-effort; followers fall back to apply-then-check if unavailable.
                             let mut prev_state_root_for_msg: [u8; 32] = [0u8; 32];
+                            let mut prev_cid_for_msg: String = String::new();
                             let mut proof_cid_for_msg: String = String::new();
 
                             // Persist latest LSU and seed.
                             if let Some(store) = &storage {
+                                // Capture previous LSU CID (tip pointer) before updating it for this cycle.
+                                if let Ok(Some(b)) = store.get_metadata("consensus:last_lsu_cid").await {
+                                    if let Ok(s) = String::from_utf8(b) {
+                                        prev_cid_for_msg = s;
+                                    }
+                                }
                                 if let Ok(bytes) = update.serialize() {
                                     // Per-cycle history
                                     let _ = store
@@ -2431,6 +2465,7 @@ impl CatalystNode {
                                                 cycle,
                                                 lsu_hash,
                                                 cid,
+                                                prev_cid: prev_cid_for_msg.clone(),
                                                 prev_state_root: prev_state_root_for_msg,
                                                 state_root,
                                                 proof_cid: proof_cid_for_msg,
@@ -2447,6 +2482,12 @@ impl CatalystNode {
                                                 let _ = store
                                                     .set_metadata("consensus:last_lsu_state_root", &msg.state_root)
                                                     .await;
+                                                // Store CID->metadata mapping for backfill requests.
+                                                if let Ok(b) = bincode::serialize(&msg) {
+                                                    let _ = store
+                                                        .set_metadata(&format!("consensus:cid_meta:{}", msg.cid), &b)
+                                                        .await;
+                                                }
                                                 // Per-cycle CID history
                                                 let _ = store
                                                     .set_metadata(
