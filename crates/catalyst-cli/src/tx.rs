@@ -302,6 +302,67 @@ impl ProtocolTxBatch {
     }
 }
 
+#[cfg(test)]
+mod wire_roundtrip_tests {
+    use super::*;
+    use catalyst_utils::NetworkMessage;
+
+    fn example_tx() -> corep::Transaction {
+        corep::Transaction {
+            core: corep::TransactionCore {
+                tx_type: corep::TransactionType::NonConfidentialTransfer,
+                entries: vec![
+                    corep::TransactionEntry {
+                        public_key: [1u8; 32],
+                        amount: EntryAmount::NonConfidential(-5),
+                    },
+                    corep::TransactionEntry {
+                        public_key: [2u8; 32],
+                        amount: EntryAmount::NonConfidential(5),
+                    },
+                ],
+                nonce: 1,
+                lock_time: 0,
+                fees: 0,
+                data: Vec::new(),
+            },
+            signature: corep::AggregatedSignature(vec![0u8; 64]),
+            timestamp: 123,
+        }
+    }
+
+    #[test]
+    fn protocol_tx_gossip_roundtrips() {
+        let tx = example_tx();
+        let msg = ProtocolTxGossip::new(tx, 999).unwrap();
+        let bytes = NetworkMessage::serialize(&msg).unwrap();
+        let got = <ProtocolTxGossip as NetworkMessage>::deserialize(&bytes).unwrap();
+        assert_eq!(msg, got);
+    }
+
+    #[test]
+    fn tx_batch_roundtrips() {
+        let entries = vec![TransactionEntry {
+            public_key: [1u8; 32],
+            amount: 1,
+            signature: vec![7u8; 8],
+        }];
+        let batch = TxBatch::new(1, entries).unwrap();
+        let bytes = NetworkMessage::serialize(&batch).unwrap();
+        let got = <TxBatch as NetworkMessage>::deserialize(&bytes).unwrap();
+        assert_eq!(batch, got);
+    }
+
+    #[test]
+    fn protocol_tx_batch_roundtrips() {
+        let txs = vec![example_tx()];
+        let batch = ProtocolTxBatch::new(1, txs).unwrap();
+        let bytes = NetworkMessage::serialize(&batch).unwrap();
+        let got = <ProtocolTxBatch as NetworkMessage>::deserialize(&bytes).unwrap();
+        assert_eq!(batch, got);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MempoolItem {
     entries: Vec<TransactionEntry>,
