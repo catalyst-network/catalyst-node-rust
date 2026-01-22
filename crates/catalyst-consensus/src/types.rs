@@ -231,6 +231,7 @@ pub fn hash_data<T: CatalystSerialize>(data: &T) -> catalyst_utils::CatalystResu
 mod wire_roundtrip_tests {
     use super::*;
     use catalyst_utils::NetworkMessage;
+    use catalyst_utils::MessageEnvelope;
 
     #[test]
     fn producer_quantity_roundtrips() {
@@ -284,6 +285,24 @@ mod wire_roundtrip_tests {
         };
         let bytes = NetworkMessage::serialize(&msg).unwrap();
         let got = <ProducerOutput as NetworkMessage>::deserialize(&bytes).unwrap();
+        assert_eq!(msg, got);
+    }
+
+    #[test]
+    fn envelope_roundtrips_and_extracts_consensus_message() {
+        // End-to-end wire path:
+        // ProducerQuantity -> MessageEnvelope::from_message -> bincode(envelope) -> bincode::deserialize -> extract_message
+        let msg = ProducerQuantity {
+            first_hash: [7u8; 32],
+            cycle_number: 99,
+            producer_id: "producer_e2e".to_string(),
+            timestamp: 999_000,
+        };
+
+        let env = MessageEnvelope::from_message(&msg, "sender".to_string(), None).unwrap();
+        let bytes = bincode::serialize(&env).unwrap();
+        let env2: MessageEnvelope = bincode::deserialize(&bytes).unwrap();
+        let got = env2.extract_message::<ProducerQuantity>().unwrap();
         assert_eq!(msg, got);
     }
 }
