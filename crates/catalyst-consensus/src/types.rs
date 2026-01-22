@@ -226,3 +226,64 @@ pub fn hash_data<T: CatalystSerialize>(data: &T) -> catalyst_utils::CatalystResu
     hash.copy_from_slice(&result[..32]);
     Ok(hash)
 }
+
+#[cfg(test)]
+mod wire_roundtrip_tests {
+    use super::*;
+    use catalyst_utils::NetworkMessage;
+
+    #[test]
+    fn producer_quantity_roundtrips() {
+        let msg = ProducerQuantity {
+            first_hash: [1u8; 32],
+            cycle_number: 42,
+            producer_id: "producer_a".to_string(),
+            timestamp: 123456,
+        };
+        let bytes = NetworkMessage::serialize(&msg).unwrap();
+        let got = <ProducerQuantity as NetworkMessage>::deserialize(&bytes).unwrap();
+        assert_eq!(msg, got);
+    }
+
+    #[test]
+    fn producer_candidate_roundtrips() {
+        let msg = ProducerCandidate {
+            majority_hash: [2u8; 32],
+            producer_list_hash: [3u8; 32],
+            cycle_number: 42,
+            producer_id: "producer_b".to_string(),
+            timestamp: 123456,
+        };
+        let bytes = NetworkMessage::serialize(&msg).unwrap();
+        let got = <ProducerCandidate as NetworkMessage>::deserialize(&bytes).unwrap();
+        assert_eq!(msg, got);
+    }
+
+    #[test]
+    fn producer_vote_roundtrips() {
+        let msg = ProducerVote {
+            ledger_state_hash: [4u8; 32],
+            vote_list_hash: [5u8; 32],
+            cycle_number: 42,
+            producer_id: "producer_c".to_string(),
+            timestamp: 123456,
+        };
+        let bytes = NetworkMessage::serialize(&msg).unwrap();
+        let got = <ProducerVote as NetworkMessage>::deserialize(&bytes).unwrap();
+        assert_eq!(msg, got);
+    }
+
+    #[test]
+    fn producer_output_roundtrips() {
+        let msg = ProducerOutput {
+            dfs_address: [9u8; 21],
+            vote_list_hash: [6u8; 32],
+            cycle_number: 42,
+            producer_id: "producer_d".to_string(),
+            timestamp: 123456,
+        };
+        let bytes = NetworkMessage::serialize(&msg).unwrap();
+        let got = <ProducerOutput as NetworkMessage>::deserialize(&bytes).unwrap();
+        assert_eq!(msg, got);
+    }
+}
