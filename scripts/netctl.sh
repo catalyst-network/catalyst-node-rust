@@ -15,6 +15,7 @@ Usage:
   scripts/netctl.sh testnet logs [node1|node2|node3]
   scripts/netctl.sh testnet wait-rpc [URL] [TIMEOUT_SECS]
   scripts/netctl.sh testnet test-basic
+  scripts/netctl.sh testnet test-contract
 
   scripts/netctl.sh devnet up --host <PUBLIC_IP_OR_DNS> [--p2p-port 30333] [--rpc-port 8545]
   scripts/netctl.sh devnet down
@@ -78,7 +79,7 @@ testnet_up() {
 
   echo "Starting node1 (bootstrap + validator + rpc) ..."
   RUST_LOG=info stdbuf -oL -eL "$BIN" --config testnet/node1/config.toml start \
-    --validator --rpc --rpc-port 8545 \
+    --validator --storage --rpc --rpc-port 8545 \
     > testnet/node1/logs/stdout.log 2>&1 &
   echo $! > testnet/node1/node.pid
 
@@ -105,6 +106,7 @@ testnet_up() {
 
 testnet_down() {
   make stop-testnet >/dev/null 2>&1 || true
+  rm -f testnet/node1/node.pid testnet/node2/node.pid testnet/node3/node.pid || true
   echo "Testnet down."
 }
 
@@ -167,6 +169,52 @@ testnet_test_basic() {
 
   echo "head: $(rpc_call "$rpc" catalyst_head '[]' | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"result\"))' 2>/dev/null || true)"
   echo "balance(node1): $(rpc_call "$rpc" catalyst_getBalance "[\"${node1_pubkey}\"]" | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"result\"))')"
+}
+
+testnet_test_contract() {
+  local rpc="http://127.0.0.1:8545"
+  testnet_wait_rpc "$rpc" 90
+
+  echo "Deploying deterministic initcode contract (returns 0x2a)..."
+  local out
+  out="$(cargo run -q -p catalyst-cli -- deploy testdata/evm/return_2a_initcode.hex --key-file testnet/faucet.key --rpc-url "$rpc" --runtime evm)"
+  echo "$out"
+  local addr
+  addr="$(echo "$out" | awk '/contract_address:/{print $2}')"
+  [ -n "$addr" ] || die "could not parse contract_address from deploy output"
+
+  echo "Waiting for getCode to be non-empty..."
+  local deadline=$(( $(date +%s) + 90 ))
+  while true; do
+    local code
+    code="$(rpc_call "$rpc" catalyst_getCode "[\"${addr}\"]" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("result",""))')"
+    if [ "$code" != "0x" ] && [ -n "$code" ] && [ "$code" != "0x0" ]; then
+      echo "code: $code"
+      break
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      die "contract code never appeared"
+    fi
+    sleep 2
+  done
+
+  echo "Calling contract (empty calldata)..."
+  cargo run -q -p catalyst-cli -- call "$addr" 0x --key-file testnet/faucet.key --rpc-url "$rpc" --value 0
+
+  echo "Waiting for last return to equal 32-byte 0x2a..."
+  deadline=$(( $(date +%s) + 90 ))
+  while true; do
+    local ret
+    ret="$(rpc_call "$rpc" catalyst_getLastReturn "[\"${addr}\"]" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("result",""))')"
+    if [ "$ret" = "0x000000000000000000000000000000000000000000000000000000000000002a" ]; then
+      echo "PASS: return=$ret"
+      break
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      die "expected return not observed; got=$ret"
+    fi
+    sleep 2
+  done
 }
 
 devnet_write_config() {
@@ -319,6 +367,7 @@ main() {
     testnet:logs) testnet_logs "${1:-node1}" ;;
     testnet:wait-rpc) testnet_wait_rpc "${1:-http://127.0.0.1:8545}" "${2:-90}" ;;
     testnet:test-basic) testnet_test_basic ;;
+    testnet:test-contract) testnet_test_contract ;;
     devnet:up) devnet_up "$@" ;;
     devnet:down) devnet_down ;;
     devnet:status) devnet_status ;;

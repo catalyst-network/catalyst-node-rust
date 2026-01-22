@@ -353,7 +353,9 @@ pub async fn deploy_contract(
     let mut from20 = [0u8; 20];
     from20.copy_from_slice(&from_pk[12..32]);
     let from_addr = EvmAddress::from_slice(&from20);
-    let created = catalyst_runtime_evm::database::utils::calculate_create_address(&from_addr, nonce);
+    // EVM nonce is derived from protocol nonce (protocol starts at 1; EVM starts at 0).
+    let evm_nonce = nonce.saturating_sub(1);
+    let created = catalyst_runtime_evm::utils::calculate_ethereum_create_address(&from_addr, evm_nonce);
 
     println!("tx_id: {tx_id}");
     println!("contract_address: 0x{}", hex::encode(created.as_slice()));

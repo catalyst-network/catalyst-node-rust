@@ -14,6 +14,7 @@ mod sync;
 mod dfs_store;
 mod identity;
 mod evm;
+mod evm_revm;
 
 use node::CatalystNode;
 use config::NodeConfig;

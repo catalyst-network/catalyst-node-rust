@@ -157,6 +157,10 @@ pub trait CatalystRpc {
     /// Get last call return data for a 20-byte hex address (dev placeholder).
     #[method(name = "catalyst_getLastReturn")]
     async fn get_last_return(&self, address: String) -> RpcResult<String>;
+
+    /// Get EVM storage slot (32-byte slot) for a contract address.
+    #[method(name = "catalyst_getStorageAt")]
+    async fn get_storage_at(&self, address: String, slot: String) -> RpcResult<String>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,6 +337,23 @@ fn evm_code_key(addr20: &[u8; 20]) -> Vec<u8> {
 fn evm_last_return_key(addr20: &[u8; 20]) -> Vec<u8> {
     let mut k = b"evm:last_return:".to_vec();
     k.extend_from_slice(addr20);
+    k
+}
+
+fn parse_hex_32bytes(s: &str) -> Result<[u8; 32], RpcServerError> {
+    let b = parse_hex_bytes(s)?;
+    if b.len() != 32 {
+        return Err(RpcServerError::InvalidParams("expected 32-byte hex".to_string()));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&b);
+    Ok(out)
+}
+
+fn evm_storage_key(addr20: &[u8; 20], slot32: &[u8; 32]) -> Vec<u8> {
+    let mut k = b"evm:storage:".to_vec();
+    k.extend_from_slice(addr20);
+    k.extend_from_slice(slot32);
     k
 }
 
@@ -662,6 +683,19 @@ impl CatalystRpcServer for CatalystRpcImpl {
             .get("accounts", &key)
             .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())))?
             .unwrap_or_default();
+        Ok(format!("0x{}", hex::encode(bytes)))
+    }
+
+    async fn get_storage_at(&self, address: String, slot: String) -> RpcResult<String> {
+        let addr20 = parse_hex_20(&address).map_err(ErrorObjectOwned::from)?;
+        let slot32 = parse_hex_32bytes(&slot).map_err(ErrorObjectOwned::from)?;
+        let key = evm_storage_key(&addr20, &slot32);
+        let bytes = self
+            .storage
+            .engine()
+            .get("accounts", &key)
+            .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())))?
+            .unwrap_or_else(|| vec![0u8; 32]);
         Ok(format!("0x{}", hex::encode(bytes)))
     }
 }

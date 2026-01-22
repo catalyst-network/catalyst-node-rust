@@ -329,6 +329,10 @@ smoke-testnet: build
 testnet-up: build
 	@bash scripts/netctl.sh testnet up
 
+.PHONY: testnet-up-clean
+testnet-up-clean: build
+	@bash scripts/netctl.sh testnet up --clean
+
 testnet-down:
 	@bash scripts/netctl.sh testnet down
 
@@ -340,6 +344,10 @@ testnet-logs:
 
 testnet-basic-test: build
 	@bash scripts/netctl.sh testnet test-basic
+
+.PHONY: testnet-contract-test
+testnet-contract-test: build
+	@bash scripts/netctl.sh testnet test-contract
 
 # Public/stable devnet helpers (single node that exposes RPC externally).
 # Example:

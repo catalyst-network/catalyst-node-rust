@@ -19,6 +19,7 @@ use crate::config::NodeConfig;
 use crate::tx::{Mempool, ProtocolTxBatch, ProtocolTxGossip, TxBatch, TxGossip};
 use crate::sync::{FileRequestMsg, FileResponseMsg, KeyProofChange, LsuCidGossip, LsuGossip, StateProofBundle};
 use crate::evm::{decode_evm_marker, encode_evm_marker, EvmTxKind, EvmTxPayload};
+use crate::evm_revm::{execute_call_and_persist, execute_deploy_and_persist};
 
 use catalyst_dfs::ContentId;
 
@@ -27,6 +28,8 @@ use crate::dfs_store::LocalContentStore;
 use catalyst_storage::{StorageConfig as StorageConfigLib, StorageManager};
 
 use alloy_primitives::Address as EvmAddress;
+
+const DEFAULT_EVM_GAS_LIMIT: u64 = 8_000_000;
 
 // Dev/testnet faucet key (32-byte scalar); pubkey is derived and is a valid compressed Ristretto point.
 const FAUCET_PRIVATE_KEY_BYTES: [u8; 32] = [0xFA; 32];
@@ -50,6 +53,13 @@ fn is_worker_reg_marker(sig: &[u8]) -> bool {
 
 fn is_evm_marker(sig: &[u8]) -> bool {
     sig.starts_with(b"EVM1")
+}
+
+fn lsu_contains_evm(lsu: &catalyst_consensus::types::LedgerStateUpdate) -> bool {
+    lsu.partial_update
+        .transaction_entries
+        .iter()
+        .any(|e| is_evm_marker(&e.signature))
 }
 
 fn pubkey_to_evm_addr20(pk: &[u8; 32]) -> [u8; 20] {
@@ -92,7 +102,8 @@ fn touched_keys_for_lsu(lsu: &catalyst_consensus::types::LedgerStateUpdate) -> V
                     EvmTxKind::Deploy { .. } => {
                         let from20 = pubkey_to_evm_addr20(&e.public_key);
                         let from_addr = EvmAddress::from_slice(&from20);
-                        let created = catalyst_runtime_evm::database::utils::calculate_create_address(&from_addr, payload.nonce);
+                        let evm_nonce = payload.nonce.saturating_sub(1);
+                        let created = catalyst_runtime_evm::utils::calculate_ethereum_create_address(&from_addr, evm_nonce);
                         let mut addr20 = [0u8; 20];
                         addr20.copy_from_slice(created.as_slice());
                         keys.insert(evm_code_key(&addr20));
@@ -176,15 +187,17 @@ fn verify_state_transition_bundle(
             continue;
         }
         if is_evm_marker(&e.signature) {
+            // NOTE: EVM execution touches dynamic storage keys; proof bundles are disabled when EVM txs exist.
             if let Some((payload, _sig64)) = decode_evm_marker(&e.signature) {
                 match payload.kind {
-                    EvmTxKind::Deploy { bytecode } => {
+                    EvmTxKind::Deploy { .. } => {
                         let from20 = pubkey_to_evm_addr20(&e.public_key);
                         let from_addr = EvmAddress::from_slice(&from20);
-                        let created = catalyst_runtime_evm::database::utils::calculate_create_address(&from_addr, payload.nonce);
+                        let evm_nonce = payload.nonce.saturating_sub(1);
+                        let created = catalyst_runtime_evm::utils::calculate_ethereum_create_address(&from_addr, evm_nonce);
                         let mut addr20 = [0u8; 20];
                         addr20.copy_from_slice(created.as_slice());
-                        expected.insert(evm_code_key(&addr20), bytecode);
+                        expected.insert(evm_code_key(&addr20), Vec::new());
                     }
                     EvmTxKind::Call { to, .. } => {
                         expected.insert(evm_last_return_key(&to), Vec::new());
@@ -256,19 +269,16 @@ async fn apply_lsu_to_storage_without_root_check(
         }
         if is_evm_marker(&e.signature) {
             if let Some((payload, _sig64)) = decode_evm_marker(&e.signature) {
+                let from20 = pubkey_to_evm_addr20(&e.public_key);
+                let from = EvmAddress::from_slice(&from20);
+                let gas_limit = DEFAULT_EVM_GAS_LIMIT.max(21_000);
                 match payload.kind {
                     EvmTxKind::Deploy { bytecode } => {
-                        let from20 = pubkey_to_evm_addr20(&e.public_key);
-                        let from_addr = EvmAddress::from_slice(&from20);
-                        let created = catalyst_runtime_evm::database::utils::calculate_create_address(&from_addr, payload.nonce);
-                        let mut addr20 = [0u8; 20];
-                        addr20.copy_from_slice(created.as_slice());
-                        let k = evm_code_key(&addr20);
-                        let _ = store.set_state(&k, bytecode).await;
+                        let _ = execute_deploy_and_persist(store, from, payload.nonce, bytecode, gas_limit).await;
                     }
-                    EvmTxKind::Call { to, .. } => {
-                        let k = evm_last_return_key(&to);
-                        let _ = store.set_state(&k, Vec::new()).await;
+                    EvmTxKind::Call { to, input } => {
+                        let to_addr = EvmAddress::from_slice(&to);
+                        let _ = execute_call_and_persist(store, from, to_addr, payload.nonce, input, gas_limit).await;
                     }
                 }
             }
@@ -880,6 +890,14 @@ async fn apply_lsu_to_storage(
     // Apply balance deltas from the LSU's ordered transaction entries.
     // Also apply worker registry markers into state under `workers:<pubkey>`.
     for e in &lsu.partial_update.transaction_entries {
+        if is_evm_marker(&e.signature) {
+            info!(
+                "EVM tx marker detected in LSU cycle={} pk={} sig_len={}",
+                lsu.cycle_number,
+                hex_encode(&e.public_key),
+                e.signature.len()
+            );
+        }
         if is_worker_reg_marker(&e.signature) {
             // Register worker (idempotent).
             let k = worker_key_for_pubkey(&e.public_key);
@@ -888,19 +906,30 @@ async fn apply_lsu_to_storage(
         }
         if is_evm_marker(&e.signature) {
             if let Some((payload, _sig64)) = decode_evm_marker(&e.signature) {
+                let from20 = pubkey_to_evm_addr20(&e.public_key);
+                let from = EvmAddress::from_slice(&from20);
+                let gas_limit = DEFAULT_EVM_GAS_LIMIT.max(21_000);
                 match payload.kind {
                     EvmTxKind::Deploy { bytecode } => {
-                        let from20 = pubkey_to_evm_addr20(&e.public_key);
-                        let from_addr = EvmAddress::from_slice(&from20);
-                        let created = catalyst_runtime_evm::database::utils::calculate_create_address(&from_addr, payload.nonce);
-                        let mut addr20 = [0u8; 20];
-                        addr20.copy_from_slice(created.as_slice());
-                        let k = evm_code_key(&addr20);
-                        let _ = store.set_state(&k, bytecode).await;
+                        match execute_deploy_and_persist(store, from, payload.nonce, bytecode, gas_limit).await {
+                            Ok((created, _ret, _persisted)) => {
+                                info!("EVM deploy applied addr=0x{}", hex::encode(created.as_slice()));
+                            }
+                            Err(err) => {
+                                tracing::warn!("EVM deploy failed: {err}");
+                            }
+                        }
                     }
-                    EvmTxKind::Call { to, .. } => {
-                        let k = evm_last_return_key(&to);
-                        let _ = store.set_state(&k, Vec::new()).await;
+                    EvmTxKind::Call { to, input } => {
+                        let to_addr = EvmAddress::from_slice(&to);
+                        match execute_call_and_persist(store, from, to_addr, payload.nonce, input, gas_limit).await {
+                            Ok((ret, _persisted)) => {
+                                info!("EVM call applied to=0x{} ret_len={}", hex::encode(to_addr.as_slice()), ret.len());
+                            }
+                            Err(err) => {
+                                tracing::warn!("EVM call failed: {err}");
+                            }
+                        }
                     }
                 }
             }
@@ -2209,11 +2238,20 @@ impl CatalystNode {
                                 }
 
                                 // Pre/post proofs for proof-driven sync bundle.
+                                // NOTE: EVM execution touches dynamic storage keys; skip proof bundles for LSUs that include EVM markers.
                                 let touched = touched_keys_for_lsu(&update);
-                                let (prev_root, prev_proofs) = store
-                                    .get_account_proofs_for_keys_with_absence(&touched)
-                                    .await
-                                    .unwrap_or(([0u8; 32], Vec::new()));
+                                // IMPORTANT: even if we skip proof bundles for EVM LSUs, we must still
+                                // gossip the correct previous state root so followers can validate
+                                // chain continuity and apply the LSU.
+                                let current_root = store.get_state_root().unwrap_or([0u8; 32]);
+                                let (prev_root, prev_proofs) = if lsu_contains_evm(&update) {
+                                    (current_root, Vec::new())
+                                } else {
+                                    store
+                                        .get_account_proofs_for_keys_with_absence(&touched)
+                                        .await
+                                        .unwrap_or((current_root, Vec::new()))
+                                };
                                 prev_state_root_for_msg = prev_root;
 
                                 // Apply to state (leader path).
@@ -2221,10 +2259,14 @@ impl CatalystNode {
                                     .await
                                     .unwrap_or([0u8; 32]);
 
-                                let (post_root, post_proofs) = store
-                                    .get_account_proofs_for_keys_with_absence(&touched)
-                                    .await
-                                    .unwrap_or(([0u8; 32], Vec::new()));
+                                let (post_root, post_proofs) = if lsu_contains_evm(&update) {
+                                    ([0u8; 32], Vec::new())
+                                } else {
+                                    store
+                                        .get_account_proofs_for_keys_with_absence(&touched)
+                                        .await
+                                        .unwrap_or(([0u8; 32], Vec::new()))
+                                };
 
                                 // Best-effort: build a proof bundle. If it fails, followers fall back.
                                 if let Some(dfs) = &dfs {

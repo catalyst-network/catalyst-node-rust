@@ -118,6 +118,16 @@ Tail logs:
 make testnet-logs NODE=node1
 ```
 
+### Contract sanity check (EVM execution)
+
+This uses a deterministic initcode fixture (`testdata/evm/return_2a_initcode.hex`) that deploys a contract which returns `0x2a` on empty calldata.
+
+```bash
+make testnet-up
+make testnet-contract-test
+make testnet-down
+```
+
 ### Smoke test (single command)
 
 Runs an end-to-end test that:

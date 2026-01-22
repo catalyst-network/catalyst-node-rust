@@ -23,6 +23,8 @@ catalyst-utils = { path = "../catalyst-utils" }
 catalyst-dfs = { path = "../catalyst-dfs" }
 catalyst-runtime-evm = { path = "../catalyst-runtime-evm" }
 alloy-primitives = { version = "1.2", features = ["serde"] }
+revm = { version = "27", default-features = true }
+thiserror = "1.0"
 
 # CLI dependencies
 clap = { version = "4.0", features = ["derive"] }
