@@ -45,15 +45,18 @@ impl ConstructionPhase {
         sorted_entries.sort_by_key(|entry| hash_data(entry).unwrap_or_default());
         let entry_count = sorted_entries.len();
 
-        // Create hash tree of transaction signatures
+        // Create a deterministic Merkle root of transaction signatures.
+        //
+        // Note: in the current testnet scaffolding, `TransactionEntry.signature` carries either:
+        // - a raw Schnorr signature (transfer entries all share the tx signature bytes), or
+        // - a marker-prefixed payload (worker registration / EVM marker).
+        //
+        // We treat these as opaque bytes at the consensus boundary and commit to them here.
         let signatures: Vec<Vec<u8>> = sorted_entries.iter().map(|e| e.signature.clone()).collect();
-        let signatures_hash = self.compute_hash_tree(&signatures)?;
+        let signatures_hash = signature_merkle_root(&signatures);
 
-        // Calculate total fees
-        let total_fees = sorted_entries.iter()
-            .filter(|entry| entry.amount < 0)  // Spending entries
-            .map(|entry| (entry.amount.abs() as u64).saturating_sub(entry.amount.abs() as u64))
-            .sum();
+        // Fees are not implemented yet in the runtime/state machine; keep deterministic.
+        let total_fees = 0u64;
 
         // Create partial ledger state update
         let partial_update = PartialLedgerStateUpdate {
@@ -85,22 +88,71 @@ impl ConstructionPhase {
         Ok(quantity)
     }
 
-    fn compute_hash_tree(&self, signatures: &[Vec<u8>]) -> CatalystResult<Hash> {
-        use blake2::{Blake2b512, Digest};
-        
-        if signatures.is_empty() {
-            return Ok([0u8; 32]);
-        }
+}
 
-        let mut hasher = Blake2b512::new();
-        for sig_bytes in signatures {
-            hasher.update(sig_bytes);
+fn blake2b_256_tagged(tag: &'static [u8], parts: &[&[u8]]) -> Hash {
+    use blake2::{Blake2b512, Digest};
+    let mut hasher = Blake2b512::new();
+    hasher.update(tag);
+    for p in parts {
+        hasher.update(p);
+    }
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result[..32]);
+    out
+}
+
+/// Deterministic Merkle root over a list of signature byte strings.
+///
+/// - leaf hash: `blake2b_256("catalyst:txsig:leaf:v1" || sig_bytes)`
+/// - node hash: `blake2b_256("catalyst:txsig:node:v1" || left || right)`
+///
+/// For odd-width levels, the last node is duplicated (Bitcoin-style).
+pub(crate) fn signature_merkle_root(signatures: &[Vec<u8>]) -> Hash {
+    const LEAF_TAG: &[u8] = b"catalyst:txsig:leaf:v1";
+    const NODE_TAG: &[u8] = b"catalyst:txsig:node:v1";
+
+    if signatures.is_empty() {
+        return [0u8; 32];
+    }
+
+    let mut level: Vec<Hash> = signatures
+        .iter()
+        .map(|s| blake2b_256_tagged(LEAF_TAG, &[s.as_slice()]))
+        .collect();
+
+    while level.len() > 1 {
+        let mut next: Vec<Hash> = Vec::with_capacity((level.len() + 1) / 2);
+        let mut i = 0usize;
+        while i < level.len() {
+            let left = level[i];
+            let right = if i + 1 < level.len() { level[i + 1] } else { level[i] };
+            next.push(blake2b_256_tagged(NODE_TAG, &[&left, &right]));
+            i += 2;
         }
-        
-        let result = hasher.finalize();
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&result[..32]);
-        Ok(hash)
+        level = next;
+    }
+    level[0]
+}
+
+#[cfg(test)]
+mod construction_tests {
+    use super::signature_merkle_root;
+
+    #[test]
+    fn signature_merkle_root_is_deterministic_and_nonzero() {
+        let sigs = vec![vec![1u8; 64], vec![2u8; 64], vec![3u8; 64]];
+        let a = signature_merkle_root(&sigs);
+        let b = signature_merkle_root(&sigs);
+        assert_eq!(a, b);
+        assert_ne!(a, [0u8; 32]);
+    }
+
+    #[test]
+    fn signature_merkle_root_empty_is_zero() {
+        let sigs: Vec<Vec<u8>> = Vec::new();
+        assert_eq!(signature_merkle_root(&sigs), [0u8; 32]);
     }
 }
 
