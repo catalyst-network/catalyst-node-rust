@@ -909,9 +909,21 @@ async fn apply_lsu_to_storage(
         .unwrap_or(0);
 
     if lsu.cycle_number <= already {
-        // Return current state root (best-effort).
-        let root = store.get_state_root().unwrap_or([0u8; 32]);
-        return Ok(root);
+        // Return persisted root if available; fall back to cached root; else compute.
+        if let Ok(Some(b)) = store.get_metadata("consensus:last_applied_state_root").await {
+            if b.len() == 32 {
+                let mut r = [0u8; 32];
+                r.copy_from_slice(&b);
+                store.set_state_root_cache(r);
+                return Ok(r);
+            }
+        }
+        if let Some(r) = store.get_state_root() {
+            return Ok(r);
+        }
+        // Worst-case: compute by scanning accounts.
+        let r = store.commit().await?;
+        return Ok(r);
     }
 
     // Apply balance deltas from the LSU's ordered transaction entries.
@@ -1051,6 +1063,23 @@ async fn apply_lsu_with_root_check(
     lsu: &catalyst_consensus::types::LedgerStateUpdate,
     expected_state_root: [u8; 32],
 ) -> Result<bool> {
+    // Capture prev root so we can restore the cache if we revert.
+    let prev_root = store
+        .get_metadata("consensus:last_applied_state_root")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|b| {
+            if b.len() != 32 {
+                return None;
+            }
+            let mut r = [0u8; 32];
+            r.copy_from_slice(&b);
+            Some(r)
+        })
+        .or_else(|| store.get_state_root())
+        .unwrap_or([0u8; 32]);
+
     let snap = format!("verify_lsu_{}_{}", lsu.cycle_number, current_timestamp_ms());
     let _ = store
         .create_snapshot(&snap)
@@ -1067,6 +1096,8 @@ async fn apply_lsu_with_root_check(
         .load_snapshot(&snap)
         .await
         .map_err(|e| anyhow::anyhow!("snapshot revert failed: {e}"))?;
+    // Restore cached root to match reverted state.
+    store.set_state_root_cache(prev_root);
     Ok(false)
 }
 
@@ -1295,6 +1326,17 @@ impl CatalystNode {
         } else {
             None
         };
+
+        // Rehydrate authenticated head/root cache from persisted metadata so restart is deterministic.
+        if let Some(store) = &storage {
+            if let Ok(Some(b)) = store.get_metadata("consensus:last_applied_state_root").await {
+                if b.len() == 32 {
+                    let mut r = [0u8; 32];
+                    r.copy_from_slice(&b);
+                    store.set_state_root_cache(r);
+                }
+            }
+        }
 
         // Auto-register as a worker (on-chain) for validator nodes.
         if self.config.validator {
