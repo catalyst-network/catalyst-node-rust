@@ -21,14 +21,16 @@ If the seed derivation or hashing is ambiguous, producer selection can diverge a
 
 The paper describes deriving \(r_{n+1}\) from a previous cycle commitment (it mentions a Merkle root).
 
-In the current codebase, the readily available 32-byte commitment is the **previous cycle LSU hash**
-persisted by the node (see metadata keys like `consensus:last_applied_lsu_hash`).
+In the current codebase, the most direct 32-byte commitment carried by the LSU is the
+**transaction signatures hash root** (`LedgerStateUpdate.partial_update.transaction_signatures_hash`),
+persisted by the node (see metadata keys like `consensus:last_applied_tx_sigs_root`).
 
 Therefore, for public testnet MVP we define:
-- `seed := prev_cycle_commitment_32`, currently the **last applied LSU hash** (32 bytes)
+- `seed := prev_cycle_commitment_32`, currently the **last applied tx signatures root** (32 bytes)
 
 This is a **placeholder mapping** until we implement the paper’s exact commitment (e.g., LSU Merkle root)
-as a first-class stored value.
+as a first-class stored value. For backwards compatibility, the node may fall back to the last applied LSU hash
+if the new seed key is not present.
 
 ### 2) Domain-separated derivation of \(r_{n+1}\)
 
