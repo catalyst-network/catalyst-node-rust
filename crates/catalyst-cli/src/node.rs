@@ -321,11 +321,15 @@ async fn apply_lsu_to_storage_without_root_check(
 
     // Persist head metadata (trusted).
     store.set_state_root_cache(new_root);
+    let tx_sigs_root = lsu.partial_update.transaction_signatures_hash;
     let _ = store
         .set_metadata("consensus:last_applied_cycle", &lsu.cycle_number.to_le_bytes())
         .await;
     let _ = store
         .set_metadata("consensus:last_applied_state_root", &new_root)
+        .await;
+    let _ = store
+        .set_metadata("consensus:last_applied_tx_sigs_root", &tx_sigs_root)
         .await;
     if let Ok(h) = catalyst_consensus::types::hash_data(lsu) {
         let _ = store
@@ -1014,6 +1018,7 @@ async fn apply_lsu_to_storage(
     // Flush + compute a state root that commits the applied balances.
     let state_root = store.commit().await?;
     let lsu_hash = hash_data(lsu).unwrap_or([0u8; 32]);
+    let tx_sigs_root = lsu.partial_update.transaction_signatures_hash;
 
     // Persist the applied head.
     let _ = store
@@ -1024,6 +1029,9 @@ async fn apply_lsu_to_storage(
         .await;
     let _ = store
         .set_metadata("consensus:last_applied_state_root", &state_root)
+        .await;
+    let _ = store
+        .set_metadata("consensus:last_applied_tx_sigs_root", &tx_sigs_root)
         .await;
 
     info!(
@@ -1752,6 +1760,7 @@ impl CatalystNode {
                                                             }
                                                         }
 
+                                                        let tx_sigs_root = lsu.partial_update.transaction_signatures_hash;
                                                         last_lsu.write().await.insert(ref_msg.cycle, lsu);
                                                         info!(
                                                             "Synced LSU via CID cycle={} cid={}",
@@ -1775,6 +1784,12 @@ impl CatalystNode {
                                                                 .await;
                                                             let _ = store
                                                                 .set_metadata(
+                                                                    &format!("consensus:tx_sigs_root:{}", ref_msg.cycle),
+                                                                    &tx_sigs_root,
+                                                                )
+                                                                .await;
+                                                            let _ = store
+                                                                .set_metadata(
                                                                     &format!("consensus:lsu_cid:{}", ref_msg.cycle),
                                                                     ref_msg.cid.as_bytes(),
                                                                 )
@@ -1791,6 +1806,9 @@ impl CatalystNode {
                                                                 .await;
                                                             let _ = store
                                                                 .set_metadata("consensus:last_lsu_hash", &ref_msg.lsu_hash)
+                                                                .await;
+                                                            let _ = store
+                                                                .set_metadata("consensus:last_tx_sigs_root", &tx_sigs_root)
                                                                 .await;
                                                             let _ = store
                                                                 .set_metadata("consensus:last_lsu_cycle", &ref_msg.cycle.to_le_bytes())
@@ -1835,6 +1853,7 @@ impl CatalystNode {
                                 if let Ok(h) = catalyst_consensus::types::hash_data(&lsu_msg.lsu) {
                                     if h == lsu_msg.lsu_hash {
                                         let lsu = lsu_msg.lsu;
+                                        let tx_sigs_root = lsu.partial_update.transaction_signatures_hash;
                                         last_lsu.write().await.insert(lsu_msg.cycle, lsu.clone());
 
                                         if let Some(store) = &storage {
@@ -1854,12 +1873,21 @@ impl CatalystNode {
                                                         &lsu_msg.lsu_hash,
                                                     )
                                                     .await;
+                                                let _ = store
+                                                    .set_metadata(
+                                                        &format!("consensus:tx_sigs_root:{}", lsu_msg.cycle),
+                                                        &tx_sigs_root,
+                                                    )
+                                                    .await;
 
                                                 let _ = store
                                                     .set_metadata("consensus:last_lsu", &bytes)
                                                     .await;
                                                 let _ = store
                                                     .set_metadata("consensus:last_lsu_hash", &lsu_msg.lsu_hash)
+                                                    .await;
+                                                let _ = store
+                                                    .set_metadata("consensus:last_tx_sigs_root", &tx_sigs_root)
                                                     .await;
                                                 let _ = store
                                                     .set_metadata("consensus:last_lsu_cycle", &lsu_msg.cycle.to_le_bytes())
@@ -2099,23 +2127,46 @@ impl CatalystNode {
             let max_entries_per_cycle = self.config.consensus.max_transactions_per_block as usize;
             self.consensus_task = Some(tokio::spawn(async move {
                 // Seed for deterministic producer selection (paper uses previous LSU merkle root).
-                // We approximate with the hash of the most recent LSU we produced/observed.
+                // We approximate with the previous cycle's transaction signatures hash root, which is a
+                // stable 32-byte commitment carried in the LSU.
                 let mut prev_seed: [u8; 32] = [0u8; 32];
 
                 // Load last persisted seed (prefer applied head).
                 if let Some(store) = &storage {
-                    let seed_bytes = match store.get_metadata("consensus:last_applied_lsu_hash").await {
-                        Ok(Some(b)) => Some(b),
-                        _ => match store.get_metadata("consensus:last_lsu_hash").await {
-                            Ok(Some(b)) => Some(b),
-                            _ => None,
-                        },
-                    };
+                    let mut seed_bytes = store
+                        .get_metadata("consensus:last_applied_tx_sigs_root")
+                        .await
+                        .ok()
+                        .flatten();
+                    if seed_bytes.is_none() {
+                        seed_bytes = store
+                            .get_metadata("consensus:last_applied_lsu_hash")
+                            .await
+                            .ok()
+                            .flatten();
+                    }
+                    if seed_bytes.is_none() {
+                        seed_bytes = store
+                            .get_metadata("consensus:last_tx_sigs_root")
+                            .await
+                            .ok()
+                            .flatten();
+                    }
+                    if seed_bytes.is_none() {
+                        seed_bytes = store
+                            .get_metadata("consensus:last_lsu_hash")
+                            .await
+                            .ok()
+                            .flatten();
+                    }
 
                     if let Some(bytes) = seed_bytes {
                         if bytes.len() == 32 {
                             prev_seed.copy_from_slice(&bytes[..32]);
-                            info!("Loaded prev_seed from storage: {}", hex_encode(&prev_seed));
+                            info!(
+                                "Loaded producer selection prev_seed from storage: {}",
+                                hex_encode(&prev_seed)
+                            );
                         }
                     }
                 }
@@ -2257,9 +2308,11 @@ impl CatalystNode {
 
                     match consensus.start_cycle(cycle, selected, transactions).await {
                         Ok(Some(update)) => {
-                            if let Ok(h) = hash_data(&update) {
-                                prev_seed = h;
-                            }
+                            // Keep LSU hash for sync/verification, but use a separate, explicit seed
+                            // for producer selection (32-byte commitment carried in the LSU).
+                            let lsu_hash = hash_data(&update).unwrap_or([0u8; 32]);
+                            let tx_sigs_root = update.partial_update.transaction_signatures_hash;
+                            prev_seed = tx_sigs_root;
 
                             // Proof-driven sync (step 4): bundle old/new proofs for touched keys.
                             // These are best-effort; followers fall back to apply-then-check if unavailable.
@@ -2274,11 +2327,15 @@ impl CatalystNode {
                                         .set_metadata(&format!("consensus:lsu:{}", cycle), &bytes)
                                         .await;
                                     let _ = store
-                                        .set_metadata(&format!("consensus:lsu_hash:{}", cycle), &prev_seed)
+                                        .set_metadata(&format!("consensus:lsu_hash:{}", cycle), &lsu_hash)
+                                        .await;
+                                    let _ = store
+                                        .set_metadata(&format!("consensus:tx_sigs_root:{}", cycle), &tx_sigs_root)
                                         .await;
 
                                     let _ = store.set_metadata("consensus:last_lsu", &bytes).await;
-                                    let _ = store.set_metadata("consensus:last_lsu_hash", &prev_seed).await;
+                                    let _ = store.set_metadata("consensus:last_lsu_hash", &lsu_hash).await;
+                                    let _ = store.set_metadata("consensus:last_tx_sigs_root", &tx_sigs_root).await;
                                     let _ = store
                                         .set_metadata("consensus:last_lsu_cycle", &cycle.to_le_bytes())
                                         .await;
@@ -2362,8 +2419,7 @@ impl CatalystNode {
                             // - gossip CID + expected LSU hash
                             // fallback: full LSU gossip if DFS is disabled/unavailable.
                             if let Some(dfs) = &dfs {
-                                if let Ok(lsu_hash) = catalyst_consensus::types::hash_data(&update) {
-                                    if let Ok(bytes) = update.serialize() {
+                                if let Ok(bytes) = update.serialize() {
                                         let cid_str = dfs.put(bytes).await.ok();
                                         if let Some(cid) = cid_str {
                                             let state_root = if let Some(store) = &storage {
@@ -2410,7 +2466,6 @@ impl CatalystNode {
                                                 let _ = network.broadcast_envelope(&env).await;
                                             }
                                         }
-                                    }
                                 }
                             } else if let Ok(msg) = LsuGossip::new(update.clone()) {
                                 if let Ok(env) = MessageEnvelope::from_message(&msg, "lsu".to_string(), None) {
