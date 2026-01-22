@@ -112,6 +112,26 @@ pub(crate) fn hash_id_list_tagged(tag: &'static [u8], ids: &[String]) -> Hash {
     blake2b_256_tagged(tag, &parts)
 }
 
+fn producer_id_to_pubkey_placeholder(producer_id: &str) -> Hash {
+    // Deterministic placeholder mapping until producer public keys are part of membership/state.
+    blake2b_256_tagged(b"catalyst:producer_id:pubkey:v1", &[producer_id.as_bytes()])
+}
+
+fn distribute_evenly(total: u64, recipients: &[String]) -> Vec<(String, u64)> {
+    // Deterministic split: base + 1 for first `remainder` recipients (lexicographically sorted).
+    if recipients.is_empty() {
+        return Vec::new();
+    }
+    let base = total / recipients.len() as u64;
+    let rem = (total % recipients.len() as u64) as usize;
+    let mut out: Vec<(String, u64)> = Vec::with_capacity(recipients.len());
+    for (i, r) in recipients.iter().enumerate() {
+        let extra = if i < rem { 1 } else { 0 };
+        out.push((r.clone(), base.saturating_add(extra)));
+    }
+    out
+}
+
 /// Deterministic Merkle root over a list of signature byte strings.
 ///
 /// - leaf hash: `blake2b_256("catalyst:txsig:leaf:v1" || sig_bytes)`
@@ -426,8 +446,17 @@ impl VotingPhase {
         // Create final producer list from candidates with P/2 threshold
         let final_producer_list = self.create_final_producer_list(&majority_hash)?;
         
-        // Create compensation entries
-        let compensation_entries = self.create_compensation_entries(&final_producer_list, reward_config)?;
+        // Build vote list deterministically (must match what we hash and store).
+        let mut final_vote_list = voting_producers.clone();
+        if !final_vote_list.contains(&self.producer.id) {
+            final_vote_list.push(self.producer.id.clone());
+        }
+        final_vote_list.sort();
+        final_vote_list.dedup();
+
+        // Create compensation entries (deterministic ordering + deterministic split)
+        let compensation_entries =
+            self.create_compensation_entries(&final_producer_list, &final_vote_list, reward_config)?;
 
         // Build complete ledger state update
         let partial_update = self.producer.partial_update.as_ref()
@@ -448,7 +477,7 @@ impl VotingPhase {
             compensation_entries,
             cycle_number: self.producer.cycle_number,
             producer_list: final_producer_list,
-            vote_list: voting_producers.clone(),
+            vote_list: final_vote_list.clone(),
         };
 
         // Hash the complete ledger state update
@@ -457,15 +486,8 @@ impl VotingPhase {
         // Store the ledger update
         self.producer.ledger_update = Some(ledger_update);
 
-        // Create vote list hash
-        let vote_list_hash = self.hash_producer_list(&voting_producers)?;
-        
-        // Include self in vote list (deterministic)
-        let mut final_vote_list = voting_producers;
-        if !final_vote_list.contains(&self.producer.id) {
-            final_vote_list.push(self.producer.id.clone());
-        }
-        final_vote_list.sort();
+        // Create vote list hash (must match ledger_update.vote_list)
+        let vote_list_hash = self.hash_producer_list(&final_vote_list)?;
         self.producer.vote_list = Some(final_vote_list);
 
         let vote = ProducerVote {
@@ -506,32 +528,42 @@ impl VotingPhase {
         Ok(final_list)
     }
 
-    fn create_compensation_entries(&self, producer_list: &[String], reward_config: &RewardConfig) -> CatalystResult<Vec<CompensationEntry>> {
-        let mut entries = Vec::new();
-        
-        if producer_list.is_empty() {
-            return Ok(entries);
-        }
+    fn create_compensation_entries(
+        &self,
+        producer_list: &[String],
+        vote_list: &[String],
+        reward_config: &RewardConfig,
+    ) -> CatalystResult<Vec<CompensationEntry>> {
+        // Deterministic recipients
+        let mut producers = producer_list.to_vec();
+        producers.sort();
+        producers.dedup();
+        let mut voters = vote_list.to_vec();
+        voters.sort();
+        voters.dedup();
 
-        let reward_per_producer = reward_config.producer_reward / producer_list.len() as u64;
-        
-        // Deterministic ordering (this list is hashed as part of LSU).
-        let mut sorted = producer_list.to_vec();
-        sorted.sort();
-        for producer_id in &sorted {
-            // In a real implementation, we'd look up the producer's public key
-            // For now, we'll use a placeholder
-            let public_key = [0u8; 32]; // Placeholder
-            
+        // Deterministic split rules (placeholder until fees + exact spec semantics are implemented).
+        let producer_payouts = distribute_evenly(reward_config.producer_reward, &producers);
+        let voter_payouts = distribute_evenly(reward_config.voter_reward, &voters);
+
+        let mut entries: Vec<CompensationEntry> = Vec::new();
+        for (pid, amount) in producer_payouts {
             entries.push(CompensationEntry {
-                producer_id: producer_id.clone(),
-                public_key,
-                amount: reward_per_producer,
+                producer_id: pid.clone(),
+                public_key: producer_id_to_pubkey_placeholder(&pid),
+                amount,
+            });
+        }
+        for (vid, amount) in voter_payouts {
+            entries.push(CompensationEntry {
+                producer_id: vid.clone(),
+                public_key: producer_id_to_pubkey_placeholder(&vid),
+                amount,
             });
         }
 
-        // Ensure stable entry ordering (by producer id).
-        entries.sort_by(|a, b| a.producer_id.cmp(&b.producer_id));
+        // Stable ordering (this list is hashed as part of LSU)
+        entries.sort_by(|a, b| a.producer_id.cmp(&b.producer_id).then(a.amount.cmp(&b.amount)));
         Ok(entries)
     }
 
