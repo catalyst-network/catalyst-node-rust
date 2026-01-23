@@ -325,6 +325,20 @@ smoke-testnet: build
 	@echo "Running local testnet smoke test..."
 	@bash scripts/smoke_testnet.sh
 
+.PHONY: release-gate
+release-gate:
+	@echo "==> release-gate: running unit tests (critical crates)"
+	@$(MAKE) sync-gvfs-mirror
+	$(CARGO) test -p catalyst-core -p catalyst-consensus -p catalyst-cli -p catalyst-rpc --manifest-path "$(CARGO_MANIFEST_PATH)"
+	@echo "==> release-gate: local testnet lifecycle + contract test"
+	@$(MAKE) testnet-down
+	@$(MAKE) testnet-up
+	@$(MAKE) testnet-status
+	@$(MAKE) testnet-contract-test
+	@$(MAKE) testnet-down
+	@echo "==> release-gate: smoke test"
+	@$(MAKE) smoke-testnet
+
 .PHONY: testnet-up testnet-down testnet-status testnet-logs testnet-basic-test devnet-up devnet-down devnet-status
 testnet-up: build
 	@bash scripts/netctl.sh testnet up
