@@ -625,11 +625,11 @@ async fn validate_and_select_protocol_txs_for_construction(
     let mut used_entries = 0usize;
     let now_secs = current_timestamp_ms() / 1000;
 
-    // Deterministic iteration order: sort by bincode(tx) hash (same as tx_id derivation).
+    // Deterministic iteration order: sort by canonical transaction id (blake2b-256 over canonical preimage).
     let mut txs = txs;
     txs.sort_by(|a, b| {
-        let ha = bincode::serialize(a).ok().and_then(|bytes| catalyst_consensus::types::hash_data(&bytes).ok()).unwrap_or([0u8;32]);
-        let hb = bincode::serialize(b).ok().and_then(|bytes| catalyst_consensus::types::hash_data(&bytes).ok()).unwrap_or([0u8;32]);
+        let ha = catalyst_core::protocol::transaction_id(a).unwrap_or([0u8; 32]);
+        let hb = catalyst_core::protocol::transaction_id(b).unwrap_or([0u8; 32]);
         ha.cmp(&hb)
     });
 
@@ -2348,6 +2348,7 @@ impl CatalystNode {
         if self.config.validator {
             let validator_worker_ids_hex = validator_worker_ids_hex.clone();
             let max_entries_per_cycle = self.config.consensus.max_transactions_per_block as usize;
+            let freeze_window_ms = (self.config.consensus.freeze_time_seconds as u64) * 1000;
             self.consensus_task = Some(tokio::spawn(async move {
                 // Seed for deterministic producer selection (paper uses previous LSU merkle root).
                 // We approximate with the previous cycle's transaction signatures hash root, which is a
@@ -2478,11 +2479,24 @@ impl CatalystNode {
                     // the same tx entries list for Construction.
                     let leader = selected.first().cloned().unwrap_or_else(|| producer_id.clone());
                     let transactions = if producer_id == leader {
+                        // Freeze-window semantics:
+                        // - cycle is epoch-aligned: cycle_start_ms = cycle * cycle_ms
+                        // - a tx is eligible for this cycle only if received_at_ms <= (cycle_start_ms - freeze_window_ms)
+                        // - deterministic ordering is by canonical tx_id (enforced by mempool snapshot sort)
+                        let cycle_start_ms = cycle.saturating_mul(cycle_ms);
+                        let cutoff_ms = cycle_start_ms.saturating_sub(freeze_window_ms);
                         let candidate_txs = {
                             let mut mp = mempool.write().await;
                             // Snapshot protocol transactions only; legacy entries are ignored for Construction.
-                            mp.snapshot_protocol_txs(max_entries_per_cycle)
+                            mp.snapshot_protocol_txs_before(max_entries_per_cycle, cutoff_ms)
                         };
+                        info!(
+                            "Cycle {} freeze_window_ms={} cutoff_ms={} candidate_txs={}",
+                            cycle,
+                            freeze_window_ms,
+                            cutoff_ms,
+                            candidate_txs.len()
+                        );
                         let txs = if let Some(store) = &storage {
                             validate_and_select_protocol_txs_for_construction(
                                 store.as_ref(),
