@@ -770,6 +770,8 @@ impl ProducerSelection {
 mod tests {
     use super::*;
     use crate::producer::Producer;
+    use crate::producer::ProducerManager;
+    use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn test_consensus_creation() {
@@ -855,5 +857,95 @@ mod tests {
         
         // Single-producer cycle should succeed without network wiring.
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_two_node_consensus_converges_with_message_passing() {
+        let config = ConsensusConfig {
+            cycle_duration_ms: 3000,
+            construction_phase_ms: 500,
+            campaigning_phase_ms: 500,
+            voting_phase_ms: 500,
+            synchronization_phase_ms: 500,
+            freeze_window_ms: 100,
+            min_producers: 2,
+            confidence_threshold: 0.6,
+        };
+
+        let cycle: CycleNumber = 1;
+        let selected: Vec<ProducerId> = vec!["producer_1".to_string(), "producer_2".to_string()];
+
+        // Shared tx set (deterministic inputs).
+        let transactions = vec![
+            TransactionEntry {
+                public_key: [10u8; 32],
+                amount: -100,
+                signature: vec![20u8; 64],
+            },
+            TransactionEntry {
+                public_key: [11u8; 32],
+                amount: 100,
+                signature: vec![21u8; 64],
+            },
+        ];
+
+        // Build node1 consensus engine with in/out channels.
+        let producer1 = Producer::new("producer_1".to_string(), [1u8; 32], cycle);
+        let manager1 = ProducerManager::new(producer1, config.clone());
+        let (out1_tx, mut out1_rx) = mpsc::unbounded_channel::<catalyst_utils::MessageEnvelope>();
+        let (in1_tx, in1_rx) = mpsc::unbounded_channel::<catalyst_utils::MessageEnvelope>();
+        let mut c1 = CollaborativeConsensus::new(config.clone());
+        c1.set_producer_manager(manager1);
+        c1.set_network_sender(out1_tx);
+        c1.set_network_receiver(in1_rx);
+
+        // Build node2 consensus engine with in/out channels.
+        let producer2 = Producer::new("producer_2".to_string(), [2u8; 32], cycle);
+        let manager2 = ProducerManager::new(producer2, config.clone());
+        let (out2_tx, mut out2_rx) = mpsc::unbounded_channel::<catalyst_utils::MessageEnvelope>();
+        let (in2_tx, in2_rx) = mpsc::unbounded_channel::<catalyst_utils::MessageEnvelope>();
+        let mut c2 = CollaborativeConsensus::new(config.clone());
+        c2.set_producer_manager(manager2);
+        c2.set_network_sender(out2_tx);
+        c2.set_network_receiver(in2_rx);
+
+        // Message bus: forward every outbound envelope to both nodes (best-effort).
+        let bus_targets = vec![in1_tx.clone(), in2_tx.clone()];
+        let bus1 = tokio::spawn(async move {
+            while let Some(env) = out1_rx.recv().await {
+                for tx in &bus_targets {
+                    let _ = tx.send(env.clone());
+                }
+            }
+        });
+        let bus_targets2 = vec![in1_tx.clone(), in2_tx.clone()];
+        let bus2 = tokio::spawn(async move {
+            while let Some(env) = out2_rx.recv().await {
+                for tx in &bus_targets2 {
+                    let _ = tx.send(env.clone());
+                }
+            }
+        });
+
+        // Run cycle concurrently.
+        let selected1 = selected.clone();
+        let selected2 = selected.clone();
+        let txs1 = transactions.clone();
+        let txs2 = transactions.clone();
+        let (r1, r2) = tokio::join!(
+            async move { c1.start_cycle(cycle, selected1, txs1).await },
+            async move { c2.start_cycle(cycle, selected2, txs2).await },
+        );
+
+        bus1.abort();
+        bus2.abort();
+
+        let u1 = r1.unwrap().expect("node1 should produce LSU");
+        let u2 = r2.unwrap().expect("node2 should produce LSU");
+
+        // Convergence: LSU hash must match.
+        let h1 = hash_data(&u1).unwrap();
+        let h2 = hash_data(&u2).unwrap();
+        assert_eq!(h1, h2, "nodes should converge on identical LSU hash");
     }
 }
