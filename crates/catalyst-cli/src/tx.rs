@@ -334,12 +334,82 @@ mod wire_roundtrip_tests {
     }
 }
 
+#[cfg(test)]
+mod mempool_freeze_window_tests {
+    use super::*;
+
+    fn example_tx(nonce: u64, sender: [u8; 32]) -> corep::Transaction {
+        corep::Transaction {
+            core: corep::TransactionCore {
+                tx_type: corep::TransactionType::NonConfidentialTransfer,
+                entries: vec![
+                    corep::TransactionEntry {
+                        public_key: sender,
+                        amount: EntryAmount::NonConfidential(-5),
+                    },
+                    corep::TransactionEntry {
+                        public_key: [2u8; 32],
+                        amount: EntryAmount::NonConfidential(5),
+                    },
+                ],
+                nonce,
+                lock_time: 0,
+                fees: 0,
+                data: Vec::new(),
+            },
+            signature: corep::AggregatedSignature(vec![nonce as u8; 64]),
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn snapshot_protocol_txs_before_respects_cutoff_and_is_deterministic() {
+        let mut mp = Mempool::new(Duration::from_secs(60), 1000);
+        let now_secs = 1_000_000;
+
+        // Insert three txs with distinct txids and different received_at_ms.
+        let tx_a = example_tx(1, [10u8; 32]);
+        let tx_b = example_tx(2, [11u8; 32]);
+        let tx_c = example_tx(3, [12u8; 32]);
+
+        let msg_a = ProtocolTxGossip::new(tx_a.clone(), 1_000).unwrap();
+        let msg_b = ProtocolTxGossip::new(tx_b.clone(), 2_000).unwrap();
+        let msg_c = ProtocolTxGossip::new(tx_c.clone(), 3_000).unwrap();
+
+        assert!(mp.insert_protocol(msg_c, now_secs)); // insert out-of-order intentionally
+        assert!(mp.insert_protocol(msg_a, now_secs));
+        assert!(mp.insert_protocol(msg_b, now_secs));
+
+        // Cutoff includes a+b, excludes c.
+        let snap = mp.snapshot_protocol_txs_before(10, 2_000);
+        assert_eq!(snap.len(), 2);
+
+        // Deterministic ordering by tx_id (mempool key sort), independent of insertion order.
+        let ids: Vec<Hash> = snap
+            .iter()
+            .map(|tx| corep::transaction_id(tx).unwrap())
+            .collect();
+        let mut ids_sorted = ids.clone();
+        ids_sorted.sort();
+        assert_eq!(ids, ids_sorted);
+
+        // Ids should match the expected subset.
+        let want_a = corep::transaction_id(&tx_a).unwrap();
+        let want_b = corep::transaction_id(&tx_b).unwrap();
+        assert!(ids.contains(&want_a));
+        assert!(ids.contains(&want_b));
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MempoolItem {
     entries: Vec<TransactionEntry>,
     sender_pubkey: Option<[u8; 32]>,
     nonce: Option<u64>,
     protocol_tx: Option<corep::Transaction>,
+    /// Wall-clock time (ms since epoch) when we first accepted this tx into the mempool.
+    /// Used for freeze-window based cycle input formation.
+    received_at_ms: u64,
     inserted_at: Instant,
 }
 
@@ -376,6 +446,7 @@ impl Mempool {
                 sender_pubkey: None,
                 nonce: None,
                 protocol_tx: None,
+                received_at_ms: tx.created_at_ms,
                 inserted_at: Instant::now(),
             },
         );
@@ -403,6 +474,7 @@ impl Mempool {
                 sender_pubkey: tx.sender_pubkey(),
                 nonce: Some(tx.tx.core.nonce),
                 protocol_tx: Some(tx.tx),
+                received_at_ms: tx.received_at_ms,
                 inserted_at: Instant::now(),
             },
         );
@@ -453,8 +525,26 @@ impl Mempool {
     /// Note: does NOT remove them. Transactions remain pending until applied (nonce advances)
     /// or TTL eviction. This prevents accidental loss if a cycle fails.
     pub fn snapshot_protocol_txs(&mut self, max_txs: usize) -> Vec<corep::Transaction> {
+        self.snapshot_protocol_txs_before(max_txs, u64::MAX)
+    }
+
+    /// Snapshot protocol transactions that were received at-or-before `cutoff_ms`.
+    ///
+    /// This implements a "freeze window": if nodes are epoch-aligned, they can independently form
+    /// the same cycle input set from the same mempool contents, excluding txs that arrived within
+    /// the last `freeze_window_ms` before the cycle boundary.
+    pub fn snapshot_protocol_txs_before(&mut self, max_txs: usize, cutoff_ms: u64) -> Vec<corep::Transaction> {
         self.evict_expired();
-        let mut keys: Vec<Hash> = self.by_id.keys().cloned().collect();
+        let mut keys: Vec<Hash> = self.by_id
+            .iter()
+            .filter_map(|(k, v)| {
+                if v.protocol_tx.is_some() && v.received_at_ms <= cutoff_ms {
+                    Some(*k)
+                } else {
+                    None
+                }
+            })
+            .collect();
         keys.sort();
 
         let mut out: Vec<corep::Transaction> = Vec::new();
