@@ -948,4 +948,78 @@ mod tests {
         let h2 = hash_data(&u2).unwrap();
         assert_eq!(h1, h2, "nodes should converge on identical LSU hash");
     }
+
+    #[tokio::test]
+    async fn test_out_of_order_messages_are_buffered_and_consumed_in_later_phases() {
+        let config = ConsensusConfig {
+            cycle_duration_ms: 1000,
+            construction_phase_ms: 50,
+            campaigning_phase_ms: 50,
+            voting_phase_ms: 50,
+            synchronization_phase_ms: 50,
+            freeze_window_ms: 10,
+            min_producers: 2,
+            confidence_threshold: 0.6,
+        };
+
+        let cycle: CycleNumber = 7;
+        let selected: Vec<ProducerId> = vec!["p1".to_string(), "p2".to_string()];
+
+        let producer = Producer::new("p1".to_string(), [1u8; 32], cycle);
+        let manager = ProducerManager::new(producer, config.clone());
+        let mut consensus = CollaborativeConsensus::new(config.clone());
+        consensus.set_producer_manager(manager);
+
+        // Wire a receiver so collection loops read real messages.
+        let (tx, rx) = mpsc::unbounded_channel::<MessageEnvelope>();
+        consensus.set_network_receiver(rx);
+
+        // Set cycle + membership (normally done in start_cycle()).
+        consensus.current_cycle = cycle;
+        consensus.selected_producers = selected.clone();
+
+        // Send a campaigning message *before* quantities are collected. It should be buffered.
+        let candidate = ProducerCandidate {
+            majority_hash: [9u8; 32],
+            producer_list_hash: [8u8; 32],
+            producer_list: selected.clone(),
+            cycle_number: cycle,
+            producer_id: "p2".to_string(),
+            timestamp: 0,
+        };
+        let env_c = MessageEnvelope::from_message(&candidate, "test".to_string(), None).unwrap();
+        tx.send(env_c).unwrap();
+
+        // Construction collection should not surface candidates.
+        let quantities = consensus
+            .collect_producer_quantities(Duration::from_millis(30))
+            .await
+            .unwrap();
+        assert!(quantities.is_empty());
+
+        // Now send the quantity and ensure construction collector sees it.
+        let q = ProducerQuantity {
+            first_hash: [7u8; 32],
+            cycle_number: cycle,
+            producer_id: "p2".to_string(),
+            timestamp: 0,
+        };
+        let env_q = MessageEnvelope::from_message(&q, "test".to_string(), None).unwrap();
+        tx.send(env_q).unwrap();
+
+        let quantities = consensus
+            .collect_producer_quantities(Duration::from_millis(30))
+            .await
+            .unwrap();
+        assert_eq!(quantities.len(), 1);
+        assert_eq!(quantities[0], q);
+
+        // Campaigning collection should drain the buffered candidate.
+        let candidates = consensus
+            .collect_producer_candidates(Duration::from_millis(30))
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0], candidate);
+    }
 }

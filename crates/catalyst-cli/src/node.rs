@@ -1138,6 +1138,85 @@ pub struct CatalystNode {
     rpc_handle: Option<jsonrpsee::server::ServerHandle>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::{KeyProofChange, StateProofBundle};
+
+    fn dummy_lsu(cycle: u64) -> catalyst_consensus::types::LedgerStateUpdate {
+        catalyst_consensus::types::LedgerStateUpdate {
+            partial_update: catalyst_consensus::types::PartialLedgerStateUpdate {
+                transaction_entries: vec![],
+                transaction_signatures_hash: [0u8; 32],
+                total_fees: 0,
+                timestamp: 0,
+            },
+            compensation_entries: vec![],
+            cycle_number: cycle,
+            producer_list: vec![],
+            vote_list: vec![],
+        }
+    }
+
+    fn dummy_proof() -> catalyst_storage::merkle::MerkleProof {
+        catalyst_storage::merkle::MerkleProof {
+            leaf: [0u8; 32],
+            steps: vec![],
+        }
+    }
+
+    #[test]
+    fn verify_bundle_rejects_cycle_mismatch() {
+        let lsu = dummy_lsu(10);
+        let bundle = StateProofBundle {
+            cycle: 11,
+            lsu_hash: [0u8; 32],
+            prev_state_root: [0u8; 32],
+            new_state_root: [0u8; 32],
+            changes: vec![KeyProofChange {
+                key: b"bal:".to_vec(),
+                old_value: vec![0u8],
+                old_proof: dummy_proof(),
+                new_value: vec![1u8],
+                new_proof: dummy_proof(),
+            }],
+        };
+        assert!(!verify_state_transition_bundle(&lsu, &bundle));
+    }
+
+    #[test]
+    fn verify_bundle_rejects_empty_changes() {
+        let lsu = dummy_lsu(10);
+        let bundle = StateProofBundle {
+            cycle: 10,
+            lsu_hash: [0u8; 32],
+            prev_state_root: [0u8; 32],
+            new_state_root: [0u8; 32],
+            changes: vec![],
+        };
+        assert!(!verify_state_transition_bundle(&lsu, &bundle));
+    }
+
+    #[test]
+    fn verify_bundle_rejects_invalid_proofs() {
+        let lsu = dummy_lsu(10);
+        let bundle = StateProofBundle {
+            cycle: 10,
+            lsu_hash: [0u8; 32],
+            prev_state_root: [3u8; 32],
+            new_state_root: [4u8; 32],
+            changes: vec![KeyProofChange {
+                key: b"bal:deadbeef".to_vec(),
+                old_value: vec![0u8],
+                old_proof: dummy_proof(),
+                new_value: vec![1u8],
+                new_proof: dummy_proof(),
+            }],
+        };
+        assert!(!verify_state_transition_bundle(&lsu, &bundle));
+    }
+}
+
 fn parse_hex_32(s: &str) -> Option<[u8; 32]> {
     let s = s.trim();
     let s = s.strip_prefix("0x").unwrap_or(s);
