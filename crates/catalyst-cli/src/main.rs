@@ -235,7 +235,14 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging(&cli.log_level, cli.json_logs)?;
 
-    info!("Starting Catalyst CLI v{}", env!("CARGO_PKG_VERSION"));
+    // Initialize metrics registry (best-effort).
+    // This enables consensus/network/storage code to record metrics, even if we only export via logs for now.
+    let _ = init_metrics();
+    if let Some(registry) = get_metrics_registry() {
+        if let Ok(mut reg) = registry.lock() {
+            let _ = catalyst_metrics::register_standard_metrics(&mut reg);
+        }
+    }
 
     // Execute command
     match cli.command {
