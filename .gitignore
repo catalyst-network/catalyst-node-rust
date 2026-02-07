@@ -1,1 +1,18 @@
 /target
+
+# Local configs / secrets
+catalyst.toml
+node.key
+*.key
+
+# Local testnets / devnets / runtime state
+/testnet/
+/scripts/.cache/
+**/*.pid
+
+# Local storage / rocksdb data (never commit)
+/crates/catalyst-storage/catalyst_data/
+**/catalyst_data/
+
+# Generated libp2p/network identity (never commit)
+/crates/catalyst-network/network_keypair

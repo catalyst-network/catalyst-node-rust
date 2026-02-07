@@ -101,15 +101,31 @@ impl NetworkMessage for ProtocolTxGossip {
 
 impl ProtocolTxGossip {
     pub fn new(tx: corep::Transaction, received_at_ms: u64) -> CatalystResult<Self> {
-        // Stable tx id for deduplication: use canonical protocol tx id.
-        let tx_id = corep::transaction_id(&tx)
-            .map_err(|e| catalyst_utils::error::CatalystError::Serialization(e))?;
+        // Stable tx id for deduplication: hash bincode(tx)
+        let bytes = bincode::serialize(&tx)
+            .map_err(|e| catalyst_utils::error::CatalystError::Serialization(e.to_string()))?;
+        let mut hasher = blake2::Blake2b512::new();
+        hasher.update(&bytes);
+        let result = hasher.finalize();
+        let mut tx_id = [0u8; 32];
+        tx_id.copy_from_slice(&result[..32]);
 
         Ok(Self { tx_id, tx, received_at_ms })
     }
 
     pub fn validate_basic(&self, now_secs: u64) -> Result<(), String> {
-        corep::validate_basic_and_unlocked(&self.tx, now_secs)
+        self.tx.validate_basic()?;
+        if self.tx.core.nonce == 0 {
+            return Err("Transaction nonce must be > 0".to_string());
+        }
+        // Interpret lock_time as unix seconds "not before".
+        if (self.tx.core.lock_time as u64) > now_secs {
+            return Err(format!(
+                "Transaction not yet unlocked: lock_time={} now={}",
+                self.tx.core.lock_time, now_secs
+            ));
+        }
+        Ok(())
     }
 
     pub fn to_consensus_entries(&self) -> Vec<TransactionEntry> {
@@ -165,7 +181,25 @@ impl ProtocolTxGossip {
     }
 
     pub fn sender_pubkey(&self) -> Option<[u8; 32]> {
-        corep::transaction_sender_pubkey(&self.tx)
+        match self.tx.core.tx_type {
+            corep::TransactionType::WorkerRegistration => self.tx.core.entries.get(0).map(|e| e.public_key),
+            corep::TransactionType::SmartContract => self.tx.core.entries.get(0).map(|e| e.public_key),
+            _ => {
+                let mut sender: Option<[u8; 32]> = None;
+                for e in &self.tx.core.entries {
+                    if let EntryAmount::NonConfidential(v) = e.amount {
+                        if v < 0 {
+                            match sender {
+                                None => sender = Some(e.public_key),
+                                Some(pk) if pk == e.public_key => {}
+                                Some(_) => return None,
+                            }
+                        }
+                    }
+                }
+                sender
+            }
+        }
     }
 }
 
@@ -273,143 +307,12 @@ impl ProtocolTxBatch {
     }
 }
 
-#[cfg(test)]
-mod wire_roundtrip_tests {
-    use super::*;
-    use catalyst_utils::NetworkMessage;
-
-    fn example_tx() -> corep::Transaction {
-        corep::Transaction {
-            core: corep::TransactionCore {
-                tx_type: corep::TransactionType::NonConfidentialTransfer,
-                entries: vec![
-                    corep::TransactionEntry {
-                        public_key: [1u8; 32],
-                        amount: EntryAmount::NonConfidential(-5),
-                    },
-                    corep::TransactionEntry {
-                        public_key: [2u8; 32],
-                        amount: EntryAmount::NonConfidential(5),
-                    },
-                ],
-                nonce: 1,
-                lock_time: 0,
-                fees: 0,
-                data: Vec::new(),
-            },
-            signature: corep::AggregatedSignature(vec![0u8; 64]),
-            timestamp: 123,
-        }
-    }
-
-    #[test]
-    fn protocol_tx_gossip_roundtrips() {
-        let tx = example_tx();
-        let msg = ProtocolTxGossip::new(tx, 999).unwrap();
-        let bytes = NetworkMessage::serialize(&msg).unwrap();
-        let got = <ProtocolTxGossip as NetworkMessage>::deserialize(&bytes).unwrap();
-        assert_eq!(msg, got);
-    }
-
-    #[test]
-    fn tx_batch_roundtrips() {
-        let entries = vec![TransactionEntry {
-            public_key: [1u8; 32],
-            amount: 1,
-            signature: vec![7u8; 8],
-        }];
-        let batch = TxBatch::new(1, entries).unwrap();
-        let bytes = NetworkMessage::serialize(&batch).unwrap();
-        let got = <TxBatch as NetworkMessage>::deserialize(&bytes).unwrap();
-        assert_eq!(batch, got);
-    }
-
-    #[test]
-    fn protocol_tx_batch_roundtrips() {
-        let txs = vec![example_tx()];
-        let batch = ProtocolTxBatch::new(1, txs).unwrap();
-        let bytes = NetworkMessage::serialize(&batch).unwrap();
-        let got = <ProtocolTxBatch as NetworkMessage>::deserialize(&bytes).unwrap();
-        assert_eq!(batch, got);
-    }
-}
-
-#[cfg(test)]
-mod mempool_freeze_window_tests {
-    use super::*;
-
-    fn example_tx(nonce: u64, sender: [u8; 32]) -> corep::Transaction {
-        corep::Transaction {
-            core: corep::TransactionCore {
-                tx_type: corep::TransactionType::NonConfidentialTransfer,
-                entries: vec![
-                    corep::TransactionEntry {
-                        public_key: sender,
-                        amount: EntryAmount::NonConfidential(-5),
-                    },
-                    corep::TransactionEntry {
-                        public_key: [2u8; 32],
-                        amount: EntryAmount::NonConfidential(5),
-                    },
-                ],
-                nonce,
-                lock_time: 0,
-                fees: 0,
-                data: Vec::new(),
-            },
-            signature: corep::AggregatedSignature(vec![nonce as u8; 64]),
-            timestamp: 0,
-        }
-    }
-
-    #[test]
-    fn snapshot_protocol_txs_before_respects_cutoff_and_is_deterministic() {
-        let mut mp = Mempool::new(Duration::from_secs(60), 1000);
-        let now_secs = 1_000_000;
-
-        // Insert three txs with distinct txids and different received_at_ms.
-        let tx_a = example_tx(1, [10u8; 32]);
-        let tx_b = example_tx(2, [11u8; 32]);
-        let tx_c = example_tx(3, [12u8; 32]);
-
-        let msg_a = ProtocolTxGossip::new(tx_a.clone(), 1_000).unwrap();
-        let msg_b = ProtocolTxGossip::new(tx_b.clone(), 2_000).unwrap();
-        let msg_c = ProtocolTxGossip::new(tx_c.clone(), 3_000).unwrap();
-
-        assert!(mp.insert_protocol(msg_c, now_secs)); // insert out-of-order intentionally
-        assert!(mp.insert_protocol(msg_a, now_secs));
-        assert!(mp.insert_protocol(msg_b, now_secs));
-
-        // Cutoff includes a+b, excludes c.
-        let snap = mp.snapshot_protocol_txs_before(10, 2_000);
-        assert_eq!(snap.len(), 2);
-
-        // Deterministic ordering by tx_id (mempool key sort), independent of insertion order.
-        let ids: Vec<Hash> = snap
-            .iter()
-            .map(|tx| corep::transaction_id(tx).unwrap())
-            .collect();
-        let mut ids_sorted = ids.clone();
-        ids_sorted.sort();
-        assert_eq!(ids, ids_sorted);
-
-        // Ids should match the expected subset.
-        let want_a = corep::transaction_id(&tx_a).unwrap();
-        let want_b = corep::transaction_id(&tx_b).unwrap();
-        assert!(ids.contains(&want_a));
-        assert!(ids.contains(&want_b));
-    }
-}
-
 #[derive(Debug, Clone)]
 struct MempoolItem {
     entries: Vec<TransactionEntry>,
     sender_pubkey: Option<[u8; 32]>,
     nonce: Option<u64>,
     protocol_tx: Option<corep::Transaction>,
-    /// Wall-clock time (ms since epoch) when we first accepted this tx into the mempool.
-    /// Used for freeze-window based cycle input formation.
-    received_at_ms: u64,
     inserted_at: Instant,
 }
 
@@ -446,7 +349,6 @@ impl Mempool {
                 sender_pubkey: None,
                 nonce: None,
                 protocol_tx: None,
-                received_at_ms: tx.created_at_ms,
                 inserted_at: Instant::now(),
             },
         );
@@ -474,7 +376,6 @@ impl Mempool {
                 sender_pubkey: tx.sender_pubkey(),
                 nonce: Some(tx.tx.core.nonce),
                 protocol_tx: Some(tx.tx),
-                received_at_ms: tx.received_at_ms,
                 inserted_at: Instant::now(),
             },
         );
@@ -525,26 +426,8 @@ impl Mempool {
     /// Note: does NOT remove them. Transactions remain pending until applied (nonce advances)
     /// or TTL eviction. This prevents accidental loss if a cycle fails.
     pub fn snapshot_protocol_txs(&mut self, max_txs: usize) -> Vec<corep::Transaction> {
-        self.snapshot_protocol_txs_before(max_txs, u64::MAX)
-    }
-
-    /// Snapshot protocol transactions that were received at-or-before `cutoff_ms`.
-    ///
-    /// This implements a "freeze window": if nodes are epoch-aligned, they can independently form
-    /// the same cycle input set from the same mempool contents, excluding txs that arrived within
-    /// the last `freeze_window_ms` before the cycle boundary.
-    pub fn snapshot_protocol_txs_before(&mut self, max_txs: usize, cutoff_ms: u64) -> Vec<corep::Transaction> {
         self.evict_expired();
-        let mut keys: Vec<Hash> = self.by_id
-            .iter()
-            .filter_map(|(k, v)| {
-                if v.protocol_tx.is_some() && v.received_at_ms <= cutoff_ms {
-                    Some(*k)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut keys: Vec<Hash> = self.by_id.keys().cloned().collect();
         keys.sort();
 
         let mut out: Vec<corep::Transaction> = Vec::new();

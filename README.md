@@ -214,11 +214,6 @@ You can run a single-node “devnet” that:
 - exposes RPC externally (binds to `0.0.0.0`)
 - prints the bootstrap multiaddr + RPC URL to share
 
-## Public Testnet (operator docs)
-
-- **Config template**: `crates/catalyst-config/configs/public_testnet.toml`
-- **Minimal runbook**: `docs/public_testnet_runbook.md`
-
 Start (replace `HOST` with your public IP or DNS name):
 
 ```bash

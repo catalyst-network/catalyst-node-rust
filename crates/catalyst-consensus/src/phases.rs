@@ -45,15 +45,9 @@ impl ConstructionPhase {
         sorted_entries.sort_by_key(|entry| hash_data(entry).unwrap_or_default());
         let entry_count = sorted_entries.len();
 
-        // Create a deterministic Merkle root of transaction signatures.
-        //
-        // Note: in the current testnet scaffolding, `TransactionEntry.signature` carries either:
-        // - a raw Schnorr signature (transfer entries all share the tx signature bytes), or
-        // - a marker-prefixed payload (worker registration / EVM marker).
-        //
-        // We treat these as opaque bytes at the consensus boundary and commit to them here.
+        // Create hash tree of transaction signatures
         let signatures: Vec<Vec<u8>> = sorted_entries.iter().map(|e| e.signature.clone()).collect();
-        let signatures_hash = signature_merkle_root(&signatures);
+        let signatures_hash = self.compute_hash_tree(&signatures)?;
 
         // Fees are not implemented yet in the runtime/state machine; keep deterministic.
         let total_fees = 0u64;
@@ -88,77 +82,16 @@ impl ConstructionPhase {
         Ok(quantity)
     }
 
-}
+    fn compute_hash_tree(&self, signatures: &[Vec<u8>]) -> CatalystResult<Hash> {
+        use blake2::{Blake2b512, Digest};
+        
+        if signatures.is_empty() {
+            return Ok([0u8; 32]);
+        }
 
-pub(crate) fn blake2b_256_tagged(tag: &'static [u8], parts: &[&[u8]]) -> Hash {
-    use blake2::{Blake2b512, Digest};
-    let mut hasher = Blake2b512::new();
-    hasher.update(tag);
-    for p in parts {
-        hasher.update(p);
-    }
-    let result = hasher.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&result[..32]);
-    out
-}
-
-pub(crate) fn hash_id_list_tagged(tag: &'static [u8], ids: &[String]) -> Hash {
-    // Caller must ensure ids are already deterministic (sorted/deduped).
-    let mut parts: Vec<&[u8]> = Vec::with_capacity(ids.len());
-    for id in ids {
-        parts.push(id.as_bytes());
-    }
-    blake2b_256_tagged(tag, &parts)
-}
-
-fn producer_id_to_pubkey_placeholder(producer_id: &str) -> Hash {
-    // Deterministic placeholder mapping until producer public keys are part of membership/state.
-    blake2b_256_tagged(b"catalyst:producer_id:pubkey:v1", &[producer_id.as_bytes()])
-}
-
-fn distribute_evenly(total: u64, recipients: &[String]) -> Vec<(String, u64)> {
-    // Deterministic split: base + 1 for first `remainder` recipients (lexicographically sorted).
-    if recipients.is_empty() {
-        return Vec::new();
-    }
-    let base = total / recipients.len() as u64;
-    let rem = (total % recipients.len() as u64) as usize;
-    let mut out: Vec<(String, u64)> = Vec::with_capacity(recipients.len());
-    for (i, r) in recipients.iter().enumerate() {
-        let extra = if i < rem { 1 } else { 0 };
-        out.push((r.clone(), base.saturating_add(extra)));
-    }
-    out
-}
-
-/// Deterministic Merkle root over a list of signature byte strings.
-///
-/// - leaf hash: `blake2b_256("catalyst:txsig:leaf:v1" || sig_bytes)`
-/// - node hash: `blake2b_256("catalyst:txsig:node:v1" || left || right)`
-///
-/// For odd-width levels, the last node is duplicated (Bitcoin-style).
-pub(crate) fn signature_merkle_root(signatures: &[Vec<u8>]) -> Hash {
-    const LEAF_TAG: &[u8] = b"catalyst:txsig:leaf:v1";
-    const NODE_TAG: &[u8] = b"catalyst:txsig:node:v1";
-
-    if signatures.is_empty() {
-        return [0u8; 32];
-    }
-
-    let mut level: Vec<Hash> = signatures
-        .iter()
-        .map(|s| blake2b_256_tagged(LEAF_TAG, &[s.as_slice()]))
-        .collect();
-
-    while level.len() > 1 {
-        let mut next: Vec<Hash> = Vec::with_capacity((level.len() + 1) / 2);
-        let mut i = 0usize;
-        while i < level.len() {
-            let left = level[i];
-            let right = if i + 1 < level.len() { level[i + 1] } else { level[i] };
-            next.push(blake2b_256_tagged(NODE_TAG, &[&left, &right]));
-            i += 2;
+        let mut hasher = Blake2b512::new();
+        for sig_bytes in signatures {
+            hasher.update(sig_bytes);
         }
         level = next;
     }
@@ -245,23 +178,21 @@ impl CampaigningPhase {
             }.into());
         }
 
-        // Count occurrences of each first hash (BTreeMap for deterministic tie-breaking).
-        let mut hash_counts: BTreeMap<Hash, BTreeMap<String, ()>> = BTreeMap::new();
-        for q in self.collected_quantities.values() {
-            hash_counts
-                .entry(q.first_hash)
-                .or_insert_with(BTreeMap::new)
-                .insert(q.producer_id.clone(), ());
+        // Count occurrences of each first hash (BTreeMap for deterministic iteration/logging)
+        let mut hash_counts: BTreeMap<Hash, Vec<String>> = BTreeMap::new();
+        for (producer_id, quantity) in &self.collected_quantities {
+            hash_counts.entry(quantity.first_hash)
+                .or_insert_with(Vec::new)
+                .push(producer_id.clone());
         }
 
-        // Find the hash with the highest count; ties resolve by hash ordering (BTreeMap).
+        // Find majority hash (required_majority is derived from membership, not from received count)
         let mut best_hash: Option<Hash> = None;
-        let mut best_count: usize = 0;
+        let mut best_list: Vec<String> = Vec::new();
         for (h, producers) in hash_counts.iter() {
-            let n = producers.len();
-            if n > best_count {
+            if producers.len() > best_list.len() {
                 best_hash = Some(*h);
-                best_count = n;
+                best_list = producers.clone();
             }
         }
         let Some(majority_hash) = best_hash else {
@@ -271,10 +202,7 @@ impl CampaigningPhase {
                 details: format!(" (phase=campaigning cycle={})", self.producer.cycle_number),
             }.into());
         };
-        let producer_list = hash_counts
-            .get(&majority_hash)
-            .map(|m| m.keys().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
+        let producer_list = best_list;
 
         if producer_list.len() < required_majority {
             log_warn!(
@@ -296,7 +224,7 @@ impl CampaigningPhase {
             }.into());
         }
 
-        // Deterministic witness list: sorted + dedup; include self if we have the majority hash.
+        // Include self if we have the majority hash
         let producer_list_len = producer_list.len();
         let mut final_producer_list = producer_list;
         if let Some(our_hash) = self.producer.first_hash {
@@ -316,7 +244,6 @@ impl CampaigningPhase {
         let candidate = ProducerCandidate {
             majority_hash,
             producer_list_hash,
-            producer_list: final_producer_list,
             cycle_number: self.producer.cycle_number,
             producer_id: self.producer.id.clone(),
             timestamp: current_timestamp_ms(),
@@ -328,9 +255,20 @@ impl CampaigningPhase {
     }
 
     fn hash_producer_list(&self, producer_list: &[String]) -> CatalystResult<Hash> {
-        // Domain-separated list hashing; list must already be deterministic (sorted/deduped).
-        const TAG: &[u8] = b"catalyst:campaigning:producer_list:v1";
-        Ok(hash_id_list_tagged(TAG, producer_list))
+        use blake2::{Blake2b512, Digest};
+        
+        let mut sorted_list = producer_list.to_vec();
+        sorted_list.sort();
+        
+        let mut hasher = Blake2b512::new();
+        for producer_id in &sorted_list {
+            hasher.update(producer_id.as_bytes());
+        }
+        
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result[..32]);
+        Ok(hash)
     }
 }
 
@@ -486,8 +424,15 @@ impl VotingPhase {
         // Store the ledger update
         self.producer.ledger_update = Some(ledger_update);
 
-        // Create vote list hash (must match ledger_update.vote_list)
-        let vote_list_hash = self.hash_producer_list(&final_vote_list)?;
+        // Create vote list hash
+        let vote_list_hash = self.hash_producer_list(&voting_producers)?;
+        
+        // Include self in vote list (deterministic)
+        let mut final_vote_list = voting_producers;
+        if !final_vote_list.contains(&self.producer.id) {
+            final_vote_list.push(self.producer.id.clone());
+        }
+        final_vote_list.sort();
         self.producer.vote_list = Some(final_vote_list);
 
         let vote = ProducerVote {
@@ -502,9 +447,9 @@ impl VotingPhase {
     }
 
     fn create_final_producer_list(&self, majority_hash: &Hash) -> CatalystResult<Vec<String>> {
-        // Collect all witness lists from candidates with majority hash and count producer occurrences.
+        // Collect all producer lists from candidates with majority hash
         let mut producer_counts: BTreeMap<String, usize> = BTreeMap::new();
-        let mut total_candidates = 0usize;
+        let mut total_candidates = 0;
 
         for candidate in self.collected_candidates.values() {
             if candidate.majority_hash != *majority_hash {
@@ -516,15 +461,15 @@ impl VotingPhase {
             }
         }
 
-        // Include only producers that appear in at least P/2 witness lists.
-        let threshold = (total_candidates + 1) / 2;
+        // Include only producers that appear in at least P/2 lists
+        let threshold = (total_candidates + 1) / 2;  // P/2 threshold
         let mut final_list: Vec<String> = producer_counts
             .into_iter()
             .filter(|(_, count)| *count >= threshold)
             .map(|(producer_id, _)| producer_id)
             .collect();
         final_list.sort();
-        final_list.dedup();
+
         Ok(final_list)
     }
 
@@ -554,7 +499,17 @@ impl VotingPhase {
                 amount,
             });
         }
-        for (vid, amount) in voter_payouts {
+
+        let reward_per_producer = reward_config.producer_reward / producer_list.len() as u64;
+        
+        // Deterministic ordering (this list is hashed as part of LSU).
+        let mut sorted = producer_list.to_vec();
+        sorted.sort();
+        for producer_id in &sorted {
+            // In a real implementation, we'd look up the producer's public key
+            // For now, we'll use a placeholder
+            let public_key = [0u8; 32]; // Placeholder
+            
             entries.push(CompensationEntry {
                 producer_id: vid.clone(),
                 public_key: producer_id_to_pubkey_placeholder(&vid),
@@ -562,15 +517,26 @@ impl VotingPhase {
             });
         }
 
-        // Stable ordering (this list is hashed as part of LSU)
-        entries.sort_by(|a, b| a.producer_id.cmp(&b.producer_id).then(a.amount.cmp(&b.amount)));
+        // Ensure stable entry ordering (by producer id).
+        entries.sort_by(|a, b| a.producer_id.cmp(&b.producer_id));
         Ok(entries)
     }
 
     fn hash_producer_list(&self, producer_list: &[String]) -> CatalystResult<Hash> {
-        // Domain-separated vote list hashing; list must already be deterministic (sorted/deduped).
-        const TAG: &[u8] = b"catalyst:voting:vote_list:v1";
-        Ok(hash_id_list_tagged(TAG, producer_list))
+        use blake2::{Blake2b512, Digest};
+        
+        let mut sorted_list = producer_list.to_vec();
+        sorted_list.sort();
+        
+        let mut hasher = Blake2b512::new();
+        for producer_id in &sorted_list {
+            hasher.update(producer_id.as_bytes());
+        }
+        
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result[..32]);
+        Ok(hash)
     }
 }
 
@@ -746,9 +712,20 @@ impl SynchronizationPhase {
     }
 
     fn hash_producer_list(&self, producer_list: &[String]) -> CatalystResult<Hash> {
-        // Must match VotingPhase vote_list hashing.
-        const TAG: &[u8] = b"catalyst:voting:vote_list:v1";
-        Ok(hash_id_list_tagged(TAG, producer_list))
+        use blake2::{Blake2b512, Digest};
+        
+        let mut sorted_list = producer_list.to_vec();
+        sorted_list.sort();
+        
+        let mut hasher = Blake2b512::new();
+        for producer_id in &sorted_list {
+            hasher.update(producer_id.as_bytes());
+        }
+        
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result[..32]);
+        Ok(hash)
     }
 }
 

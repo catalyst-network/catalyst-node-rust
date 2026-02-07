@@ -12,13 +12,12 @@ use catalyst_utils::{
     CatalystDeserialize, CatalystSerialize, MessageType, MessageEnvelope,
     utils::current_timestamp_ms,
 };
-use catalyst_utils::{increment_counter, observe_histogram, set_gauge};
 use catalyst_consensus::types::hash_data;
 use catalyst_utils::state::StateManager;
 
 use crate::config::NodeConfig;
 use crate::tx::{Mempool, ProtocolTxBatch, ProtocolTxGossip, TxBatch, TxGossip};
-use crate::sync::{FileRequestMsg, FileResponseMsg, KeyProofChange, LsuCidGossip, LsuGossip, LsuMetaRequest, StateProofBundle};
+use crate::sync::{FileRequestMsg, FileResponseMsg, KeyProofChange, LsuCidGossip, LsuGossip, StateProofBundle};
 use crate::evm::{decode_evm_marker, encode_evm_marker, EvmTxKind, EvmTxPayload};
 use crate::evm_revm::{execute_call_and_persist, execute_deploy_and_persist};
 
@@ -168,10 +167,10 @@ fn verify_state_transition_bundle(
     let mut new: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
     for c in &bundle.changes {
-        if !catalyst_storage::sparse_merkle::verify_proof_for_key_value(&bundle.prev_state_root, &c.key, Some(&c.old_value), &c.old_proof) {
+        if !catalyst_storage::merkle::verify_proof(&bundle.prev_state_root, &c.old_proof) {
             return false;
         }
-        if !catalyst_storage::sparse_merkle::verify_proof_for_key_value(&bundle.new_state_root, &c.key, Some(&c.new_value), &c.new_proof) {
+        if !catalyst_storage::merkle::verify_proof(&bundle.new_state_root, &c.new_proof) {
             return false;
         }
         old.insert(c.key.clone(), c.old_value.clone());
@@ -322,15 +321,11 @@ async fn apply_lsu_to_storage_without_root_check(
 
     // Persist head metadata (trusted).
     store.set_state_root_cache(new_root);
-    let tx_sigs_root = lsu.partial_update.transaction_signatures_hash;
     let _ = store
         .set_metadata("consensus:last_applied_cycle", &lsu.cycle_number.to_le_bytes())
         .await;
     let _ = store
         .set_metadata("consensus:last_applied_state_root", &new_root)
-        .await;
-    let _ = store
-        .set_metadata("consensus:last_applied_tx_sigs_root", &tx_sigs_root)
         .await;
     if let Ok(h) = catalyst_consensus::types::hash_data(lsu) {
         let _ = store
@@ -473,53 +468,12 @@ fn tx_is_sane(entries: &[catalyst_consensus::types::TransactionEntry]) -> bool {
 }
 
 async fn tx_is_funded(store: &StorageManager, entries: &[catalyst_consensus::types::TransactionEntry]) -> bool {
-    // Sufficient-funds check with aggregation:
-    // for each pubkey, ensure (balance + sum(deltas)) >= 0.
-    use std::collections::BTreeMap;
-    let mut deltas: BTreeMap<[u8; 32], i64> = BTreeMap::new();
+    // Minimal sufficient-funds check:
+    // if an entry is negative, ensure balance + delta >= 0 for that pubkey.
     for e in entries {
-        *deltas.entry(e.public_key).or_insert(0) = deltas
-            .get(&e.public_key)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(e.amount);
-    }
-    for (pk, delta) in deltas {
-        if delta < 0 {
-            let bal = get_balance_i64(store, &pk).await;
-            if bal.saturating_add(delta) < 0 {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-async fn tx_is_funded_protocol(store: &StorageManager, tx: &catalyst_core::protocol::Transaction) -> bool {
-    use catalyst_core::protocol::{EntryAmount, TransactionType};
-    use std::collections::BTreeMap;
-
-    match tx.core.tx_type {
-        TransactionType::NonConfidentialTransfer => {}
-        // No balance impact (for now) for these scaffolded tx types.
-        TransactionType::WorkerRegistration | TransactionType::SmartContract => return true,
-        _ => return false,
-    }
-
-    let mut deltas: BTreeMap<[u8; 32], i64> = BTreeMap::new();
-    for e in &tx.core.entries {
-        let v = match e.amount {
-            EntryAmount::NonConfidential(v) => v,
-            EntryAmount::Confidential { .. } => return false,
-        };
-        *deltas.entry(e.public_key).or_insert(0) =
-            deltas.get(&e.public_key).copied().unwrap_or(0).saturating_add(v);
-    }
-
-    for (pk, delta) in deltas {
-        if delta < 0 {
-            let bal = get_balance_i64(store, &pk).await;
-            if bal.saturating_add(delta) < 0 {
+        if e.amount < 0 {
+            let bal = get_balance_i64(store, &e.public_key).await;
+            if bal.saturating_add(e.amount) < 0 {
                 return false;
             }
         }
@@ -563,7 +517,25 @@ fn load_workers_from_state(store: &StorageManager) -> Vec<[u8; 32]> {
 }
 
 fn tx_sender_pubkey(tx: &catalyst_core::protocol::Transaction) -> Option<[u8; 32]> {
-    catalyst_core::protocol::transaction_sender_pubkey(tx)
+    match tx.core.tx_type {
+        catalyst_core::protocol::TransactionType::WorkerRegistration => tx.core.entries.get(0).map(|e| e.public_key),
+        catalyst_core::protocol::TransactionType::SmartContract => tx.core.entries.get(0).map(|e| e.public_key),
+        _ => {
+            let mut sender: Option<[u8; 32]> = None;
+            for e in &tx.core.entries {
+                if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
+                    if v < 0 {
+                        match sender {
+                            None => sender = Some(e.public_key),
+                            Some(pk) if pk == e.public_key => {}
+                            Some(_) => return None,
+                        }
+                    }
+                }
+            }
+            sender
+        }
+    }
 }
 
 fn tx_to_consensus_entries(tx: &catalyst_core::protocol::Transaction) -> Vec<catalyst_consensus::types::TransactionEntry> {
@@ -625,11 +597,11 @@ async fn validate_and_select_protocol_txs_for_construction(
     let mut used_entries = 0usize;
     let now_secs = current_timestamp_ms() / 1000;
 
-    // Deterministic iteration order: sort by canonical transaction id (blake2b-256 over canonical preimage).
+    // Deterministic iteration order: sort by bincode(tx) hash (same as tx_id derivation).
     let mut txs = txs;
     txs.sort_by(|a, b| {
-        let ha = catalyst_core::protocol::transaction_id(a).unwrap_or([0u8; 32]);
-        let hb = catalyst_core::protocol::transaction_id(b).unwrap_or([0u8; 32]);
+        let ha = bincode::serialize(a).ok().and_then(|bytes| catalyst_consensus::types::hash_data(&bytes).ok()).unwrap_or([0u8;32]);
+        let hb = bincode::serialize(b).ok().and_then(|bytes| catalyst_consensus::types::hash_data(&bytes).ok()).unwrap_or([0u8;32]);
         ha.cmp(&hb)
     });
 
@@ -910,21 +882,9 @@ async fn apply_lsu_to_storage(
         .unwrap_or(0);
 
     if lsu.cycle_number <= already {
-        // Return persisted root if available; fall back to cached root; else compute.
-        if let Ok(Some(b)) = store.get_metadata("consensus:last_applied_state_root").await {
-            if b.len() == 32 {
-                let mut r = [0u8; 32];
-                r.copy_from_slice(&b);
-                store.set_state_root_cache(r);
-                return Ok(r);
-            }
-        }
-        if let Some(r) = store.get_state_root() {
-            return Ok(r);
-        }
-        // Worst-case: compute by scanning accounts.
-        let r = store.commit().await?;
-        return Ok(r);
+        // Return current state root (best-effort).
+        let root = store.get_state_root().unwrap_or([0u8; 32]);
+        return Ok(root);
     }
 
     // Apply balance deltas from the LSU's ordered transaction entries.
@@ -1031,7 +991,6 @@ async fn apply_lsu_to_storage(
     // Flush + compute a state root that commits the applied balances.
     let state_root = store.commit().await?;
     let lsu_hash = hash_data(lsu).unwrap_or([0u8; 32]);
-    let tx_sigs_root = lsu.partial_update.transaction_signatures_hash;
 
     // Persist the applied head.
     let _ = store
@@ -1042,9 +1001,6 @@ async fn apply_lsu_to_storage(
         .await;
     let _ = store
         .set_metadata("consensus:last_applied_state_root", &state_root)
-        .await;
-    let _ = store
-        .set_metadata("consensus:last_applied_tx_sigs_root", &tx_sigs_root)
         .await;
 
     info!(
@@ -1063,24 +1019,7 @@ async fn apply_lsu_with_root_check(
     store: &StorageManager,
     lsu: &catalyst_consensus::types::LedgerStateUpdate,
     expected_state_root: [u8; 32],
-) -> Result<()> {
-    // Capture prev root so we can restore the cache if we revert.
-    let prev_root = store
-        .get_metadata("consensus:last_applied_state_root")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|b| {
-            if b.len() != 32 {
-                return None;
-            }
-            let mut r = [0u8; 32];
-            r.copy_from_slice(&b);
-            Some(r)
-        })
-        .or_else(|| store.get_state_root())
-        .unwrap_or([0u8; 32]);
-
+) -> Result<bool> {
     let snap = format!("verify_lsu_{}_{}", lsu.cycle_number, current_timestamp_ms());
     let _ = store
         .create_snapshot(&snap)
@@ -1089,7 +1028,7 @@ async fn apply_lsu_with_root_check(
 
     let got = apply_lsu_to_storage(store, lsu).await?;
     if got == expected_state_root {
-        return Ok(());
+        return Ok(true);
     }
 
     // Revert
@@ -1097,13 +1036,7 @@ async fn apply_lsu_with_root_check(
         .load_snapshot(&snap)
         .await
         .map_err(|e| anyhow::anyhow!("snapshot revert failed: {e}"))?;
-    // Restore cached root to match reverted state.
-    store.set_state_root_cache(prev_root);
-    Err(anyhow::anyhow!(
-        "state_root mismatch expected={} got={}",
-        hex_encode(&expected_state_root),
-        hex_encode(&got)
-    ))
+    Ok(false)
 }
 
 /// Main Catalyst node implementation.
@@ -1136,85 +1069,6 @@ pub struct CatalystNode {
 
     /// Optional JSON-RPC server handle (when enabled)
     rpc_handle: Option<jsonrpsee::server::ServerHandle>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::sync::{KeyProofChange, StateProofBundle};
-
-    fn dummy_lsu(cycle: u64) -> catalyst_consensus::types::LedgerStateUpdate {
-        catalyst_consensus::types::LedgerStateUpdate {
-            partial_update: catalyst_consensus::types::PartialLedgerStateUpdate {
-                transaction_entries: vec![],
-                transaction_signatures_hash: [0u8; 32],
-                total_fees: 0,
-                timestamp: 0,
-            },
-            compensation_entries: vec![],
-            cycle_number: cycle,
-            producer_list: vec![],
-            vote_list: vec![],
-        }
-    }
-
-    fn dummy_proof() -> catalyst_storage::merkle::MerkleProof {
-        catalyst_storage::merkle::MerkleProof {
-            leaf: [0u8; 32],
-            steps: vec![],
-        }
-    }
-
-    #[test]
-    fn verify_bundle_rejects_cycle_mismatch() {
-        let lsu = dummy_lsu(10);
-        let bundle = StateProofBundle {
-            cycle: 11,
-            lsu_hash: [0u8; 32],
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
-            changes: vec![KeyProofChange {
-                key: b"bal:".to_vec(),
-                old_value: vec![0u8],
-                old_proof: dummy_proof(),
-                new_value: vec![1u8],
-                new_proof: dummy_proof(),
-            }],
-        };
-        assert!(!verify_state_transition_bundle(&lsu, &bundle));
-    }
-
-    #[test]
-    fn verify_bundle_rejects_empty_changes() {
-        let lsu = dummy_lsu(10);
-        let bundle = StateProofBundle {
-            cycle: 10,
-            lsu_hash: [0u8; 32],
-            prev_state_root: [0u8; 32],
-            new_state_root: [0u8; 32],
-            changes: vec![],
-        };
-        assert!(!verify_state_transition_bundle(&lsu, &bundle));
-    }
-
-    #[test]
-    fn verify_bundle_rejects_invalid_proofs() {
-        let lsu = dummy_lsu(10);
-        let bundle = StateProofBundle {
-            cycle: 10,
-            lsu_hash: [0u8; 32],
-            prev_state_root: [3u8; 32],
-            new_state_root: [4u8; 32],
-            changes: vec![KeyProofChange {
-                key: b"bal:deadbeef".to_vec(),
-                old_value: vec![0u8],
-                old_proof: dummy_proof(),
-                new_value: vec![1u8],
-                new_proof: dummy_proof(),
-            }],
-        };
-        assert!(!verify_state_transition_bundle(&lsu, &bundle));
-    }
 }
 
 fn parse_hex_32(s: &str) -> Option<[u8; 32]> {
@@ -1411,17 +1265,6 @@ impl CatalystNode {
             None
         };
 
-        // Rehydrate authenticated head/root cache from persisted metadata so restart is deterministic.
-        if let Some(store) = &storage {
-            if let Ok(Some(b)) = store.get_metadata("consensus:last_applied_state_root").await {
-                if b.len() == 32 {
-                    let mut r = [0u8; 32];
-                    r.copy_from_slice(&b);
-                    store.set_state_root_cache(r);
-                }
-            }
-        }
-
         // Auto-register as a worker (on-chain) for validator nodes.
         if self.config.validator {
             if let Some(store) = &storage {
@@ -1480,60 +1323,6 @@ impl CatalystNode {
             rehydrate_mempool_from_storage(store.as_ref(), &mempool).await;
         }
 
-        // --- Observability loop (logs + gauges) ---
-        // Export operator-relevant signals without requiring external infra.
-        {
-            let net = network.clone();
-            let mempool = mempool.clone();
-            let store = storage.clone();
-            let node_id = producer_id.clone();
-            let mut shutdown_rx_obs = shutdown_rx.clone();
-            let handle = tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tokio::select! {
-                        _ = tick.tick() => {},
-                        _ = shutdown_rx_obs.changed() => {
-                            if *shutdown_rx_obs.borrow() { break; }
-                            continue;
-                        }
-                    }
-                    if *shutdown_rx_obs.borrow() { break; }
-
-                    let peers = net.get_stats().await.connected_peers as u64;
-                    let mp_len = mempool.read().await.len() as u64;
-                    set_gauge!("network_peers_connected", peers as f64);
-                    set_gauge!("mempool_size", mp_len as f64);
-
-                    let applied_cycle = if let Some(store) = &store {
-                        store.get_metadata("consensus:last_applied_cycle")
-                            .await
-                            .ok()
-                            .flatten()
-                            .and_then(|b| {
-                                if b.len() != 8 { return None; }
-                                let mut a = [0u8; 8];
-                                a.copy_from_slice(&b);
-                                Some(u64::from_le_bytes(a))
-                            })
-                            .unwrap_or(0)
-                    } else {
-                        0
-                    };
-
-                    info!(
-                        "OBS node={} peers={} mempool={} applied_cycle={}",
-                        node_id,
-                        peers,
-                        mp_len,
-                        applied_cycle
-                    );
-                }
-            });
-            self.network_tasks.push(handle);
-        }
-
         // Initialize faucet (dev/testnet): create a deterministic funded account if missing.
         if let Some(store) = &storage {
             let faucet_pk = faucet_pubkey_bytes();
@@ -1564,28 +1353,7 @@ impl CatalystNode {
                 let bind: std::net::SocketAddr = format!("{}:{}", self.config.rpc.address, self.config.rpc.port)
                     .parse()
                     .map_err(|e| anyhow::anyhow!("invalid rpc bind addr: {e}"))?;
-                // Safety: do not allow public bind or wildcard CORS without explicit opt-in.
-                if !bind.ip().is_loopback() && !self.config.rpc.allow_unsafe_exposure {
-                    return Err(anyhow::anyhow!(
-                        "refusing to start RPC on non-loopback address {} without rpc.allow_unsafe_exposure=true",
-                        bind
-                    ));
-                }
-                if self.config.rpc.cors_enabled
-                    && self.config.rpc.cors_origins.iter().any(|o| o == "*")
-                    && !self.config.rpc.allow_unsafe_exposure
-                {
-                    return Err(anyhow::anyhow!(
-                        "refusing to start RPC with wildcard CORS without rpc.allow_unsafe_exposure=true"
-                    ));
-                }
-                let handle = catalyst_rpc::start_rpc_http(
-                    bind,
-                    store.clone(),
-                    Some(network.clone()),
-                    Some(rpc_tx),
-                    self.config.rpc.rate_limit,
-                )
+                let handle = catalyst_rpc::start_rpc_http(bind, store.clone(), Some(network.clone()), Some(rpc_tx))
                     .await
                     .map_err(|e| anyhow::anyhow!("rpc start failed: {e}"))?;
                 info!("RPC server listening on http://{}", bind);
@@ -1789,29 +1557,7 @@ impl CatalystNode {
                             // Prefer protocol-shaped txs; fall back to legacy TxGossip.
                             let now_secs = current_timestamp_ms() / 1000;
                             if let Ok(tx) = envelope.extract_message::<ProtocolTxGossip>() {
-                                // Reject if tx_id does not match canonical tx id for the embedded tx.
-                                if let Ok(expected) = catalyst_core::protocol::transaction_id(&tx.tx) {
-                                    if expected != tx.tx_id {
-                                        tracing::warn!("reject_tx: bad_txid");
-                                        continue;
-                                    }
-                                } else {
-                                    tracing::warn!("reject_tx: txid_compute_failed");
-                                    continue;
-                                }
-
-                                // Basic format + lock-time.
-                                if catalyst_core::protocol::validate_basic_and_unlocked(&tx.tx, now_secs).is_err() {
-                                    tracing::warn!("reject_tx: basic_or_locktime");
-                                    continue;
-                                }
-                                // Pure semantics (fees/conservation/type support).
-                                if catalyst_core::protocol::validate_tx_semantics_for_mempool(&tx.tx).is_err() {
-                                    tracing::warn!("reject_tx: semantics");
-                                    continue;
-                                }
                                 if !verify_protocol_tx_signature(&tx.tx) {
-                                    tracing::warn!("reject_tx: bad_signature");
                                     continue;
                                 }
                                 // Nonce check (single-sender only, requires storage).
@@ -1824,19 +1570,17 @@ impl CatalystNode {
                                     let expected =
                                         tx_nonce_expected_next(store.as_ref(), &sender_pk, pending_max).await;
                                     if tx.tx.core.nonce != expected {
-                                        tracing::warn!("reject_tx: bad_nonce expected={} got={}", expected, tx.tx.core.nonce);
                                         continue;
                                     }
                                 }
                                 // Enforce basic sufficient-funds using current storage.
                                 if let Some(store) = &storage {
-                                    if tx_is_funded_protocol(store.as_ref(), &tx.tx).await {
+                                    let entries = tx.to_consensus_entries();
+                                    if tx_is_sane(&entries) && tx_is_funded(store.as_ref(), &entries).await {
                                         let mut mp = mempool.write().await;
                                         if mp.insert_protocol(tx.clone(), now_secs) {
                                             persist_mempool_tx(store.as_ref(), &tx.tx).await;
                                         }
-                                    } else {
-                                        tracing::warn!("reject_tx: insufficient_funds");
                                     }
                                 } else {
                                     let mut mp = mempool.write().await;
@@ -1870,19 +1614,7 @@ impl CatalystNode {
                             }
                         } else if envelope.message_type == MessageType::ConsensusSync {
                             // Prefer CID-based LSU sync; fallback to full LSU gossip.
-                            if let Ok(req) = envelope.extract_message::<LsuMetaRequest>() {
-                                // Best-effort: respond with stored metadata for this CID, if we have it.
-                                if let Some(store) = &storage {
-                                    let key = format!("consensus:cid_meta:{}", req.cid);
-                                    if let Ok(Some(b)) = store.get_metadata(&key).await {
-                                        if let Ok(meta) = bincode::deserialize::<LsuCidGossip>(&b) {
-                                            if let Ok(env) = MessageEnvelope::from_message(&meta, "lsu_meta".to_string(), None) {
-                                                let _ = net.broadcast_envelope(&env).await;
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if let Ok(ref_msg) = envelope.extract_message::<LsuCidGossip>() {
+                            if let Ok(ref_msg) = envelope.extract_message::<LsuCidGossip>() {
                                 if let Some(dfs) = &dfs {
                                     if let Ok(_cid) = ContentId::from_string(&ref_msg.cid) {
                                         if let Ok(bytes) = dfs.get(&ref_msg.cid).await {
@@ -1908,16 +1640,6 @@ impl CatalystNode {
                                                                 .unwrap_or([0u8; 32]);
 
                                                             if local_prev != ref_msg.prev_state_root && local_prev != [0u8; 32] {
-                                                                if !ref_msg.prev_cid.is_empty() {
-                                                                    // Request metadata for the previous CID to enable backfill.
-                                                                    let req = LsuMetaRequest {
-                                                                        requester: producer_id_self.clone(),
-                                                                        cid: ref_msg.prev_cid.clone(),
-                                                                    };
-                                                                    if let Ok(env) = MessageEnvelope::from_message(&req, "lsu_meta_req".to_string(), None) {
-                                                                        let _ = net.broadcast_envelope(&env).await;
-                                                                    }
-                                                                }
                                                                 tracing::warn!(
                                                                     "Skipping LSU cycle={} cid={} (prev_root mismatch local={} expected={})",
                                                                     ref_msg.cycle,
@@ -1962,13 +1684,19 @@ impl CatalystNode {
                                                                 )
                                                                 .await
                                                                 {
-                                                                    Ok(()) => applied = true,
+                                                                    Ok(true) => applied = true,
+                                                                    Ok(false) => {
+                                                                        tracing::warn!(
+                                                                            "Rejected LSU via CID cycle={} (state_root mismatch) cid={}",
+                                                                            ref_msg.cycle,
+                                                                            ref_msg.cid
+                                                                        );
+                                                                        continue;
+                                                                    }
                                                                     Err(e) => {
                                                                         tracing::warn!(
-                                                                            "Rejected LSU via CID cycle={} cid={} expected_root={} err={}",
+                                                                            "Failed to verify/apply LSU via CID cycle={} err={}",
                                                                             ref_msg.cycle,
-                                                                            ref_msg.cid,
-                                                                            hex_encode(&ref_msg.state_root),
                                                                             e
                                                                         );
                                                                         continue;
@@ -1977,7 +1705,6 @@ impl CatalystNode {
                                                             }
                                                         }
 
-                                                        let tx_sigs_root = lsu.partial_update.transaction_signatures_hash;
                                                         last_lsu.write().await.insert(ref_msg.cycle, lsu);
                                                         info!(
                                                             "Synced LSU via CID cycle={} cid={}",
@@ -2001,12 +1728,6 @@ impl CatalystNode {
                                                                 .await;
                                                             let _ = store
                                                                 .set_metadata(
-                                                                    &format!("consensus:tx_sigs_root:{}", ref_msg.cycle),
-                                                                    &tx_sigs_root,
-                                                                )
-                                                                .await;
-                                                            let _ = store
-                                                                .set_metadata(
                                                                     &format!("consensus:lsu_cid:{}", ref_msg.cycle),
                                                                     ref_msg.cid.as_bytes(),
                                                                 )
@@ -2025,9 +1746,6 @@ impl CatalystNode {
                                                                 .set_metadata("consensus:last_lsu_hash", &ref_msg.lsu_hash)
                                                                 .await;
                                                             let _ = store
-                                                                .set_metadata("consensus:last_tx_sigs_root", &tx_sigs_root)
-                                                                .await;
-                                                            let _ = store
                                                                 .set_metadata("consensus:last_lsu_cycle", &ref_msg.cycle.to_le_bytes())
                                                                 .await;
                                                             let _ = store
@@ -2036,11 +1754,6 @@ impl CatalystNode {
                                                             let _ = store
                                                                 .set_metadata("consensus:last_lsu_state_root", &ref_msg.state_root)
                                                                 .await;
-                                                            if let Ok(b) = bincode::serialize(&ref_msg) {
-                                                                let _ = store
-                                                                    .set_metadata(&format!("consensus:cid_meta:{}", ref_msg.cid), &b)
-                                                                    .await;
-                                                            }
                                                         }
                                                     }
                                                 }
@@ -2075,7 +1788,6 @@ impl CatalystNode {
                                 if let Ok(h) = catalyst_consensus::types::hash_data(&lsu_msg.lsu) {
                                     if h == lsu_msg.lsu_hash {
                                         let lsu = lsu_msg.lsu;
-                                        let tx_sigs_root = lsu.partial_update.transaction_signatures_hash;
                                         last_lsu.write().await.insert(lsu_msg.cycle, lsu.clone());
 
                                         if let Some(store) = &storage {
@@ -2095,21 +1807,12 @@ impl CatalystNode {
                                                         &lsu_msg.lsu_hash,
                                                     )
                                                     .await;
-                                                let _ = store
-                                                    .set_metadata(
-                                                        &format!("consensus:tx_sigs_root:{}", lsu_msg.cycle),
-                                                        &tx_sigs_root,
-                                                    )
-                                                    .await;
 
                                                 let _ = store
                                                     .set_metadata("consensus:last_lsu", &bytes)
                                                     .await;
                                                 let _ = store
                                                     .set_metadata("consensus:last_lsu_hash", &lsu_msg.lsu_hash)
-                                                    .await;
-                                                let _ = store
-                                                    .set_metadata("consensus:last_tx_sigs_root", &tx_sigs_root)
                                                     .await;
                                                 let _ = store
                                                     .set_metadata("consensus:last_lsu_cycle", &lsu_msg.cycle.to_le_bytes())
@@ -2209,7 +1912,6 @@ impl CatalystNode {
                                                     info.expected_state_root,
                                                 )
                                                 .await
-                                                .map(|_| true)
                                                 .unwrap_or(false);
                                             }
                                             if ok {
@@ -2348,49 +2050,25 @@ impl CatalystNode {
         if self.config.validator {
             let validator_worker_ids_hex = validator_worker_ids_hex.clone();
             let max_entries_per_cycle = self.config.consensus.max_transactions_per_block as usize;
-            let freeze_window_ms = (self.config.consensus.freeze_time_seconds as u64) * 1000;
             self.consensus_task = Some(tokio::spawn(async move {
                 // Seed for deterministic producer selection (paper uses previous LSU merkle root).
-                // We approximate with the previous cycle's transaction signatures hash root, which is a
-                // stable 32-byte commitment carried in the LSU.
+                // We approximate with the hash of the most recent LSU we produced/observed.
                 let mut prev_seed: [u8; 32] = [0u8; 32];
 
                 // Load last persisted seed (prefer applied head).
                 if let Some(store) = &storage {
-                    let mut seed_bytes = store
-                        .get_metadata("consensus:last_applied_tx_sigs_root")
-                        .await
-                        .ok()
-                        .flatten();
-                    if seed_bytes.is_none() {
-                        seed_bytes = store
-                            .get_metadata("consensus:last_applied_lsu_hash")
-                            .await
-                            .ok()
-                            .flatten();
-                    }
-                    if seed_bytes.is_none() {
-                        seed_bytes = store
-                            .get_metadata("consensus:last_tx_sigs_root")
-                            .await
-                            .ok()
-                            .flatten();
-                    }
-                    if seed_bytes.is_none() {
-                        seed_bytes = store
-                            .get_metadata("consensus:last_lsu_hash")
-                            .await
-                            .ok()
-                            .flatten();
-                    }
+                    let seed_bytes = match store.get_metadata("consensus:last_applied_lsu_hash").await {
+                        Ok(Some(b)) => Some(b),
+                        _ => match store.get_metadata("consensus:last_lsu_hash").await {
+                            Ok(Some(b)) => Some(b),
+                            _ => None,
+                        },
+                    };
 
                     if let Some(bytes) = seed_bytes {
                         if bytes.len() == 32 {
                             prev_seed.copy_from_slice(&bytes[..32]);
-                            info!(
-                                "Loaded producer selection prev_seed from storage: {}",
-                                hex_encode(&prev_seed)
-                            );
+                            info!("Loaded prev_seed from storage: {}", hex_encode(&prev_seed));
                         }
                     }
                 }
@@ -2479,24 +2157,11 @@ impl CatalystNode {
                     // the same tx entries list for Construction.
                     let leader = selected.first().cloned().unwrap_or_else(|| producer_id.clone());
                     let transactions = if producer_id == leader {
-                        // Freeze-window semantics:
-                        // - cycle is epoch-aligned: cycle_start_ms = cycle * cycle_ms
-                        // - a tx is eligible for this cycle only if received_at_ms <= (cycle_start_ms - freeze_window_ms)
-                        // - deterministic ordering is by canonical tx_id (enforced by mempool snapshot sort)
-                        let cycle_start_ms = cycle.saturating_mul(cycle_ms);
-                        let cutoff_ms = cycle_start_ms.saturating_sub(freeze_window_ms);
                         let candidate_txs = {
                             let mut mp = mempool.write().await;
                             // Snapshot protocol transactions only; legacy entries are ignored for Construction.
-                            mp.snapshot_protocol_txs_before(max_entries_per_cycle, cutoff_ms)
+                            mp.snapshot_protocol_txs(max_entries_per_cycle)
                         };
-                        info!(
-                            "Cycle {} freeze_window_ms={} cutoff_ms={} candidate_txs={}",
-                            cycle,
-                            freeze_window_ms,
-                            cutoff_ms,
-                            candidate_txs.len()
-                        );
                         let txs = if let Some(store) = &storage {
                             validate_and_select_protocol_txs_for_construction(
                                 store.as_ref(),
@@ -2545,41 +2210,28 @@ impl CatalystNode {
 
                     match consensus.start_cycle(cycle, selected, transactions).await {
                         Ok(Some(update)) => {
-                            // Keep LSU hash for sync/verification, but use a separate, explicit seed
-                            // for producer selection (32-byte commitment carried in the LSU).
-                            let lsu_hash = hash_data(&update).unwrap_or([0u8; 32]);
-                            let tx_sigs_root = update.partial_update.transaction_signatures_hash;
-                            prev_seed = tx_sigs_root;
+                            if let Ok(h) = hash_data(&update) {
+                                prev_seed = h;
+                            }
 
                             // Proof-driven sync (step 4): bundle old/new proofs for touched keys.
                             // These are best-effort; followers fall back to apply-then-check if unavailable.
                             let mut prev_state_root_for_msg: [u8; 32] = [0u8; 32];
-                            let mut prev_cid_for_msg: String = String::new();
                             let mut proof_cid_for_msg: String = String::new();
 
                             // Persist latest LSU and seed.
                             if let Some(store) = &storage {
-                                // Capture previous LSU CID (tip pointer) before updating it for this cycle.
-                                if let Ok(Some(b)) = store.get_metadata("consensus:last_lsu_cid").await {
-                                    if let Ok(s) = String::from_utf8(b) {
-                                        prev_cid_for_msg = s;
-                                    }
-                                }
                                 if let Ok(bytes) = update.serialize() {
                                     // Per-cycle history
                                     let _ = store
                                         .set_metadata(&format!("consensus:lsu:{}", cycle), &bytes)
                                         .await;
                                     let _ = store
-                                        .set_metadata(&format!("consensus:lsu_hash:{}", cycle), &lsu_hash)
-                                        .await;
-                                    let _ = store
-                                        .set_metadata(&format!("consensus:tx_sigs_root:{}", cycle), &tx_sigs_root)
+                                        .set_metadata(&format!("consensus:lsu_hash:{}", cycle), &prev_seed)
                                         .await;
 
                                     let _ = store.set_metadata("consensus:last_lsu", &bytes).await;
-                                    let _ = store.set_metadata("consensus:last_lsu_hash", &lsu_hash).await;
-                                    let _ = store.set_metadata("consensus:last_tx_sigs_root", &tx_sigs_root).await;
+                                    let _ = store.set_metadata("consensus:last_lsu_hash", &prev_seed).await;
                                     let _ = store
                                         .set_metadata("consensus:last_lsu_cycle", &cycle.to_le_bytes())
                                         .await;
@@ -2663,7 +2315,8 @@ impl CatalystNode {
                             // - gossip CID + expected LSU hash
                             // fallback: full LSU gossip if DFS is disabled/unavailable.
                             if let Some(dfs) = &dfs {
-                                if let Ok(bytes) = update.serialize() {
+                                if let Ok(lsu_hash) = catalyst_consensus::types::hash_data(&update) {
+                                    if let Ok(bytes) = update.serialize() {
                                         let cid_str = dfs.put(bytes).await.ok();
                                         if let Some(cid) = cid_str {
                                             let state_root = if let Some(store) = &storage {
@@ -2675,7 +2328,6 @@ impl CatalystNode {
                                                 cycle,
                                                 lsu_hash,
                                                 cid,
-                                                prev_cid: prev_cid_for_msg.clone(),
                                                 prev_state_root: prev_state_root_for_msg,
                                                 state_root,
                                                 proof_cid: proof_cid_for_msg,
@@ -2692,12 +2344,6 @@ impl CatalystNode {
                                                 let _ = store
                                                     .set_metadata("consensus:last_lsu_state_root", &msg.state_root)
                                                     .await;
-                                                // Store CID->metadata mapping for backfill requests.
-                                                if let Ok(b) = bincode::serialize(&msg) {
-                                                    let _ = store
-                                                        .set_metadata(&format!("consensus:cid_meta:{}", msg.cid), &b)
-                                                        .await;
-                                                }
                                                 // Per-cycle CID history
                                                 let _ = store
                                                     .set_metadata(
@@ -2717,6 +2363,7 @@ impl CatalystNode {
                                                 let _ = network.broadcast_envelope(&env).await;
                                             }
                                         }
+                                    }
                                 }
                             } else if let Ok(msg) = LsuGossip::new(update.clone()) {
                                 if let Ok(env) = MessageEnvelope::from_message(&msg, "lsu".to_string(), None) {

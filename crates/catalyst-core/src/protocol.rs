@@ -12,25 +12,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{BlockHash, NodeId, Timestamp};
 
-/// Canonical transaction id used for mempool/network deduplication.
-///
-/// Current definition (stable for dev/testnet):
-/// - `tx_id = blake2b_256(bincode(Transaction))`
-///
-/// This MUST remain consistent across:
-/// - RPC `catalyst_sendRawTransaction` return values
-/// - P2P tx gossip ids / mempool persistence keys
-pub fn transaction_id(tx: &Transaction) -> Result<Hash32, String> {
-    use blake2::{Blake2b512, Digest};
-    let bytes = bincode::serialize(tx).map_err(|e| format!("serialize tx: {e}"))?;
-    let mut hasher = Blake2b512::new();
-    hasher.update(&bytes);
-    let out = hasher.finalize();
-    let mut h = [0u8; 32];
-    h.copy_from_slice(&out[..32]);
-    Ok(h)
-}
-
 /// Canonical signing payload for a transaction: `bincode(TransactionCore) || timestamp_le`.
 ///
 /// This is a temporary “real signature validation” step while aggregated signatures and
@@ -162,110 +143,6 @@ impl Transaction {
     }
 }
 
-/// Determine the canonical sender public key for a transaction (current single-sender rule).
-///
-/// Rules (scaffold, aligned with current node/RPC expectations):
-/// - `WorkerRegistration` / `SmartContract`: sender is `entries[0].public_key`
-/// - transfers: sender is the (single) pubkey with a negative `NonConfidential` amount
-///
-/// Returns `None` if:
-/// - there is no identifiable sender
-/// - multiple distinct negative-amount senders are present (multi-sender unsupported for now)
-pub fn transaction_sender_pubkey(tx: &Transaction) -> Option<[u8; 32]> {
-    match tx.core.tx_type {
-        TransactionType::WorkerRegistration | TransactionType::SmartContract => {
-            tx.core.entries.get(0).map(|e| e.public_key)
-        }
-        _ => {
-            let mut sender: Option<[u8; 32]> = None;
-            for e in &tx.core.entries {
-                if let EntryAmount::NonConfidential(v) = e.amount {
-                    if v < 0 {
-                        match sender {
-                            None => sender = Some(e.public_key),
-                            Some(pk) if pk == e.public_key => {}
-                            Some(_) => return None,
-                        }
-                    }
-                }
-            }
-            sender
-        }
-    }
-}
-
-/// Check whether `tx.core.lock_time` (treated as unix seconds) is unlocked at `now_secs`.
-pub fn transaction_is_unlocked(tx: &Transaction, now_secs: u64) -> bool {
-    (tx.core.lock_time as u64) <= now_secs
-}
-
-/// Validate basic structural rules plus lock-time at `now_secs`.
-pub fn validate_basic_and_unlocked(tx: &Transaction, now_secs: u64) -> Result<(), String> {
-    tx.validate_basic()?;
-    if tx.core.nonce == 0 {
-        return Err("Transaction nonce must be > 0".to_string());
-    }
-    if !transaction_is_unlocked(tx, now_secs) {
-        return Err(format!(
-            "Transaction not yet unlocked: lock_time={} now={}",
-            tx.core.lock_time, now_secs
-        ));
-    }
-    Ok(())
-}
-
-/// Validate transaction semantics required for mempool admission (pure checks, no state access).
-///
-/// This intentionally does NOT verify signatures or balances; those require crypto/state.
-///
-/// Current MVP rules:
-/// - fees must be 0 (fees are not yet implemented in the runtime/state machine)
-/// - only non-confidential amounts are supported
-/// - non-confidential transfers must conserve value (sum == 0) and have a single sender
-pub fn validate_tx_semantics_for_mempool(tx: &Transaction) -> Result<(), String> {
-    if tx.core.fees != 0 {
-        return Err("Fees not supported (expected fees=0)".to_string());
-    }
-
-    match tx.core.tx_type {
-        TransactionType::WorkerRegistration | TransactionType::SmartContract => {
-            // validate_basic already enforces the 1-entry + amount==0 scaffold for these types.
-            Ok(())
-        }
-        TransactionType::NonConfidentialTransfer => {
-            // Ensure all entries are non-confidential and conserve value.
-            let mut sum: i64 = 0;
-            let mut saw_negative = false;
-            for e in &tx.core.entries {
-                match e.amount {
-                    EntryAmount::NonConfidential(v) => {
-                        sum = sum.saturating_add(v);
-                        if v < 0 {
-                            saw_negative = true;
-                        }
-                    }
-                    EntryAmount::Confidential { .. } => {
-                        return Err("Confidential amounts not supported yet".to_string());
-                    }
-                }
-            }
-            if !saw_negative {
-                return Err("Transfer must include a negative sender entry".to_string());
-            }
-            if sum != 0 {
-                return Err("Transfer entries must conserve value (sum must be 0)".to_string());
-            }
-            if transaction_sender_pubkey(tx).is_none() {
-                return Err("Multi-sender transactions not supported yet".to_string());
-            }
-            Ok(())
-        }
-        TransactionType::ConfidentialTransfer
-        | TransactionType::DataStorageRequest
-        | TransactionType::DataStorageRetrieve => Err("Transaction type not supported yet".to_string()),
-    }
-}
-
 /// Partial ledger state update `ΔLn,j` (§5.2.1): sorted entries + tx-signature hash tree root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartialLedgerStateUpdate {
@@ -347,7 +224,7 @@ pub fn select_producers_for_next_cycle(
     prev_cycle_merkle_root: &BlockHash,
     producer_count: usize,
 ) -> Vec<WorkerId> {
-    let r = producer_selection_r_n_plus_1(prev_cycle_merkle_root);
+    let r = prng_32(prev_cycle_merkle_root);
 
     let mut scored: Vec<(Hash32, WorkerId)> = worker_pool
         .iter()
@@ -389,135 +266,6 @@ mod tests {
         let all = select_producers_for_next_cycle(&workers, &seed, 999);
         assert_eq!(all.len(), workers.len());
     }
-
-    #[test]
-    fn producer_selection_r_is_domain_separated_and_stable() {
-        // Fixed test vector to prevent accidental hash algorithm drift.
-        // Computed as: blake2b_512(seed || PRODUCER_SELECTION_DOMAIN_TAG) truncated to 32 bytes.
-        let seed: BlockHash = [42u8; 32];
-        let r = producer_selection_r_n_plus_1(&seed);
-        assert_eq!(
-            hex::encode(r),
-            "aa206f69386f0622bcae8aca302c10e7b8bd6b238b512f8180d98248267123ac"
-        );
-    }
-
-    #[test]
-    fn producer_selection_r_differs_from_legacy_prng() {
-        // Ensure domain separation is effective (and we don't accidentally use the legacy tag).
-        let seed: BlockHash = [42u8; 32];
-        let a = producer_selection_r_n_plus_1(&seed);
-        let b = prng_32(&seed);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn tx_sender_pubkey_is_determined_for_single_sender_transfer() {
-        let from = [1u8; 32];
-        let to = [2u8; 32];
-        let tx = Transaction {
-            core: TransactionCore {
-                tx_type: TransactionType::NonConfidentialTransfer,
-                entries: vec![
-                    TransactionEntry {
-                        public_key: from,
-                        amount: EntryAmount::NonConfidential(-1),
-                    },
-                    TransactionEntry {
-                        public_key: to,
-                        amount: EntryAmount::NonConfidential(1),
-                    },
-                ],
-                nonce: 1,
-                lock_time: 0,
-                fees: 0,
-                data: Vec::new(),
-            },
-            signature: AggregatedSignature(vec![0u8; 64]),
-            timestamp: 0,
-        };
-        assert_eq!(transaction_sender_pubkey(&tx), Some(from));
-    }
-
-    #[test]
-    fn tx_sender_pubkey_is_none_for_multi_sender_negative_entries() {
-        let a = [1u8; 32];
-        let b = [2u8; 32];
-        let tx = Transaction {
-            core: TransactionCore {
-                tx_type: TransactionType::NonConfidentialTransfer,
-                entries: vec![
-                    TransactionEntry {
-                        public_key: a,
-                        amount: EntryAmount::NonConfidential(-1),
-                    },
-                    TransactionEntry {
-                        public_key: b,
-                        amount: EntryAmount::NonConfidential(-1),
-                    },
-                ],
-                nonce: 1,
-                lock_time: 0,
-                fees: 0,
-                data: Vec::new(),
-            },
-            signature: AggregatedSignature(vec![0u8; 64]),
-            timestamp: 0,
-        };
-        assert_eq!(transaction_sender_pubkey(&tx), None);
-    }
-
-    #[test]
-    fn mempool_semantics_reject_nonzero_fees() {
-        let tx = Transaction {
-            core: TransactionCore {
-                tx_type: TransactionType::NonConfidentialTransfer,
-                entries: vec![
-                    TransactionEntry {
-                        public_key: [1u8; 32],
-                        amount: EntryAmount::NonConfidential(-1),
-                    },
-                    TransactionEntry {
-                        public_key: [2u8; 32],
-                        amount: EntryAmount::NonConfidential(1),
-                    },
-                ],
-                nonce: 1,
-                lock_time: 0,
-                fees: 1,
-                data: Vec::new(),
-            },
-            signature: AggregatedSignature(vec![0u8; 64]),
-            timestamp: 0,
-        };
-        assert!(validate_tx_semantics_for_mempool(&tx).is_err());
-    }
-
-    #[test]
-    fn mempool_semantics_reject_non_conserving_transfer() {
-        let tx = Transaction {
-            core: TransactionCore {
-                tx_type: TransactionType::NonConfidentialTransfer,
-                entries: vec![
-                    TransactionEntry {
-                        public_key: [1u8; 32],
-                        amount: EntryAmount::NonConfidential(-1),
-                    },
-                    TransactionEntry {
-                        public_key: [2u8; 32],
-                        amount: EntryAmount::NonConfidential(2),
-                    },
-                ],
-                nonce: 1,
-                lock_time: 0,
-                fees: 0,
-                data: Vec::new(),
-            },
-            signature: AggregatedSignature(vec![0u8; 64]),
-            timestamp: 0,
-        };
-        assert!(validate_tx_semantics_for_mempool(&tx).is_err());
-    }
 }
 
 fn xor32(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
@@ -528,46 +276,13 @@ fn xor32(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
     out
 }
 
-/// Domain separation tag for producer selection randomness derivation.
-///
-/// This is part of "Wire v1" consensus-critical hashing rules.
-const PRODUCER_SELECTION_DOMAIN_TAG: &[u8] = b"catalyst:producer_selection:r_n_plus_1:v1";
-
-/// Deterministically derive `r_{n+1}` (32 bytes) from a 32-byte previous-cycle commitment.
-///
-/// Spec intent (Consensus v1.2 §2.2.1):
-/// - seed should be derived from the previous cycle’s commitment (paper mentions Merkle root)
-///
-/// Current implementation contract:
-/// - caller supplies a 32-byte commitment (for now we accept the previous LSU hash/state commitment
-///   as the available 32-byte value in the node; later we should switch to the paper’s exact root
-///   once implemented in storage/consensus).
-/// - `r_{n+1} = blake2b_256(seed || DOMAIN_TAG)` where `blake2b_256` means truncation of Blake2b-512.
-fn producer_selection_r_n_plus_1(seed: &[u8; 32]) -> [u8; 32] {
-    use blake2::{Blake2b512, Digest};
-
-    let mut h = Blake2b512::new();
-    h.update(seed);
-    h.update(PRODUCER_SELECTION_DOMAIN_TAG);
-    let out = h.finalize();
-    let mut r = [0u8; 32];
-    r.copy_from_slice(&out[..32]);
-    r
-}
-
 /// Simple deterministic PRNG to derive 32 bytes from a 32-byte seed.
 ///
 /// NOTE: Replace with the paper’s full hashing/PRNG approach once the crypto crate
 /// defines it. This is stable and deterministic for tests.
 fn prng_32(seed: &[u8; 32]) -> [u8; 32] {
-    use blake2::{Blake2b512, Digest};
-
-    // NOTE: Consensus paper v1.2 §1.2 specifies Blake2b as the hashing choice.
-    // For now we follow the same convention used elsewhere in the repo:
-    // `blake2b_256(x) := first_32_bytes(blake2b_512(x))`
-    //
-    // Domain separation tag (legacy placeholder).
-    let mut h = Blake2b512::new();
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
     h.update(seed);
     h.update(b"catalyst-prng-32");
     let out = h.finalize();

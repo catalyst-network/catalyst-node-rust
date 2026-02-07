@@ -5,7 +5,6 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use std::path::PathBuf;
 use std::path::Path;
 use serde::Deserialize;
-use catalyst_utils::metrics::{init_metrics, get_metrics_registry, catalyst_metrics};
 
 mod node;
 mod commands;
@@ -244,8 +243,6 @@ async fn main() -> Result<()> {
             let _ = catalyst_metrics::register_standard_metrics(&mut reg);
         }
     }
-
-    info!("Starting Catalyst CLI v{}", env!("CARGO_PKG_VERSION"));
 
     // Execute command
     match cli.command {

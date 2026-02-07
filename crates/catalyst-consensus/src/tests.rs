@@ -317,7 +317,6 @@ mod integration_tests {
         let c = ProducerCandidate {
             majority_hash: [2u8; 32],
             producer_list_hash: [3u8; 32],
-            producer_list: vec!["p1".to_string(), "p2".to_string()],
             cycle_number: 1,
             producer_id: "p2".to_string(),
             timestamp: current_timestamp_ms(),
@@ -379,7 +378,6 @@ mod integration_tests {
         let candidate = ProducerCandidate {
             majority_hash: [43u8; 32],
             producer_list_hash: [44u8; 32],
-            producer_list: vec!["test_producer".to_string()],
             cycle_number: 1,
             producer_id: "test_producer".to_string(),
             timestamp: current_timestamp_ms(),

@@ -15,7 +15,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
-use tokio::sync::Mutex;
 
 
 // Note: The initial scaffold referenced sub-modules (`methods`, `server`, `types`) that
@@ -53,9 +52,6 @@ impl From<RpcServerError> for ErrorObjectOwned {
             RpcServerError::TransactionNotFound(_) |
             RpcServerError::BlockNotFound(_) |
             RpcServerError::AccountNotFound(_) => {
-                ErrorObjectOwned::owned(CALL_EXECUTION_FAILED_CODE, err.to_string(), None::<()>)
-            }
-            RpcServerError::RateLimited => {
                 ErrorObjectOwned::owned(CALL_EXECUTION_FAILED_CODE, err.to_string(), None::<()>)
             }
             _ => ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, err.to_string(), None::<()>),
@@ -158,12 +154,6 @@ pub trait CatalystRpc {
     /// Get applied head info (cycle/hash/state_root)
     #[method(name = "catalyst_head")]
     async fn head(&self) -> RpcResult<RpcHead>;
-
-    /// Get the current worker pool derived from on-chain state (`workers:<pubkey>` markers).
-    ///
-    /// Returns a sorted list of 32-byte hex public keys (0x-prefixed).
-    #[method(name = "catalyst_getWorkers")]
-    async fn get_workers(&self) -> RpcResult<Vec<String>>;
 
     /// Get EVM contract bytecode for a 20-byte hex address.
     #[method(name = "catalyst_getCode")]
@@ -426,7 +416,25 @@ fn verify_tx_signature(tx: &catalyst_core::protocol::Transaction) -> bool {
 }
 
 fn tx_sender_pubkey(tx: &catalyst_core::protocol::Transaction) -> Option<[u8; 32]> {
-    catalyst_core::protocol::transaction_sender_pubkey(tx)
+    match tx.core.tx_type {
+        catalyst_core::protocol::TransactionType::WorkerRegistration => tx.core.entries.get(0).map(|e| e.public_key),
+        catalyst_core::protocol::TransactionType::SmartContract => tx.core.entries.get(0).map(|e| e.public_key),
+        _ => {
+            let mut sender: Option<[u8; 32]> = None;
+            for e in &tx.core.entries {
+                if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
+                    if v < 0 {
+                        match sender {
+                            None => sender = Some(e.public_key),
+                            Some(pk) if pk == e.public_key => {}
+                            Some(_) => return None,
+                        }
+                    }
+                }
+            }
+            sender
+        }
+    }
 }
 
 /// Minimal RPC implementation backed by `catalyst-storage`.
@@ -434,14 +442,6 @@ pub struct CatalystRpcImpl {
     storage: Arc<catalyst_storage::StorageManager>,
     network: Option<Arc<catalyst_network::NetworkService>>,
     tx_submit: Option<mpsc::UnboundedSender<catalyst_core::protocol::Transaction>>,
-    rate_limiter: Option<Arc<Mutex<RateLimiterState>>>,
-}
-
-#[derive(Debug, Clone)]
-struct RateLimiterState {
-    limit_per_minute: u32,
-    window_start_secs: u64,
-    count: u32,
 }
 
 impl CatalystRpcImpl {
@@ -449,87 +449,42 @@ impl CatalystRpcImpl {
         storage: Arc<catalyst_storage::StorageManager>,
         network: Option<Arc<catalyst_network::NetworkService>>,
         tx_submit: Option<mpsc::UnboundedSender<catalyst_core::protocol::Transaction>>,
-        rate_limit_per_minute: u32,
     ) -> Self {
         Self {
             storage,
             network,
             tx_submit,
-            rate_limiter: if rate_limit_per_minute == 0 {
-                None
-            } else {
-                Some(Arc::new(Mutex::new(RateLimiterState {
-                    limit_per_minute: rate_limit_per_minute,
-                    window_start_secs: 0,
-                    count: 0,
-                })))
-            },
         }
-    }
-
-    async fn enforce_rate_limit(&self) -> Result<(), ErrorObjectOwned> {
-        let Some(rl) = &self.rate_limiter else { return Ok(()) };
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let mut st = rl.lock().await;
-        if st.window_start_secs == 0 || now.saturating_sub(st.window_start_secs) >= 60 {
-            st.window_start_secs = now;
-            st.count = 0;
-        }
-        if st.count >= st.limit_per_minute {
-            return Err(ErrorObjectOwned::from(RpcServerError::RateLimited));
-        }
-        st.count = st.count.saturating_add(1);
-        Ok(())
-    }
-
-    async fn block_number_inner(&self) -> u64 {
-        self.storage
-            .get_metadata("consensus:last_applied_cycle")
-            .await
-            .ok()
-            .flatten()
-            .map(|b| decode_u64_le(&b))
-            .unwrap_or(0)
-    }
-
-    async fn peer_count_inner(&self) -> u64 {
-        if let Some(net) = &self.network {
-            let st = net.get_stats().await;
-            return st.connected_peers as u64;
-        }
-        0
     }
 }
 
 #[async_trait]
 impl CatalystRpcServer for CatalystRpcImpl {
     async fn block_number(&self) -> RpcResult<u64> {
-        self.enforce_rate_limit().await?;
-        Ok(self.block_number_inner().await)
+        let n = self
+            .storage
+            .get_metadata("consensus:last_applied_cycle")
+            .await
+            .ok()
+            .flatten()
+            .map(|b| decode_u64_le(&b))
+            .unwrap_or(0);
+        Ok(n)
     }
 
     async fn get_block_by_hash(&self, _hash: String, _full_transactions: bool) -> RpcResult<Option<RpcBlock>> {
-        self.enforce_rate_limit().await?;
         Ok(None)
     }
 
     async fn get_block_by_number(&self, _number: u64, _full_transactions: bool) -> RpcResult<Option<RpcBlock>> {
-        self.enforce_rate_limit().await?;
         Ok(None)
     }
 
     async fn get_transaction_by_hash(&self, _hash: String) -> RpcResult<Option<RpcTransaction>> {
-        self.enforce_rate_limit().await?;
         Ok(None)
     }
 
     async fn get_balance(&self, address: String) -> RpcResult<String> {
-        self.enforce_rate_limit().await?;
         let pk = parse_hex_32(&address).map_err(ErrorObjectOwned::from)?;
         let key = bal_key(&pk);
         let bal = self
@@ -543,26 +498,23 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn get_balance_proof(&self, address: String) -> RpcResult<RpcBalanceProof> {
-        self.enforce_rate_limit().await?;
         let pk = parse_hex_32(&address).map_err(ErrorObjectOwned::from)?;
         let key = bal_key(&pk);
 
-        let (root, proofs) = self
+        let Some((root, value_bytes, proof)) = self
             .storage
-            .get_account_proofs_for_keys_with_absence(&vec![key.clone()])
+            .get_account_proof(&key)
             .await
-            .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())))?;
+            .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())))?
+        else {
+            return Ok(RpcBalanceProof {
+                balance: "0".to_string(),
+                state_root: format!("0x{}", hex::encode([0u8; 32])),
+                proof: Vec::new(),
+            });
+        };
 
-        let (_k, maybe_value, proof) = proofs
-            .into_iter()
-            .next()
-            .expect("one proof entry");
-
-        let bal = maybe_value
-            .as_ref()
-            .map(|b| decode_i64(b).to_string())
-            .unwrap_or_else(|| "0".to_string());
-
+        let bal = decode_i64(&value_bytes).to_string();
         let mut steps: Vec<String> = Vec::with_capacity(proof.steps.len());
         for s in proof.steps {
             let tag = if s.sibling_is_left { "L" } else { "R" };
@@ -577,7 +529,6 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn get_nonce(&self, address: String) -> RpcResult<u64> {
-        self.enforce_rate_limit().await?;
         let pk = parse_hex_32(&address).map_err(ErrorObjectOwned::from)?;
         let mut k = b"nonce:".to_vec();
         k.extend_from_slice(&pk);
@@ -592,62 +543,15 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn get_account(&self, _address: String) -> RpcResult<Option<RpcAccount>> {
-        self.enforce_rate_limit().await?;
         Ok(None)
     }
 
-    async fn get_workers(&self) -> RpcResult<Vec<String>> {
-        self.enforce_rate_limit().await?;
-        let mut out: Vec<[u8; 32]> = Vec::new();
-        if let Ok(iter) = self.storage.engine().iterator("accounts") {
-            for item in iter {
-                if let Ok((k, v)) = item {
-                    if !k.starts_with(b"workers:") {
-                        continue;
-                    }
-                    if v.as_ref() != [1u8] {
-                        continue;
-                    }
-                    if k.len() != b"workers:".len() + 32 {
-                        continue;
-                    }
-                    let mut pk = [0u8; 32];
-                    pk.copy_from_slice(&k[b"workers:".len()..]);
-                    out.push(pk);
-                }
-            }
-        }
-        out.sort();
-        out.dedup();
-        Ok(out
-            .into_iter()
-            .map(|pk| format!("0x{}", hex::encode(pk)))
-            .collect())
-    }
-
     async fn send_raw_transaction(&self, _data: String) -> RpcResult<String> {
-        self.enforce_rate_limit().await?;
         // Accept hex-encoded bincode(Transaction) for now (dev transport).
         let bytes = parse_hex_bytes(&_data).map_err(ErrorObjectOwned::from)?;
         let tx: catalyst_core::protocol::Transaction = bincode::deserialize(&bytes).map_err(
             |e: bincode::Error| ErrorObjectOwned::from(RpcServerError::InvalidParams(e.to_string())),
         )?;
-
-        // Basic structural validation + lock-time gate at the RPC boundary.
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if let Err(e) = catalyst_core::protocol::validate_basic_and_unlocked(&tx, now_secs) {
-            return Err(ErrorObjectOwned::from(RpcServerError::InvalidParams(format!(
-                "TX_REJECT:BASIC_OR_LOCKTIME:{e}"
-            ))));
-        }
-        if let Err(e) = catalyst_core::protocol::validate_tx_semantics_for_mempool(&tx) {
-            return Err(ErrorObjectOwned::from(RpcServerError::InvalidParams(format!(
-                "TX_REJECT:SEMANTICS:{e}"
-            ))));
-        }
 
         if !verify_tx_signature(&tx) {
             return Err(ErrorObjectOwned::from(RpcServerError::InvalidParams(
@@ -673,42 +577,14 @@ impl CatalystRpcServer for CatalystRpcImpl {
                     "Nonce too low".to_string(),
                 )));
             }
-
-            // Sufficient-funds check against committed state (does not account for pending txs).
-            // This is a minimal RPC-side guardrail; the node/mempool will enforce full sequencing.
-            if tx.core.tx_type == catalyst_core::protocol::TransactionType::NonConfidentialTransfer {
-                use std::collections::BTreeMap;
-                let mut deltas: BTreeMap<[u8; 32], i64> = BTreeMap::new();
-                for e in &tx.core.entries {
-                    if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
-                        *deltas.entry(e.public_key).or_insert(0) =
-                            deltas.get(&e.public_key).copied().unwrap_or(0).saturating_add(v);
-                    }
-                }
-                for (pk, delta) in deltas {
-                    if delta < 0 {
-                        let key = bal_key(&pk);
-                        let bal = self
-                            .storage
-                            .engine()
-                            .get("accounts", &key)
-                            .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())))?
-                            .map(|b| decode_i64(&b))
-                            .unwrap_or(0);
-                        if bal.saturating_add(delta) < 0 {
-                            return Err(ErrorObjectOwned::from(RpcServerError::InvalidParams(
-                                "TX_REJECT:INSUFFICIENT_FUNDS".to_string(),
-                            )));
-                        }
-                    }
-                }
-            }
         }
 
-        // Canonical tx id (must match P2P/mempool tx ids).
-        let h = catalyst_core::protocol::transaction_id(&tx)
-            .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e)))?;
-        let tx_id = format!("0x{}", hex::encode(h));
+        // tx_id = sha256(bincode(tx))
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        let out = h.finalize();
+        let tx_id = format!("0x{}", hex::encode(out));
 
         if let Some(sender) = &self.tx_submit {
             sender.send(tx).map_err(|_| {
@@ -725,43 +601,40 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn estimate_fee(&self, _transaction: RpcTransactionRequest) -> RpcResult<String> {
-        self.enforce_rate_limit().await?;
         Ok("0".to_string())
     }
 
     async fn network_info(&self) -> RpcResult<RpcNetworkInfo> {
-        self.enforce_rate_limit().await?;
-        let peer_count = self.peer_count_inner().await;
-        let current_block = self.block_number_inner().await;
+        let peer_count = self.peer_count().await.unwrap_or(0);
         Ok(RpcNetworkInfo {
             chain_id: 0,
             network_id: 0,
             protocol_version: "catalyst/0".to_string(),
             genesis_hash: "0x0".to_string(),
-            current_block,
-            highest_block: current_block,
+            current_block: self.block_number().await?,
+            highest_block: self.block_number().await?,
             peer_count,
         })
     }
 
     async fn syncing(&self) -> RpcResult<RpcSyncStatus> {
-        self.enforce_rate_limit().await?;
         Ok(RpcSyncStatus::Synced(true))
     }
 
     async fn peer_count(&self) -> RpcResult<u64> {
-        self.enforce_rate_limit().await?;
-        Ok(self.peer_count_inner().await)
+        if let Some(net) = &self.network {
+            let st = net.get_stats().await;
+            return Ok(st.connected_peers as u64);
+        }
+        Ok(0)
     }
 
     async fn version(&self) -> RpcResult<String> {
-        self.enforce_rate_limit().await?;
         Ok(format!("catalyst-rpc/{}", env!("CARGO_PKG_VERSION")))
     }
 
     async fn head(&self) -> RpcResult<RpcHead> {
-        self.enforce_rate_limit().await?;
-        let applied_cycle = self.block_number_inner().await;
+        let applied_cycle = self.block_number().await?;
         let applied_lsu_hash = self
             .storage
             .get_metadata("consensus:last_applied_lsu_hash")
@@ -770,21 +643,14 @@ impl CatalystRpcServer for CatalystRpcImpl {
             .flatten()
             .map(|b| format!("0x{}", hex::encode(b)))
             .unwrap_or_else(|| "0x0".to_string());
-        let applied_state_root = match self
+        let applied_state_root = self
             .storage
             .get_metadata("consensus:last_applied_state_root")
             .await
             .ok()
             .flatten()
-        {
-            Some(b) if b.len() == 32 => format!("0x{}", hex::encode(b)),
-            // Fallback: compute root from current `accounts` state so `catalyst_head`
-            // still returns an authenticated root even if metadata isn't set yet.
-            _ => match self.storage.get_account_proofs_for_keys_with_absence(&[]).await {
-                Ok((root, _)) => format!("0x{}", hex::encode(root)),
-                Err(_) => "0x0".to_string(),
-            },
-        };
+            .map(|b| format!("0x{}", hex::encode(b)))
+            .unwrap_or_else(|| "0x0".to_string());
         let last_lsu_cid = self
             .storage
             .get_metadata("consensus:last_lsu_cid")
@@ -802,7 +668,6 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn get_code(&self, address: String) -> RpcResult<String> {
-        self.enforce_rate_limit().await?;
         let addr20 = parse_hex_20(&address).map_err(ErrorObjectOwned::from)?;
         let key = evm_code_key(&addr20);
         let bytes = self
@@ -815,7 +680,6 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn get_last_return(&self, address: String) -> RpcResult<String> {
-        self.enforce_rate_limit().await?;
         let addr20 = parse_hex_20(&address).map_err(ErrorObjectOwned::from)?;
         let key = evm_last_return_key(&addr20);
         let bytes = self
@@ -828,7 +692,6 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn get_storage_at(&self, address: String, slot: String) -> RpcResult<String> {
-        self.enforce_rate_limit().await?;
         let addr20 = parse_hex_20(&address).map_err(ErrorObjectOwned::from)?;
         let slot32 = parse_hex_32bytes(&slot).map_err(ErrorObjectOwned::from)?;
         let key = evm_storage_key(&addr20, &slot32);
@@ -848,14 +711,13 @@ pub async fn start_rpc_http(
     storage: Arc<catalyst_storage::StorageManager>,
     network: Option<Arc<catalyst_network::NetworkService>>,
     tx_submit: Option<mpsc::UnboundedSender<catalyst_core::protocol::Transaction>>,
-    rate_limit_per_minute: u32,
 ) -> Result<ServerHandle, RpcServerError> {
     let server = jsonrpsee::server::ServerBuilder::default()
         .build(bind_address)
         .await
         .map_err(|e| RpcServerError::Server(e.to_string()))?;
 
-    let rpc = CatalystRpcImpl::new(storage, network, tx_submit, rate_limit_per_minute).into_rpc();
+    let rpc = CatalystRpcImpl::new(storage, network, tx_submit).into_rpc();
     let handle = server.start(rpc);
 
     Ok(handle)

@@ -243,7 +243,7 @@ impl CollaborativeConsensus {
         manager: &ProducerManager,
         collected_quantities: Vec<ProducerQuantity>,
     ) -> CatalystResult<ProducerCandidate> {
-        log_info!(LogCategory::Consensus, "Starting campaigning phase (cycle={})", self.current_cycle);
+        log_info!(LogCategory::Consensus, "Starting campaigning phase");
 
         let phase_timeout = Duration::from_millis(self.config.campaigning_phase_ms);
         let campaigning_future = manager.execute_campaigning_phase(collected_quantities);
@@ -271,7 +271,7 @@ impl CollaborativeConsensus {
         manager: &ProducerManager,
         collected_candidates: Vec<ProducerCandidate>,
     ) -> CatalystResult<ProducerVote> {
-        log_info!(LogCategory::Consensus, "Starting voting phase (cycle={})", self.current_cycle);
+        log_info!(LogCategory::Consensus, "Starting voting phase");
 
         let phase_timeout = Duration::from_millis(self.config.voting_phase_ms);
         let voting_future = manager.execute_voting_phase(collected_candidates);
@@ -299,7 +299,7 @@ impl CollaborativeConsensus {
         manager: &ProducerManager,
         collected_votes: Vec<ProducerVote>,
     ) -> CatalystResult<Option<LedgerStateUpdate>> {
-        log_info!(LogCategory::Consensus, "Starting synchronization phase (cycle={})", self.current_cycle);
+        log_info!(LogCategory::Consensus, "Starting synchronization phase");
 
         let phase_timeout = Duration::from_millis(self.config.synchronization_phase_ms);
         let sync_future = manager.execute_synchronization_phase(collected_votes);
@@ -365,7 +365,7 @@ impl CollaborativeConsensus {
         // First, consume any previously buffered messages of this type.
         for env in self.drain_pending_by_type(MessageType::ProducerQuantity).await {
             if let Ok(q) = env.extract_message::<ProducerQuantity>() {
-                if q.cycle_number == self.current_cycle && self.selected_producers.contains(&q.producer_id) {
+                if q.cycle_number == self.current_cycle {
                     out.insert(q.producer_id.clone(), q);
                 }
             }
@@ -383,7 +383,7 @@ impl CollaborativeConsensus {
                 Ok(Some(env)) => {
                     if env.message_type == MessageType::ProducerQuantity {
                         if let Ok(q) = env.extract_message::<ProducerQuantity>() {
-                            if q.cycle_number == self.current_cycle && self.selected_producers.contains(&q.producer_id) {
+                            if q.cycle_number == self.current_cycle {
                                 out.insert(q.producer_id.clone(), q);
                             }
                         }
@@ -415,7 +415,7 @@ impl CollaborativeConsensus {
 
         for env in self.drain_pending_by_type(MessageType::ProducerCandidate).await {
             if let Ok(c) = env.extract_message::<ProducerCandidate>() {
-                if c.cycle_number == self.current_cycle && self.selected_producers.contains(&c.producer_id) {
+                if c.cycle_number == self.current_cycle {
                     out.insert(c.producer_id.clone(), c);
                 }
             }
@@ -433,7 +433,7 @@ impl CollaborativeConsensus {
                 Ok(Some(env)) => {
                     if env.message_type == MessageType::ProducerCandidate {
                         if let Ok(c) = env.extract_message::<ProducerCandidate>() {
-                            if c.cycle_number == self.current_cycle && self.selected_producers.contains(&c.producer_id) {
+                            if c.cycle_number == self.current_cycle {
                                 out.insert(c.producer_id.clone(), c);
                             }
                         }
@@ -464,7 +464,7 @@ impl CollaborativeConsensus {
 
         for env in self.drain_pending_by_type(MessageType::ProducerVote).await {
             if let Ok(v) = env.extract_message::<ProducerVote>() {
-                if v.cycle_number == self.current_cycle && self.selected_producers.contains(&v.producer_id) {
+                if v.cycle_number == self.current_cycle {
                     out.insert(v.producer_id.clone(), v);
                 }
             }
@@ -482,7 +482,7 @@ impl CollaborativeConsensus {
                 Ok(Some(env)) => {
                     if env.message_type == MessageType::ProducerVote {
                         if let Ok(v) = env.extract_message::<ProducerVote>() {
-                            if v.cycle_number == self.current_cycle && self.selected_producers.contains(&v.producer_id) {
+                            if v.cycle_number == self.current_cycle {
                                 out.insert(v.producer_id.clone(), v);
                             }
                         }
@@ -770,8 +770,6 @@ impl ProducerSelection {
 mod tests {
     use super::*;
     use crate::producer::Producer;
-    use crate::producer::ProducerManager;
-    use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn test_consensus_creation() {
@@ -857,169 +855,5 @@ mod tests {
         
         // Single-producer cycle should succeed without network wiring.
         assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_two_node_consensus_converges_with_message_passing() {
-        let config = ConsensusConfig {
-            cycle_duration_ms: 3000,
-            construction_phase_ms: 500,
-            campaigning_phase_ms: 500,
-            voting_phase_ms: 500,
-            synchronization_phase_ms: 500,
-            freeze_window_ms: 100,
-            min_producers: 2,
-            confidence_threshold: 0.6,
-        };
-
-        let cycle: CycleNumber = 1;
-        let selected: Vec<ProducerId> = vec!["producer_1".to_string(), "producer_2".to_string()];
-
-        // Shared tx set (deterministic inputs).
-        let transactions = vec![
-            TransactionEntry {
-                public_key: [10u8; 32],
-                amount: -100,
-                signature: vec![20u8; 64],
-            },
-            TransactionEntry {
-                public_key: [11u8; 32],
-                amount: 100,
-                signature: vec![21u8; 64],
-            },
-        ];
-
-        // Build node1 consensus engine with in/out channels.
-        let producer1 = Producer::new("producer_1".to_string(), [1u8; 32], cycle);
-        let manager1 = ProducerManager::new(producer1, config.clone());
-        let (out1_tx, mut out1_rx) = mpsc::unbounded_channel::<catalyst_utils::MessageEnvelope>();
-        let (in1_tx, in1_rx) = mpsc::unbounded_channel::<catalyst_utils::MessageEnvelope>();
-        let mut c1 = CollaborativeConsensus::new(config.clone());
-        c1.set_producer_manager(manager1);
-        c1.set_network_sender(out1_tx);
-        c1.set_network_receiver(in1_rx);
-
-        // Build node2 consensus engine with in/out channels.
-        let producer2 = Producer::new("producer_2".to_string(), [2u8; 32], cycle);
-        let manager2 = ProducerManager::new(producer2, config.clone());
-        let (out2_tx, mut out2_rx) = mpsc::unbounded_channel::<catalyst_utils::MessageEnvelope>();
-        let (in2_tx, in2_rx) = mpsc::unbounded_channel::<catalyst_utils::MessageEnvelope>();
-        let mut c2 = CollaborativeConsensus::new(config.clone());
-        c2.set_producer_manager(manager2);
-        c2.set_network_sender(out2_tx);
-        c2.set_network_receiver(in2_rx);
-
-        // Message bus: forward every outbound envelope to both nodes (best-effort).
-        let bus_targets = vec![in1_tx.clone(), in2_tx.clone()];
-        let bus1 = tokio::spawn(async move {
-            while let Some(env) = out1_rx.recv().await {
-                for tx in &bus_targets {
-                    let _ = tx.send(env.clone());
-                }
-            }
-        });
-        let bus_targets2 = vec![in1_tx.clone(), in2_tx.clone()];
-        let bus2 = tokio::spawn(async move {
-            while let Some(env) = out2_rx.recv().await {
-                for tx in &bus_targets2 {
-                    let _ = tx.send(env.clone());
-                }
-            }
-        });
-
-        // Run cycle concurrently.
-        let selected1 = selected.clone();
-        let selected2 = selected.clone();
-        let txs1 = transactions.clone();
-        let txs2 = transactions.clone();
-        let (r1, r2) = tokio::join!(
-            async move { c1.start_cycle(cycle, selected1, txs1).await },
-            async move { c2.start_cycle(cycle, selected2, txs2).await },
-        );
-
-        bus1.abort();
-        bus2.abort();
-
-        let u1 = r1.unwrap().expect("node1 should produce LSU");
-        let u2 = r2.unwrap().expect("node2 should produce LSU");
-
-        // Convergence: LSU hash must match.
-        let h1 = hash_data(&u1).unwrap();
-        let h2 = hash_data(&u2).unwrap();
-        assert_eq!(h1, h2, "nodes should converge on identical LSU hash");
-    }
-
-    #[tokio::test]
-    async fn test_out_of_order_messages_are_buffered_and_consumed_in_later_phases() {
-        let config = ConsensusConfig {
-            cycle_duration_ms: 1000,
-            construction_phase_ms: 50,
-            campaigning_phase_ms: 50,
-            voting_phase_ms: 50,
-            synchronization_phase_ms: 50,
-            freeze_window_ms: 10,
-            min_producers: 2,
-            confidence_threshold: 0.6,
-        };
-
-        let cycle: CycleNumber = 7;
-        let selected: Vec<ProducerId> = vec!["p1".to_string(), "p2".to_string()];
-
-        let producer = Producer::new("p1".to_string(), [1u8; 32], cycle);
-        let manager = ProducerManager::new(producer, config.clone());
-        let mut consensus = CollaborativeConsensus::new(config.clone());
-        consensus.set_producer_manager(manager);
-
-        // Wire a receiver so collection loops read real messages.
-        let (tx, rx) = mpsc::unbounded_channel::<MessageEnvelope>();
-        consensus.set_network_receiver(rx);
-
-        // Set cycle + membership (normally done in start_cycle()).
-        consensus.current_cycle = cycle;
-        consensus.selected_producers = selected.clone();
-
-        // Send a campaigning message *before* quantities are collected. It should be buffered.
-        let candidate = ProducerCandidate {
-            majority_hash: [9u8; 32],
-            producer_list_hash: [8u8; 32],
-            producer_list: selected.clone(),
-            cycle_number: cycle,
-            producer_id: "p2".to_string(),
-            timestamp: 0,
-        };
-        let env_c = MessageEnvelope::from_message(&candidate, "test".to_string(), None).unwrap();
-        tx.send(env_c).unwrap();
-
-        // Construction collection should not surface candidates.
-        let quantities = consensus
-            .collect_producer_quantities(Duration::from_millis(30))
-            .await
-            .unwrap();
-        assert!(quantities.is_empty());
-
-        // Now send the quantity and ensure construction collector sees it.
-        let q = ProducerQuantity {
-            first_hash: [7u8; 32],
-            cycle_number: cycle,
-            producer_id: "p2".to_string(),
-            timestamp: 0,
-        };
-        let env_q = MessageEnvelope::from_message(&q, "test".to_string(), None).unwrap();
-        tx.send(env_q).unwrap();
-
-        let quantities = consensus
-            .collect_producer_quantities(Duration::from_millis(30))
-            .await
-            .unwrap();
-        assert_eq!(quantities.len(), 1);
-        assert_eq!(quantities[0], q);
-
-        // Campaigning collection should drain the buffered candidate.
-        let candidates = consensus
-            .collect_producer_candidates(Duration::from_millis(30))
-            .await
-            .unwrap();
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0], candidate);
     }
 }
