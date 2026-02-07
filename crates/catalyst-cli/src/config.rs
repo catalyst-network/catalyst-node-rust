@@ -134,6 +134,13 @@ pub struct ConsensusConfig {
     
     /// Consensus timeouts for each phase
     pub phase_timeouts: PhaseTimeouts,
+
+    /// Deterministic validator worker pool for producer selection (32-byte hex public keys).
+    ///
+    /// This is used to derive the producer set without relying on ad-hoc gossip discovery messages.
+    /// For local testnet, it can be auto-populated from `testnet/validators.toml`.
+    #[serde(default)]
+    pub validator_worker_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -364,6 +371,7 @@ impl Default for NodeConfig {
                     voting_timeout: 15,
                     synchronization_timeout: 15,
                 },
+                validator_worker_ids: Vec::new(),
             },
             runtimes: RuntimeConfig {
                 evm: EvmRuntimeConfig {
@@ -432,20 +440,69 @@ impl Default for NodeConfig {
 impl NodeConfig {
     /// Load configuration from file
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        // Prefer JSON parsing to avoid adding a new direct dependency on `toml` in this crate.
-        // The rest of the workspace can still use TOML where appropriate; this CLI will accept
-        // JSON configs for now.
-        let config: NodeConfig = serde_json::from_str(&content)
-            .map_err(|e| anyhow::anyhow!("Failed to parse config as JSON: {e}"))?;
+        let content = std::fs::read_to_string(path.as_ref())?;
+
+        // Try JSON first (backwards compatible), then TOML (matches Makefile config.toml usage).
+        if let Ok(config) = serde_json::from_str::<NodeConfig>(&content) {
+            return Ok(config);
+        }
+
+        let config: NodeConfig = toml::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("Failed to parse config as JSON or TOML: {e}"))?;
         Ok(config)
     }
     
     /// Save configuration to file
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let content = serde_json::to_string_pretty(self)?;
+        let path = path.as_ref();
+        let content = match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase()
+            .as_str()
+        {
+            "toml" => toml::to_string_pretty(self)?,
+            _ => serde_json::to_string_pretty(self)?,
+        };
+
         std::fs::write(path, content)?;
         Ok(())
+    }
+
+    /// Create a reasonable default config for a given config file path.
+    ///
+    /// Used by `catalyst-cli start --config some/path/config.toml` when the file doesn't exist.
+    pub fn default_for_config_path(path: &Path) -> Self {
+        let mut cfg = NodeConfig::default();
+
+        // Put node state alongside the config file to avoid collisions in local testnets.
+        if let Some(dir) = path.parent() {
+            cfg.storage.data_dir = dir.join("data");
+            cfg.dfs.cache_dir = dir.join("dfs_cache");
+            cfg.logging.file_path = dir.join("logs").join("catalyst.log");
+            cfg.node.private_key_file = dir.join("node.key");
+        }
+
+        // If the path contains `nodeN` (e.g. testnet/node2/config.toml), derive unique ports.
+        if let Some(idx) = extract_node_index(path) {
+            cfg.node.name = format!("catalyst-node-{}", idx);
+
+            // P2P listen port: 30333 + (idx-1)
+            let p2p_port = 30333u16.saturating_add((idx.saturating_sub(1)) as u16);
+            cfg.network.listen_addresses = vec![
+                format!("/ip4/0.0.0.0/tcp/{}", p2p_port),
+                format!("/ip6/::/tcp/{}", p2p_port),
+            ];
+
+            // Service bus websocket port: 8546 + (idx-1)
+            cfg.service_bus.websocket_port = 8546u16.saturating_add((idx.saturating_sub(1)) as u16);
+
+            // Default RPC port too (CLI flags can override).
+            cfg.rpc.port = 8545u16.saturating_add((idx.saturating_sub(1)) as u16);
+        }
+
+        cfg
     }
     
     /// Validate configuration
@@ -506,4 +563,33 @@ impl NodeConfig {
         
         Ok(())
     }
+}
+
+fn extract_node_index(path: &Path) -> Option<usize> {
+    // Find first occurrence of "node" followed by digits.
+    let s = path.to_string_lossy();
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i + 4 <= bytes.len() {
+        if &bytes[i..i + 4] == b"node" {
+            let mut j = i + 4;
+            let mut n: usize = 0;
+            let mut saw_digit = false;
+            while j < bytes.len() {
+                let b = bytes[j];
+                if (b'0'..=b'9').contains(&b) {
+                    saw_digit = true;
+                    n = n.saturating_mul(10).saturating_add((b - b'0') as usize);
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if saw_digit && n > 0 {
+                return Some(n);
+            }
+        }
+        i += 1;
+    }
+    None
 }

@@ -192,6 +192,13 @@ impl ServiceBusClient {
     where
         F: Fn(BlockchainEvent) + Send + Sync + 'static,
     {
+        // If we're not connected yet, don't block forever waiting for the background task
+        // to establish a connection (tests and callers expect this to be bounded).
+        let state = self.connection_state.read().await.clone();
+        if !matches!(state, ConnectionState::Connected) {
+            return Err(ServiceBusError::NetworkError("Not connected".to_string()).into());
+        }
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         let callback = Arc::new(callback);
         
@@ -206,6 +213,11 @@ impl ServiceBusClient {
     
     /// Unsubscribe from events
     pub async fn unsubscribe(&self, subscription_id: Uuid) -> CatalystResult<()> {
+        let state = self.connection_state.read().await.clone();
+        if !matches!(state, ConnectionState::Connected) {
+            return Err(ServiceBusError::NetworkError("Not connected".to_string()).into());
+        }
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         
         self.command_tx.send(ClientCommand::Unsubscribe {
@@ -218,6 +230,11 @@ impl ServiceBusClient {
     
     /// Get historical events
     pub async fn get_history(&self, filter: EventFilter, limit: Option<usize>) -> CatalystResult<Vec<BlockchainEvent>> {
+        let state = self.connection_state.read().await.clone();
+        if !matches!(state, ConnectionState::Connected) {
+            return Err(ServiceBusError::NetworkError("Not connected".to_string()).into());
+        }
+
         let (tx, rx) = tokio::sync::oneshot::channel();
         
         self.command_tx.send(ClientCommand::GetHistory {

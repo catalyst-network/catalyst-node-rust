@@ -127,6 +127,7 @@ mod integration_tests {
         for i in 0..3 {
             campaigning.add_quantity(ProducerQuantity {
                 first_hash: common_hash,
+                cycle_number: 1,
                 producer_id: format!("producer_{}", i),
                 timestamp: current_timestamp_ms(),
             });
@@ -135,6 +136,7 @@ mod integration_tests {
         // Add one minority vote
         campaigning.add_quantity(ProducerQuantity {
             first_hash: minority_hash,
+            cycle_number: 1,
             producer_id: "minority_producer".to_string(),
             timestamp: current_timestamp_ms(),
         });
@@ -290,6 +292,7 @@ mod integration_tests {
 
         let q = ProducerQuantity {
             first_hash: [1u8; 32],
+            cycle_number: 1,
             producer_id: "p1".to_string(),
             timestamp: current_timestamp_ms(),
         };
@@ -305,6 +308,7 @@ mod integration_tests {
         let c = ProducerCandidate {
             majority_hash: [2u8; 32],
             producer_list_hash: [3u8; 32],
+            cycle_number: 1,
             producer_id: "p2".to_string(),
             timestamp: current_timestamp_ms(),
         };
@@ -319,6 +323,7 @@ mod integration_tests {
         let v = ProducerVote {
             ledger_state_hash: [4u8; 32],
             vote_list_hash: [5u8; 32],
+            cycle_number: 1,
             producer_id: "p3".to_string(),
             timestamp: current_timestamp_ms(),
         };
@@ -333,6 +338,7 @@ mod integration_tests {
         let o = ProducerOutput {
             dfs_address: [9u8; 21],
             vote_list_hash: [6u8; 32],
+            cycle_number: 1,
             producer_id: "p4".to_string(),
             timestamp: current_timestamp_ms(),
         };
@@ -350,6 +356,7 @@ mod integration_tests {
         // Test ProducerQuantity serialization
         let quantity = ProducerQuantity {
             first_hash: [42u8; 32],
+            cycle_number: 1,
             producer_id: "test_producer".to_string(),
             timestamp: current_timestamp_ms(),
         };
@@ -362,6 +369,7 @@ mod integration_tests {
         let candidate = ProducerCandidate {
             majority_hash: [43u8; 32],
             producer_list_hash: [44u8; 32],
+            cycle_number: 1,
             producer_id: "test_producer".to_string(),
             timestamp: current_timestamp_ms(),
         };

@@ -269,7 +269,7 @@ impl EventProcessor {
 mod tests {
     use super::*;
     use crate::{config::ServiceBusConfig, events::{EventType, events}};
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{timeout, Duration};
 
     #[tokio::test]
     async fn test_server_creation() {
@@ -295,7 +295,9 @@ mod tests {
             21000,
         );
         
-        let result = server.process_event(event).await;
+        let result = timeout(Duration::from_secs(2), server.process_event(event))
+            .await
+            .expect("process_event timed out");
         assert!(result.is_ok());
     }
 
@@ -310,7 +312,9 @@ mod tests {
             events::block_finalized(2, [2u8; 32]),
         ];
         
-        let result = processor.process_events(events).await;
+        let result = timeout(Duration::from_secs(2), processor.process_events(events))
+            .await
+            .expect("process_events timed out");
         assert!(result.is_ok());
     }
 

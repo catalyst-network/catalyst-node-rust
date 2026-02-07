@@ -5,7 +5,8 @@ use catalyst_utils::{CatalystResult, Hash};
 use catalyst_utils::logging::{LogCategory, log_info, log_warn, log_error};
 use catalyst_utils::{increment_counter, observe_histogram, time_operation};
 use catalyst_utils::{NetworkMessage, MessageEnvelope};
-use std::collections::HashMap;
+use catalyst_utils::MessageType;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, mpsc};
@@ -18,6 +19,8 @@ pub struct CollaborativeConsensus {
     selected_producers: Vec<ProducerId>,
     current_cycle: CycleNumber,
     network_sender: Option<mpsc::UnboundedSender<MessageEnvelope>>,
+    network_receiver: Option<Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<MessageEnvelope>>>>,
+    pending_envelopes: Arc<tokio::sync::Mutex<VecDeque<MessageEnvelope>>>,
     is_running: Arc<RwLock<bool>>,
 }
 
@@ -30,8 +33,31 @@ impl CollaborativeConsensus {
             selected_producers: Vec::new(),
             current_cycle: 0,
             network_sender: None,
+            network_receiver: None,
+            pending_envelopes: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             is_running: Arc::new(RwLock::new(false)),
         }
+    }
+
+    async fn drain_pending_by_type(&self, want: MessageType) -> Vec<MessageEnvelope> {
+        let mut pending = self.pending_envelopes.lock().await;
+        if pending.is_empty() {
+            return Vec::new();
+        }
+
+        let mut keep: VecDeque<MessageEnvelope> = VecDeque::with_capacity(pending.len());
+        let mut out: Vec<MessageEnvelope> = Vec::new();
+
+        while let Some(env) = pending.pop_front() {
+            if env.message_type == want {
+                out.push(env);
+            } else {
+                keep.push_back(env);
+            }
+        }
+
+        *pending = keep;
+        out
     }
 
     /// Set producer manager for this node
@@ -42,6 +68,11 @@ impl CollaborativeConsensus {
     /// Set network sender for broadcasting messages
     pub fn set_network_sender(&mut self, sender: mpsc::UnboundedSender<MessageEnvelope>) {
         self.network_sender = Some(sender);
+    }
+
+    /// Set network receiver for collecting inbound messages.
+    pub fn set_network_receiver(&mut self, receiver: mpsc::UnboundedReceiver<MessageEnvelope>) {
+        self.network_receiver = Some(Arc::new(tokio::sync::Mutex::new(receiver)));
     }
 
     /// Start consensus for a new cycle
@@ -63,7 +94,7 @@ impl CollaborativeConsensus {
                 let producer = manager.get_producer().await;
                 if selected_producers.contains(&producer.id) {
                     log_info!(LogCategory::Consensus, "Participating as producer in cycle {}", cycle_number);
-                    manager.reset_for_cycle(cycle_number).await;
+                    manager.reset_for_cycle(cycle_number, selected_producers.len()).await;
                     Some(manager)
                 } else {
                     log_info!(LogCategory::Consensus, "Not selected as producer for cycle {}, observing only", cycle_number);
@@ -129,19 +160,52 @@ impl CollaborativeConsensus {
     ) -> CatalystResult<Option<LedgerStateUpdate>> {
         // Phase 1: Construction
         let quantity = self.run_construction_phase(manager, transactions).await?;
+        let mut quantities = self
+            .collect_producer_quantities(Duration::from_millis(self.config.construction_phase_ms))
+            .await?;
+        quantities.push(quantity.clone());
+        dedup_by_producer_id_quantity(&mut quantities);
+        log_info!(
+            LogCategory::Consensus,
+            "Construction collected quantities: {} (cycle={})",
+            quantities.len(),
+            self.current_cycle
+        );
 
         // Phase 2: Campaigning
         //
         // NOTE: Networking collection is still WIP, but to make the node runnable (single
         // producer) we always feed our own message forward. When networking is wired in,
         // this should be replaced with the collected set from the network, plus our own.
-        let candidate = self.run_campaigning_phase(manager, vec![quantity.clone()]).await?;
+        let candidate = self.run_campaigning_phase(manager, quantities).await?;
+        let mut candidates = self
+            .collect_producer_candidates(Duration::from_millis(self.config.campaigning_phase_ms))
+            .await?;
+        candidates.push(candidate.clone());
+        dedup_by_producer_id_candidate(&mut candidates);
+        log_info!(
+            LogCategory::Consensus,
+            "Campaigning collected candidates: {} (cycle={})",
+            candidates.len(),
+            self.current_cycle
+        );
 
         // Phase 3: Voting
-        let vote = self.run_voting_phase(manager, vec![candidate.clone()]).await?;
+        let vote = self.run_voting_phase(manager, candidates).await?;
+        let mut votes = self
+            .collect_producer_votes(Duration::from_millis(self.config.voting_phase_ms))
+            .await?;
+        votes.push(vote.clone());
+        dedup_by_producer_id_vote(&mut votes);
+        log_info!(
+            LogCategory::Consensus,
+            "Voting collected votes: {} (cycle={})",
+            votes.len(),
+            self.current_cycle
+        );
 
         // Phase 4: Synchronization
-        let final_result = self.run_synchronization_phase(manager, vec![vote.clone()]).await?;
+        let final_result = self.run_synchronization_phase(manager, votes).await?;
         
         // Return the final ledger state update
         Ok(final_result)
@@ -167,11 +231,7 @@ impl CollaborativeConsensus {
 
         // Broadcast our quantity
         self.broadcast_message(&quantity).await?;
-        
-        // Collect quantities from other producers for a limited time
-        let collection_timeout = Duration::from_millis(self.config.construction_phase_ms);
-        let _collected = self.collect_producer_quantities(collection_timeout).await?;
-        
+
         Ok(quantity)
     }
 
@@ -286,10 +346,50 @@ impl CollaborativeConsensus {
         &self,
         timeout_duration: Duration,
     ) -> CatalystResult<Vec<ProducerQuantity>> {
-        // TODO: Implement actual message collection from network
-        // For now, return empty collection
-        sleep(timeout_duration).await;
-        Ok(Vec::new())
+        let Some(rx) = &self.network_receiver else {
+            sleep(timeout_duration).await;
+            return Ok(Vec::new());
+        };
+
+        let deadline = Instant::now() + timeout_duration;
+        let mut out: HashMap<ProducerId, ProducerQuantity> = HashMap::new();
+
+        // First, consume any previously buffered messages of this type.
+        for env in self.drain_pending_by_type(MessageType::ProducerQuantity).await {
+            if let Ok(q) = env.extract_message::<ProducerQuantity>() {
+                if q.cycle_number == self.current_cycle {
+                    out.insert(q.producer_id.clone(), q);
+                }
+            }
+        }
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline - now;
+
+            let mut guard = rx.lock().await;
+            match timeout(remaining, guard.recv()).await {
+                Ok(Some(env)) => {
+                    if env.message_type == MessageType::ProducerQuantity {
+                        if let Ok(q) = env.extract_message::<ProducerQuantity>() {
+                            if q.cycle_number == self.current_cycle {
+                                out.insert(q.producer_id.clone(), q);
+                            }
+                        }
+                    } else {
+                        // Buffer for later phases instead of dropping it.
+                        self.pending_envelopes.lock().await.push_back(env);
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        Ok(out.into_values().collect())
     }
 
     /// Collect producer candidates during campaigning phase
@@ -297,9 +397,48 @@ impl CollaborativeConsensus {
         &self,
         timeout_duration: Duration,
     ) -> CatalystResult<Vec<ProducerCandidate>> {
-        // TODO: Implement actual message collection from network
-        sleep(timeout_duration).await;
-        Ok(Vec::new())
+        let Some(rx) = &self.network_receiver else {
+            sleep(timeout_duration).await;
+            return Ok(Vec::new());
+        };
+
+        let deadline = Instant::now() + timeout_duration;
+        let mut out: HashMap<ProducerId, ProducerCandidate> = HashMap::new();
+
+        for env in self.drain_pending_by_type(MessageType::ProducerCandidate).await {
+            if let Ok(c) = env.extract_message::<ProducerCandidate>() {
+                if c.cycle_number == self.current_cycle {
+                    out.insert(c.producer_id.clone(), c);
+                }
+            }
+        }
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline - now;
+
+            let mut guard = rx.lock().await;
+            match timeout(remaining, guard.recv()).await {
+                Ok(Some(env)) => {
+                    if env.message_type == MessageType::ProducerCandidate {
+                        if let Ok(c) = env.extract_message::<ProducerCandidate>() {
+                            if c.cycle_number == self.current_cycle {
+                                out.insert(c.producer_id.clone(), c);
+                            }
+                        }
+                    } else {
+                        self.pending_envelopes.lock().await.push_back(env);
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        Ok(out.into_values().collect())
     }
 
     /// Collect producer votes during voting phase
@@ -307,9 +446,48 @@ impl CollaborativeConsensus {
         &self,
         timeout_duration: Duration,
     ) -> CatalystResult<Vec<ProducerVote>> {
-        // TODO: Implement actual message collection from network
-        sleep(timeout_duration).await;
-        Ok(Vec::new())
+        let Some(rx) = &self.network_receiver else {
+            sleep(timeout_duration).await;
+            return Ok(Vec::new());
+        };
+
+        let deadline = Instant::now() + timeout_duration;
+        let mut out: HashMap<ProducerId, ProducerVote> = HashMap::new();
+
+        for env in self.drain_pending_by_type(MessageType::ProducerVote).await {
+            if let Ok(v) = env.extract_message::<ProducerVote>() {
+                if v.cycle_number == self.current_cycle {
+                    out.insert(v.producer_id.clone(), v);
+                }
+            }
+        }
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline - now;
+
+            let mut guard = rx.lock().await;
+            match timeout(remaining, guard.recv()).await {
+                Ok(Some(env)) => {
+                    if env.message_type == MessageType::ProducerVote {
+                        if let Ok(v) = env.extract_message::<ProducerVote>() {
+                            if v.cycle_number == self.current_cycle {
+                                out.insert(v.producer_id.clone(), v);
+                            }
+                        }
+                    } else {
+                        self.pending_envelopes.lock().await.push_back(env);
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        Ok(out.into_values().collect())
     }
 
     /// Collect producer outputs during synchronization phase
@@ -317,9 +495,48 @@ impl CollaborativeConsensus {
         &self,
         timeout_duration: Duration,
     ) -> CatalystResult<Vec<ProducerOutput>> {
-        // TODO: Implement actual message collection from network
-        sleep(timeout_duration).await;
-        Ok(Vec::new())
+        let Some(rx) = &self.network_receiver else {
+            sleep(timeout_duration).await;
+            return Ok(Vec::new());
+        };
+
+        let deadline = Instant::now() + timeout_duration;
+        let mut out: HashMap<ProducerId, ProducerOutput> = HashMap::new();
+
+        for env in self.drain_pending_by_type(MessageType::ProducerOutput).await {
+            if let Ok(o) = env.extract_message::<ProducerOutput>() {
+                if o.cycle_number == self.current_cycle {
+                    out.insert(o.producer_id.clone(), o);
+                }
+            }
+        }
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline - now;
+
+            let mut guard = rx.lock().await;
+            match timeout(remaining, guard.recv()).await {
+                Ok(Some(env)) => {
+                    if env.message_type == MessageType::ProducerOutput {
+                        if let Ok(o) = env.extract_message::<ProducerOutput>() {
+                            if o.cycle_number == self.current_cycle {
+                                out.insert(o.producer_id.clone(), o);
+                            }
+                        }
+                    } else {
+                        self.pending_envelopes.lock().await.push_back(env);
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        Ok(out.into_values().collect())
     }
 
     /// Check if consensus is currently running
@@ -347,6 +564,30 @@ impl CollaborativeConsensus {
     pub fn config(&self) -> &ConsensusConfig {
         &self.config
     }
+}
+
+fn dedup_by_producer_id_quantity(v: &mut Vec<ProducerQuantity>) {
+    let mut seen: BTreeMap<String, ProducerQuantity> = BTreeMap::new();
+    for q in v.drain(..) {
+        seen.insert(q.producer_id.clone(), q);
+    }
+    *v = seen.into_values().collect();
+}
+
+fn dedup_by_producer_id_candidate(v: &mut Vec<ProducerCandidate>) {
+    let mut seen: BTreeMap<String, ProducerCandidate> = BTreeMap::new();
+    for c in v.drain(..) {
+        seen.insert(c.producer_id.clone(), c);
+    }
+    *v = seen.into_values().collect();
+}
+
+fn dedup_by_producer_id_vote(v: &mut Vec<ProducerVote>) {
+    let mut seen: BTreeMap<String, ProducerVote> = BTreeMap::new();
+    for x in v.drain(..) {
+        seen.insert(x.producer_id.clone(), x);
+    }
+    *v = seen.into_values().collect();
 }
 
 /// Message collector for gathering consensus messages from network
@@ -568,6 +809,7 @@ mod tests {
         
         let quantity = ProducerQuantity {
             first_hash: [1u8; 32],
+            cycle_number: 1,
             producer_id: "test_producer".to_string(),
             timestamp: current_timestamp_ms(),
         };
@@ -603,7 +845,7 @@ mod tests {
         
         let result = consensus.start_cycle(1, selected_producers, transactions).await;
         
-        // Should fail due to missing network setup, but validates the flow
-        assert!(result.is_err());
+        // Single-producer cycle should succeed without network wiring.
+        assert!(result.is_ok());
     }
 }

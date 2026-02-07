@@ -2,9 +2,9 @@
 
 use crate::events::{BlockchainEvent, EventFilter, EventSubscription};
 use catalyst_utils::{CatalystResult, CatalystError, logging::LogCategory};
-use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
+use parking_lot::RwLock;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -15,13 +15,13 @@ const MAX_REPLAY_BUFFER_SIZE: usize = 10000;
 #[derive(Debug)]
 pub struct FilterEngine {
     /// Active subscriptions by ID
-    subscriptions: Arc<DashMap<Uuid, EventSubscription>>,
+    subscriptions: Arc<RwLock<HashMap<Uuid, EventSubscription>>>,
     
     /// Event replay buffer
-    replay_buffer: Arc<DashMap<u64, Vec<BlockchainEvent>>>, // block_number -> events
+    replay_buffer: Arc<RwLock<HashMap<u64, Vec<BlockchainEvent>>>>, // block_number -> events
     
     /// Event broadcasters by subscription ID
-    broadcasters: Arc<DashMap<Uuid, broadcast::Sender<BlockchainEvent>>>,
+    broadcasters: Arc<RwLock<HashMap<Uuid, broadcast::Sender<BlockchainEvent>>>>,
     
     /// Configuration
     max_filters_per_connection: usize,
@@ -29,7 +29,7 @@ pub struct FilterEngine {
     replay_buffer_size: usize,
     
     /// Connection to subscription mapping
-    connection_subscriptions: Arc<DashMap<String, Vec<Uuid>>>, // connection_id -> subscription_ids
+    connection_subscriptions: Arc<RwLock<HashMap<String, Vec<Uuid>>>>, // connection_id -> subscription_ids
 }
 
 impl FilterEngine {
@@ -40,13 +40,13 @@ impl FilterEngine {
         replay_buffer_size: usize,
     ) -> Self {
         Self {
-            subscriptions: Arc::new(DashMap::new()),
-            replay_buffer: Arc::new(DashMap::new()),
-            broadcasters: Arc::new(DashMap::new()),
+            subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            replay_buffer: Arc::new(RwLock::new(HashMap::new())),
+            broadcasters: Arc::new(RwLock::new(HashMap::new())),
             max_filters_per_connection,
             enable_replay,
             replay_buffer_size: replay_buffer_size.min(MAX_REPLAY_BUFFER_SIZE),
-            connection_subscriptions: Arc::new(DashMap::new()),
+            connection_subscriptions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
     
@@ -57,8 +57,8 @@ impl FilterEngine {
         filter: EventFilter,
     ) -> CatalystResult<(Uuid, broadcast::Receiver<BlockchainEvent>)> {
         // Check connection filter limit
-        let mut connection_subs = self.connection_subscriptions.entry(connection_id.clone())
-            .or_insert_with(Vec::new);
+        let mut conn_map = self.connection_subscriptions.write();
+        let connection_subs = conn_map.entry(connection_id.clone()).or_insert_with(Vec::new);
         
         if connection_subs.len() >= self.max_filters_per_connection {
             return Err(CatalystError::Invalid(format!(
@@ -74,8 +74,8 @@ impl FilterEngine {
         let (tx, rx) = broadcast::channel(1000);
         
         // Store subscription and broadcaster
-        self.subscriptions.insert(subscription_id, subscription);
-        self.broadcasters.insert(subscription_id, tx);
+        self.subscriptions.write().insert(subscription_id, subscription);
+        self.broadcasters.write().insert(subscription_id, tx);
         connection_subs.push(subscription_id);
         
         catalyst_utils::logging::log_info!(
@@ -91,12 +91,12 @@ impl FilterEngine {
     /// Remove a subscription
     pub fn remove_subscription(&self, subscription_id: Uuid, connection_id: &str) -> CatalystResult<()> {
         // Remove from subscriptions
-        self.subscriptions.remove(&subscription_id);
-        self.broadcasters.remove(&subscription_id);
+        self.subscriptions.write().remove(&subscription_id);
+        self.broadcasters.write().remove(&subscription_id);
         
         // Remove from connection tracking
-        if let Some(mut connection_subs) = self.connection_subscriptions.get_mut(connection_id) {
-            connection_subs.retain(|&id| id != subscription_id);
+        if let Some(connection_subs) = self.connection_subscriptions.write().get_mut(connection_id) {
+            connection_subs.retain(|id| *id != subscription_id);
         }
         
         catalyst_utils::logging::log_info!(
@@ -111,10 +111,11 @@ impl FilterEngine {
     
     /// Remove all subscriptions for a connection
     pub fn remove_connection_subscriptions(&self, connection_id: &str) {
-        if let Some((_, subscription_ids)) = self.connection_subscriptions.remove(connection_id) {
+        let mut conn_map = self.connection_subscriptions.write();
+        if let Some(subscription_ids) = conn_map.remove(connection_id) {
             for subscription_id in subscription_ids {
-                self.subscriptions.remove(&subscription_id);
-                self.broadcasters.remove(&subscription_id);
+                self.subscriptions.write().remove(&subscription_id);
+                self.broadcasters.write().remove(&subscription_id);
             }
             
             catalyst_utils::logging::log_info!(
@@ -129,17 +130,17 @@ impl FilterEngine {
     pub async fn process_event(&self, event: BlockchainEvent) -> CatalystResult<()> {
         // Add to replay buffer if enabled
         if self.enable_replay {
-            self.add_to_replay_buffer(&event).await?;
+            self.add_to_replay_buffer(&event)?;
         }
         
         // Find matching subscriptions and broadcast event
         let mut matched_count = 0;
-        
-        for subscription_ref in self.subscriptions.iter() {
-            let subscription = subscription_ref.value();
-            
+
+        let subscriptions = self.subscriptions.read();
+        let broadcasters = self.broadcasters.read();
+        for subscription in subscriptions.values() {
             if subscription.matches(&event) {
-                if let Some(broadcaster) = self.broadcasters.get(&subscription.id) {
+                if let Some(broadcaster) = broadcasters.get(&subscription.id) {
                     // Send to all subscribers of this filter
                     match broadcaster.send(event.clone()) {
                         Ok(receiver_count) => {
@@ -188,11 +189,10 @@ impl FilterEngine {
         let to_block = filter.to_block.unwrap_or(u64::MAX);
         
         // Collect events from replay buffer
-        for entry in self.replay_buffer.iter() {
-            let block_number = *entry.key();
-            
+        let replay = self.replay_buffer.read();
+        for (&block_number, block_events) in replay.iter() {
             if block_number >= from_block && block_number <= to_block {
-                for event in entry.value().iter() {
+                for event in block_events.iter() {
                     if event.matches_filter(filter) {
                         events.push(event.clone());
                         
@@ -215,18 +215,18 @@ impl FilterEngine {
     }
     
     /// Add event to replay buffer
-    async fn add_to_replay_buffer(&self, event: &BlockchainEvent) -> CatalystResult<()> {
+    fn add_to_replay_buffer(&self, event: &BlockchainEvent) -> CatalystResult<()> {
         let block_number = event.block_number;
         
         // Add event to the appropriate block bucket
-        let mut block_events = self.replay_buffer.entry(block_number).or_insert_with(Vec::new);
-        block_events.push(event.clone());
+        let mut replay = self.replay_buffer.write();
+        replay.entry(block_number).or_insert_with(Vec::new).push(event.clone());
         
         // Maintain buffer size - remove old blocks if needed
-        if self.replay_buffer.len() > self.replay_buffer_size {
+        if replay.len() > self.replay_buffer_size {
             // Find oldest block and remove it
-            if let Some(oldest_block) = self.replay_buffer.iter().map(|entry| *entry.key()).min() {
-                self.replay_buffer.remove(&oldest_block);
+            if let Some(oldest_block) = replay.keys().min().copied() {
+                replay.remove(&oldest_block);
             }
         }
         
@@ -235,12 +235,11 @@ impl FilterEngine {
     
     /// Get subscription statistics
     pub fn get_stats(&self) -> FilterEngineStats {
-        let total_subscriptions = self.subscriptions.len();
-        let total_connections = self.connection_subscriptions.len();
-        let replay_buffer_blocks = self.replay_buffer.len();
-        let replay_buffer_events: usize = self.replay_buffer.iter()
-            .map(|entry| entry.value().len())
-            .sum();
+        let total_subscriptions = self.subscriptions.read().len();
+        let total_connections = self.connection_subscriptions.read().len();
+        let replay = self.replay_buffer.read();
+        let replay_buffer_blocks = replay.len();
+        let replay_buffer_events: usize = replay.values().map(|v| v.len()).sum();
         
         FilterEngineStats {
             total_subscriptions,
@@ -252,14 +251,16 @@ impl FilterEngine {
     
     /// Get active subscriptions for a connection
     pub fn get_connection_subscriptions(&self, connection_id: &str) -> Vec<EventSubscription> {
-        if let Some(subscription_ids) = self.connection_subscriptions.get(connection_id) {
-            subscription_ids
-                .iter()
-                .filter_map(|&id| self.subscriptions.get(&id).map(|sub| sub.clone()))
-                .collect()
-        } else {
-            Vec::new()
-        }
+        let conn_map = self.connection_subscriptions.read();
+        let subs = self.subscriptions.read();
+        conn_map
+            .get(connection_id)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| subs.get(id).cloned())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
     
     /// Update subscription filter
@@ -268,7 +269,8 @@ impl FilterEngine {
         subscription_id: Uuid,
         new_filter: EventFilter,
     ) -> CatalystResult<()> {
-        if let Some(mut subscription) = self.subscriptions.get_mut(&subscription_id) {
+        let mut subs = self.subscriptions.write();
+        if let Some(subscription) = subs.get_mut(&subscription_id) {
             subscription.filter = new_filter;
             
             catalyst_utils::logging::log_info!(
@@ -353,7 +355,7 @@ impl EventMatcher {
 mod tests {
     use super::*;
     use crate::events::{EventType, events};
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{timeout, Duration};
 
     #[tokio::test]
     async fn test_filter_engine_subscription() {
@@ -377,10 +379,16 @@ mod tests {
             21000,
         );
         
-        engine.process_event(event.clone()).await.unwrap();
+        timeout(Duration::from_secs(2), engine.process_event(event.clone()))
+            .await
+            .expect("process_event timed out")
+            .unwrap();
         
         // Should receive the event
-        let received_event = rx.recv().await.unwrap();
+        let received_event = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("rx.recv timed out")
+            .unwrap();
         assert_eq!(received_event.id, event.id);
         
         // Clean up
@@ -412,7 +420,10 @@ mod tests {
         // Add some events to replay buffer
         for i in 1..=10 {
             let event = events::block_finalized(i, [i as u8; 32]);
-            engine.process_event(event).await.unwrap();
+            timeout(Duration::from_secs(2), engine.process_event(event))
+                .await
+                .expect("process_event timed out")
+                .unwrap();
         }
         
         let stats = engine.get_stats();
@@ -433,7 +444,10 @@ mod tests {
                 1000 * i,
                 21000,
             );
-            engine.process_event(event).await.unwrap();
+            timeout(Duration::from_secs(2), engine.process_event(event))
+                .await
+                .expect("process_event timed out")
+                .unwrap();
         }
         
         // Query historical events
@@ -441,7 +455,10 @@ mod tests {
             .with_event_types(vec![EventType::TransactionConfirmed])
             .with_block_range(Some(2), Some(4));
         
-        let historical = engine.get_historical_events(&filter, Some(10)).await.unwrap();
+        let historical = timeout(Duration::from_secs(2), engine.get_historical_events(&filter, Some(10)))
+            .await
+            .expect("get_historical_events timed out")
+            .unwrap();
         
         // Should get events from blocks 2, 3, 4
         assert_eq!(historical.len(), 3);

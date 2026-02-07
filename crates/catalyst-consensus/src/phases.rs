@@ -4,7 +4,7 @@ use crate::{
 use catalyst_utils::{CatalystResult, Hash};
 use catalyst_utils::logging::{LogCategory, log_info, log_warn, log_error};
 use catalyst_utils::{increment_counter, observe_histogram, time_operation};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 use indexmap::IndexMap;
 
@@ -60,7 +60,9 @@ impl ConstructionPhase {
             transaction_entries: sorted_entries,
             transaction_signatures_hash: signatures_hash,
             total_fees,
-            timestamp: current_timestamp_ms(),
+            // Must be deterministic across producers for the same cycle; otherwise the
+            // partial update hash (first_hash) will never converge to a majority.
+            timestamp: self.producer.cycle_number,
         };
 
         // Hash the partial update
@@ -73,6 +75,7 @@ impl ConstructionPhase {
         // Create producer quantity
         let quantity = ProducerQuantity {
             first_hash,
+            cycle_number: self.producer.cycle_number,
             producer_id: self.producer.id.clone(),
             timestamp: current_timestamp_ms(),
         };
@@ -121,12 +124,12 @@ impl CampaigningPhase {
     }
 
     /// Execute campaigning phase
-    pub async fn execute(&mut self, min_data: usize, threshold: f64) -> CatalystResult<ProducerCandidate> {
+    pub async fn execute(&mut self, required_majority: usize) -> CatalystResult<ProducerCandidate> {
         log_info!(LogCategory::Consensus, "Starting campaigning phase for cycle {}", self.producer.cycle_number);
         increment_counter!("consensus_campaigning_phase_total", 1);
         
         let result = time_operation!("consensus_campaigning_phase_duration", {
-            self.find_majority_candidate(min_data, threshold).await
+            self.find_majority_candidate(required_majority).await
         });
         
         match result {
@@ -141,39 +144,62 @@ impl CampaigningPhase {
         }
     }
 
-    async fn find_majority_candidate(&mut self, min_data: usize, threshold: f64) -> CatalystResult<ProducerCandidate> {
+    pub fn expected_producers(&self) -> usize {
+        self.producer.expected_producers
+    }
+
+    async fn find_majority_candidate(&mut self, required_majority: usize) -> CatalystResult<ProducerCandidate> {
         // Check minimum data requirement
-        if self.collected_quantities.len() < min_data {
+        if self.collected_quantities.len() < required_majority {
             return Err(ConsensusError::InsufficientData {
                 got: self.collected_quantities.len(),
-                required: min_data,
+                required: required_majority,
             }.into());
         }
 
-        // Count occurrences of each first hash
-        let mut hash_counts: HashMap<Hash, Vec<String>> = HashMap::new();
+        // Count occurrences of each first hash (BTreeMap for deterministic iteration/logging)
+        let mut hash_counts: BTreeMap<Hash, Vec<String>> = BTreeMap::new();
         for (producer_id, quantity) in &self.collected_quantities {
             hash_counts.entry(quantity.first_hash)
                 .or_insert_with(Vec::new)
                 .push(producer_id.clone());
         }
 
-        // Find majority hash
-        let total_count = self.collected_quantities.len();
-        let required_majority = (total_count as f64 * threshold).ceil() as usize;
-        
-        let (majority_hash, producer_list) = hash_counts
-            .into_iter()
-            .max_by_key(|(_, producers)| producers.len())
-            .ok_or_else(|| ConsensusError::NoMajority {
+        // Find majority hash (required_majority is derived from membership, not from received count)
+        let mut best_hash: Option<Hash> = None;
+        let mut best_list: Vec<String> = Vec::new();
+        for (h, producers) in hash_counts.iter() {
+            if producers.len() > best_list.len() {
+                best_hash = Some(*h);
+                best_list = producers.clone();
+            }
+        }
+        let Some(majority_hash) = best_hash else {
+            return Err(ConsensusError::NoMajority {
                 highest: 0,
                 threshold: required_majority,
-            })?;
+                details: format!(" (phase=campaigning cycle={})", self.producer.cycle_number),
+            }.into());
+        };
+        let producer_list = best_list;
 
         if producer_list.len() < required_majority {
+            log_warn!(
+                LogCategory::Consensus,
+                "No majority first_hash for cycle {}: need {} got {} counts={:?}",
+                self.producer.cycle_number,
+                required_majority,
+                producer_list.len(),
+                hash_counts.iter().map(|(h, ps)| (hex::encode(h), ps.len())).collect::<Vec<_>>()
+            );
             return Err(ConsensusError::NoMajority {
                 highest: producer_list.len(),
                 threshold: required_majority,
+                details: format!(
+                    " (phase=campaigning cycle={} first_hash_counts={:?})",
+                    self.producer.cycle_number,
+                    hash_counts.iter().map(|(h, ps)| (hex::encode(h), ps.len())).collect::<Vec<_>>()
+                ),
             }.into());
         }
 
@@ -195,6 +221,7 @@ impl CampaigningPhase {
         let candidate = ProducerCandidate {
             majority_hash,
             producer_list_hash,
+            cycle_number: self.producer.cycle_number,
             producer_id: self.producer.id.clone(),
             timestamp: current_timestamp_ms(),
         };
@@ -242,12 +269,12 @@ impl VotingPhase {
     }
 
     /// Execute voting phase
-    pub async fn execute(&mut self, min_data: usize, threshold: f64, reward_config: &RewardConfig) -> CatalystResult<ProducerVote> {
+    pub async fn execute(&mut self, required_majority: usize, reward_config: &RewardConfig) -> CatalystResult<ProducerVote> {
         log_info!(LogCategory::Consensus, "Starting voting phase for cycle {}", self.producer.cycle_number);
         increment_counter!("consensus_voting_phase_total", 1);
         
         let result = time_operation!("consensus_voting_phase_duration", {
-            self.create_final_ledger_update(min_data, threshold, reward_config).await
+            self.create_final_ledger_update(required_majority, reward_config).await
         });
         
         match result {
@@ -262,7 +289,11 @@ impl VotingPhase {
         }
     }
 
-    async fn create_final_ledger_update(&mut self, min_data: usize, threshold: f64, reward_config: &RewardConfig) -> CatalystResult<ProducerVote> {
+    pub fn expected_producers(&self) -> usize {
+        self.producer.expected_producers
+    }
+
+    async fn create_final_ledger_update(&mut self, required_majority: usize, reward_config: &RewardConfig) -> CatalystResult<ProducerVote> {
         // Check if we can participate (must have correct hash)
         let our_hash = self.producer.first_hash.ok_or_else(|| {
             ConsensusError::ConsensusFailed {
@@ -271,10 +302,10 @@ impl VotingPhase {
         })?;
 
         // Verify minimum data and find majority
-        if self.collected_candidates.len() < min_data {
+        if self.collected_candidates.len() < required_majority {
             return Err(ConsensusError::InsufficientData {
                 got: self.collected_candidates.len(),
-                required: min_data,
+                required: required_majority,
             }.into());
         }
 
@@ -286,21 +317,21 @@ impl VotingPhase {
                 .push(producer_id.clone());
         }
 
-        let total_count = self.collected_candidates.len();
-        let required_majority = (total_count as f64 * threshold).ceil() as usize;
-        
+        // required_majority is derived from membership, not from received count
         let (majority_hash, voting_producers) = hash_counts
             .into_iter()
             .max_by_key(|(_, producers)| producers.len())
             .ok_or_else(|| ConsensusError::NoMajority {
                 highest: 0,
                 threshold: required_majority,
+                details: format!(" (phase=voting cycle={})", self.producer.cycle_number),
             })?;
 
         if voting_producers.len() < required_majority {
             return Err(ConsensusError::NoMajority {
                 highest: voting_producers.len(),
                 threshold: required_majority,
+                details: format!(" (phase=voting cycle={} candidate_majority_hash_counts=ambiguous)", self.producer.cycle_number),
             }.into());
         }
 
@@ -324,6 +355,13 @@ impl VotingPhase {
             })?
             .clone();
 
+        // Deterministic ordering is critical: this structure is hashed and becomes the vote value.
+        let mut final_producer_list = final_producer_list;
+        final_producer_list.sort();
+
+        let mut voting_producers = voting_producers.clone();
+        voting_producers.sort();
+
         let ledger_update = LedgerStateUpdate {
             partial_update,
             compensation_entries,
@@ -341,16 +379,18 @@ impl VotingPhase {
         // Create vote list hash
         let vote_list_hash = self.hash_producer_list(&voting_producers)?;
         
-        // Include self in vote list
+        // Include self in vote list (deterministic)
         let mut final_vote_list = voting_producers;
         if !final_vote_list.contains(&self.producer.id) {
             final_vote_list.push(self.producer.id.clone());
         }
+        final_vote_list.sort();
         self.producer.vote_list = Some(final_vote_list);
 
         let vote = ProducerVote {
             ledger_state_hash,
             vote_list_hash,
+            cycle_number: self.producer.cycle_number,
             producer_id: self.producer.id.clone(),
             timestamp: current_timestamp_ms(),
         };
@@ -360,7 +400,7 @@ impl VotingPhase {
 
     fn create_final_producer_list(&self, majority_hash: &Hash) -> CatalystResult<Vec<String>> {
         // Collect all producer lists from candidates with majority hash
-        let mut producer_counts: HashMap<String, usize> = HashMap::new();
+        let mut producer_counts: BTreeMap<String, usize> = BTreeMap::new();
         let mut total_candidates = 0;
 
         for candidate in self.collected_candidates.values() {
@@ -374,11 +414,12 @@ impl VotingPhase {
 
         // Include only producers that appear in at least P/2 lists
         let threshold = (total_candidates + 1) / 2;  // P/2 threshold
-        let final_list: Vec<String> = producer_counts
+        let mut final_list: Vec<String> = producer_counts
             .into_iter()
             .filter(|(_, count)| *count >= threshold)
             .map(|(producer_id, _)| producer_id)
             .collect();
+        final_list.sort();
 
         Ok(final_list)
     }
@@ -392,7 +433,10 @@ impl VotingPhase {
 
         let reward_per_producer = reward_config.producer_reward / producer_list.len() as u64;
         
-        for producer_id in producer_list {
+        // Deterministic ordering (this list is hashed as part of LSU).
+        let mut sorted = producer_list.to_vec();
+        sorted.sort();
+        for producer_id in &sorted {
             // In a real implementation, we'd look up the producer's public key
             // For now, we'll use a placeholder
             let public_key = [0u8; 32]; // Placeholder
@@ -404,6 +448,8 @@ impl VotingPhase {
             });
         }
 
+        // Ensure stable entry ordering (by producer id).
+        entries.sort_by(|a, b| a.producer_id.cmp(&b.producer_id));
         Ok(entries)
     }
 
@@ -445,12 +491,12 @@ impl SynchronizationPhase {
     }
 
     /// Execute synchronization phase
-    pub async fn execute(&mut self, min_data: usize, threshold: f64) -> CatalystResult<ProducerOutput> {
+    pub async fn execute(&mut self, required_majority: usize) -> CatalystResult<ProducerOutput> {
         log_info!(LogCategory::Consensus, "Starting synchronization phase for cycle {}", self.producer.cycle_number);
         increment_counter!("consensus_synchronization_phase_total", 1);
         
         let result = time_operation!("consensus_synchronization_phase_duration", {
-            self.finalize_ledger_update(min_data, threshold).await
+            self.finalize_ledger_update(required_majority).await
         });
         
         match result {
@@ -465,12 +511,16 @@ impl SynchronizationPhase {
         }
     }
 
-    async fn finalize_ledger_update(&mut self, min_data: usize, threshold: f64) -> CatalystResult<ProducerOutput> {
+    pub fn expected_producers(&self) -> usize {
+        self.producer.expected_producers
+    }
+
+    async fn finalize_ledger_update(&mut self, required_majority: usize) -> CatalystResult<ProducerOutput> {
         // Check minimum data requirement
-        if self.collected_votes.len() < min_data {
+        if self.collected_votes.len() < required_majority {
             return Err(ConsensusError::InsufficientData {
                 got: self.collected_votes.len(),
-                required: min_data,
+                required: required_majority,
             }.into());
         }
 
@@ -482,21 +532,24 @@ impl SynchronizationPhase {
                 .push(producer_id.clone());
         }
 
-        let total_count = self.collected_votes.len();
-        let required_majority = (total_count as f64 * threshold).ceil() as usize;
-        
+        // required_majority is derived from membership, not from received count
         let (final_hash, vote_producers) = hash_counts
             .into_iter()
             .max_by_key(|(_, producers)| producers.len())
             .ok_or_else(|| ConsensusError::NoMajority {
                 highest: 0,
                 threshold: required_majority,
+                details: format!(" (phase=synchronization cycle={})", self.producer.cycle_number),
             })?;
 
         if vote_producers.len() < required_majority {
             return Err(ConsensusError::NoMajority {
                 highest: vote_producers.len(),
                 threshold: required_majority,
+                details: format!(
+                    " (phase=synchronization cycle={} ledger_state_hash_counts=ambiguous)",
+                    self.producer.cycle_number
+                ),
             }.into());
         }
 
@@ -525,6 +578,7 @@ impl SynchronizationPhase {
         let output = ProducerOutput {
             dfs_address,
             vote_list_hash,
+            cycle_number: self.producer.cycle_number,
             producer_id: self.producer.id.clone(),
             timestamp: current_timestamp_ms(),
         };
@@ -557,12 +611,13 @@ impl SynchronizationPhase {
             .unwrap_or(0);
         let threshold = (cn + 1) / 2;  // Cn/2 threshold
         
-        let final_list: Vec<String> = vote_counts
+        let mut final_list: Vec<String> = vote_counts
             .into_iter()
             .filter(|(_, count)| *count >= threshold)
             .map(|(producer_id, _)| producer_id)
             .collect();
 
+        final_list.sort();
         Ok(final_list)
     }
 

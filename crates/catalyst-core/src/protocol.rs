@@ -12,6 +12,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{BlockHash, NodeId, Timestamp};
 
+/// Canonical signing payload for a transaction: `bincode(TransactionCore) || timestamp_le`.
+///
+/// This is a temporary “real signature validation” step while aggregated signatures and
+/// signature-hash trees are still being completed across crates.
+pub fn transaction_signing_payload(core: &TransactionCore, timestamp: u64) -> Result<Vec<u8>, String> {
+    let mut out = bincode::serialize(core).map_err(|e| format!("serialize core: {e}"))?;
+    out.extend_from_slice(&timestamp.to_le_bytes());
+    Ok(out)
+}
+
 /// Ledger cycle number.
 pub type CycleNumber = u64;
 
@@ -32,6 +42,8 @@ pub enum TransactionType {
     DataStorageRequest,
     DataStorageRetrieve,
     SmartContract,
+    /// Register the sender as an on-chain worker/validator candidate (minimal scaffold).
+    WorkerRegistration,
 }
 
 /// Amount component of an entry (§4.3).
@@ -69,6 +81,8 @@ pub struct AggregatedSignature(pub Vec<u8>);
 pub struct TransactionCore {
     pub tx_type: TransactionType,
     pub entries: Vec<TransactionEntry>,
+    /// Sender nonce for replay protection (monotonic per-sender counter).
+    pub nonce: u64,
     /// Locking time (paper uses 4 bytes, "point in time after which can be processed").
     pub lock_time: u32,
     /// Transaction fees paid by participants (8 bytes).
@@ -88,13 +102,44 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn validate_basic(&self) -> Result<(), String> {
-        if self.core.entries.len() < 2 {
-            return Err("Transaction must contain at least 2 entries".to_string());
+        match self.core.tx_type {
+            TransactionType::WorkerRegistration => {
+                // Minimal: single entry identifying the worker pubkey with amount 0.
+                if self.core.entries.len() != 1 {
+                    return Err("WorkerRegistration must contain exactly 1 entry".to_string());
+                }
+                match self.core.entries[0].amount {
+                    EntryAmount::NonConfidential(v) if v == 0 => {}
+                    _ => return Err("WorkerRegistration entry amount must be NonConfidential(0)".to_string()),
+                }
+            }
+            TransactionType::SmartContract => {
+                // Minimal: single entry identifying the caller pubkey with amount 0.
+                if self.core.entries.len() != 1 {
+                    return Err("SmartContract must contain exactly 1 entry".to_string());
+                }
+                match self.core.entries[0].amount {
+                    EntryAmount::NonConfidential(v) if v == 0 => {}
+                    _ => return Err("SmartContract entry amount must be NonConfidential(0)".to_string()),
+                }
+            }
+            _ => {
+                if self.core.entries.len() < 2 {
+                    return Err("Transaction must contain at least 2 entries".to_string());
+                }
+            }
+        }
+        if self.core.nonce == 0 {
+            return Err("Transaction nonce must be > 0".to_string());
         }
         if self.core.data.len() > 60 {
             return Err("Transaction data field must be <= 60 bytes".to_string());
         }
         Ok(())
+    }
+
+    pub fn signing_payload(&self) -> Result<Vec<u8>, String> {
+        transaction_signing_payload(&self.core, self.timestamp)
     }
 }
 

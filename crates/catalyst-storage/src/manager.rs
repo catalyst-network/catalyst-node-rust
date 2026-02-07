@@ -28,6 +28,7 @@ use crate::{
     transaction::TransactionBatch,
     snapshot::{Snapshot, SnapshotManager},
     migration::MigrationManager,
+    merkle,
 };
 
 use tokio::sync::Semaphore;
@@ -337,27 +338,68 @@ impl StorageManager {
     
     /// Compute current state root hash
     async fn compute_state_root(&self) -> StorageResult<Hash> {
-        let mut hasher = Sha256::new();
-        
-        // Hash all account states
+        // Authenticated state root (step 3): Sparse Merkle Tree over `accounts` keys.
+        // This makes proofs O(log 256) rather than O(N).
         let account_iter = self.engine.iterator("accounts")?;
-        
+        let mut items: Vec<(Box<[u8]>, Box<[u8]>)> = Vec::new();
         for item in account_iter {
-            let (key, value) = item
-                .map_err(|e| StorageError::internal(format!("Iterator error: {}", e)))?;
-            hasher.update(&key);
-            hasher.update(&value);
+            let (key, value) =
+                item.map_err(|e| StorageError::internal(format!("Iterator error: {}", e)))?;
+            items.push((key, value));
         }
-        
-        let state_root: Hash = hasher.finalize().into();
+        let state_root: Hash = crate::sparse_merkle::compute_root_from_iter(items)?;
         *self.current_state_root.write() = Some(state_root);
-        
         Ok(state_root)
+    }
+
+    /// Compute an inclusion proof for an `accounts` key against the current (or freshly computed) state root.
+    ///
+    /// Returns: (state_root, value, proof_steps)
+    pub async fn get_account_proof(
+        &self,
+        key: &[u8],
+    ) -> StorageResult<Option<(Hash, Vec<u8>, merkle::MerkleProof)>> {
+        let account_iter = self.engine.iterator("accounts")?;
+        let mut items: Vec<(Box<[u8]>, Box<[u8]>)> = Vec::new();
+        for item in account_iter {
+            let (k, v) =
+                item.map_err(|e| StorageError::internal(format!("Iterator error: {}", e)))?;
+            items.push((k, v));
+        }
+        let out = crate::sparse_merkle::compute_root_and_proof_from_iter(items, key)?;
+        if let Some((root, value, proof)) = &out {
+            *self.current_state_root.write() = Some(*root);
+            Ok(Some((*root, value.clone(), proof.clone())))
+        } else {
+            Ok(None)
+        }
     }
     
     /// Get current state root
     pub fn get_state_root(&self) -> Option<Hash> {
         *self.current_state_root.read()
+    }
+
+    /// Set cached state root (used when the caller has independently verified a transition).
+    pub fn set_state_root_cache(&self, root: Hash) {
+        *self.current_state_root.write() = Some(root);
+    }
+
+    /// Compute SMT root and proofs for multiple keys in a single scan.
+    ///
+    /// Returns: (root, vec[(key, maybe_value, proof)])
+    pub async fn get_account_proofs_for_keys_with_absence(
+        &self,
+        keys: &[Vec<u8>],
+    ) -> StorageResult<(Hash, Vec<(Vec<u8>, Option<Vec<u8>>, merkle::MerkleProof)>)> {
+        let account_iter = self.engine.iterator("accounts")?;
+        let mut items: Vec<(Box<[u8]>, Box<[u8]>)> = Vec::new();
+        for item in account_iter {
+            let (k, v) =
+                item.map_err(|e| StorageError::internal(format!("Iterator error: {}", e)))?;
+            items.push((k, v));
+        }
+        crate::sparse_merkle::compute_root_and_multi_proofs_from_iter(items, keys)
     }
     
     /// Create a snapshot
@@ -629,22 +671,33 @@ mod tests {
     use tempfile::TempDir;
     use catalyst_utils::state::AccountType;
     
-    async fn create_test_manager() -> StorageManager {
+    struct TestEnv {
+        manager: StorageManager,
+        // Keep temp dir alive until after StorageManager drop (RocksDB flushes on drop).
+        _temp_dir: TempDir,
+    }
+
+    async fn create_test_env() -> TestEnv {
         let temp_dir = TempDir::new().unwrap();
         let mut config = StorageConfig::default();
         config.data_dir = temp_dir.path().to_path_buf();
-        StorageManager::new(config).await.unwrap()
+        let manager = StorageManager::new(config).await.unwrap();
+        TestEnv {
+            manager,
+            _temp_dir: temp_dir,
+        }
     }
     
     #[tokio::test]
     async fn test_manager_creation() {
-        let manager = create_test_manager().await;
-        assert!(manager.is_healthy().await);
+        let env = create_test_env().await;
+        assert!(env.manager.is_healthy().await);
     }
     
     #[tokio::test]
     async fn test_account_operations() {
-        let manager = create_test_manager().await;
+        let env = create_test_env().await;
+        let manager = &env.manager;
         let address = [1u8; 21];
         
         // Test account doesn't exist initially
@@ -663,7 +716,8 @@ mod tests {
     
     #[tokio::test]
     async fn test_transaction_operations() {
-        let manager = create_test_manager().await;
+        let env = create_test_env().await;
+        let manager = &env.manager;
         let tx_hash = [2u8; 32];
         let tx_data = b"transaction_data".to_vec();
         
@@ -677,7 +731,8 @@ mod tests {
     
     #[tokio::test]
     async fn test_metadata_operations() {
-        let manager = create_test_manager().await;
+        let env = create_test_env().await;
+        let manager = &env.manager;
         
         // Set metadata
         manager.set_metadata("test_key", b"test_value").await.unwrap();
@@ -689,7 +744,8 @@ mod tests {
     
     #[tokio::test]
     async fn test_transaction_batch() {
-        let manager = create_test_manager().await;
+        let env = create_test_env().await;
+        let manager = &env.manager;
         
         // Create transaction
         let tx_batch = manager.create_transaction("test_tx".to_string()).unwrap();
@@ -710,7 +766,8 @@ mod tests {
     
     #[tokio::test]
     async fn test_state_manager_trait() {
-        let manager = create_test_manager().await;
+        let env = create_test_env().await;
+        let manager = &env.manager;
         
         // Test basic state operations
         manager.set_state(b"key1", b"value1".to_vec()).await.unwrap();
@@ -724,7 +781,8 @@ mod tests {
     
     #[tokio::test]
     async fn test_snapshots() {
-        let manager = create_test_manager().await;
+        let env = create_test_env().await;
+        let manager = &env.manager;
         
         // Add some data
         let address = [4u8; 21];
@@ -750,7 +808,8 @@ mod tests {
     
     #[tokio::test]
     async fn test_statistics() {
-        let manager = create_test_manager().await;
+        let env = create_test_env().await;
+        let manager = &env.manager;
         
         // Add some data
         for i in 0..10 {

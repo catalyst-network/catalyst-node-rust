@@ -7,7 +7,7 @@ use catalyst_utils::{
     
     Hash,
     logging::LogCategory,  // Only LogCategory from logging module if needed
-    utils::current_timestamp,
+    utils::{current_timestamp, current_timestamp_ms},
 };
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
@@ -142,7 +142,8 @@ impl SnapshotManager {
         // Create the snapshot
         let snapshot = Snapshot {
             name: name.to_string(),
-            created_at: current_timestamp(),
+            // Millisecond precision so rapid successive snapshots have a stable ordering.
+            created_at: current_timestamp_ms(),
             state_root,
             metadata,
             file_path: snapshot_file.clone(),
@@ -722,7 +723,7 @@ mod tests {
     use tempfile::TempDir;
     use catalyst_utils::state::AccountState;
     
-    fn create_test_setup() -> (Arc<RocksEngine>, SnapshotManager, TempDir) {
+    async fn create_test_setup() -> (Arc<RocksEngine>, SnapshotManager, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let mut config = StorageConfig::default();
         config.data_dir = temp_dir.path().join("db");
@@ -736,8 +737,8 @@ mod tests {
             snapshot_dir: Some(temp_dir.path().join("snapshots")),
         };
         
-        let snapshot_manager = tokio::runtime::Runtime::new().unwrap()
-            .block_on(SnapshotManager::new(engine.clone(), snapshot_config))
+        let snapshot_manager = SnapshotManager::new(engine.clone(), snapshot_config)
+            .await
             .unwrap();
         
         (engine, snapshot_manager, temp_dir)
@@ -745,7 +746,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_snapshot_creation() {
-        let (_engine, manager, _temp_dir) = create_test_setup();
+        let (_engine, manager, _temp_dir) = create_test_setup().await;
         
         let snapshot = manager.create_snapshot("test_snapshot").await.unwrap();
         assert_eq!(snapshot.name(), "test_snapshot");
@@ -754,7 +755,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_snapshot_with_data() {
-        let (engine, manager, _temp_dir) = create_test_setup();
+        let (engine, manager, _temp_dir) = create_test_setup().await;
         
         // Add some test data
         let address = [1u8; 21];
@@ -772,7 +773,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_snapshot_list() {
-        let (_engine, manager, _temp_dir) = create_test_setup();
+        let (_engine, manager, _temp_dir) = create_test_setup().await;
         
         // Create multiple snapshots
         manager.create_snapshot("snapshot1").await.unwrap();
@@ -788,7 +789,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_snapshot_info() {
-        let (_engine, manager, _temp_dir) = create_test_setup();
+        let (_engine, manager, _temp_dir) = create_test_setup().await;
         
         let created_snapshot = manager.create_snapshot("info_test").await.unwrap();
         
@@ -803,7 +804,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_snapshot_deletion() {
-        let (_engine, manager, _temp_dir) = create_test_setup();
+        let (_engine, manager, _temp_dir) = create_test_setup().await;
         
         manager.create_snapshot("delete_test").await.unwrap();
         
@@ -818,7 +819,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_snapshot_cleanup() {
-        let (_engine, manager, _temp_dir) = create_test_setup();
+        let (_engine, manager, _temp_dir) = create_test_setup().await;
         
         // Create more snapshots than the limit (5)
         for i in 0..8 {
@@ -838,7 +839,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_snapshot_statistics() {
-        let (_engine, manager, _temp_dir) = create_test_setup();
+        let (_engine, manager, _temp_dir) = create_test_setup().await;
         
         manager.create_snapshot("stats_test_1").await.unwrap();
         manager.create_snapshot("stats_test_2").await.unwrap();
@@ -853,7 +854,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_duplicate_snapshot_name() {
-        let (_engine, manager, _temp_dir) = create_test_setup();
+        let (_engine, manager, _temp_dir) = create_test_setup().await;
         
         manager.create_snapshot("duplicate_test").await.unwrap();
         
@@ -864,7 +865,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_snapshot_metadata_collection() {
-        let (engine, manager, _temp_dir) = create_test_setup();
+        let (engine, manager, _temp_dir) = create_test_setup().await;
         
         // Add data to multiple column families
         engine.put("accounts", b"key1", b"value1").unwrap();

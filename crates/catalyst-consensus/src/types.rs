@@ -90,6 +90,7 @@ impl_catalyst_serialize!(LedgerStateUpdate, partial_update, compensation_entries
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProducerQuantity {
     pub first_hash: Hash,
+    pub cycle_number: CycleNumber,
     pub producer_id: ProducerId,
     pub timestamp: u64,
 }
@@ -112,13 +113,14 @@ impl NetworkMessage for ProducerQuantity {
     }
 }
 
-impl_catalyst_serialize!(ProducerQuantity, first_hash, producer_id, timestamp);
+impl_catalyst_serialize!(ProducerQuantity, first_hash, cycle_number, producer_id, timestamp);
 
 /// Producer candidate (Campaigning phase)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProducerCandidate {
     pub majority_hash: Hash,
     pub producer_list_hash: Hash,
+    pub cycle_number: CycleNumber,
     pub producer_id: ProducerId,
     pub timestamp: u64,
 }
@@ -141,13 +143,14 @@ impl NetworkMessage for ProducerCandidate {
     }
 }
 
-impl_catalyst_serialize!(ProducerCandidate, majority_hash, producer_list_hash, producer_id, timestamp);
+impl_catalyst_serialize!(ProducerCandidate, majority_hash, producer_list_hash, cycle_number, producer_id, timestamp);
 
 /// Producer vote (Voting phase)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProducerVote {
     pub ledger_state_hash: Hash,
     pub vote_list_hash: Hash,
+    pub cycle_number: CycleNumber,
     pub producer_id: ProducerId,
     pub timestamp: u64,
 }
@@ -170,13 +173,14 @@ impl NetworkMessage for ProducerVote {
     }
 }
 
-impl_catalyst_serialize!(ProducerVote, ledger_state_hash, vote_list_hash, producer_id, timestamp);
+impl_catalyst_serialize!(ProducerVote, ledger_state_hash, vote_list_hash, cycle_number, producer_id, timestamp);
 
 /// Producer output (Synchronization phase)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProducerOutput {
     pub dfs_address: Address,
     pub vote_list_hash: Hash,
+    pub cycle_number: CycleNumber,
     pub producer_id: ProducerId,
     pub timestamp: u64,
 }
@@ -191,7 +195,7 @@ impl NetworkMessage for ProducerOutput {
     }
     
     fn message_type(&self) -> MessageType {
-        MessageType::Custom(200) // Custom message type for producer output
+        MessageType::ProducerOutput
     }
     
     fn priority(&self) -> u8 {
@@ -199,7 +203,7 @@ impl NetworkMessage for ProducerOutput {
     }
 }
 
-impl_catalyst_serialize!(ProducerOutput, dfs_address, vote_list_hash, producer_id, timestamp);
+impl_catalyst_serialize!(ProducerOutput, dfs_address, vote_list_hash, cycle_number, producer_id, timestamp);
 
 /// Current timestamp in milliseconds
 pub fn current_timestamp_ms() -> u64 {
