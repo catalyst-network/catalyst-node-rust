@@ -146,7 +146,6 @@ mod integration_tests {
 
         let candidate = result.unwrap();
         assert_eq!(candidate.majority_hash, common_hash);
-        assert!(!candidate.producer_list.is_empty());
     }
 
     #[tokio::test]
@@ -171,18 +170,10 @@ mod integration_tests {
         let mut voting = VotingPhase::new(producer);
 
         // Add candidates with same majority hash
-        // Note: VotingPhase validates producer_list_hash against producer_list (domain-separated).
-        let producer_list = vec!["producer_0".to_string(), "producer_1".to_string()];
-        let expected_hash = blake2b_256_tagged(
-            b"catalyst:campaigning:producer_list:v1",
-            &[producer_list[0].as_bytes(), producer_list[1].as_bytes()],
-        );
         for i in 0..3 {
             voting.add_candidate(ProducerCandidate {
                 majority_hash: [1u8; 32],
-                producer_list_hash: expected_hash,
-                producer_list: producer_list.clone(),
-                cycle_number: 1,
+                producer_list_hash: [10u8; 32],
                 producer_id: format!("producer_{}", i),
                 timestamp: current_timestamp_ms(),
             });
@@ -194,7 +185,7 @@ mod integration_tests {
             total_new_tokens: 10000,
         };
 
-        let result = voting.execute(2, &reward_config).await;
+        let result = voting.execute(2, 0.6, &reward_config).await;
         assert!(result.is_ok());
 
         let vote = result.unwrap();

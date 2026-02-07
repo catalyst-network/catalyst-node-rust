@@ -295,11 +295,6 @@ pub struct RpcConfig {
     
     /// Rate limiting (requests per minute)
     pub rate_limit: u32,
-
-    /// Allow unsafe public exposure (binding to non-loopback and/or wildcard CORS).
-    ///
-    /// Default: false. Public testnet operators should keep RPC behind a reverse proxy / auth.
-    pub allow_unsafe_exposure: bool,
     
     /// Request timeout in seconds
     pub request_timeout: u64,
@@ -422,15 +417,11 @@ impl Default for NodeConfig {
                 address: "127.0.0.1".to_string(),
                 port: 8545,
                 cors_enabled: true,
-                cors_origins: vec![
-                    "http://localhost".to_string(),
-                    "http://127.0.0.1".to_string(),
-                ],
+                cors_origins: vec!["*".to_string()],
                 auth_enabled: false,
                 api_key: None,
                 rate_limit: 100,
                 request_timeout: 30,
-                allow_unsafe_exposure: false,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),

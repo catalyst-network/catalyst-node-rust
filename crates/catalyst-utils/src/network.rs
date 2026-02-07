@@ -310,16 +310,8 @@ impl MessageEnvelope {
     fn signing_data(&self) -> CatalystResult<Vec<u8>> {
         let mut envelope = self.clone();
         envelope.signature = None; // Remove signature for signing
-        // IMPORTANT: signing preimage must be canonical and deterministic.
-        //
-        // We intentionally do NOT use JSON here because:
-        // - it is not a canonical binary encoding for consensus/security purposes
-        // - other implementations/languages may produce different JSON encodings
-        //
-        // Wire v1 policy: use `bincode` for `MessageEnvelope` signing preimage.
-        bincode::serialize(&envelope).map_err(|e| {
-            CatalystError::Serialization(format!("Failed to bincode-serialize envelope for signing: {}", e))
-        })
+        serde_json::to_vec(&envelope)
+            .map_err(|e| CatalystError::Serialization(format!("Failed to serialize envelope for signing: {}", e)))
     }
     
     /// Add routing information
@@ -576,26 +568,6 @@ mod tests {
         assert_eq!(envelope.target, Some("node2".to_string()));
         assert_eq!(envelope.payload, payload);
         assert!(!envelope.is_expired());
-    }
-
-    #[test]
-    fn test_message_envelope_signing_preimage_is_bincode_and_stable() {
-        let payload = b"payload".to_vec();
-        let mut env = MessageEnvelope::new(
-            MessageType::Transaction,
-            "node1".to_string(),
-            None,
-            payload,
-        );
-
-        // Sign using an identity function so we can inspect the signed bytes.
-        env.sign(|data| Ok(data.to_vec())).unwrap();
-
-        let mut expected = env.clone();
-        expected.signature = None;
-        let expected_bytes = bincode::serialize(&expected).unwrap();
-
-        assert_eq!(env.signature.unwrap(), expected_bytes);
     }
     
     #[test]

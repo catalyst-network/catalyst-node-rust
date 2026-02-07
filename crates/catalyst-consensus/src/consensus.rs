@@ -217,11 +217,10 @@ impl CollaborativeConsensus {
         manager: &ProducerManager,
         transactions: Vec<TransactionEntry>,
     ) -> CatalystResult<ProducerQuantity> {
-        log_info!(LogCategory::Consensus, "Starting construction phase (cycle={})", self.current_cycle);
+        log_info!(LogCategory::Consensus, "Starting construction phase");
         
         let phase_timeout = Duration::from_millis(self.config.construction_phase_ms);
         let construction_future = manager.execute_construction_phase(transactions);
-        let t0 = Instant::now();
         
         let quantity = timeout(phase_timeout, construction_future)
             .await
@@ -229,7 +228,6 @@ impl CollaborativeConsensus {
                 phase: "construction".to_string(),
                 duration_ms: self.config.construction_phase_ms,
             })??;
-        observe_histogram!("consensus_phase_duration", t0.elapsed().as_secs_f64());
 
         // Broadcast our quantity
         self.broadcast_message(&quantity).await?;
@@ -247,7 +245,6 @@ impl CollaborativeConsensus {
 
         let phase_timeout = Duration::from_millis(self.config.campaigning_phase_ms);
         let campaigning_future = manager.execute_campaigning_phase(collected_quantities);
-        let t0 = Instant::now();
         
         let candidate = timeout(phase_timeout, campaigning_future)
             .await
@@ -255,7 +252,6 @@ impl CollaborativeConsensus {
                 phase: "campaigning".to_string(),
                 duration_ms: self.config.campaigning_phase_ms,
             })??;
-        observe_histogram!("consensus_phase_duration", t0.elapsed().as_secs_f64());
 
         // Broadcast our candidate
         self.broadcast_message(&candidate).await?;
@@ -275,7 +271,6 @@ impl CollaborativeConsensus {
 
         let phase_timeout = Duration::from_millis(self.config.voting_phase_ms);
         let voting_future = manager.execute_voting_phase(collected_candidates);
-        let t0 = Instant::now();
         
         let vote = timeout(phase_timeout, voting_future)
             .await
@@ -283,7 +278,6 @@ impl CollaborativeConsensus {
                 phase: "voting".to_string(),
                 duration_ms: self.config.voting_phase_ms,
             })??;
-        observe_histogram!("consensus_phase_duration", t0.elapsed().as_secs_f64());
 
         // Broadcast our vote
         self.broadcast_message(&vote).await?;
@@ -303,7 +297,6 @@ impl CollaborativeConsensus {
 
         let phase_timeout = Duration::from_millis(self.config.synchronization_phase_ms);
         let sync_future = manager.execute_synchronization_phase(collected_votes);
-        let t0 = Instant::now();
         
         let output = timeout(phase_timeout, sync_future)
             .await
@@ -311,7 +304,6 @@ impl CollaborativeConsensus {
                 phase: "synchronization".to_string(),
                 duration_ms: self.config.synchronization_phase_ms,
             })??;
-        observe_histogram!("consensus_phase_duration", t0.elapsed().as_secs_f64());
 
         // Broadcast our output
         self.broadcast_message(&output).await?;
