@@ -12,10 +12,17 @@
 //! ```rust
 //! use catalyst_storage::{StorageManager, StorageConfig};
 //! use catalyst_utils::state::StateManager;
+//! use tempfile::TempDir;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let config = StorageConfig::default();
+//!     // Use a unique temp directory so examples/tests don't collide with
+//!     // any existing local RocksDB data.
+//!     let temp_dir = TempDir::new()?;
+//!     let config = StorageConfig {
+//!         data_dir: temp_dir.path().to_path_buf(),
+//!         ..Default::default()
+//!     };
 //!     let storage = StorageManager::new(config).await?;
 //!     
 //!     // Use as StateManager
