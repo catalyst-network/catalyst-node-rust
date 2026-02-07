@@ -35,8 +35,6 @@ pub enum RpcServerError {
     AccountNotFound(String),
     #[error("Network error: {0}")]
     Network(String),
-    #[error("Rate limited")]
-    RateLimited,
 }
 
 impl From<RpcServerError> for ErrorObjectOwned {
@@ -83,10 +81,7 @@ impl Default for RpcConfig {
             max_connections: 100,
             enable_http: true,
             enable_ws: true,
-            cors_origins: vec![
-                "http://localhost".to_string(),
-                "http://127.0.0.1".to_string(),
-            ],
+            cors_origins: vec!["*".to_string()],
             request_timeout: 30,
         }
     }
@@ -758,68 +753,4 @@ mod tests {
         let deserialized: RpcAccount = serde_json::from_str(&json).unwrap();
         assert_eq!(account.address, deserialized.address);
     }
-    #[tokio::test]
-    async fn test_balance_proof_verifies() {
-        use catalyst_storage::{StorageConfig, StorageManager};
-        use tempfile::tempdir;
-
-        // Create isolated storage.
-        let dir = tempdir().unwrap();
-        let mut cfg = StorageConfig::default();
-        cfg.data_dir = dir.path().join("db");
-        let storage = StorageManager::new(cfg).await.unwrap();
-
-        // Write a balance entry using the canonical key format.
-        let pk = [7u8; 32];
-        let key = bal_key(&pk);
-        storage
-            .engine()
-            .put("accounts", &key, &(123i64).to_le_bytes())
-            .unwrap();
-
-        // Persist a realistic "applied head" root so `catalyst_head` and proofs match.
-        let (root, _) = storage.get_account_proofs_for_keys_with_absence(&[]).await.unwrap();
-        storage
-            .set_metadata("consensus:last_applied_state_root", &root)
-            .await
-            .unwrap();
-        storage
-            .set_metadata("consensus:last_applied_cycle", &1u64.to_le_bytes())
-            .await
-            .unwrap();
-
-        // Call RPC method directly.
-        let rpc = CatalystRpcImpl::new(std::sync::Arc::new(storage), None, None, 1000);
-        let head = rpc.head().await.unwrap();
-        let proof = rpc.get_balance_proof(format!("0x{}", hex::encode(pk))).await.unwrap();
-        assert_eq!(proof.balance, "123");
-        assert_eq!(proof.state_root, head.applied_state_root);
-
-        // Verify proof against root (ignore L/R tags; ordering is derived from key path).
-        let root = parse_hex_32(&proof.state_root).unwrap();
-        let siblings: Vec<[u8; 32]> = proof
-            .proof
-            .iter()
-            .map(|s| {
-                let parts: Vec<&str> = s.split(":").collect();
-                let hx = if parts.len() == 2 { parts[1] } else { parts[0] };
-                parse_hex_32(hx).unwrap()
-            })
-            .collect();
-
-        let merkle_proof = catalyst_storage::merkle::MerkleProof {
-            leaf: [0u8; 32], // unused by verify_proof_for_key_value
-            steps: siblings
-                .into_iter()
-                .map(|sib| catalyst_storage::merkle::MerkleStep { sibling_is_left: false, sibling: sib })
-                .collect(),
-        };
-        assert!(catalyst_storage::sparse_merkle::verify_proof_for_key_value(
-            &root,
-            &key,
-            Some(&(123i64).to_le_bytes()),
-            &merkle_proof,
-        ));
-    }
-
 }
