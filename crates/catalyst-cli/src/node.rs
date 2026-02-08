@@ -671,6 +671,86 @@ fn verify_protocol_tx_signature(tx: &catalyst_core::protocol::Transaction) -> bo
     SignatureScheme::new().verify(&payload, &sig, &sender_pk).unwrap_or(false)
 }
 
+async fn load_genesis_hash_32(store: &StorageManager) -> [u8; 32] {
+    let Some(bytes) = store
+        .get_metadata(META_PROTOCOL_GENESIS_HASH)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return [0u8; 32];
+    };
+    if bytes.len() != 32 {
+        return [0u8; 32];
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    out
+}
+
+async fn verify_protocol_tx_signature_with_domain(store: &StorageManager, tx: &catalyst_core::protocol::Transaction) -> bool {
+    use catalyst_crypto::signatures::SignatureScheme;
+
+    // Determine sender:
+    // - transfers: the (single) pubkey with negative NonConfidential amount
+    // - worker registration: entry[0].public_key
+    // - smart contract: entry[0].public_key
+    let sender_pk_bytes: [u8; 32] = match tx.core.tx_type {
+        catalyst_core::protocol::TransactionType::WorkerRegistration => {
+            let Some(e0) = tx.core.entries.get(0) else { return false };
+            e0.public_key
+        }
+        catalyst_core::protocol::TransactionType::SmartContract => {
+            let Some(e0) = tx.core.entries.get(0) else { return false };
+            e0.public_key
+        }
+        _ => {
+            let mut sender: Option<[u8; 32]> = None;
+            for e in &tx.core.entries {
+                if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
+                    if v < 0 {
+                        match sender {
+                            None => sender = Some(e.public_key),
+                            Some(pk) if pk == e.public_key => {}
+                            Some(_) => return false, // multi-sender not supported yet
+                        }
+                    }
+                }
+            }
+            let Some(sender) = sender else { return false };
+            sender
+        }
+    };
+
+    if tx.signature.0.len() != 64 {
+        return false;
+    }
+    let mut sig_bytes = [0u8; 64];
+    sig_bytes.copy_from_slice(&tx.signature.0);
+    let sig = match catalyst_crypto::signatures::Signature::from_bytes(sig_bytes) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let sender_pk = match catalyst_crypto::PublicKey::from_bytes(sender_pk_bytes) {
+        Ok(pk) => pk,
+        Err(_) => return false,
+    };
+
+    // Prefer v1 domain-separated payload; fall back to legacy for backward compatibility.
+    let chain_id = load_chain_id_u64(store).await;
+    let genesis_hash = load_genesis_hash_32(store).await;
+    if let Ok(p) = tx.signing_payload_v1(chain_id, genesis_hash) {
+        if SignatureScheme::new().verify(&p, &sig, &sender_pk).unwrap_or(false) {
+            return true;
+        }
+    }
+    let legacy = match tx.signing_payload() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    SignatureScheme::new().verify(&legacy, &sig, &sender_pk).unwrap_or(false)
+}
+
 async fn get_balance_i64(store: &StorageManager, pubkey: &[u8; 32]) -> i64 {
     let k = balance_key_for_pubkey(pubkey);
     store
@@ -978,14 +1058,7 @@ async fn validate_and_select_protocol_txs_for_construction(
 }
 
 fn mempool_txid(tx: &catalyst_core::protocol::Transaction) -> Option<[u8; 32]> {
-    let bytes = bincode::serialize(tx).ok()?;
-    let mut hasher = blake2::Blake2b512::new();
-    use blake2::Digest;
-    hasher.update(&bytes);
-    let result = hasher.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&result[..32]);
-    Some(out)
+    catalyst_core::protocol::tx_id_v1(tx).ok()
 }
 
 fn mempool_tx_key(txid: &[u8; 32]) -> String {
@@ -1147,7 +1220,7 @@ async fn prune_persisted_mempool(store: &StorageManager) {
         };
 
         // Drop invalid or already-applied txs.
-        if tx.validate_basic().is_err() || !verify_protocol_tx_signature(&tx) {
+        if tx.validate_basic().is_err() || !verify_protocol_tx_signature_with_domain(store, &tx).await {
             delete_persisted_mempool_tx(store, &txid).await;
             continue;
         }
@@ -1181,7 +1254,7 @@ async fn rehydrate_mempool_from_storage(store: &StorageManager, mempool: &tokio:
         };
 
         // Basic gate: must still validate/signature-check.
-        if tx.validate_basic().is_err() || !verify_protocol_tx_signature(&tx) {
+        if tx.validate_basic().is_err() || !verify_protocol_tx_signature_with_domain(store, &tx).await {
             delete_persisted_mempool_tx(store, &txid).await;
             continue;
         }
@@ -1236,7 +1309,7 @@ async fn rebroadcast_persisted_mempool(
             continue;
         };
         // Only broadcast txs that still look valid (cheap checks).
-        if tx.validate_basic().is_err() || !verify_protocol_tx_signature(&tx) {
+        if tx.validate_basic().is_err() || !verify_protocol_tx_signature_with_domain(store, &tx).await {
             continue;
         }
         if tx.core.lock_time as u64 > now_secs {
@@ -1870,7 +1943,7 @@ impl CatalystNode {
                         let now = current_timestamp_ms();
                         let now_secs = now / 1000;
                         if let Ok(msg) = ProtocolTxGossip::new(tx, now) {
-                            if !verify_protocol_tx_signature(&msg.tx) {
+                            if !verify_protocol_tx_signature_with_domain(storage.as_ref(), &msg.tx).await {
                                 continue;
                             }
                             // Nonce check (single-sender only).
@@ -2059,11 +2132,11 @@ impl CatalystNode {
                             // Prefer protocol-shaped txs; fall back to legacy TxGossip.
                             let now_secs = current_timestamp_ms() / 1000;
                             if let Ok(tx) = envelope.extract_message::<ProtocolTxGossip>() {
-                                if !verify_protocol_tx_signature(&tx.tx) {
-                                    continue;
-                                }
                                 // Nonce check (single-sender only, requires storage).
                                 if let Some(store) = &storage {
+                                    if !verify_protocol_tx_signature_with_domain(store.as_ref(), &tx.tx).await {
+                                        continue;
+                                    }
                                     let Some(sender_pk) = tx.sender_pubkey() else { continue };
                                     let pending_max = {
                                         let mp = mempool.read().await;

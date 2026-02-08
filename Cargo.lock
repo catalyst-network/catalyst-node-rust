@@ -1209,6 +1209,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bincode",
+ "blake2",
+ "catalyst-utils",
  "futures",
  "hex",
  "serde",

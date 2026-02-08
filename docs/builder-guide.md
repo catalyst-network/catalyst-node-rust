@@ -16,16 +16,29 @@ Core:
 - `catalyst_peerCount`
 - `catalyst_head`
 - `catalyst_blockNumber` (mapped to applied cycle)
+- `catalyst_chainId`
+- `catalyst_networkId`
+- `catalyst_genesisHash`
 
 Accounts:
 - `catalyst_getBalance` (returns decimal string)
 - `catalyst_getBalanceProof` (balance + state root + Merkle proof steps)
 - `catalyst_getNonce`
+- `catalyst_getAccount`
 
 Tx submission:
 - `catalyst_sendRawTransaction`
-  - payload is **hex-encoded bincode(Transaction)** (dev transport)
-  - returns a `tx_id` (sha256 over tx bytes)
+- payload is either:
+  - **v1 canonical wire tx**: `0x` + hex(`"CTX1"` + canonical `Transaction` bytes)
+  - legacy dev transport: `0x` + hex(`bincode(Transaction)`)
+- returns a `tx_id` (32-byte hex): `blake2b512(CTX1||tx_bytes)[..32]`
+
+Tx query / receipts:
+- `catalyst_getTransactionByHash`
+- `catalyst_getTransactionReceipt`
+- `catalyst_getTransactionInclusionProof`
+- `catalyst_getBlocksByNumberRange`
+- `catalyst_getTransactionsByAddress`
 
 EVM helpers (dev/test):
 - `catalyst_getCode` (20-byte address)
@@ -34,11 +47,13 @@ EVM helpers (dev/test):
 
 ## Transaction model (current)
 
-The CLI constructs `catalyst_core::protocol::Transaction` objects and submits them as bincode bytes.
+The CLI constructs `catalyst_core::protocol::Transaction` objects and submits them as **v1 canonical wire bytes**.
 
 Important behavior:
 - RPC verifies Schnorr signature and rejects “nonce too low”.
 - Inclusion happens via validator consensus cycles; acceptance at RPC does not guarantee immediate inclusion.
+
+For external wallets/integrators, see [`wallet-interop.md`](./wallet-interop.md) for the v1 encoding + signing payload.
 
 ## Faucet model (dev/test)
 
@@ -72,14 +87,14 @@ See [`user-guide.md`](./user-guide.md).
 Current behavior is scaffolding-oriented:
 - balances are integer values stored under `bal:<pubkey>`
 - transfers are validated with a simple “no negative balances” rule
-- transaction `fees` are set to `0` in the CLI
-- EVM executes with `gas_price = 0` (no fee charging yet)
+- transaction `fees` are enforced via a deterministic minimum fee schedule
+- EVM executes with `gas_price = 0` (fee charging is at the protocol layer for now)
 
 There is no implemented issuance schedule, staking rewards, inflation, or burn mechanics in this repo snapshot.
 
 ## Known limitations
 
-- RPC does not currently return rich transaction/block data (e.g. `getTransactionByHash` returns `None`).
+- Explorer-grade indexing is still best-effort (indexers should use block ranges + receipts).
 - RPC peer count reflects the RPC node’s current network connections; it is not always a full picture of the validator mesh.
 - Logging config includes a `file_path`, but the node primarily logs to stdout/stderr via `tracing` in the current setup.
 

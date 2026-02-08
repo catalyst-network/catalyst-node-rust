@@ -438,7 +438,11 @@ fn evm_storage_key(addr20: &[u8; 20], slot32: &[u8; 32]) -> Vec<u8> {
     k
 }
 
-fn verify_tx_signature(tx: &catalyst_core::protocol::Transaction) -> bool {
+fn verify_tx_signature_with_domain(
+    tx: &catalyst_core::protocol::Transaction,
+    chain_id: u64,
+    genesis_hash: [u8; 32],
+) -> bool {
     use catalyst_crypto::signatures::SignatureScheme;
 
     // Determine sender:
@@ -484,11 +488,18 @@ fn verify_tx_signature(tx: &catalyst_core::protocol::Transaction) -> bool {
         Ok(pk) => pk,
         Err(_) => return false,
     };
-    let payload = match tx.signing_payload() {
+
+    // Prefer v1 domain-separated payload; fall back to legacy.
+    if let Ok(p) = tx.signing_payload_v1(chain_id, genesis_hash) {
+        if SignatureScheme::new().verify(&p, &sig, &sender_pk).unwrap_or(false) {
+            return true;
+        }
+    }
+    let legacy = match tx.signing_payload() {
         Ok(p) => p,
         Err(_) => return false,
     };
-    SignatureScheme::new().verify(&payload, &sig, &sender_pk).unwrap_or(false)
+    SignatureScheme::new().verify(&legacy, &sig, &sender_pk).unwrap_or(false)
 }
 
 fn tx_sender_pubkey(tx: &catalyst_core::protocol::Transaction) -> Option<[u8; 32]> {
@@ -874,11 +885,11 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn send_raw_transaction(&self, _data: String) -> RpcResult<String> {
-        // Accept hex-encoded bincode(Transaction) for now (dev transport).
+        // Accept hex-encoded legacy bincode(Transaction) OR v1 canonical wire tx (CTX1...).
         let bytes = parse_hex_bytes(&_data).map_err(ErrorObjectOwned::from)?;
-        let tx: catalyst_core::protocol::Transaction = bincode::deserialize(&bytes).map_err(
-            |e: bincode::Error| ErrorObjectOwned::from(RpcServerError::InvalidParams(e.to_string())),
-        )?;
+        let tx: catalyst_core::protocol::Transaction =
+            catalyst_core::protocol::decode_wire_tx_any(&bytes)
+                .map_err(|e| ErrorObjectOwned::from(RpcServerError::InvalidParams(e)))?;
 
         // Basic format + fee floor checks.
         tx.validate_basic()
@@ -891,7 +902,31 @@ impl CatalystRpcServer for CatalystRpcImpl {
             ))));
         }
 
-        if !verify_tx_signature(&tx) {
+        let chain_id = self
+            .storage
+            .get_metadata(META_PROTOCOL_CHAIN_ID)
+            .await
+            .ok()
+            .flatten()
+            .map(|b| decode_u64_le(&b))
+            .unwrap_or(31337);
+        let genesis_hash = self
+            .storage
+            .get_metadata(META_PROTOCOL_GENESIS_HASH)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| {
+                if b.len() != 32 {
+                    return None;
+                }
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&b);
+                Some(out)
+            })
+            .unwrap_or([0u8; 32]);
+
+        if !verify_tx_signature_with_domain(&tx, chain_id, genesis_hash) {
             return Err(ErrorObjectOwned::from(RpcServerError::InvalidParams(
                 "Invalid transaction signature".to_string(),
             )));
@@ -917,8 +952,9 @@ impl CatalystRpcServer for CatalystRpcImpl {
             }
         }
 
-        // tx_id = blake2b512(bincode(tx))[..32] (must match node/mempool).
-        let txid = tx_id_blake2b_32(&bytes);
+        // tx_id = blake2b512(CTX1 || canonical_tx_bytes)[..32]
+        let txid = catalyst_core::protocol::tx_id_v1(&tx)
+            .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e)))?;
         let tx_id = format!("0x{}", hex::encode(txid));
 
         // Persist tx raw + meta so clients can poll receipt immediately (best-effort).
@@ -942,7 +978,11 @@ impl CatalystRpcServer for CatalystRpcImpl {
             evm_gas_used: None,
             evm_return: None,
         };
-        let _ = self.storage.set_metadata(&tx_raw_key(&txid), &bytes).await;
+        // Persist in internal format (bincode) for node/RPC decoding.
+        let ser = bincode::serialize(&tx).map_err(|e: bincode::Error| {
+            ErrorObjectOwned::from(RpcServerError::Server(e.to_string()))
+        })?;
+        let _ = self.storage.set_metadata(&tx_raw_key(&txid), &ser).await;
         if let Ok(mbytes) = bincode::serialize(&meta) {
             let _ = self.storage.set_metadata(&tx_meta_key(&txid), &mbytes).await;
         }
@@ -1218,16 +1258,6 @@ fn tx_participants(tx: &catalyst_core::protocol::Transaction) -> Vec<[u8; 32]> {
             out
         }
     }
-}
-
-fn tx_id_blake2b_32(bytes: &[u8]) -> [u8; 32] {
-    use blake2::{Blake2b512, Digest};
-    let mut h = Blake2b512::new();
-    h.update(bytes);
-    let out = h.finalize();
-    let mut id = [0u8; 32];
-    id.copy_from_slice(&out[..32]);
-    id
 }
 
 fn tx_raw_key(txid: &[u8; 32]) -> String {

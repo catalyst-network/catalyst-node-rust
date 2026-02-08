@@ -22,6 +22,10 @@ These docs are written against the current `catalyst-node-rust` implementation (
   - RPC methods currently implemented
   - Contract/runtime notes and current limitations
 
+- **Wallets / Integrators**: [`wallet-interop.md`](./wallet-interop.md)
+  - Canonical address format
+  - v1 transaction signing payload + wire encoding
+
 ## Important implementation notes (current state)
 
 - **Consensus traffic is P2P on `30333/tcp`**, not RPC. RPC is only for client interaction.
