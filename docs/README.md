@@ -26,6 +26,14 @@ These docs are written against the current `catalyst-node-rust` implementation (
   - Canonical address format
   - v1 transaction signing payload + wire encoding
 
+- **Explorer / Indexer handoff**: [`explorer-handoff.md`](./explorer-handoff.md)
+  - Chain model + compatibility notes
+  - Practical indexing loop (blocks-by-range + receipts)
+
+- **Sync / Fast sync**: [`sync-guide.md`](./sync-guide.md)
+  - Snapshot-based node restore workflow
+  - Verifying chain identity + head
+
 ## Important implementation notes (current state)
 
 - **Consensus traffic is P2P on `30333/tcp`**, not RPC. RPC is only for client interaction.

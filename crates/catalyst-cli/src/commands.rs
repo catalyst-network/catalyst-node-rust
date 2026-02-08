@@ -14,6 +14,29 @@ use crate::evm::EvmTxKind;
 use alloy_primitives::Address as EvmAddress;
 use catalyst_storage::{StorageConfig as StorageConfigLib, StorageManager};
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SnapshotMetaV1 {
+    version: u32,
+    created_at_ms: u64,
+    chain_id: u64,
+    network_id: String,
+    genesis_hash: String,
+    applied_cycle: u64,
+    applied_lsu_hash: String,
+    applied_state_root: String,
+    last_lsu_cid: Option<String>,
+}
+
+fn decode_u64_le_opt(bytes: Option<Vec<u8>>) -> u64 {
+    let Some(b) = bytes else { return 0 };
+    if b.len() != 8 {
+        return 0;
+    }
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(&b);
+    u64::from_le_bytes(arr)
+}
+
 fn parse_hex_32(s: &str) -> anyhow::Result<[u8; 32]> {
     let s = s.trim().strip_prefix("0x").unwrap_or(s);
     let bytes = hex::decode(s)?;
@@ -222,16 +245,101 @@ pub async fn db_backup(data_dir: &Path, out_dir: &Path) -> Result<()> {
     cfg.data_dir = data_dir.to_path_buf();
     let store = StorageManager::new(cfg).await?;
     store.backup_to_directory(out_dir).await?;
+    
+    // Write chain identity + head metadata to the snapshot directory for fast-sync verification.
+    let chain_id = decode_u64_le_opt(store.get_metadata("protocol:chain_id").await.ok().flatten());
+    let network_id = store
+        .get_metadata("protocol:network_id")
+        .await
+        .ok()
+        .flatten()
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let genesis_hash = store
+        .get_metadata("protocol:genesis_hash")
+        .await
+        .ok()
+        .flatten()
+        .map(|b| format!("0x{}", hex::encode(b)))
+        .unwrap_or_else(|| "0x0".to_string());
+    let applied_cycle =
+        decode_u64_le_opt(store.get_metadata("consensus:last_applied_cycle").await.ok().flatten());
+    let applied_lsu_hash = store
+        .get_metadata("consensus:last_applied_lsu_hash")
+        .await
+        .ok()
+        .flatten()
+        .map(|b| format!("0x{}", hex::encode(b)))
+        .unwrap_or_else(|| "0x0".to_string());
+    let applied_state_root = store
+        .get_metadata("consensus:last_applied_state_root")
+        .await
+        .ok()
+        .flatten()
+        .map(|b| format!("0x{}", hex::encode(b)))
+        .unwrap_or_else(|| "0x0".to_string());
+    let last_lsu_cid = store
+        .get_metadata("consensus:last_lsu_cid")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|b| String::from_utf8(b).ok());
+
+    let meta = SnapshotMetaV1 {
+        version: 1,
+        created_at_ms: catalyst_utils::utils::current_timestamp_ms(),
+        chain_id,
+        network_id,
+        genesis_hash,
+        applied_cycle,
+        applied_lsu_hash,
+        applied_state_root,
+        last_lsu_cid,
+    };
+    let meta_path = out_dir.join("catalyst_snapshot.json");
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
+    println!("meta_path: {}", meta_path.display());
+
     println!("backup_ok: true");
     println!("out_dir: {}", out_dir.display());
     Ok(())
 }
 
 pub async fn db_restore(data_dir: &Path, from_dir: &Path) -> Result<()> {
+    // Optional pre-flight: if metadata is present, load it for post-restore verification.
+    let meta_path = from_dir.join("catalyst_snapshot.json");
+    let meta: Option<SnapshotMetaV1> = std::fs::read_to_string(&meta_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<SnapshotMetaV1>(&s).ok());
+
     let mut cfg = StorageConfigLib::default();
     cfg.data_dir = data_dir.to_path_buf();
     let store = StorageManager::new(cfg).await?;
     store.restore_from_directory(from_dir).await?;
+
+    if let Some(m) = meta {
+        let chain_id = decode_u64_le_opt(store.get_metadata("protocol:chain_id").await.ok().flatten());
+        let genesis_hash = store
+            .get_metadata("protocol:genesis_hash")
+            .await
+            .ok()
+            .flatten()
+            .map(|b| format!("0x{}", hex::encode(b)))
+            .unwrap_or_else(|| "0x0".to_string());
+        anyhow::ensure!(
+            chain_id == m.chain_id,
+            "restore verification failed: chain_id mismatch (snapshot={} restored={})",
+            m.chain_id,
+            chain_id
+        );
+        anyhow::ensure!(
+            genesis_hash == m.genesis_hash,
+            "restore verification failed: genesis_hash mismatch (snapshot={} restored={})",
+            m.genesis_hash,
+            genesis_hash
+        );
+    }
+
     println!("restore_ok: true");
     println!("from_dir: {}", from_dir.display());
     Ok(())

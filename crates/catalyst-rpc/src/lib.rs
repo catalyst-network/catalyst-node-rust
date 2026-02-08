@@ -114,6 +114,10 @@ pub trait CatalystRpc {
     #[method(name = "catalyst_genesisHash")]
     async fn genesis_hash(&self) -> RpcResult<String>;
 
+    /// Get sync/snapshot metadata needed for fast-sync verification.
+    #[method(name = "catalyst_getSyncInfo")]
+    async fn get_sync_info(&self) -> RpcResult<RpcSyncInfo>;
+
     /// Get the current block number
     #[method(name = "catalyst_blockNumber")]
     async fn block_number(&self) -> RpcResult<u64>;
@@ -233,6 +237,15 @@ pub struct RpcHead {
     pub applied_lsu_hash: String,
     pub applied_state_root: String,
     pub last_lsu_cid: Option<String>,
+}
+
+/// Sync metadata used by snapshot-based fast sync tooling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcSyncInfo {
+    pub chain_id: String,
+    pub network_id: String,
+    pub genesis_hash: String,
+    pub head: RpcHead,
 }
 
 /// RPC transaction request structure
@@ -641,6 +654,15 @@ impl CatalystRpcServer for CatalystRpcImpl {
         } else {
             Ok("0x0".to_string())
         }
+    }
+
+    async fn get_sync_info(&self) -> RpcResult<RpcSyncInfo> {
+        Ok(RpcSyncInfo {
+            chain_id: self.chain_id().await?,
+            network_id: self.network_id().await?,
+            genesis_hash: self.genesis_hash().await?,
+            head: self.head().await?,
+        })
     }
 
     async fn block_number(&self) -> RpcResult<u64> {
