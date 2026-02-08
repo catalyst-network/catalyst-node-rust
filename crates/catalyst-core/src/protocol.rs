@@ -100,6 +100,32 @@ pub struct Transaction {
     pub timestamp: u64,
 }
 
+/// Deterministic minimum fee schedule for the current implementation.
+///
+/// This is intentionally simple and “testnet-ready”:
+/// - it enables anti-spam by requiring a non-zero fee floor
+/// - it is fully deterministic from the `TransactionCore` fields
+/// - it does not yet model gas used / basefee dynamics (tracked under economics epic)
+pub fn min_fee_for_core(core: &TransactionCore) -> u64 {
+    // Base fee per tx type (units: base token “atoms”; currently the same unit as balances).
+    let base: u64 = match core.tx_type {
+        TransactionType::NonConfidentialTransfer => 1,
+        TransactionType::SmartContract => 5,
+        TransactionType::WorkerRegistration => 1,
+        // Other tx types are not wired end-to-end yet; keep a small floor.
+        _ => 1,
+    };
+
+    // Small per-entry overhead to discourage huge fanout.
+    let per_entry: u64 = 1;
+
+    base.saturating_add(per_entry.saturating_mul(core.entries.len() as u64))
+}
+
+pub fn min_fee(tx: &Transaction) -> u64 {
+    min_fee_for_core(&tx.core)
+}
+
 impl Transaction {
     pub fn validate_basic(&self) -> Result<(), String> {
         match self.core.tx_type {

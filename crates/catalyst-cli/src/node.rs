@@ -461,19 +461,31 @@ async fn set_nonce_u64(store: &StorageManager, pubkey: &[u8; 32], v: u64) -> Res
 
 fn tx_is_sane(entries: &[catalyst_consensus::types::TransactionEntry]) -> bool {
     // Minimal sanity for our dev tx model:
-    // - at least 2 entries
-    // - sum of amounts is 0 (conservation)
+    // - non-empty
+    // - net sum is <= 0 (net-negative is interpreted as burned fees)
+    //
+    // NOTE: We intentionally allow `sum < 0` to support fee debits represented as a
+    // dedicated negative entry within the transaction boundary.
     let sum: i64 = entries.iter().map(|e| e.amount).sum();
-    !entries.is_empty() && sum == 0
+    !entries.is_empty() && sum <= 0
 }
 
 async fn tx_is_funded(store: &StorageManager, entries: &[catalyst_consensus::types::TransactionEntry]) -> bool {
-    // Minimal sufficient-funds check:
-    // if an entry is negative, ensure balance + delta >= 0 for that pubkey.
+    // Sufficient-funds check:
+    // compute the net delta per pubkey and ensure no account would go negative.
+    use std::collections::HashMap;
+    let mut deltas: HashMap<[u8; 32], i64> = HashMap::new();
     for e in entries {
-        if e.amount < 0 {
-            let bal = get_balance_i64(store, &e.public_key).await;
-            if bal.saturating_add(e.amount) < 0 {
+        *deltas.entry(e.public_key).or_insert(0) = deltas
+            .get(&e.public_key)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(e.amount);
+    }
+    for (pk, d) in deltas {
+        if d < 0 {
+            let bal = get_balance_i64(store, &pk).await;
+            if bal.saturating_add(d) < 0 {
                 return false;
             }
         }
@@ -610,6 +622,11 @@ async fn validate_and_select_protocol_txs_for_construction(
         if tx.validate_basic().is_err() {
             continue;
         }
+        // Fee floor check
+        let min_fee = catalyst_core::protocol::min_fee(&tx);
+        if tx.core.fees < min_fee {
+            continue;
+        }
         // Lock_time gate (same as mempool)
         if tx.core.lock_time as u64 > now_secs {
             continue;
@@ -653,6 +670,15 @@ async fn validate_and_select_protocol_txs_for_construction(
             deltas.push((e.public_key, v));
         }
         if !ok {
+            continue;
+        }
+        // Fee debit is burned (no sink credit yet).
+        if let Ok(fee_i64) = i64::try_from(tx.core.fees) {
+            if fee_i64 > 0 {
+                deltas.push((sender, -fee_i64));
+            }
+        } else {
+            // Fee doesn't fit into ledger delta representation
             continue;
         }
 
@@ -1295,6 +1321,7 @@ impl CatalystNode {
                         signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
                         timestamp: now_ms,
                     };
+                    tx.core.fees = catalyst_core::protocol::min_fee(&tx);
 
                     let payload = tx.signing_payload().map_err(anyhow::Error::msg)?;
                     let scheme = catalyst_crypto::signatures::SignatureScheme::new();
@@ -2004,9 +2031,10 @@ impl CatalystNode {
                         signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
                         timestamp: now,
                     };
+                    let mut tx = tx;
+                    tx.core.fees = catalyst_core::protocol::min_fee(&tx);
 
                     // Real signature
-                    let mut tx = tx;
                     let payload = match tx.signing_payload() {
                         Ok(p) => p,
                         Err(_) => continue,

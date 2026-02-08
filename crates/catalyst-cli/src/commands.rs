@@ -196,6 +196,7 @@ pub async fn send_transaction(
         signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
         timestamp: now_ms,
     };
+    tx.core.fees = catalyst_core::protocol::min_fee(&tx);
 
     // Real signature: Schnorr over canonical payload.
     let payload = tx.signing_payload().map_err(anyhow::Error::msg)?;
@@ -256,6 +257,7 @@ pub async fn register_worker(key_file: &Path, rpc_url: &str) -> Result<()> {
         signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
         timestamp: now_ms,
     };
+    tx.core.fees = catalyst_core::protocol::min_fee(&tx);
 
     // Real signature: Schnorr over canonical payload.
     let payload = tx.signing_payload().map_err(anyhow::Error::msg)?;
@@ -336,6 +338,7 @@ pub async fn deploy_contract(
         signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
         timestamp: now_ms,
     };
+    tx.core.fees = catalyst_core::protocol::min_fee(&tx);
 
     let payload = tx.signing_payload().map_err(anyhow::Error::msg)?;
     let mut rng = rand::rngs::OsRng;
@@ -415,6 +418,7 @@ pub async fn call_contract(
         signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
         timestamp: now_ms,
     };
+    tx.core.fees = catalyst_core::protocol::min_fee(&tx);
 
     let payload = tx.signing_payload().map_err(anyhow::Error::msg)?;
     let mut rng = rand::rngs::OsRng;

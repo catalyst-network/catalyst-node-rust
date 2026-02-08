@@ -66,9 +66,18 @@ impl ConstructionPhase {
             .collect();
         let signatures_hash = compute_merkle_root(&signature_leaves);
 
-        // Fees are scaffolding in the current implementation; keep this deterministic.
-        // TODO(#184/#186): compute fees from tx model and enforce at mempool + formation time.
-        let total_fees = 0u64;
+        // Fees: represent fees as a net-negative sum of entry amounts (burned fees).
+        // This is deterministic from the sorted entry set and keeps the consensus engine
+        // independent of the higher-level protocol tx container for now.
+        //
+        // Note: transfers and current marker tx types sum to 0; any net-negative is interpreted
+        // as fees debited from senders.
+        let net: i128 = sorted_entries.iter().map(|e| e.amount as i128).sum();
+        let total_fees: u64 = if net < 0 {
+            (-net).min(u64::MAX as i128) as u64
+        } else {
+            0
+        };
 
         // Create partial ledger state update
         let partial_update = PartialLedgerStateUpdate {
