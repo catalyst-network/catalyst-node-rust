@@ -500,11 +500,81 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn get_block_by_hash(&self, _hash: String, _full_transactions: bool) -> RpcResult<Option<RpcBlock>> {
-        Ok(None)
+        let h = parse_hex_32bytes(&_hash).map_err(ErrorObjectOwned::from)?;
+        let key = cycle_by_lsu_hash_key(&h);
+        let Some(bytes) = self.storage.get_metadata(&key).await.ok().flatten() else {
+            return Ok(None);
+        };
+        if bytes.len() != 8 {
+            return Ok(None);
+        }
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&bytes);
+        let cycle = u64::from_le_bytes(arr);
+        self.get_block_by_number(cycle, _full_transactions).await
     }
 
     async fn get_block_by_number(&self, _number: u64, _full_transactions: bool) -> RpcResult<Option<RpcBlock>> {
-        Ok(None)
+        let cycle = _number;
+        let lsu_key = format!("consensus:lsu:{}", cycle);
+        let lsu_hash_key = format!("consensus:lsu_hash:{}", cycle);
+
+        let Some(lsu_bytes) = self.storage.get_metadata(&lsu_key).await.ok().flatten() else {
+            return Ok(None);
+        };
+
+        let lsu: catalyst_consensus::types::LedgerStateUpdate =
+            <catalyst_consensus::types::LedgerStateUpdate as catalyst_utils::CatalystDeserialize>::deserialize(&lsu_bytes)
+                .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())))?;
+
+        let lsu_hash = self
+            .storage
+            .get_metadata(&lsu_hash_key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| if b.len() == 32 {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(&b);
+                Some(h)
+            } else {
+                None
+            })
+            .unwrap_or_else(|| catalyst_consensus::types::hash_data(&lsu).unwrap_or([0u8; 32]));
+
+        let parent_hash = if cycle > 0 {
+            self.storage
+                .get_metadata(&format!("consensus:lsu_hash:{}", cycle.saturating_sub(1)))
+                .await
+                .ok()
+                .flatten()
+                .and_then(|b| if b.len() == 32 {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(&b);
+                    Some(h)
+                } else {
+                    None
+                })
+                .unwrap_or([0u8; 32])
+        } else {
+            [0u8; 32]
+        };
+
+        let txids = load_cycle_txids(self.storage.as_ref(), cycle).await;
+        let mut txs: Vec<RpcTransactionSummary> = Vec::new();
+        for txid in &txids {
+            txs.push(load_tx_summary(self.storage.as_ref(), txid).await);
+        }
+
+        Ok(Some(RpcBlock {
+            hash: format!("0x{}", hex::encode(lsu_hash)),
+            number: cycle,
+            parent_hash: format!("0x{}", hex::encode(parent_hash)),
+            timestamp: lsu.partial_update.timestamp,
+            transactions: txs,
+            transaction_count: txids.len(),
+            size: lsu_bytes.len() as u64,
+        }))
     }
 
     async fn get_transaction_by_hash(&self, hash: String) -> RpcResult<Option<RpcTransaction>> {
@@ -889,11 +959,70 @@ fn cycle_txids_key(cycle: u64) -> String {
     format!("tx:cycle:{}:txids", cycle)
 }
 
+fn cycle_by_lsu_hash_key(lsu_hash: &[u8; 32]) -> String {
+    format!("consensus:cycle_by_lsu_hash:{}", hex::encode(lsu_hash))
+}
+
 async fn load_cycle_txids(store: &catalyst_storage::StorageManager, cycle: u64) -> Vec<[u8; 32]> {
     let Some(bytes) = store.get_metadata(&cycle_txids_key(cycle)).await.ok().flatten() else {
         return Vec::new();
     };
     bincode::deserialize::<Vec<[u8; 32]>>(&bytes).unwrap_or_default()
+}
+
+async fn load_tx_summary(
+    store: &catalyst_storage::StorageManager,
+    txid: &[u8; 32],
+) -> RpcTransactionSummary {
+    let hash = format!("0x{}", hex::encode(txid));
+    let key = tx_raw_key(txid);
+    let Some(bytes) = store.get_metadata(&key).await.ok().flatten() else {
+        return RpcTransactionSummary {
+            hash,
+            from: "0x0".to_string(),
+            to: None,
+            value: "0".to_string(),
+        };
+    };
+    let Ok(tx) = bincode::deserialize::<catalyst_core::protocol::Transaction>(&bytes) else {
+        return RpcTransactionSummary {
+            hash,
+            from: "0x0".to_string(),
+            to: None,
+            value: "0".to_string(),
+        };
+    };
+
+    let from = tx_sender_pubkey(&tx)
+        .map(|pk| format!("0x{}", hex::encode(pk)))
+        .unwrap_or_else(|| "0x0".to_string());
+
+    let (to, value) = match tx.core.tx_type {
+        catalyst_core::protocol::TransactionType::NonConfidentialTransfer => {
+            let sender = tx_sender_pubkey(&tx);
+            let mut to_pk: Option<[u8; 32]> = None;
+            let mut val: i64 = 0;
+            for e in &tx.core.entries {
+                if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
+                    if v > 0 {
+                        if sender.map(|s| s != e.public_key).unwrap_or(true) {
+                            to_pk = Some(e.public_key);
+                            val = val.saturating_add(v);
+                        }
+                    }
+                }
+            }
+            (to_pk.map(|pk| format!("0x{}", hex::encode(pk))), val.max(0) as u64)
+        }
+        _ => (None, 0u64),
+    };
+
+    RpcTransactionSummary {
+        hash,
+        from,
+        to,
+        value: value.to_string(),
+    }
 }
 
 async fn load_tx_meta(

@@ -740,6 +740,10 @@ fn cycle_txids_key(cycle: u64) -> String {
     format!("tx:cycle:{}:txids", cycle)
 }
 
+fn cycle_by_lsu_hash_key(lsu_hash: &[u8; 32]) -> String {
+    format!("consensus:cycle_by_lsu_hash:{}", hex_encode(lsu_hash))
+}
+
 async fn load_mempool_txids(store: &StorageManager) -> Vec<[u8; 32]> {
     let Some(bytes) = store.get_metadata("mempool:txids").await.ok().flatten() else {
         return Vec::new();
@@ -1884,6 +1888,12 @@ impl CatalystNode {
                                                                 .await;
                                                             let _ = store
                                                                 .set_metadata(
+                                                                    &cycle_by_lsu_hash_key(&ref_msg.lsu_hash),
+                                                                    &ref_msg.cycle.to_le_bytes(),
+                                                                )
+                                                                .await;
+                                                            let _ = store
+                                                                .set_metadata(
                                                                     &format!("consensus:lsu_cid:{}", ref_msg.cycle),
                                                                     ref_msg.cid.as_bytes(),
                                                                 )
@@ -1961,6 +1971,12 @@ impl CatalystNode {
                                                     .set_metadata(
                                                         &format!("consensus:lsu_hash:{}", lsu_msg.cycle),
                                                         &lsu_msg.lsu_hash,
+                                                    )
+                                                    .await;
+                                                let _ = store
+                                                    .set_metadata(
+                                                        &cycle_by_lsu_hash_key(&lsu_msg.lsu_hash),
+                                                        &lsu_msg.cycle.to_le_bytes(),
                                                     )
                                                     .await;
 
@@ -2394,6 +2410,9 @@ impl CatalystNode {
                                         .await;
                                     let _ = store
                                         .set_metadata(&format!("consensus:lsu_hash:{}", cycle), &prev_seed)
+                                        .await;
+                                    let _ = store
+                                        .set_metadata(&cycle_by_lsu_hash_key(&prev_seed), &cycle.to_le_bytes())
                                         .await;
 
                                     let _ = store.set_metadata("consensus:last_lsu", &bytes).await;

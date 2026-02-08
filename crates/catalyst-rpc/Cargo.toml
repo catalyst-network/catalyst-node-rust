@@ -7,6 +7,8 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 catalyst-core = { path = "../catalyst-core" }
+catalyst-consensus = { path = "../catalyst-consensus" }
+catalyst-utils = { path = "../catalyst-utils" }
 catalyst-storage = { path = "../catalyst-storage" }
 catalyst-network = { path = "../catalyst-network" }
 catalyst-crypto = { path = "../catalyst-crypto" }
