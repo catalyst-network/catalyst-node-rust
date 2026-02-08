@@ -16,6 +16,9 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+const META_PROTOCOL_CHAIN_ID: &str = "protocol:chain_id";
+const META_PROTOCOL_NETWORK_ID: &str = "protocol:network_id";
+const META_PROTOCOL_GENESIS_HASH: &str = "protocol:genesis_hash";
 
 // Note: The initial scaffold referenced sub-modules (`methods`, `server`, `types`) that
 // aren't present yet. Keeping the RPC types and traits in this file for now so the
@@ -90,6 +93,18 @@ impl Default for RpcConfig {
 /// Main RPC API trait defining all available methods
 #[rpc(server)]
 pub trait CatalystRpc {
+    /// Get the chain id (EVM domain separation; tooling identity).
+    #[method(name = "catalyst_chainId")]
+    async fn chain_id(&self) -> RpcResult<String>;
+
+    /// Get the network id (human-readable network identity).
+    #[method(name = "catalyst_networkId")]
+    async fn network_id(&self) -> RpcResult<String>;
+
+    /// Get the genesis hash (stable chain identity hash; best-effort for legacy DBs).
+    #[method(name = "catalyst_genesisHash")]
+    async fn genesis_hash(&self) -> RpcResult<String>;
+
     /// Get the current block number
     #[method(name = "catalyst_blockNumber")]
     async fn block_number(&self) -> RpcResult<u64>;
@@ -521,6 +536,45 @@ impl CatalystRpcImpl {
 
 #[async_trait]
 impl CatalystRpcServer for CatalystRpcImpl {
+    async fn chain_id(&self) -> RpcResult<String> {
+        let cid = self
+            .storage
+            .get_metadata(META_PROTOCOL_CHAIN_ID)
+            .await
+            .ok()
+            .flatten()
+            .map(|b| decode_u64_le(&b))
+            .unwrap_or(31337);
+        Ok(format!("0x{:x}", cid))
+    }
+
+    async fn network_id(&self) -> RpcResult<String> {
+        let nid = self
+            .storage
+            .get_metadata(META_PROTOCOL_NETWORK_ID)
+            .await
+            .ok()
+            .flatten()
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        Ok(nid)
+    }
+
+    async fn genesis_hash(&self) -> RpcResult<String> {
+        let gh = self
+            .storage
+            .get_metadata(META_PROTOCOL_GENESIS_HASH)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if gh.len() == 32 {
+            Ok(format!("0x{}", hex::encode(gh)))
+        } else {
+            Ok("0x0".to_string())
+        }
+    }
+
     async fn block_number(&self) -> RpcResult<u64> {
         let n = self
             .storage
@@ -1481,5 +1535,11 @@ mod tests {
         let parts = tx_participants(&tx);
         assert!(parts.contains(&sender));
         assert!(parts.contains(&recv));
+    }
+
+    #[test]
+    fn chain_id_formats_as_hex() {
+        assert_eq!(format!("0x{:x}", 31337u64), "0x7a69");
+        assert_eq!(format!("0x{:x}", 1u64), "0x1");
     }
 }

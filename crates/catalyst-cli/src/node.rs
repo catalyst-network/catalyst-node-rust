@@ -11,6 +11,7 @@ use catalyst_network::{NetworkConfig as P2pConfig, NetworkService as P2pService,
 use catalyst_utils::{
     CatalystDeserialize, CatalystSerialize, MessageType, MessageEnvelope,
     utils::current_timestamp_ms,
+    impl_catalyst_serialize,
 };
 use catalyst_consensus::types::hash_data;
 use catalyst_utils::state::StateManager;
@@ -34,6 +35,10 @@ const DEFAULT_EVM_GAS_LIMIT: u64 = 8_000_000;
 // Dev/testnet faucet key (32-byte scalar); pubkey is derived and is a valid compressed Ristretto point.
 const FAUCET_PRIVATE_KEY_BYTES: [u8; 32] = [0xFA; 32];
 const FAUCET_INITIAL_BALANCE: i64 = 1_000_000;
+
+const META_PROTOCOL_CHAIN_ID: &str = "protocol:chain_id";
+const META_PROTOCOL_NETWORK_ID: &str = "protocol:network_id";
+const META_PROTOCOL_GENESIS_HASH: &str = "protocol:genesis_hash";
 
 fn balance_key_for_pubkey(pubkey: &[u8; 32]) -> Vec<u8> {
     let mut k = b"bal:".to_vec();
@@ -271,6 +276,8 @@ async fn apply_lsu_to_storage_without_root_check(
     let mut outcome_by_sig: std::collections::HashMap<Vec<u8>, ApplyOutcome> = std::collections::HashMap::new();
     let mut executed_sigs: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
 
+    let chain_id = load_chain_id_u64(store).await;
+
     // Apply balance / worker / EVM updates.
     for e in &lsu.partial_update.transaction_entries {
         if is_worker_reg_marker(&e.signature) {
@@ -291,7 +298,7 @@ async fn apply_lsu_to_storage_without_root_check(
                     let gas_limit = DEFAULT_EVM_GAS_LIMIT.max(21_000);
                     match payload.kind {
                         EvmTxKind::Deploy { bytecode } => {
-                            match execute_deploy_and_persist(store, from, payload.nonce, bytecode, gas_limit).await {
+                            match execute_deploy_and_persist(store, from, chain_id, payload.nonce, bytecode, gas_limit).await {
                                 Ok((_created, info, _persisted)) => {
                                     outcome_by_sig.insert(
                                         e.signature.clone(),
@@ -317,7 +324,7 @@ async fn apply_lsu_to_storage_without_root_check(
                         }
                         EvmTxKind::Call { to, input } => {
                             let to_addr = EvmAddress::from_slice(&to);
-                            match execute_call_and_persist(store, from, to_addr, payload.nonce, input, gas_limit).await {
+                            match execute_call_and_persist(store, from, to_addr, chain_id, payload.nonce, input, gas_limit).await {
                                 Ok((info, _persisted)) => {
                                     outcome_by_sig.insert(
                                         e.signature.clone(),
@@ -488,6 +495,124 @@ fn faucet_pubkey_bytes() -> [u8; 32] {
     catalyst_crypto::PrivateKey::from_bytes(FAUCET_PRIVATE_KEY_BYTES)
         .public_key()
         .to_bytes()
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct GenesisDescriptor {
+    mode: String,
+    chain_id: u64,
+    network_id: String,
+    faucet_pubkey: [u8; 32],
+    faucet_balance: i64,
+}
+
+impl_catalyst_serialize!(GenesisDescriptor, mode, chain_id, network_id, faucet_pubkey, faucet_balance);
+
+async fn load_chain_id_u64(store: &StorageManager) -> u64 {
+    store
+        .get_metadata(META_PROTOCOL_CHAIN_ID)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|b| {
+            if b.len() != 8 {
+                return None;
+            }
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&b);
+            Some(u64::from_le_bytes(arr))
+        })
+        .unwrap_or(31337)
+}
+
+async fn ensure_chain_identity_and_genesis(store: &StorageManager, cfg: &crate::config::ProtocolConfig) {
+    // Chain id
+    let existing_chain_id = store.get_metadata(META_PROTOCOL_CHAIN_ID).await.ok().flatten();
+    if existing_chain_id.is_none() {
+        let _ = store
+            .set_metadata(META_PROTOCOL_CHAIN_ID, &cfg.chain_id.to_le_bytes())
+            .await;
+    }
+
+    // Network id
+    let existing_net = store.get_metadata(META_PROTOCOL_NETWORK_ID).await.ok().flatten();
+    if existing_net.is_none() {
+        let _ = store
+            .set_metadata(META_PROTOCOL_NETWORK_ID, cfg.network_id.as_bytes())
+            .await;
+    }
+
+    // Genesis hash: only apply genesis state on a fresh DB.
+    let existing_genesis = store.get_metadata(META_PROTOCOL_GENESIS_HASH).await.ok().flatten();
+    if existing_genesis.is_some() {
+        return;
+    }
+
+    let already = store
+        .get_metadata("consensus:last_applied_cycle")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|b| {
+            if b.len() != 8 {
+                return None;
+            }
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&b);
+            Some(u64::from_le_bytes(arr))
+        })
+        .unwrap_or(0);
+
+    let faucet_pk = faucet_pubkey_bytes();
+
+    if already == 0 {
+        // Fresh DB: apply a minimal deterministic genesis state (faucet funding).
+        let existing_balance = store
+            .get_state(&balance_key_for_pubkey(&faucet_pk))
+            .await
+            .ok()
+            .flatten();
+        if existing_balance.is_none() {
+            let _ = set_balance_i64(store, &faucet_pk, FAUCET_INITIAL_BALANCE).await;
+            let _ = set_nonce_u64(store, &faucet_pk, 0).await;
+        }
+        let _ = store.commit().await;
+
+        let g = GenesisDescriptor {
+            mode: "fresh".to_string(),
+            chain_id: cfg.chain_id,
+            network_id: cfg.network_id.clone(),
+            faucet_pubkey: faucet_pk,
+            faucet_balance: FAUCET_INITIAL_BALANCE,
+        };
+        let gh = hash_data(&g).unwrap_or([0u8; 32]);
+        let _ = store.set_metadata(META_PROTOCOL_GENESIS_HASH, &gh).await;
+        info!(
+            "Genesis initialized chain_id={} network_id={} genesis_hash=0x{} faucet_pk={} faucet_balance={}",
+            cfg.chain_id,
+            cfg.network_id,
+            hex_encode(&gh),
+            hex_encode(&faucet_pk),
+            FAUCET_INITIAL_BALANCE
+        );
+    } else {
+        // Legacy DB: do not mutate balances/consensus head; just stamp an identity hash.
+        let g = GenesisDescriptor {
+            mode: "legacy".to_string(),
+            chain_id: cfg.chain_id,
+            network_id: cfg.network_id.clone(),
+            faucet_pubkey: faucet_pk,
+            faucet_balance: FAUCET_INITIAL_BALANCE,
+        };
+        let gh = hash_data(&g).unwrap_or([0u8; 32]);
+        let _ = store.set_metadata(META_PROTOCOL_GENESIS_HASH, &gh).await;
+        info!(
+            "Stamped legacy genesis identity chain_id={} network_id={} genesis_hash=0x{} (no state reset)",
+            cfg.chain_id,
+            cfg.network_id,
+            hex_encode(&gh),
+        );
+    }
 }
 
 fn verify_protocol_tx_signature(tx: &catalyst_core::protocol::Transaction) -> bool {
@@ -1168,6 +1293,8 @@ async fn apply_lsu_to_storage(
     let mut outcome_by_sig: std::collections::HashMap<Vec<u8>, ApplyOutcome> = std::collections::HashMap::new();
     let mut executed_sigs: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
 
+    let chain_id = load_chain_id_u64(store).await;
+
     // Apply balance deltas from the LSU's ordered transaction entries.
     // Also apply worker registry markers into state under `workers:<pubkey>`.
     for e in &lsu.partial_update.transaction_entries {
@@ -1199,7 +1326,7 @@ async fn apply_lsu_to_storage(
                     let gas_limit = DEFAULT_EVM_GAS_LIMIT.max(21_000);
                     match payload.kind {
                         EvmTxKind::Deploy { bytecode } => {
-                            match execute_deploy_and_persist(store, from, payload.nonce, bytecode, gas_limit).await {
+                            match execute_deploy_and_persist(store, from, chain_id, payload.nonce, bytecode, gas_limit).await {
                                 Ok((created, info, _persisted)) => {
                                     info!("EVM deploy applied addr=0x{} ok={} gas_used={}", hex::encode(created.as_slice()), info.success, info.gas_used);
                                     outcome_by_sig.insert(
@@ -1227,7 +1354,7 @@ async fn apply_lsu_to_storage(
                         }
                         EvmTxKind::Call { to, input } => {
                             let to_addr = EvmAddress::from_slice(&to);
-                            match execute_call_and_persist(store, from, to_addr, payload.nonce, input, gas_limit).await {
+                            match execute_call_and_persist(store, from, to_addr, chain_id, payload.nonce, input, gas_limit).await {
                                 Ok((info, _persisted)) => {
                                     info!(
                                         "EVM call applied to=0x{} ok={} gas_used={} ret_len={}",
@@ -1654,6 +1781,11 @@ impl CatalystNode {
             None
         };
 
+        // Ensure chain identity + genesis are initialized (one-time, idempotent).
+        if let Some(store) = &storage {
+            ensure_chain_identity_and_genesis(store.as_ref(), &self.config.protocol).await;
+        }
+
         // Auto-register as a worker (on-chain) for validator nodes.
         if self.config.validator {
             if let Some(store) = &storage {
@@ -1711,26 +1843,6 @@ impl CatalystNode {
         // Rehydrate mempool from persisted txs (best-effort).
         if let Some(store) = &storage {
             rehydrate_mempool_from_storage(store.as_ref(), &mempool).await;
-        }
-
-        // Initialize faucet (dev/testnet): create a deterministic funded account if missing.
-        if let Some(store) = &storage {
-            let faucet_pk = faucet_pubkey_bytes();
-            let existing = store
-                .get_state(&balance_key_for_pubkey(&faucet_pk))
-                .await
-                .ok()
-                .flatten();
-            if existing.is_none() {
-                let _ = set_balance_i64(store.as_ref(), &faucet_pk, FAUCET_INITIAL_BALANCE).await;
-                let _ = set_nonce_u64(store.as_ref(), &faucet_pk, 0).await;
-                let _ = store.commit().await;
-                info!(
-                    "Initialized faucet pubkey={} balance={}",
-                    hex_encode(&faucet_pk),
-                    FAUCET_INITIAL_BALANCE
-                );
-            }
         }
 
         // --- RPC (HTTP JSON-RPC) ---
