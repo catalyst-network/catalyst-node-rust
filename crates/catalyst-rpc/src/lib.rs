@@ -207,6 +207,9 @@ pub struct RpcBlock {
     pub parent_hash: String,
     pub timestamp: u64,
     pub transactions: Vec<RpcTransactionSummary>,
+    /// Optional full transaction objects when requested (see `full_transactions` arg).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transactions_full: Option<Vec<RpcTransaction>>,
     pub transaction_count: usize,
     pub size: u64,
 }
@@ -566,12 +569,32 @@ impl CatalystRpcServer for CatalystRpcImpl {
             txs.push(load_tx_summary(self.storage.as_ref(), txid).await);
         }
 
+        let transactions_full = if _full_transactions {
+            let mut out: Vec<RpcTransaction> = Vec::new();
+            for txid in &txids {
+                if let Some(tx) = load_tx_full(
+                    self.storage.as_ref(),
+                    txid,
+                    Some(cycle),
+                    Some(lsu_hash),
+                )
+                .await
+                {
+                    out.push(tx);
+                }
+            }
+            Some(out)
+        } else {
+            None
+        };
+
         Ok(Some(RpcBlock {
             hash: format!("0x{}", hex::encode(lsu_hash)),
             number: cycle,
             parent_hash: format!("0x{}", hex::encode(parent_hash)),
             timestamp: lsu.partial_update.timestamp,
             transactions: txs,
+            transactions_full,
             transaction_count: txids.len(),
             size: lsu_bytes.len() as u64,
         }))
@@ -745,7 +768,32 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn get_account(&self, _address: String) -> RpcResult<Option<RpcAccount>> {
-        Ok(None)
+        let pk = parse_hex_32(&_address).map_err(ErrorObjectOwned::from)?;
+        let bal_key = bal_key(&pk);
+        let bal = self
+            .storage
+            .engine()
+            .get("accounts", &bal_key)
+            .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())))?
+            .map(|b| decode_i64(&b))
+            .unwrap_or(0);
+
+        let mut nonce_key = b"nonce:".to_vec();
+        nonce_key.extend_from_slice(&pk);
+        let nonce = self
+            .storage
+            .engine()
+            .get("accounts", &nonce_key)
+            .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())))?
+            .map(|b| decode_u64_le(&b))
+            .unwrap_or(0);
+
+        Ok(Some(RpcAccount {
+            address: _address,
+            balance: bal.to_string(),
+            account_type: "user".to_string(),
+            nonce,
+        }))
     }
 
     async fn send_raw_transaction(&self, _data: String) -> RpcResult<String> {
@@ -833,7 +881,35 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn estimate_fee(&self, _transaction: RpcTransactionRequest) -> RpcResult<String> {
-        Ok("0".to_string())
+        let from = parse_hex_32(&_transaction.from).map_err(ErrorObjectOwned::from)?;
+        let tx_type = if _transaction.data.as_deref().unwrap_or("").trim().is_empty() {
+            catalyst_core::protocol::TransactionType::NonConfidentialTransfer
+        } else {
+            catalyst_core::protocol::TransactionType::SmartContract
+        };
+
+        let entries_len = match tx_type {
+            catalyst_core::protocol::TransactionType::SmartContract => 1usize,
+            catalyst_core::protocol::TransactionType::WorkerRegistration => 1usize,
+            _ => 2usize,
+        };
+
+        // We only need the core shape for fee estimation.
+        let core = catalyst_core::protocol::TransactionCore {
+            tx_type,
+            entries: (0..entries_len)
+                .map(|i| catalyst_core::protocol::TransactionEntry {
+                    public_key: if i == 0 { from } else { [0u8; 32] },
+                    amount: catalyst_core::protocol::EntryAmount::NonConfidential(0),
+                })
+                .collect(),
+            nonce: 1,
+            lock_time: 0,
+            fees: 0,
+            data: Vec::new(),
+        };
+        let fee = catalyst_core::protocol::min_fee_for_core(&core);
+        Ok(fee.to_string())
     }
 
     async fn network_info(&self) -> RpcResult<RpcNetworkInfo> {
@@ -1023,6 +1099,59 @@ async fn load_tx_summary(
         to,
         value: value.to_string(),
     }
+}
+
+async fn load_tx_full(
+    store: &catalyst_storage::StorageManager,
+    txid: &[u8; 32],
+    block_number: Option<u64>,
+    block_hash: Option<[u8; 32]>,
+) -> Option<RpcTransaction> {
+    let hash = format!("0x{}", hex::encode(txid));
+    let key = tx_raw_key(txid);
+    let bytes = store.get_metadata(&key).await.ok().flatten()?;
+    let tx: catalyst_core::protocol::Transaction = bincode::deserialize(&bytes).ok()?;
+
+    let meta = load_tx_meta(store, txid).await;
+    let status = meta
+        .as_ref()
+        .map(|m| tx_status_string(&m.status))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let from = tx_sender_pubkey(&tx).map(|pk| format!("0x{}", hex::encode(pk)));
+    let (to, value) = match tx.core.tx_type {
+        catalyst_core::protocol::TransactionType::NonConfidentialTransfer => {
+            let sender = tx_sender_pubkey(&tx);
+            let mut to_pk: Option<[u8; 32]> = None;
+            let mut val: i64 = 0;
+            for e in &tx.core.entries {
+                if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
+                    if v > 0 {
+                        if sender.map(|s| s != e.public_key).unwrap_or(true) {
+                            to_pk = Some(e.public_key);
+                            val = val.saturating_add(v);
+                        }
+                    }
+                }
+            }
+            (to_pk.map(|pk| format!("0x{}", hex::encode(pk))), val.max(0) as u64)
+        }
+        _ => (None, 0u64),
+    };
+
+    Some(RpcTransaction {
+        hash,
+        block_hash: block_hash.map(|h| format!("0x{}", hex::encode(h))),
+        block_number,
+        from: from.unwrap_or_else(|| "0x0".to_string()),
+        to,
+        value: value.to_string(),
+        data: format!("0x{}", hex::encode(&tx.core.data)),
+        gas_limit: 0,
+        gas_price: "0".to_string(),
+        gas_used: None,
+        status: Some(status),
+    })
 }
 
 async fn load_tx_meta(
