@@ -133,6 +133,24 @@ enum Commands {
         #[arg(long, default_value = "http://localhost:8545")]
         rpc_url: String,
     },
+    /// Backup node database to a directory (snapshot export)
+    DbBackup {
+        /// Data directory (same as config.storage.data_dir)
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Output directory for the backup
+        #[arg(long)]
+        out_dir: PathBuf,
+    },
+    /// Restore node database from a backup directory (snapshot import)
+    DbRestore {
+        /// Data directory (same as config.storage.data_dir)
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Backup directory to restore from
+        #[arg(long)]
+        from_dir: PathBuf,
+    },
     /// Show a transaction receipt/status (and inclusion proof when applied)
     Receipt {
         /// Transaction hash (tx_id)
@@ -356,6 +374,12 @@ async fn main() -> Result<()> {
         }
         Commands::Peers { rpc_url } => {
             commands::show_peers(&rpc_url).await?;
+        }
+        Commands::DbBackup { data_dir, out_dir } => {
+            commands::db_backup(&data_dir, &out_dir).await?;
+        }
+        Commands::DbRestore { data_dir, from_dir } => {
+            commands::db_restore(&data_dir, &from_dir).await?;
         }
         Commands::Receipt { tx_hash, rpc_url } => {
             commands::show_receipt(&tx_hash, &rpc_url).await?;

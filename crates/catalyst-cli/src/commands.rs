@@ -12,6 +12,7 @@ use jsonrpsee::core::client::ClientT;
 use catalyst_crypto::signatures::{Signature, SignatureScheme};
 use crate::evm::EvmTxKind;
 use alloy_primitives::Address as EvmAddress;
+use catalyst_storage::{StorageConfig as StorageConfigLib, StorageManager};
 
 fn parse_hex_32(s: &str) -> anyhow::Result<[u8; 32]> {
     let s = s.trim().strip_prefix("0x").unwrap_or(s);
@@ -214,6 +215,26 @@ pub async fn show_status(rpc_url: &str) -> Result<()> {
 
 pub async fn show_peers(rpc_url: &str) -> Result<()> {
     get_peers(rpc_url).await
+}
+
+pub async fn db_backup(data_dir: &Path, out_dir: &Path) -> Result<()> {
+    let mut cfg = StorageConfigLib::default();
+    cfg.data_dir = data_dir.to_path_buf();
+    let store = StorageManager::new(cfg).await?;
+    store.backup_to_directory(out_dir).await?;
+    println!("backup_ok: true");
+    println!("out_dir: {}", out_dir.display());
+    Ok(())
+}
+
+pub async fn db_restore(data_dir: &Path, from_dir: &Path) -> Result<()> {
+    let mut cfg = StorageConfigLib::default();
+    cfg.data_dir = data_dir.to_path_buf();
+    let store = StorageManager::new(cfg).await?;
+    store.restore_from_directory(from_dir).await?;
+    println!("restore_ok: true");
+    println!("from_dir: {}", from_dir.display());
+    Ok(())
 }
 
 pub async fn show_receipt(tx_hash: &str, rpc_url: &str) -> Result<()> {
