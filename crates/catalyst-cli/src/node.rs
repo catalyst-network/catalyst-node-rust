@@ -1928,7 +1928,14 @@ impl CatalystNode {
                 let bind: std::net::SocketAddr = format!("{}:{}", self.config.rpc.address, self.config.rpc.port)
                     .parse()
                     .map_err(|e| anyhow::anyhow!("invalid rpc bind addr: {e}"))?;
-                let handle = catalyst_rpc::start_rpc_http(bind, store.clone(), Some(network.clone()), Some(rpc_tx))
+                let handle = catalyst_rpc::start_rpc_http(
+                    bind,
+                    store.clone(),
+                    Some(network.clone()),
+                    Some(rpc_tx),
+                    self.config.rpc.rate_limit,
+                    self.config.rpc.rate_limit,
+                )
                     .await
                     .map_err(|e| anyhow::anyhow!("rpc start failed: {e}"))?;
                 info!("RPC server listening on http://{}", bind);
@@ -2155,15 +2162,21 @@ impl CatalystNode {
                                         let mut mp = mempool.write().await;
                                         if mp.insert_protocol(tx.clone(), now_secs) {
                                             persist_mempool_tx(store.as_ref(), &tx.tx).await;
+                                            // Help multi-hop propagation on WAN: rebroadcast when first seen.
+                                            let _ = net.broadcast_envelope(&envelope).await;
                                         }
                                     }
                                 } else {
                                     let mut mp = mempool.write().await;
-                                    let _ = mp.insert_protocol(tx, now_secs);
+                                    if mp.insert_protocol(tx, now_secs) {
+                                        let _ = net.broadcast_envelope(&envelope).await;
+                                    }
                                 }
                             } else if let Ok(tx) = envelope.extract_message::<TxGossip>() {
                                 let mut mp = mempool.write().await;
-                                let _ = mp.insert(tx);
+                                if mp.insert(tx) {
+                                    let _ = net.broadcast_envelope(&envelope).await;
+                                }
                             }
                         } else if envelope.message_type == MessageType::TransactionBatch {
                             // Prefer protocol tx batches (full signed txs), fallback to legacy entry batch.

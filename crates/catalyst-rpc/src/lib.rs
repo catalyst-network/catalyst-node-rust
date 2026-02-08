@@ -13,12 +13,16 @@ use jsonrpsee::{
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Mutex;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 const META_PROTOCOL_CHAIN_ID: &str = "protocol:chain_id";
 const META_PROTOCOL_NETWORK_ID: &str = "protocol:network_id";
 const META_PROTOCOL_GENESIS_HASH: &str = "protocol:genesis_hash";
+
+const RPC_ERR_RATE_LIMITED_CODE: i32 = -32029;
 
 // Note: The initial scaffold referenced sub-modules (`methods`, `server`, `types`) that
 // aren't present yet. Keeping the RPC types and traits in this file for now so the
@@ -38,6 +42,8 @@ pub enum RpcServerError {
     AccountNotFound(String),
     #[error("Network error: {0}")]
     Network(String),
+    #[error("Rate limited")]
+    RateLimited,
 }
 
 impl From<RpcServerError> for ErrorObjectOwned {
@@ -49,6 +55,9 @@ impl From<RpcServerError> for ErrorObjectOwned {
         match err {
             RpcServerError::InvalidParams(msg) => {
                 ErrorObjectOwned::owned(INVALID_PARAMS_CODE, msg, None::<()>)
+            }
+            RpcServerError::RateLimited => {
+                ErrorObjectOwned::owned(RPC_ERR_RATE_LIMITED_CODE, err.to_string(), None::<()>)
             }
             RpcServerError::TransactionNotFound(_) |
             RpcServerError::BlockNotFound(_) |
@@ -529,6 +538,49 @@ pub struct CatalystRpcImpl {
     storage: Arc<catalyst_storage::StorageManager>,
     network: Option<Arc<catalyst_network::NetworkService>>,
     tx_submit: Option<mpsc::UnboundedSender<catalyst_core::protocol::Transaction>>,
+    limiter: Arc<RpcLimiters>,
+    _global_rps: u32,
+    sender_rps: u32,
+}
+
+struct RpcLimiters {
+    global: Mutex<catalyst_utils::utils::RateLimiter>,
+    by_sender: Mutex<std::collections::HashMap<[u8; 32], catalyst_utils::utils::RateLimiter>>,
+    drops_global: AtomicU64,
+    drops_sender: AtomicU64,
+}
+
+impl RpcLimiters {
+    fn new(global_rps: u32, sender_rps: u32) -> Self {
+        let global_rps = global_rps.max(1);
+        Self {
+            global: Mutex::new(catalyst_utils::utils::RateLimiter::new(global_rps, global_rps)),
+            by_sender: Mutex::new(std::collections::HashMap::new()),
+            drops_global: AtomicU64::new(0),
+            drops_sender: AtomicU64::new(0),
+        }
+    }
+
+    async fn acquire_global(&self, cost: u32) -> bool {
+        let mut g = self.global.lock().await;
+        let ok = g.try_acquire(cost.max(1));
+        if !ok {
+            self.drops_global.fetch_add(1, Ordering::Relaxed);
+        }
+        ok
+    }
+
+    async fn acquire_sender(&self, sender: [u8; 32], cost: u32, sender_rps: u32) -> bool {
+        let mut map = self.by_sender.lock().await;
+        let lim = map
+            .entry(sender)
+            .or_insert_with(|| catalyst_utils::utils::RateLimiter::new(sender_rps.max(1), sender_rps.max(1)));
+        let ok = lim.try_acquire(cost.max(1));
+        if !ok {
+            self.drops_sender.fetch_add(1, Ordering::Relaxed);
+        }
+        ok
+    }
 }
 
 impl CatalystRpcImpl {
@@ -536,11 +588,16 @@ impl CatalystRpcImpl {
         storage: Arc<catalyst_storage::StorageManager>,
         network: Option<Arc<catalyst_network::NetworkService>>,
         tx_submit: Option<mpsc::UnboundedSender<catalyst_core::protocol::Transaction>>,
+        global_rps: u32,
+        sender_rps: u32,
     ) -> Self {
         Self {
             storage,
             network,
             tx_submit,
+            limiter: Arc::new(RpcLimiters::new(global_rps, sender_rps)),
+            _global_rps: global_rps,
+            sender_rps,
         }
     }
 }
@@ -631,6 +688,11 @@ impl CatalystRpcServer for CatalystRpcImpl {
         count: u64,
         full_transactions: bool,
     ) -> RpcResult<Vec<RpcBlock>> {
+        // Throttle proportional to requested work.
+        let cost = 1u32.saturating_add((count.min(10_000) / 100) as u32);
+        if !self.limiter.acquire_global(cost).await {
+            return Err(ErrorObjectOwned::from(RpcServerError::RateLimited));
+        }
         let mut out: Vec<RpcBlock> = Vec::new();
         let count = count.min(10_000); // hard cap to protect node
         for i in 0..count {
@@ -764,6 +826,10 @@ impl CatalystRpcServer for CatalystRpcImpl {
         from_cycle: Option<u64>,
         limit: u64,
     ) -> RpcResult<Vec<RpcTransactionSummary>> {
+        let cost = 1u32.saturating_add((limit.min(5_000) / 10) as u32);
+        if !self.limiter.acquire_global(cost).await {
+            return Err(ErrorObjectOwned::from(RpcServerError::RateLimited));
+        }
         let pk = parse_hex_32(&address).map_err(ErrorObjectOwned::from)?;
         let head = self.block_number().await.unwrap_or(0);
         let mut cycle = from_cycle.unwrap_or(head);
@@ -885,6 +951,11 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn send_raw_transaction(&self, _data: String) -> RpcResult<String> {
+        // Global throttling: protect CPU/memory under load.
+        if !self.limiter.acquire_global(1).await {
+            return Err(ErrorObjectOwned::from(RpcServerError::RateLimited));
+        }
+
         // Accept hex-encoded legacy bincode(Transaction) OR v1 canonical wire tx (CTX1...).
         let bytes = parse_hex_bytes(&_data).map_err(ErrorObjectOwned::from)?;
         let tx: catalyst_core::protocol::Transaction =
@@ -936,6 +1007,15 @@ impl CatalystRpcServer for CatalystRpcImpl {
         // - reject nonce <= committed nonce for sender
         // (node/mempool also enforces sequential nonces)
         if let Some(sender_pk) = tx_sender_pubkey(&tx) {
+            // Per-sender throttling: stop single-key spam even behind NAT.
+            if !self
+                .limiter
+                .acquire_sender(sender_pk, 1, self.sender_rps)
+                .await
+            {
+                return Err(ErrorObjectOwned::from(RpcServerError::RateLimited));
+            }
+
             let mut k = b"nonce:".to_vec();
             k.extend_from_slice(&sender_pk);
             let committed = self
@@ -1465,13 +1545,15 @@ pub async fn start_rpc_http(
     storage: Arc<catalyst_storage::StorageManager>,
     network: Option<Arc<catalyst_network::NetworkService>>,
     tx_submit: Option<mpsc::UnboundedSender<catalyst_core::protocol::Transaction>>,
+    global_rps: u32,
+    sender_rps: u32,
 ) -> Result<ServerHandle, RpcServerError> {
     let server = jsonrpsee::server::ServerBuilder::default()
         .build(bind_address)
         .await
         .map_err(|e| RpcServerError::Server(e.to_string()))?;
 
-    let rpc = CatalystRpcImpl::new(storage, network, tx_submit).into_rpc();
+    let rpc = CatalystRpcImpl::new(storage, network, tx_submit, global_rps, sender_rps).into_rpc();
     let handle = server.start(rpc);
 
     Ok(handle)
