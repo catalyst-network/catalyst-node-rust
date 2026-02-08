@@ -118,6 +118,13 @@ impl ProtocolTxGossip {
         if self.tx.core.nonce == 0 {
             return Err("Transaction nonce must be > 0".to_string());
         }
+        let min_fee = corep::min_fee(&self.tx);
+        if self.tx.core.fees < min_fee {
+            return Err(format!(
+                "Transaction fee too low: fees={} min_required={}",
+                self.tx.core.fees, min_fee
+            ));
+        }
         // Interpret lock_time as unix seconds "not before".
         if (self.tx.core.lock_time as u64) > now_secs {
             return Err(format!(
@@ -143,11 +150,14 @@ impl ProtocolTxGossip {
                 let pk = self.tx.core.entries.get(0).map(|e| e.public_key).unwrap_or([0u8; 32]);
                 let mut sig = b"WRKREG1".to_vec();
                 sig.extend_from_slice(&self.tx.signature.0);
-                vec![TransactionEntry {
+                let mut out = vec![TransactionEntry {
                     public_key: pk,
                     amount: 0,
                     signature: sig,
-                }]
+                }];
+                // Charge fees by adding a dedicated fee debit entry under the same tx boundary (same signature bytes).
+                out.extend(self.fee_debit_entries(pk, out[0].signature.clone()));
+                out
             }
             corep::TransactionType::SmartContract => {
                 let pk = self.tx.core.entries.get(0).map(|e| e.public_key).unwrap_or([0u8; 32]);
@@ -155,11 +165,13 @@ impl ProtocolTxGossip {
                     .unwrap_or(EvmTxKind::Call { to: [0u8; 20], input: Vec::new() });
                 let payload = EvmTxPayload { nonce: self.tx.core.nonce, kind };
                 let marker = encode_evm_marker(&payload, &self.tx.signature.0).unwrap_or_else(|_| self.tx.signature.0.clone());
-                vec![TransactionEntry {
+                let mut out = vec![TransactionEntry {
                     public_key: pk,
                     amount: 0,
                     signature: marker,
-                }]
+                }];
+                out.extend(self.fee_debit_entries(pk, out[0].signature.clone()));
+                out
             }
             _ => {
                 let sig = self.tx.signature.0.clone();
@@ -175,9 +187,30 @@ impl ProtocolTxGossip {
                         signature: sig.clone(),
                     });
                 }
+                if let Some(sender) = self.sender_pubkey() {
+                    out.extend(self.fee_debit_entries(sender, sig.clone()));
+                }
                 out
             }
         }
+    }
+
+    fn fee_debit_entries(&self, sender: [u8; 32], sig: Vec<u8>) -> Vec<TransactionEntry> {
+        // Fees are charged as a dedicated negative entry so the LSU application can apply it deterministically.
+        // This “burns” fees (no explicit sink credit yet; routing is handled in the economics epic).
+        let fees_u64 = self.tx.core.fees;
+        if fees_u64 == 0 {
+            return Vec::new();
+        }
+        let fees_i64: i64 = match i64::try_from(fees_u64) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(), // refuse to encode impossible fee into i64 ledger delta
+        };
+        vec![TransactionEntry {
+            public_key: sender,
+            amount: -fees_i64,
+            signature: sig,
+        }]
     }
 
     pub fn sender_pubkey(&self) -> Option<[u8; 32]> {
@@ -200,6 +233,44 @@ impl ProtocolTxGossip {
                 sender
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fee_tests {
+    use super::*;
+
+    #[test]
+    fn protocol_tx_to_consensus_entries_includes_fee_debit() {
+        let now_ms = 1_700_000_000_000u64;
+        let now_secs = (now_ms / 1000) as u64;
+        let sender = [1u8; 32];
+        let recv = [2u8; 32];
+        let mut tx = corep::Transaction {
+            core: corep::TransactionCore {
+                tx_type: corep::TransactionType::NonConfidentialTransfer,
+                entries: vec![
+                    corep::TransactionEntry { public_key: sender, amount: EntryAmount::NonConfidential(-10) },
+                    corep::TransactionEntry { public_key: recv, amount: EntryAmount::NonConfidential(10) },
+                ],
+                nonce: 1,
+                lock_time: 0,
+                fees: 0,
+                data: Vec::new(),
+            },
+            signature: corep::AggregatedSignature(vec![9u8; 64]),
+            timestamp: now_ms,
+        };
+        tx.core.fees = corep::min_fee(&tx);
+
+        let msg = ProtocolTxGossip::new(tx, now_ms).unwrap();
+        msg.validate_basic(now_secs).unwrap();
+        let entries = msg.to_consensus_entries();
+
+        // Contains the transfer entries plus 1 fee debit entry.
+        assert_eq!(entries.len(), 3);
+        let fee = entries.iter().find(|e| e.public_key == sender && e.amount < 0 && e.amount != -10).unwrap();
+        assert_eq!(fee.amount, -(msg.tx.core.fees as i64));
     }
 }
 

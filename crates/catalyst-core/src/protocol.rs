@@ -100,6 +100,72 @@ pub struct Transaction {
     pub timestamp: u64,
 }
 
+/// Deterministic minimum fee schedule for the current implementation.
+///
+/// This is intentionally simple and “testnet-ready”:
+/// - it enables anti-spam by requiring a non-zero fee floor
+/// - it is fully deterministic from the `TransactionCore` fields
+/// - it does not yet model gas used / basefee dynamics (tracked under economics epic)
+pub fn min_fee_for_core(core: &TransactionCore) -> u64 {
+    // Base fee per tx type (units: base token “atoms”; currently the same unit as balances).
+    let base: u64 = match core.tx_type {
+        TransactionType::NonConfidentialTransfer => 1,
+        TransactionType::SmartContract => 5,
+        TransactionType::WorkerRegistration => 1,
+        // Other tx types are not wired end-to-end yet; keep a small floor.
+        _ => 1,
+    };
+
+    // Small per-entry overhead to discourage huge fanout.
+    let per_entry: u64 = 1;
+
+    base.saturating_add(per_entry.saturating_mul(core.entries.len() as u64))
+}
+
+pub fn min_fee(tx: &Transaction) -> u64 {
+    min_fee_for_core(&tx.core)
+}
+
+/// Transaction status as observed by a node.
+///
+/// This is a pragmatic “receipt” state machine for testnet ergonomics; it is not yet a
+/// full mainnet finality model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TxStatus {
+    /// Accepted for gossip / mempool, but not yet included in an applied cycle.
+    Pending,
+    /// Selected into a cycle’s batch (best-effort; may still fail to apply).
+    Selected,
+    /// Included in a cycle that was applied locally (and therefore part of the node’s head).
+    Applied,
+    /// Explicitly dropped/rejected (optional; not all paths set this).
+    Dropped,
+}
+
+/// Persisted transaction metadata used to serve receipt-like RPCs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxMeta {
+    /// 32-byte tx id (blake2b512(bincode(tx))[..32] in the current node implementation).
+    pub tx_id: [u8; 32],
+    pub status: TxStatus,
+    pub received_at_ms: u64,
+    pub sender: Option<[u8; 32]>,
+    pub nonce: u64,
+    pub fees: u64,
+    pub selected_cycle: Option<u64>,
+    pub applied_cycle: Option<u64>,
+    pub applied_lsu_hash: Option<[u8; 32]>,
+    pub applied_state_root: Option<[u8; 32]>,
+    /// Whether the tx executed successfully (best-effort).
+    pub applied_success: Option<bool>,
+    /// Optional error/revert string (best-effort).
+    pub applied_error: Option<String>,
+    /// EVM-only: gas used (if available).
+    pub evm_gas_used: Option<u64>,
+    /// EVM-only: return data (raw bytes).
+    pub evm_return: Option<Vec<u8>>,
+}
+
 impl Transaction {
     pub fn validate_basic(&self) -> Result<(), String> {
         match self.core.tx_type {
