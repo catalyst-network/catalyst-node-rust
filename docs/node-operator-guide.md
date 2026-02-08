@@ -1,0 +1,176 @@
+# Node operator guide (local + public testnet)
+
+This guide covers running the current Rust node implementation (`catalyst-cli`).
+
+## Quick glossary
+
+- **P2P**: peer-to-peer networking for consensus + gossip (`30333/tcp`)
+- **RPC**: HTTP JSON-RPC for clients (default `8545/tcp`)
+- **Validator**: runs the consensus loop (`catalyst-cli start --validator`)
+
+## Build
+
+From the repo root:
+
+```bash
+make build
+```
+
+The binary you run is:
+
+```bash
+./target/release/catalyst-cli
+```
+
+## Local single node
+
+```bash
+./target/release/catalyst-cli start --rpc
+```
+
+Notes:
+- If you pass `--config /some/path/config.toml` and it doesn’t exist, the node will **generate** it and create sibling dirs (data/dfs_cache/logs/node.key) near that config path.
+
+## Public 3-node testnet (Vultr-style)
+
+Topology:
+- **EU**: boot + RPC + validator
+- **US**: validator
+- **Asia**: validator
+
+### Example deployment values (reference)
+
+These are example values from a working 3-node deployment (use your own IPs/keys).
+
+| Instance | Location | Public IP | Worker id (pubkey hex) |
+|---|---|---:|---|
+| `catalyst-1` | London (EU) | `45.32.177.248` | `cc88b786e388e7bfc8406f569458beb6c9238f8800c0b2511c4366d40808b919` |
+| `catalyst-2` | Chicago (US) | `45.76.21.153` | `26f4404048d8bef3a36cd38775f8139e031689cf1041d793687c3d906da98a76` |
+| `catalyst-3` | Singapore (Asia) | `207.148.126.35` | `20facef46a9495c43d342eeb4a80ccc7a1c02c228277d3f277cee0cfabfd544f` |
+
+### 1) Network ports / firewall
+
+On **all 3 servers**:
+- Allow inbound **`30333/tcp`** (P2P)
+
+On **EU only**:
+- Allow inbound **`8545/tcp`** (RPC). Recommended: restrict to your IP, or use SSH tunneling.
+
+If using `ufw`:
+
+```bash
+# all servers
+sudo ufw allow 30333/tcp
+
+# EU only
+sudo ufw allow 8545/tcp
+
+sudo ufw reload
+sudo ufw status numbered
+```
+
+Verify the process is listening:
+
+```bash
+sudo ss -ltnp | egrep ':30333|:8545' || true
+```
+
+Verify connectivity (run on each server, to the other two):
+
+```bash
+nc -vz <OTHER_PUBLIC_IP> 30333
+```
+
+### 2) Configure bootstrap peers
+
+This codebase uses plain multiaddrs without `/p2p/<peerid>`:
+
+```toml
+[network]
+bootstrap_peers = [
+  "/ip4/<EU_PUBLIC_IP>/tcp/30333",
+  "/ip4/<US_PUBLIC_IP>/tcp/30333",
+  "/ip4/<ASIA_PUBLIC_IP>/tcp/30333",
+]
+listen_addresses = ["/ip4/0.0.0.0/tcp/30333"]
+```
+
+### 3) Bootstrap the validator set (critical)
+
+For a brand-new network, the on-chain worker set starts empty. This implementation uses
+`[consensus].validator_worker_ids` as the initial “membership bootstrap” for producer selection.
+
+On each server, ensure a stable node key exists (starting once will auto-create it next to the config):
+
+```bash
+./target/release/catalyst-cli --config /var/lib/catalyst/<region>/config.toml start
+# Ctrl+C once it’s started; this creates /var/lib/catalyst/<region>/node.key
+```
+
+Derive each node’s worker id (public key hex):
+
+```bash
+./target/release/catalyst-cli pubkey --key-file /var/lib/catalyst/eu/node.key
+./target/release/catalyst-cli pubkey --key-file /var/lib/catalyst/us/node.key
+./target/release/catalyst-cli pubkey --key-file /var/lib/catalyst/asia/node.key
+```
+
+Then set, on **all three** configs:
+
+```toml
+[consensus]
+min_producer_count = 2
+validator_worker_ids = [
+  "<EU_PUBKEY_HEX>",
+  "<US_PUBKEY_HEX>",
+  "<ASIA_PUBKEY_HEX>",
+]
+```
+
+Why `min_producer_count = 2`?
+- With 3 validators, liveness is **2-of-3**. One validator can be down without halting progress.
+
+### 4) Start nodes (recommended order)
+
+Start EU first:
+
+```bash
+./target/release/catalyst-cli --config /var/lib/catalyst/eu/config.toml start \
+  --validator --rpc --rpc-address 0.0.0.0 --rpc-port 8545
+```
+
+Start US and Asia:
+
+```bash
+./target/release/catalyst-cli --config /var/lib/catalyst/us/config.toml start --validator
+./target/release/catalyst-cli --config /var/lib/catalyst/asia/config.toml start --validator
+```
+
+Note: CLI flags override config values at runtime. For example, `--validator` makes the node a validator even if `validator = false` is present in the file.
+
+### 5) Health check
+
+From any machine that can reach EU RPC:
+
+```bash
+./target/release/catalyst-cli status --rpc-url http://<EU_PUBLIC_IP>:8545
+sleep 30
+./target/release/catalyst-cli status --rpc-url http://<EU_PUBLIC_IP>:8545
+```
+
+`applied_cycle` should advance.
+
+## Troubleshooting
+
+### “Insufficient data collected: got 1, required 2”
+
+This means validators are not receiving enough peer messages in a cycle. Common causes:
+- `30333/tcp` blocked (cloud firewall or `ufw`)
+- node not listening on `0.0.0.0:30333`
+- not actually connected to other validators (bootstrap peers missing/wrong)
+- large clock drift (ensure NTP/chrony)
+
+### RPC is reachable but tx inclusion is slow
+
+This is expected in the current implementation: RPC acceptance returns a tx id immediately; inclusion can take a few cycles depending on propagation and which validator is the tx batch leader.
+
