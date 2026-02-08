@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 const META_PROTOCOL_CHAIN_ID: &str = "protocol:chain_id";
 const META_PROTOCOL_NETWORK_ID: &str = "protocol:network_id";
 const META_PROTOCOL_GENESIS_HASH: &str = "protocol:genesis_hash";
+const META_SNAPSHOT_LATEST: &str = "snapshot:latest";
 
 const RPC_ERR_RATE_LIMITED_CODE: i32 = -32029;
 
@@ -117,6 +118,10 @@ pub trait CatalystRpc {
     /// Get sync/snapshot metadata needed for fast-sync verification.
     #[method(name = "catalyst_getSyncInfo")]
     async fn get_sync_info(&self) -> RpcResult<RpcSyncInfo>;
+
+    /// Get published snapshot info for fast sync (if the node operator published one).
+    #[method(name = "catalyst_getSnapshotInfo")]
+    async fn get_snapshot_info(&self) -> RpcResult<Option<RpcSnapshotInfo>>;
 
     /// Get the current block number
     #[method(name = "catalyst_blockNumber")]
@@ -246,6 +251,27 @@ pub struct RpcSyncInfo {
     pub network_id: String,
     pub genesis_hash: String,
     pub head: RpcHead,
+}
+
+/// Operator-published snapshot metadata for fast sync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcSnapshotInfo {
+    pub version: u32,
+    pub created_at_ms: u64,
+    pub chain_id: String,
+    pub network_id: String,
+    pub genesis_hash: String,
+    pub applied_cycle: u64,
+    pub applied_lsu_hash: String,
+    pub applied_state_root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_lsu_cid: Option<String>,
+    /// Download URL for a tar archive that extracts to a snapshot directory.
+    pub archive_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_bytes: Option<u64>,
 }
 
 /// RPC transaction request structure
@@ -564,7 +590,7 @@ struct RpcLimiters {
 }
 
 impl RpcLimiters {
-    fn new(global_rps: u32, sender_rps: u32) -> Self {
+    fn new(global_rps: u32, _sender_rps: u32) -> Self {
         let global_rps = global_rps.max(1);
         Self {
             global: Mutex::new(catalyst_utils::utils::RateLimiter::new(global_rps, global_rps)),
@@ -663,6 +689,22 @@ impl CatalystRpcServer for CatalystRpcImpl {
             genesis_hash: self.genesis_hash().await?,
             head: self.head().await?,
         })
+    }
+
+    async fn get_snapshot_info(&self) -> RpcResult<Option<RpcSnapshotInfo>> {
+        let Some(bytes) = self
+            .storage
+            .get_metadata(META_SNAPSHOT_LATEST)
+            .await
+            .ok()
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        let s = String::from_utf8_lossy(&bytes).to_string();
+        let info = serde_json::from_str::<RpcSnapshotInfo>(&s)
+            .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())))?;
+        Ok(Some(info))
     }
 
     async fn block_number(&self) -> RpcResult<u64> {

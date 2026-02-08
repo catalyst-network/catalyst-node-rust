@@ -141,6 +141,9 @@ enum Commands {
         /// Output directory for the backup
         #[arg(long)]
         out_dir: PathBuf,
+        /// Optional tar archive output path for distribution
+        #[arg(long)]
+        archive: Option<PathBuf>,
     },
     /// Restore node database from a backup directory (snapshot import)
     DbRestore {
@@ -150,6 +153,33 @@ enum Commands {
         /// Backup directory to restore from
         #[arg(long)]
         from_dir: PathBuf,
+    },
+    /// Publish snapshot metadata into the node DB (served via RPC for fast-sync tooling)
+    SnapshotPublish {
+        /// Data directory (same as config.storage.data_dir) of the RPC node
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Snapshot directory created by `db-backup` (contains *.snapshot and *_data)
+        #[arg(long)]
+        snapshot_dir: PathBuf,
+        /// URL where the snapshot archive can be downloaded
+        #[arg(long)]
+        archive_url: String,
+        /// Path to the tar archive file (used to compute sha256/bytes)
+        #[arg(long)]
+        archive_path: PathBuf,
+    },
+    /// Download the published snapshot archive and restore it locally
+    SyncFromSnapshot {
+        /// RPC endpoint to fetch snapshot info from
+        #[arg(long, default_value = "http://localhost:8545")]
+        rpc_url: String,
+        /// Data directory to restore into (same as config.storage.data_dir)
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Directory to download/extract into (defaults to /tmp)
+        #[arg(long)]
+        work_dir: Option<PathBuf>,
     },
     /// Show a transaction receipt/status (and inclusion proof when applied)
     Receipt {
@@ -375,11 +405,17 @@ async fn main() -> Result<()> {
         Commands::Peers { rpc_url } => {
             commands::show_peers(&rpc_url).await?;
         }
-        Commands::DbBackup { data_dir, out_dir } => {
-            commands::db_backup(&data_dir, &out_dir).await?;
+        Commands::DbBackup { data_dir, out_dir, archive } => {
+            commands::db_backup(&data_dir, &out_dir, archive.as_deref()).await?;
         }
         Commands::DbRestore { data_dir, from_dir } => {
             commands::db_restore(&data_dir, &from_dir).await?;
+        }
+        Commands::SnapshotPublish { data_dir, snapshot_dir, archive_url, archive_path } => {
+            commands::snapshot_publish(&data_dir, &snapshot_dir, &archive_url, &archive_path).await?;
+        }
+        Commands::SyncFromSnapshot { rpc_url, data_dir, work_dir } => {
+            commands::sync_from_snapshot(&rpc_url, &data_dir, work_dir.as_deref()).await?;
         }
         Commands::Receipt { tx_hash, rpc_url } => {
             commands::show_receipt(&tx_hash, &rpc_url).await?;

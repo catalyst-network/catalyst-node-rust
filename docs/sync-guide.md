@@ -27,7 +27,8 @@ Run on the source node (adjust data dir path to your config):
 ```bash
 ./target/release/catalyst-cli db-backup \
   --data-dir /var/lib/catalyst/eu/data \
-  --out-dir /tmp/catalyst-snapshot
+  --out-dir /tmp/catalyst-snapshot \
+  --archive /tmp/catalyst-snapshot.tar
 ```
 
 This writes:
@@ -36,6 +37,7 @@ This writes:
 - `catalyst_snapshot.json` containing:
   - chain identity (`chain_id`, `network_id`, `genesis_hash`)
   - applied head (`applied_cycle`, `applied_lsu_hash`, `applied_state_root`)
+- optionally, a tar archive (recommended for transport)
 
 ### 3) Transfer the snapshot directory to the destination node
 
@@ -44,6 +46,20 @@ Copy the full directory (including `catalyst_snapshot.json`) to the destination 
 ```bash
 rsync -av /tmp/catalyst-snapshot/ root@DEST:/tmp/catalyst-snapshot/
 ```
+
+### 3b) (Optional) Publish snapshot info for automation
+
+If your RPC node should advertise a downloadable snapshot to new nodes, publish it:
+
+```bash
+./target/release/catalyst-cli snapshot-publish \
+  --data-dir /var/lib/catalyst/eu/data \
+  --snapshot-dir /tmp/catalyst-snapshot \
+  --archive-path /tmp/catalyst-snapshot.tar \
+  --archive-url https://<your-host>/catalyst-snapshot.tar
+```
+
+Then clients can query `catalyst_getSnapshotInfo` from RPC.
 
 ### 4) Restore on the destination node
 
@@ -56,6 +72,16 @@ Stop the node if it is running, then restore:
 ```
 
 If `catalyst_snapshot.json` is present, the CLI verifies `chain_id` and `genesis_hash` after restore.
+
+### 4b) (Optional) Automated restore from RPC-published snapshot
+
+On a new node, you can download and restore the published snapshot archive:
+
+```bash
+./target/release/catalyst-cli sync-from-snapshot \
+  --rpc-url http://<rpc-host>:8545 \
+  --data-dir /var/lib/catalyst/us/data
+```
 
 ### 5) Start the node normally and verify it is on the same chain
 

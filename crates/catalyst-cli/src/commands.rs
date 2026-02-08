@@ -13,6 +13,7 @@ use catalyst_crypto::signatures::{Signature, SignatureScheme};
 use crate::evm::EvmTxKind;
 use alloy_primitives::Address as EvmAddress;
 use catalyst_storage::{StorageConfig as StorageConfigLib, StorageManager};
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SnapshotMetaV1 {
@@ -240,7 +241,7 @@ pub async fn show_peers(rpc_url: &str) -> Result<()> {
     get_peers(rpc_url).await
 }
 
-pub async fn db_backup(data_dir: &Path, out_dir: &Path) -> Result<()> {
+pub async fn db_backup(data_dir: &Path, out_dir: &Path, archive: Option<&Path>) -> Result<()> {
     let mut cfg = StorageConfigLib::default();
     cfg.data_dir = data_dir.to_path_buf();
     let store = StorageManager::new(cfg).await?;
@@ -300,6 +301,24 @@ pub async fn db_backup(data_dir: &Path, out_dir: &Path) -> Result<()> {
     std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
     println!("meta_path: {}", meta_path.display());
 
+    if let Some(archive_path) = archive {
+        // Package the snapshot directory into a tar archive for distribution.
+        let f = std::fs::File::create(archive_path)?;
+        let mut builder = tar::Builder::new(f);
+        builder.append_dir_all(".", out_dir)?;
+        builder.finish()?;
+
+        // Compute sha256 + bytes for operator publishing.
+        use sha2::Digest;
+        let bytes = std::fs::read(archive_path)?;
+        let mut h = sha2::Sha256::new();
+        h.update(&bytes);
+        let sum = h.finalize();
+        println!("archive_path: {}", archive_path.display());
+        println!("archive_bytes: {}", bytes.len());
+        println!("archive_sha256: 0x{}", hex::encode(sum));
+    }
+
     println!("backup_ok: true");
     println!("out_dir: {}", out_dir.display());
     Ok(())
@@ -342,6 +361,117 @@ pub async fn db_restore(data_dir: &Path, from_dir: &Path) -> Result<()> {
 
     println!("restore_ok: true");
     println!("from_dir: {}", from_dir.display());
+    Ok(())
+}
+
+pub async fn snapshot_publish(
+    data_dir: &Path,
+    snapshot_dir: &Path,
+    archive_url: &str,
+    archive_path: &Path,
+) -> Result<()> {
+    // Load snapshot meta file produced by db-backup.
+    let meta_path = snapshot_dir.join("catalyst_snapshot.json");
+    let meta: SnapshotMetaV1 = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
+
+    // Compute sha256 + bytes of archive.
+    use sha2::Digest;
+    let bytes = std::fs::read(archive_path)?;
+    let mut h = sha2::Sha256::new();
+    h.update(&bytes);
+    let sum = h.finalize();
+
+    let info = catalyst_rpc::RpcSnapshotInfo {
+        version: 1,
+        created_at_ms: meta.created_at_ms,
+        chain_id: format!("0x{:x}", meta.chain_id),
+        network_id: meta.network_id.clone(),
+        genesis_hash: meta.genesis_hash.clone(),
+        applied_cycle: meta.applied_cycle,
+        applied_lsu_hash: meta.applied_lsu_hash.clone(),
+        applied_state_root: meta.applied_state_root.clone(),
+        last_lsu_cid: meta.last_lsu_cid.clone(),
+        archive_url: archive_url.to_string(),
+        archive_sha256: Some(format!("0x{}", hex::encode(sum))),
+        archive_bytes: Some(bytes.len() as u64),
+    };
+
+    let mut cfg = StorageConfigLib::default();
+    cfg.data_dir = data_dir.to_path_buf();
+    let store = StorageManager::new(cfg).await?;
+    let payload = serde_json::to_vec(&info)?;
+    store.set_metadata("snapshot:latest", &payload).await?;
+
+    println!("published: true");
+    println!("archive_url: {}", info.archive_url);
+    println!("archive_sha256: {}", info.archive_sha256.clone().unwrap_or_else(|| "null".to_string()));
+    println!("archive_bytes: {}", info.archive_bytes.unwrap_or(0));
+    Ok(())
+}
+
+pub async fn sync_from_snapshot(
+    rpc_url: &str,
+    data_dir: &Path,
+    work_dir: Option<&Path>,
+) -> Result<()> {
+    let client = HttpClientBuilder::default().build(rpc_url)?;
+    let snap: Option<catalyst_rpc::RpcSnapshotInfo> = client
+        .request("catalyst_getSnapshotInfo", jsonrpsee::rpc_params![])
+        .await?;
+    let Some(s) = snap else {
+        anyhow::bail!("no snapshot published by RPC node");
+    };
+
+    let base = work_dir
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::temp_dir().join("catalyst-sync"));
+    std::fs::create_dir_all(&base)?;
+    let archive_path = base.join("snapshot.tar");
+    let extract_dir = base.join("snapshot");
+    if extract_dir.exists() {
+        std::fs::remove_dir_all(&extract_dir)?;
+    }
+    std::fs::create_dir_all(&extract_dir)?;
+
+    // Download archive (stream to disk).
+    let resp = reqwest::get(&s.archive_url).await?;
+    anyhow::ensure!(resp.status().is_success(), "download failed: {}", resp.status());
+    let mut file = tokio::fs::File::create(&archive_path).await?;
+    let mut stream = resp.bytes_stream();
+    use futures::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+
+    // Verify sha256 if provided.
+    if let Some(expect) = &s.archive_sha256 {
+        use sha2::Digest;
+        let bytes = std::fs::read(&archive_path)?;
+        let mut h = sha2::Sha256::new();
+        h.update(&bytes);
+        let got = format!("0x{}", hex::encode(h.finalize()));
+        anyhow::ensure!(
+            got.to_lowercase() == expect.to_lowercase(),
+            "sha256 mismatch: expected={} got={}",
+            expect,
+            got
+        );
+    }
+
+    // Extract tar to directory.
+    let f = std::fs::File::open(&archive_path)?;
+    let mut ar = tar::Archive::new(f);
+    ar.unpack(&extract_dir)?;
+
+    // Restore into data_dir.
+    db_restore(data_dir, &extract_dir).await?;
+
+    println!("restored: true");
+    println!("expected_chain_id: {}", s.chain_id);
+    println!("expected_genesis_hash: {}", s.genesis_hash);
+    println!("snapshot_cycle: {}", s.applied_cycle);
     Ok(())
 }
 
