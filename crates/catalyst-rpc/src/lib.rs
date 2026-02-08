@@ -101,6 +101,17 @@ pub trait CatalystRpc {
     /// Get block by number
     #[method(name = "catalyst_getBlockByNumber")]
     async fn get_block_by_number(&self, number: u64, full_transactions: bool) -> RpcResult<Option<RpcBlock>>;
+
+    /// Get a range of blocks by number (pagination primitive).
+    ///
+    /// Returns up to `count` blocks starting at `start` (inclusive), in ascending order.
+    #[method(name = "catalyst_getBlocksByNumberRange")]
+    async fn get_blocks_by_number_range(
+        &self,
+        start: u64,
+        count: u64,
+        full_transactions: bool,
+    ) -> RpcResult<Vec<RpcBlock>>;
     
     /// Get transaction by hash
     #[method(name = "catalyst_getTransactionByHash")]
@@ -113,6 +124,18 @@ pub trait CatalystRpc {
     /// Get a deterministic inclusion proof for a transaction against the cycle's tx Merkle root.
     #[method(name = "catalyst_getTransactionInclusionProof")]
     async fn get_transaction_inclusion_proof(&self, hash: String) -> RpcResult<Option<RpcTxInclusionProof>>;
+
+    /// List recent transactions involving an address (best-effort).
+    ///
+    /// Scans applied cycles backwards from `from_cycle` (defaults to head) and returns up to `limit`
+    /// transaction summaries that involve the address (sender, recipient, or special tx owner).
+    #[method(name = "catalyst_getTransactionsByAddress")]
+    async fn get_transactions_by_address(
+        &self,
+        address: String,
+        from_cycle: Option<u64>,
+        limit: u64,
+    ) -> RpcResult<Vec<RpcTransactionSummary>>;
     
     /// Get account balance
     #[method(name = "catalyst_getBalance")]
@@ -518,86 +541,35 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn get_block_by_number(&self, _number: u64, _full_transactions: bool) -> RpcResult<Option<RpcBlock>> {
-        let cycle = _number;
-        let lsu_key = format!("consensus:lsu:{}", cycle);
-        let lsu_hash_key = format!("consensus:lsu_hash:{}", cycle);
-
-        let Some(lsu_bytes) = self.storage.get_metadata(&lsu_key).await.ok().flatten() else {
-            return Ok(None);
-        };
-
-        let lsu: catalyst_consensus::types::LedgerStateUpdate =
-            <catalyst_consensus::types::LedgerStateUpdate as catalyst_utils::CatalystDeserialize>::deserialize(&lsu_bytes)
-                .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())))?;
-
-        let lsu_hash = self
-            .storage
-            .get_metadata(&lsu_hash_key)
+        build_block(self.storage.as_ref(), _number, _full_transactions)
             .await
-            .ok()
-            .flatten()
-            .and_then(|b| if b.len() == 32 {
-                let mut h = [0u8; 32];
-                h.copy_from_slice(&b);
-                Some(h)
-            } else {
-                None
+            .map_err(ErrorObjectOwned::from)
+            .map(Some)
+            .or_else(|e| {
+                // If block missing, return Ok(None) instead of error.
+                let _ = e;
+                Ok(None)
             })
-            .unwrap_or_else(|| catalyst_consensus::types::hash_data(&lsu).unwrap_or([0u8; 32]));
+    }
 
-        let parent_hash = if cycle > 0 {
-            self.storage
-                .get_metadata(&format!("consensus:lsu_hash:{}", cycle.saturating_sub(1)))
-                .await
-                .ok()
-                .flatten()
-                .and_then(|b| if b.len() == 32 {
-                    let mut h = [0u8; 32];
-                    h.copy_from_slice(&b);
-                    Some(h)
-                } else {
-                    None
-                })
-                .unwrap_or([0u8; 32])
-        } else {
-            [0u8; 32]
-        };
-
-        let txids = load_cycle_txids(self.storage.as_ref(), cycle).await;
-        let mut txs: Vec<RpcTransactionSummary> = Vec::new();
-        for txid in &txids {
-            txs.push(load_tx_summary(self.storage.as_ref(), txid).await);
-        }
-
-        let transactions_full = if _full_transactions {
-            let mut out: Vec<RpcTransaction> = Vec::new();
-            for txid in &txids {
-                if let Some(tx) = load_tx_full(
-                    self.storage.as_ref(),
-                    txid,
-                    Some(cycle),
-                    Some(lsu_hash),
-                )
-                .await
-                {
-                    out.push(tx);
-                }
+    async fn get_blocks_by_number_range(
+        &self,
+        start: u64,
+        count: u64,
+        full_transactions: bool,
+    ) -> RpcResult<Vec<RpcBlock>> {
+        let mut out: Vec<RpcBlock> = Vec::new();
+        let count = count.min(10_000); // hard cap to protect node
+        for i in 0..count {
+            let n = start.saturating_add(i);
+            if let Ok(b) = build_block(self.storage.as_ref(), n, full_transactions).await {
+                out.push(b);
+            } else {
+                // Stop at first missing to keep semantics simple for indexers.
+                break;
             }
-            Some(out)
-        } else {
-            None
-        };
-
-        Ok(Some(RpcBlock {
-            hash: format!("0x{}", hex::encode(lsu_hash)),
-            number: cycle,
-            parent_hash: format!("0x{}", hex::encode(parent_hash)),
-            timestamp: lsu.partial_update.timestamp,
-            transactions: txs,
-            transactions_full,
-            transaction_count: txids.len(),
-            size: lsu_bytes.len() as u64,
-        }))
+        }
+        Ok(out)
     }
 
     async fn get_transaction_by_hash(&self, hash: String) -> RpcResult<Option<RpcTransaction>> {
@@ -707,6 +679,45 @@ impl CatalystRpcServer for CatalystRpcImpl {
             merkle_root: format!("0x{}", hex::encode(root)),
             proof,
         }))
+    }
+
+    async fn get_transactions_by_address(
+        &self,
+        address: String,
+        from_cycle: Option<u64>,
+        limit: u64,
+    ) -> RpcResult<Vec<RpcTransactionSummary>> {
+        let pk = parse_hex_32(&address).map_err(ErrorObjectOwned::from)?;
+        let head = self.block_number().await.unwrap_or(0);
+        let mut cycle = from_cycle.unwrap_or(head);
+        let mut out: Vec<RpcTransactionSummary> = Vec::new();
+
+        let limit = limit.min(5_000) as usize; // protect node
+        while out.len() < limit {
+            // Stop if we've walked past genesis.
+            if cycle == 0 && from_cycle.is_some() {
+                // allow cycle 0 scan once
+            } else if cycle == 0 && from_cycle.is_none() && head == 0 {
+                // empty chain
+            }
+
+            let txids = load_cycle_txids(self.storage.as_ref(), cycle).await;
+            for txid in txids {
+                if out.len() >= limit {
+                    break;
+                }
+                if tx_involves_address(self.storage.as_ref(), &txid, &pk).await {
+                    out.push(load_tx_summary(self.storage.as_ref(), &txid).await);
+                }
+            }
+
+            if cycle == 0 {
+                break;
+            }
+            cycle = cycle.saturating_sub(1);
+        }
+
+        Ok(out)
     }
 
     async fn get_balance(&self, address: String) -> RpcResult<String> {
@@ -1013,6 +1024,132 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 }
 
+async fn build_block(
+    store: &catalyst_storage::StorageManager,
+    cycle: u64,
+    full_transactions: bool,
+) -> Result<RpcBlock, RpcServerError> {
+    let lsu_key = format!("consensus:lsu:{}", cycle);
+    let lsu_hash_key = format!("consensus:lsu_hash:{}", cycle);
+
+    let Some(lsu_bytes) = store.get_metadata(&lsu_key).await.ok().flatten() else {
+        return Err(RpcServerError::BlockNotFound(format!("cycle={}", cycle)));
+    };
+
+    let lsu: catalyst_consensus::types::LedgerStateUpdate =
+        <catalyst_consensus::types::LedgerStateUpdate as catalyst_utils::CatalystDeserialize>::deserialize(&lsu_bytes)
+            .map_err(|e| RpcServerError::Server(e.to_string()))?;
+
+    let lsu_hash = store
+        .get_metadata(&lsu_hash_key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|b| if b.len() == 32 {
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&b);
+            Some(h)
+        } else {
+            None
+        })
+        .unwrap_or_else(|| catalyst_consensus::types::hash_data(&lsu).unwrap_or([0u8; 32]));
+
+    let parent_hash = if cycle > 0 {
+        store
+            .get_metadata(&format!("consensus:lsu_hash:{}", cycle.saturating_sub(1)))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| if b.len() == 32 {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(&b);
+                Some(h)
+            } else {
+                None
+            })
+            .unwrap_or([0u8; 32])
+    } else {
+        [0u8; 32]
+    };
+
+    let txids = load_cycle_txids(store, cycle).await;
+    let mut txs: Vec<RpcTransactionSummary> = Vec::new();
+    for txid in &txids {
+        txs.push(load_tx_summary(store, txid).await);
+    }
+
+    let transactions_full = if full_transactions {
+        let mut out: Vec<RpcTransaction> = Vec::new();
+        for txid in &txids {
+            if let Some(tx) = load_tx_full(store, txid, Some(cycle), Some(lsu_hash)).await {
+                out.push(tx);
+            }
+        }
+        Some(out)
+    } else {
+        None
+    };
+
+    Ok(RpcBlock {
+        hash: format!("0x{}", hex::encode(lsu_hash)),
+        number: cycle,
+        parent_hash: format!("0x{}", hex::encode(parent_hash)),
+        timestamp: lsu.partial_update.timestamp,
+        transactions: txs,
+        transactions_full,
+        transaction_count: txids.len(),
+        size: lsu_bytes.len() as u64,
+    })
+}
+
+async fn tx_involves_address(
+    store: &catalyst_storage::StorageManager,
+    txid: &[u8; 32],
+    pk: &[u8; 32],
+) -> bool {
+    let key = tx_raw_key(txid);
+    let Some(bytes) = store.get_metadata(&key).await.ok().flatten() else {
+        return false;
+    };
+    let Ok(tx) = bincode::deserialize::<catalyst_core::protocol::Transaction>(&bytes) else {
+        return false;
+    };
+    tx_participants(&tx).iter().any(|p| p == pk)
+}
+
+fn tx_participants(tx: &catalyst_core::protocol::Transaction) -> Vec<[u8; 32]> {
+    match tx.core.tx_type {
+        catalyst_core::protocol::TransactionType::WorkerRegistration => tx
+            .core
+            .entries
+            .get(0)
+            .map(|e| vec![e.public_key])
+            .unwrap_or_default(),
+        catalyst_core::protocol::TransactionType::SmartContract => tx
+            .core
+            .entries
+            .get(0)
+            .map(|e| vec![e.public_key])
+            .unwrap_or_default(),
+        _ => {
+            let mut out: Vec<[u8; 32]> = Vec::new();
+            if let Some(sender) = tx_sender_pubkey(tx) {
+                out.push(sender);
+            }
+            for e in &tx.core.entries {
+                if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
+                    if v > 0 {
+                        out.push(e.public_key);
+                    }
+                }
+            }
+            out.sort();
+            out.dedup();
+            out
+        }
+    }
+}
+
 fn tx_id_blake2b_32(bytes: &[u8]) -> [u8; 32] {
     use blake2::{Blake2b512, Digest};
     let mut h = Blake2b512::new();
@@ -1298,5 +1435,35 @@ mod tests {
             };
         }
         assert_eq!(cur, root);
+    }
+
+    #[test]
+    fn tx_participants_includes_sender_and_receiver() {
+        let sender = [1u8; 32];
+        let recv = [2u8; 32];
+        let tx = catalyst_core::protocol::Transaction {
+            core: catalyst_core::protocol::TransactionCore {
+                tx_type: catalyst_core::protocol::TransactionType::NonConfidentialTransfer,
+                entries: vec![
+                    catalyst_core::protocol::TransactionEntry {
+                        public_key: sender,
+                        amount: catalyst_core::protocol::EntryAmount::NonConfidential(-5),
+                    },
+                    catalyst_core::protocol::TransactionEntry {
+                        public_key: recv,
+                        amount: catalyst_core::protocol::EntryAmount::NonConfidential(5),
+                    },
+                ],
+                nonce: 1,
+                lock_time: 0,
+                fees: 1,
+                data: Vec::new(),
+            },
+            signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
+            timestamp: 0,
+        };
+        let parts = tx_participants(&tx);
+        assert!(parts.contains(&sender));
+        assert!(parts.contains(&recv));
     }
 }
