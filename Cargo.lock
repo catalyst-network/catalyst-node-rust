@@ -1290,6 +1290,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bincode",
+ "blake2",
  "catalyst-core",
  "catalyst-crypto",
  "catalyst-network",

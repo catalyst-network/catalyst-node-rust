@@ -728,6 +728,18 @@ fn mempool_tx_key(txid: &[u8; 32]) -> String {
     format!("mempool:tx:{}", hex_encode(txid))
 }
 
+fn tx_raw_key(txid: &[u8; 32]) -> String {
+    format!("tx:raw:{}", hex_encode(txid))
+}
+
+fn tx_meta_key(txid: &[u8; 32]) -> String {
+    format!("tx:meta:{}", hex_encode(txid))
+}
+
+fn cycle_txids_key(cycle: u64) -> String {
+    format!("tx:cycle:{}:txids", cycle)
+}
+
 async fn load_mempool_txids(store: &StorageManager) -> Vec<[u8; 32]> {
     let Some(bytes) = store.get_metadata("mempool:txids").await.ok().flatten() else {
         return Vec::new();
@@ -745,9 +757,47 @@ async fn save_mempool_txids(store: &StorageManager, mut ids: Vec<[u8; 32]>) {
 
 async fn persist_mempool_tx(store: &StorageManager, tx: &catalyst_core::protocol::Transaction) {
     let Some(txid) = mempool_txid(tx) else { return };
-    let key = mempool_tx_key(&txid);
     let Ok(bytes) = bincode::serialize(tx) else { return };
-    let _ = store.set_metadata(&key, &bytes).await;
+
+    // 1) Persist in the mempool namespace (pruned later).
+    let _ = store.set_metadata(&mempool_tx_key(&txid), &bytes).await;
+    // 2) Persist in the tx history namespace (NOT pruned).
+    let _ = store.set_metadata(&tx_raw_key(&txid), &bytes).await;
+
+    // 3) Persist tx meta for receipt-like RPCs (best-effort, idempotent).
+    //    If meta already exists with a later status, do not regress it.
+    let now_ms = current_timestamp_ms();
+    let existing = store.get_metadata(&tx_meta_key(&txid)).await.ok().flatten();
+    let mut meta = existing
+        .as_deref()
+        .and_then(|b| bincode::deserialize::<catalyst_core::protocol::TxMeta>(b).ok())
+        .unwrap_or_else(|| {
+            catalyst_core::protocol::TxMeta {
+                tx_id: txid,
+                status: catalyst_core::protocol::TxStatus::Pending,
+                received_at_ms: now_ms,
+                sender: tx_sender_pubkey(tx),
+                nonce: tx.core.nonce,
+                fees: tx.core.fees,
+                selected_cycle: None,
+                applied_cycle: None,
+                applied_lsu_hash: None,
+                applied_state_root: None,
+            }
+        });
+    // Never regress terminal-ish states
+    if matches!(meta.status, catalyst_core::protocol::TxStatus::Applied) {
+        // keep
+    } else {
+        meta.status = catalyst_core::protocol::TxStatus::Pending;
+        meta.received_at_ms = meta.received_at_ms.max(now_ms);
+        meta.sender = meta.sender.or_else(|| tx_sender_pubkey(tx));
+        meta.nonce = meta.nonce.max(tx.core.nonce);
+        meta.fees = meta.fees.max(tx.core.fees);
+    }
+    if let Ok(mbytes) = bincode::serialize(&meta) {
+        let _ = store.set_metadata(&tx_meta_key(&txid), &mbytes).await;
+    }
 
     let mut ids = load_mempool_txids(store).await;
     if !ids.iter().any(|x| x == &txid) {
@@ -762,6 +812,49 @@ async fn delete_persisted_mempool_tx(store: &StorageManager, txid: &[u8; 32]) {
     let mut ids = load_mempool_txids(store).await;
     ids.retain(|x| x != txid);
     save_mempool_txids(store, ids).await;
+}
+
+async fn persist_cycle_txids(store: &StorageManager, cycle: u64, mut txids: Vec<[u8; 32]>) {
+    txids.sort();
+    txids.dedup();
+    if let Ok(bytes) = bincode::serialize(&txids) {
+        let _ = store.set_metadata(&cycle_txids_key(cycle), &bytes).await;
+    }
+}
+
+async fn load_cycle_txids(store: &StorageManager, cycle: u64) -> Vec<[u8; 32]> {
+    let Some(bytes) = store.get_metadata(&cycle_txids_key(cycle)).await.ok().flatten() else {
+        return Vec::new();
+    };
+    bincode::deserialize::<Vec<[u8; 32]>>(&bytes).unwrap_or_default()
+}
+
+async fn update_tx_meta_status_selected(store: &StorageManager, tx: &catalyst_core::protocol::Transaction, cycle: u64) {
+    let Some(txid) = mempool_txid(tx) else { return };
+    let key = tx_meta_key(&txid);
+    let existing = store.get_metadata(&key).await.ok().flatten();
+    let mut meta = existing
+        .as_deref()
+        .and_then(|b| bincode::deserialize::<catalyst_core::protocol::TxMeta>(b).ok())
+        .unwrap_or_else(|| catalyst_core::protocol::TxMeta {
+            tx_id: txid,
+            status: catalyst_core::protocol::TxStatus::Pending,
+            received_at_ms: current_timestamp_ms(),
+            sender: tx_sender_pubkey(tx),
+            nonce: tx.core.nonce,
+            fees: tx.core.fees,
+            selected_cycle: None,
+            applied_cycle: None,
+            applied_lsu_hash: None,
+            applied_state_root: None,
+        });
+    if !matches!(meta.status, catalyst_core::protocol::TxStatus::Applied) {
+        meta.status = catalyst_core::protocol::TxStatus::Selected;
+        meta.selected_cycle = Some(cycle);
+    }
+    if let Ok(mbytes) = bincode::serialize(&meta) {
+        let _ = store.set_metadata(&key, &mbytes).await;
+    }
 }
 
 async fn prune_persisted_mempool(store: &StorageManager) {
@@ -1017,6 +1110,36 @@ async fn apply_lsu_to_storage(
     // Flush + compute a state root that commits the applied balances.
     let state_root = store.commit().await?;
     let lsu_hash = hash_data(lsu).unwrap_or([0u8; 32]);
+
+    // Update per-tx receipts for this cycle (best-effort): mark Applied.
+    let cycle = lsu.cycle_number;
+    let txids = load_cycle_txids(store, cycle).await;
+    for txid in txids {
+        let key = tx_meta_key(&txid);
+        let existing = store.get_metadata(&key).await.ok().flatten();
+        let mut meta = existing
+            .as_deref()
+            .and_then(|b| bincode::deserialize::<catalyst_core::protocol::TxMeta>(b).ok())
+            .unwrap_or_else(|| catalyst_core::protocol::TxMeta {
+                tx_id: txid,
+                status: catalyst_core::protocol::TxStatus::Pending,
+                received_at_ms: current_timestamp_ms(),
+                sender: None,
+                nonce: 0,
+                fees: 0,
+                selected_cycle: Some(cycle),
+                applied_cycle: None,
+                applied_lsu_hash: None,
+                applied_state_root: None,
+            });
+        meta.status = catalyst_core::protocol::TxStatus::Applied;
+        meta.applied_cycle = Some(cycle);
+        meta.applied_lsu_hash = Some(lsu_hash);
+        meta.applied_state_root = Some(state_root);
+        if let Ok(mbytes) = bincode::serialize(&meta) {
+            let _ = store.set_metadata(&key, &mbytes).await;
+        }
+    }
 
     // Persist the applied head.
     let _ = store
@@ -1628,6 +1751,12 @@ impl CatalystNode {
                                         for tx in &valid {
                                             entries.extend(tx_to_consensus_entries(tx));
                                         }
+                                        // Persist cycle txids + mark Selected.
+                                        let txids: Vec<[u8; 32]> = valid.iter().filter_map(|t| mempool_txid(t)).collect();
+                                        persist_cycle_txids(store.as_ref(), batch.cycle, txids).await;
+                                        for tx in &valid {
+                                            update_tx_meta_status_selected(store.as_ref(), tx, batch.cycle).await;
+                                        }
                                         tx_batches.write().await.insert(batch.cycle, entries);
                                     }
                                 }
@@ -2200,6 +2329,15 @@ impl CatalystNode {
                         } else {
                             Vec::new()
                         };
+
+                        // Persist per-cycle txids + mark Selected (so receipts can show progress).
+                        if let Some(store) = &storage {
+                            let txids: Vec<[u8; 32]> = txs.iter().filter_map(|t| mempool_txid(t)).collect();
+                            persist_cycle_txids(store.as_ref(), cycle, txids).await;
+                            for tx in &txs {
+                                update_tx_meta_status_selected(store.as_ref(), tx, cycle).await;
+                            }
+                        }
 
                         let mut entries: Vec<catalyst_consensus::types::TransactionEntry> = Vec::new();
                         for tx in &txs {

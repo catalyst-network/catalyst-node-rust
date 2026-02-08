@@ -133,6 +133,14 @@ enum Commands {
         #[arg(long, default_value = "http://localhost:8545")]
         rpc_url: String,
     },
+    /// Show a transaction receipt/status (and inclusion proof when applied)
+    Receipt {
+        /// Transaction hash (tx_id)
+        tx_hash: String,
+        /// RPC endpoint
+        #[arg(long, default_value = "http://localhost:8545")]
+        rpc_url: String,
+    },
     /// Send a transaction
     Send {
         /// Recipient address
@@ -348,6 +356,9 @@ async fn main() -> Result<()> {
         }
         Commands::Peers { rpc_url } => {
             commands::show_peers(&rpc_url).await?;
+        }
+        Commands::Receipt { tx_hash, rpc_url } => {
+            commands::show_receipt(&tx_hash, &rpc_url).await?;
         }
         Commands::Send {
             to,

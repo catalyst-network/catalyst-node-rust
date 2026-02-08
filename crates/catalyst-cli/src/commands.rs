@@ -99,6 +99,54 @@ pub async fn get_peers(rpc_url: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn get_receipt(tx_hash: &str, rpc_url: &str) -> Result<()> {
+    let client = HttpClientBuilder::default().build(rpc_url)?;
+    let receipt: Option<catalyst_rpc::RpcTxReceipt> = client
+        .request("catalyst_getTransactionReceipt", jsonrpsee::rpc_params![tx_hash])
+        .await?;
+    let Some(r) = receipt else {
+        println!("receipt: null");
+        return Ok(());
+    };
+    println!("tx_hash: {}", r.tx_hash);
+    println!("status: {}", r.status);
+    println!("received_at_ms: {}", r.received_at_ms);
+    if let Some(from) = r.from {
+        println!("from: {from}");
+    }
+    println!("nonce: {}", r.nonce);
+    println!("fees: {}", r.fees);
+    if let Some(c) = r.selected_cycle {
+        println!("selected_cycle: {c}");
+    }
+    if let Some(c) = r.applied_cycle {
+        println!("applied_cycle: {c}");
+    }
+    if let Some(h) = r.applied_lsu_hash {
+        println!("applied_lsu_hash: {h}");
+    }
+    if let Some(h) = r.applied_state_root {
+        println!("applied_state_root: {h}");
+    }
+
+    if r.applied_cycle.is_some() {
+        let proof: Option<catalyst_rpc::RpcTxInclusionProof> = client
+            .request(
+                "catalyst_getTransactionInclusionProof",
+                jsonrpsee::rpc_params![tx_hash],
+            )
+            .await
+            .unwrap_or(None);
+        if let Some(p) = proof {
+            println!("inclusion_cycle: {}", p.cycle);
+            println!("inclusion_tx_index: {}", p.tx_index);
+            println!("inclusion_merkle_root: {}", p.merkle_root);
+            println!("inclusion_proof_len: {}", p.proof.len());
+        }
+    }
+    Ok(())
+}
+
 pub async fn balance_proof(address: &str, rpc_url: &str) -> Result<()> {
     let client = HttpClientBuilder::default().build(rpc_url)?;
     let p: catalyst_rpc::RpcBalanceProof =
@@ -134,6 +182,10 @@ pub async fn show_status(rpc_url: &str) -> Result<()> {
 
 pub async fn show_peers(rpc_url: &str) -> Result<()> {
     get_peers(rpc_url).await
+}
+
+pub async fn show_receipt(tx_hash: &str, rpc_url: &str) -> Result<()> {
+    get_receipt(tx_hash, rpc_url).await
 }
 
 pub async fn send_transaction(

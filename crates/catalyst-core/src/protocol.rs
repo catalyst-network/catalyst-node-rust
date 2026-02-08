@@ -126,6 +126,38 @@ pub fn min_fee(tx: &Transaction) -> u64 {
     min_fee_for_core(&tx.core)
 }
 
+/// Transaction status as observed by a node.
+///
+/// This is a pragmatic “receipt” state machine for testnet ergonomics; it is not yet a
+/// full mainnet finality model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TxStatus {
+    /// Accepted for gossip / mempool, but not yet included in an applied cycle.
+    Pending,
+    /// Selected into a cycle’s batch (best-effort; may still fail to apply).
+    Selected,
+    /// Included in a cycle that was applied locally (and therefore part of the node’s head).
+    Applied,
+    /// Explicitly dropped/rejected (optional; not all paths set this).
+    Dropped,
+}
+
+/// Persisted transaction metadata used to serve receipt-like RPCs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TxMeta {
+    /// 32-byte tx id (blake2b512(bincode(tx))[..32] in the current node implementation).
+    pub tx_id: [u8; 32],
+    pub status: TxStatus,
+    pub received_at_ms: u64,
+    pub sender: Option<[u8; 32]>,
+    pub nonce: u64,
+    pub fees: u64,
+    pub selected_cycle: Option<u64>,
+    pub applied_cycle: Option<u64>,
+    pub applied_lsu_hash: Option<[u8; 32]>,
+    pub applied_state_root: Option<[u8; 32]>,
+}
+
 impl Transaction {
     pub fn validate_basic(&self) -> Result<(), String> {
         match self.core.tx_type {

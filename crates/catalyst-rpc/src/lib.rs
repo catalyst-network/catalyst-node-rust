@@ -105,6 +105,14 @@ pub trait CatalystRpc {
     /// Get transaction by hash
     #[method(name = "catalyst_getTransactionByHash")]
     async fn get_transaction_by_hash(&self, hash: String) -> RpcResult<Option<RpcTransaction>>;
+
+    /// Get a receipt-like view for a submitted transaction.
+    #[method(name = "catalyst_getTransactionReceipt")]
+    async fn get_transaction_receipt(&self, hash: String) -> RpcResult<Option<RpcTxReceipt>>;
+
+    /// Get a deterministic inclusion proof for a transaction against the cycle's tx Merkle root.
+    #[method(name = "catalyst_getTransactionInclusionProof")]
+    async fn get_transaction_inclusion_proof(&self, hash: String) -> RpcResult<Option<RpcTxInclusionProof>>;
     
     /// Get account balance
     #[method(name = "catalyst_getBalance")]
@@ -217,6 +225,30 @@ pub struct RpcTransaction {
     pub gas_price: String,
     pub gas_used: Option<u64>,
     pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcTxReceipt {
+    pub tx_hash: String,
+    pub status: String,
+    pub received_at_ms: u64,
+    pub from: Option<String>,
+    pub nonce: u64,
+    pub fees: String,
+    pub selected_cycle: Option<u64>,
+    pub applied_cycle: Option<u64>,
+    pub applied_lsu_hash: Option<String>,
+    pub applied_state_root: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcTxInclusionProof {
+    pub tx_hash: String,
+    pub cycle: u64,
+    pub tx_index: usize,
+    pub merkle_root: String,
+    /// Each step is "L:<hex>" or "R:<hex>" meaning sibling is on the Left or Right.
+    pub proof: Vec<String>,
 }
 
 /// RPC transaction summary (in blocks)
@@ -475,8 +507,113 @@ impl CatalystRpcServer for CatalystRpcImpl {
         Ok(None)
     }
 
-    async fn get_transaction_by_hash(&self, _hash: String) -> RpcResult<Option<RpcTransaction>> {
-        Ok(None)
+    async fn get_transaction_by_hash(&self, hash: String) -> RpcResult<Option<RpcTransaction>> {
+        let txid = parse_hex_32bytes(&hash).map_err(ErrorObjectOwned::from)?;
+        let key = tx_raw_key(&txid);
+        let Some(bytes) = self
+            .storage
+            .get_metadata(&key)
+            .await
+            .ok()
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        let tx: catalyst_core::protocol::Transaction = bincode::deserialize(&bytes).map_err(
+            |e: bincode::Error| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())),
+        )?;
+
+        let meta = load_tx_meta(self.storage.as_ref(), &txid).await;
+        let status = meta
+            .as_ref()
+            .map(|m| tx_status_string(&m.status))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let from = tx_sender_pubkey(&tx).map(|pk| format!("0x{}", hex::encode(pk)));
+
+        // Map a minimal "to/value" view for non-confidential transfers.
+        let (to, value) = match tx.core.tx_type {
+            catalyst_core::protocol::TransactionType::NonConfidentialTransfer => {
+                let sender = tx_sender_pubkey(&tx);
+                let mut to_pk: Option<[u8; 32]> = None;
+                let mut val: i64 = 0;
+                for e in &tx.core.entries {
+                    if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
+                        if v > 0 {
+                            if sender.map(|s| s != e.public_key).unwrap_or(true) {
+                                to_pk = Some(e.public_key);
+                                val = val.saturating_add(v);
+                            }
+                        }
+                    }
+                }
+                (to_pk.map(|pk| format!("0x{}", hex::encode(pk))), val.max(0) as u64)
+            }
+            _ => (None, 0u64),
+        };
+
+        let (block_number, block_hash) = meta
+            .as_ref()
+            .and_then(|m| m.applied_cycle.map(|c| (Some(c), m.applied_lsu_hash)))
+            .map(|(c, h)| (c, h.map(|hh| format!("0x{}", hex::encode(hh)))))
+            .unwrap_or((None, None));
+
+        Ok(Some(RpcTransaction {
+            hash,
+            block_hash,
+            block_number,
+            from: from.unwrap_or_else(|| "0x0".to_string()),
+            to,
+            value: value.to_string(),
+            data: format!("0x{}", hex::encode(&tx.core.data)),
+            gas_limit: 0,
+            gas_price: "0".to_string(),
+            gas_used: None,
+            status: Some(status),
+        }))
+    }
+
+    async fn get_transaction_receipt(&self, hash: String) -> RpcResult<Option<RpcTxReceipt>> {
+        let txid = parse_hex_32bytes(&hash).map_err(ErrorObjectOwned::from)?;
+        let meta = load_tx_meta(self.storage.as_ref(), &txid).await;
+        let Some(m) = meta else {
+            return Ok(None);
+        };
+        Ok(Some(RpcTxReceipt {
+            tx_hash: hash,
+            status: tx_status_string(&m.status),
+            received_at_ms: m.received_at_ms,
+            from: m.sender.map(|pk| format!("0x{}", hex::encode(pk))),
+            nonce: m.nonce,
+            fees: m.fees.to_string(),
+            selected_cycle: m.selected_cycle,
+            applied_cycle: m.applied_cycle,
+            applied_lsu_hash: m.applied_lsu_hash.map(|h| format!("0x{}", hex::encode(h))),
+            applied_state_root: m.applied_state_root.map(|h| format!("0x{}", hex::encode(h))),
+        }))
+    }
+
+    async fn get_transaction_inclusion_proof(
+        &self,
+        hash: String,
+    ) -> RpcResult<Option<RpcTxInclusionProof>> {
+        let txid = parse_hex_32bytes(&hash).map_err(ErrorObjectOwned::from)?;
+        let meta = load_tx_meta(self.storage.as_ref(), &txid).await;
+        let Some(m) = meta else { return Ok(None) };
+        let Some(cycle) = m.applied_cycle else { return Ok(None) };
+
+        let txids = load_cycle_txids(self.storage.as_ref(), cycle).await;
+        let Some((idx, _)) = txids.iter().enumerate().find(|(_, t)| **t == txid) else {
+            return Ok(None);
+        };
+        let (root, proof) = merkle_root_and_proof(&txids, idx);
+        Ok(Some(RpcTxInclusionProof {
+            tx_hash: hash,
+            cycle,
+            tx_index: idx,
+            merkle_root: format!("0x{}", hex::encode(root)),
+            proof,
+        }))
     }
 
     async fn get_balance(&self, address: String) -> RpcResult<String> {
@@ -548,6 +685,17 @@ impl CatalystRpcServer for CatalystRpcImpl {
             |e: bincode::Error| ErrorObjectOwned::from(RpcServerError::InvalidParams(e.to_string())),
         )?;
 
+        // Basic format + fee floor checks.
+        tx.validate_basic()
+            .map_err(|e| ErrorObjectOwned::from(RpcServerError::InvalidParams(e)))?;
+        let min_fee = catalyst_core::protocol::min_fee(&tx);
+        if tx.core.fees < min_fee {
+            return Err(ErrorObjectOwned::from(RpcServerError::InvalidParams(format!(
+                "fee too low: fees={} min_required={}",
+                tx.core.fees, min_fee
+            ))));
+        }
+
         if !verify_tx_signature(&tx) {
             return Err(ErrorObjectOwned::from(RpcServerError::InvalidParams(
                 "Invalid transaction signature".to_string(),
@@ -574,12 +722,31 @@ impl CatalystRpcServer for CatalystRpcImpl {
             }
         }
 
-        // tx_id = sha256(bincode(tx))
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(&bytes);
-        let out = h.finalize();
-        let tx_id = format!("0x{}", hex::encode(out));
+        // tx_id = blake2b512(bincode(tx))[..32] (must match node/mempool).
+        let txid = tx_id_blake2b_32(&bytes);
+        let tx_id = format!("0x{}", hex::encode(txid));
+
+        // Persist tx raw + meta so clients can poll receipt immediately (best-effort).
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let meta = catalyst_core::protocol::TxMeta {
+            tx_id: txid,
+            status: catalyst_core::protocol::TxStatus::Pending,
+            received_at_ms: now_ms,
+            sender: tx_sender_pubkey(&tx),
+            nonce: tx.core.nonce,
+            fees: tx.core.fees,
+            selected_cycle: None,
+            applied_cycle: None,
+            applied_lsu_hash: None,
+            applied_state_root: None,
+        };
+        let _ = self.storage.set_metadata(&tx_raw_key(&txid), &bytes).await;
+        if let Ok(mbytes) = bincode::serialize(&meta) {
+            let _ = self.storage.set_metadata(&tx_meta_key(&txid), &mbytes).await;
+        }
 
         if let Some(sender) = &self.tx_submit {
             sender.send(tx).map_err(|_| {
@@ -700,6 +867,103 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 }
 
+fn tx_id_blake2b_32(bytes: &[u8]) -> [u8; 32] {
+    use blake2::{Blake2b512, Digest};
+    let mut h = Blake2b512::new();
+    h.update(bytes);
+    let out = h.finalize();
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&out[..32]);
+    id
+}
+
+fn tx_raw_key(txid: &[u8; 32]) -> String {
+    format!("tx:raw:{}", hex::encode(txid))
+}
+
+fn tx_meta_key(txid: &[u8; 32]) -> String {
+    format!("tx:meta:{}", hex::encode(txid))
+}
+
+fn cycle_txids_key(cycle: u64) -> String {
+    format!("tx:cycle:{}:txids", cycle)
+}
+
+async fn load_cycle_txids(store: &catalyst_storage::StorageManager, cycle: u64) -> Vec<[u8; 32]> {
+    let Some(bytes) = store.get_metadata(&cycle_txids_key(cycle)).await.ok().flatten() else {
+        return Vec::new();
+    };
+    bincode::deserialize::<Vec<[u8; 32]>>(&bytes).unwrap_or_default()
+}
+
+async fn load_tx_meta(
+    store: &catalyst_storage::StorageManager,
+    txid: &[u8; 32],
+) -> Option<catalyst_core::protocol::TxMeta> {
+    let Some(bytes) = store.get_metadata(&tx_meta_key(txid)).await.ok().flatten() else {
+        return None;
+    };
+    bincode::deserialize::<catalyst_core::protocol::TxMeta>(&bytes).ok()
+}
+
+fn tx_status_string(st: &catalyst_core::protocol::TxStatus) -> String {
+    match st {
+        catalyst_core::protocol::TxStatus::Pending => "pending",
+        catalyst_core::protocol::TxStatus::Selected => "selected",
+        catalyst_core::protocol::TxStatus::Applied => "applied",
+        catalyst_core::protocol::TxStatus::Dropped => "dropped",
+    }
+    .to_string()
+}
+
+fn hash_pair(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
+    use blake2::{Blake2b512, Digest};
+    let mut h = Blake2b512::new();
+    h.update(left);
+    h.update(right);
+    let out = h.finalize();
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&out[..32]);
+    id
+}
+
+fn merkle_root_and_proof(leaves: &[[u8; 32]], index: usize) -> ([u8; 32], Vec<String>) {
+    if leaves.is_empty() {
+        return ([0u8; 32], Vec::new());
+    }
+    if leaves.len() == 1 {
+        return (leaves[0], Vec::new());
+    }
+
+    let mut idx = index;
+    let mut level: Vec<[u8; 32]> = leaves.to_vec();
+    let mut proof: Vec<String> = Vec::new();
+
+    while level.len() > 1 {
+        let is_right = idx % 2 == 1;
+        let sib_idx = if is_right { idx - 1 } else { idx + 1 };
+        let sib = if sib_idx < level.len() { level[sib_idx] } else { level[idx] };
+        proof.push(format!(
+            "{}:0x{}",
+            if is_right { "L" } else { "R" },
+            hex::encode(sib)
+        ));
+
+        let mut next: Vec<[u8; 32]> = Vec::with_capacity((level.len() + 1) / 2);
+        let mut i = 0usize;
+        while i < level.len() {
+            let left = level[i];
+            let right = if i + 1 < level.len() { level[i + 1] } else { level[i] };
+            next.push(hash_pair(left, right));
+            i += 2;
+        }
+        level = next;
+        idx /= 2;
+    }
+
+    (level[0], proof)
+}
+
 /// Start a minimal HTTP JSON-RPC server on `bind_address`.
 pub async fn start_rpc_http(
     bind_address: SocketAddr,
@@ -752,5 +1016,29 @@ mod tests {
         let json = serde_json::to_string(&account).unwrap();
         let deserialized: RpcAccount = serde_json::from_str(&json).unwrap();
         assert_eq!(account.address, deserialized.address);
+    }
+
+    #[test]
+    fn merkle_proof_roundtrip() {
+        let leaves: Vec<[u8; 32]> = vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32], [5u8; 32]];
+        let idx = 2usize;
+        let (root, proof) = merkle_root_and_proof(&leaves, idx);
+
+        // Verify by folding the proof.
+        let mut cur = leaves[idx];
+        for step in proof {
+            let (side, hex_sib) = step.split_once(':').expect("bad proof step");
+            let hex_sib = hex_sib.strip_prefix("0x").unwrap_or(hex_sib);
+            let sib_bytes = hex::decode(hex_sib).expect("bad sibling hex");
+            assert_eq!(sib_bytes.len(), 32);
+            let mut sib = [0u8; 32];
+            sib.copy_from_slice(&sib_bytes);
+            cur = match side {
+                "L" => hash_pair(sib, cur),
+                "R" => hash_pair(cur, sib),
+                _ => panic!("bad side"),
+            };
+        }
+        assert_eq!(cur, root);
     }
 }
