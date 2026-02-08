@@ -265,6 +265,14 @@ pub struct RpcTxReceipt {
     pub applied_cycle: Option<u64>,
     pub applied_lsu_hash: Option<String>,
     pub applied_state_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gas_used: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_data: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -655,6 +663,10 @@ impl CatalystRpcServer for CatalystRpcImpl {
             applied_cycle: m.applied_cycle,
             applied_lsu_hash: m.applied_lsu_hash.map(|h| format!("0x{}", hex::encode(h))),
             applied_state_root: m.applied_state_root.map(|h| format!("0x{}", hex::encode(h))),
+            success: m.applied_success,
+            error: m.applied_error.clone(),
+            gas_used: m.evm_gas_used,
+            return_data: m.evm_return.as_ref().map(|b| format!("0x{}", hex::encode(b))),
         }))
     }
 
@@ -871,6 +883,10 @@ impl CatalystRpcServer for CatalystRpcImpl {
             applied_cycle: None,
             applied_lsu_hash: None,
             applied_state_root: None,
+            applied_success: None,
+            applied_error: None,
+            evm_gas_used: None,
+            evm_return: None,
         };
         let _ = self.storage.set_metadata(&tx_raw_key(&txid), &bytes).await;
         if let Ok(mbytes) = bincode::serialize(&meta) {

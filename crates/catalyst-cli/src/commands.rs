@@ -116,6 +116,18 @@ pub async fn get_receipt(tx_hash: &str, rpc_url: &str) -> Result<()> {
     }
     println!("nonce: {}", r.nonce);
     println!("fees: {}", r.fees);
+    if let Some(ok) = r.success {
+        println!("success: {ok}");
+    }
+    if let Some(err) = r.error {
+        println!("error: {err}");
+    }
+    if let Some(g) = r.gas_used {
+        println!("gas_used: {g}");
+    }
+    if let Some(ret) = r.return_data {
+        println!("return_data: {ret}");
+    }
     if let Some(c) = r.selected_cycle {
         println!("selected_cycle: {c}");
     }

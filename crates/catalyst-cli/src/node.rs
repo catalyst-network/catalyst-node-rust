@@ -260,25 +260,87 @@ async fn apply_lsu_to_storage_without_root_check(
     lsu: &catalyst_consensus::types::LedgerStateUpdate,
     new_root: [u8; 32],
 ) -> Result<()> {
+    #[derive(Clone, Debug, Default)]
+    struct ApplyOutcome {
+        success: bool,
+        gas_used: Option<u64>,
+        return_data: Option<Vec<u8>>,
+        error: Option<String>,
+    }
+
+    let mut outcome_by_sig: std::collections::HashMap<Vec<u8>, ApplyOutcome> = std::collections::HashMap::new();
+    let mut executed_sigs: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+
     // Apply balance / worker / EVM updates.
     for e in &lsu.partial_update.transaction_entries {
         if is_worker_reg_marker(&e.signature) {
             let k = worker_key_for_pubkey(&e.public_key);
             let _ = store.set_state(&k, vec![1u8]).await;
+            outcome_by_sig.entry(e.signature.clone()).or_insert(ApplyOutcome {
+                success: true,
+                ..Default::default()
+            });
             continue;
         }
         if is_evm_marker(&e.signature) {
-            if let Some((payload, _sig64)) = decode_evm_marker(&e.signature) {
-                let from20 = pubkey_to_evm_addr20(&e.public_key);
-                let from = EvmAddress::from_slice(&from20);
-                let gas_limit = DEFAULT_EVM_GAS_LIMIT.max(21_000);
-                match payload.kind {
-                    EvmTxKind::Deploy { bytecode } => {
-                        let _ = execute_deploy_and_persist(store, from, payload.nonce, bytecode, gas_limit).await;
-                    }
-                    EvmTxKind::Call { to, input } => {
-                        let to_addr = EvmAddress::from_slice(&to);
-                        let _ = execute_call_and_persist(store, from, to_addr, payload.nonce, input, gas_limit).await;
+            if !executed_sigs.contains(&e.signature) {
+                executed_sigs.insert(e.signature.clone());
+                if let Some((payload, _sig64)) = decode_evm_marker(&e.signature) {
+                    let from20 = pubkey_to_evm_addr20(&e.public_key);
+                    let from = EvmAddress::from_slice(&from20);
+                    let gas_limit = DEFAULT_EVM_GAS_LIMIT.max(21_000);
+                    match payload.kind {
+                        EvmTxKind::Deploy { bytecode } => {
+                            match execute_deploy_and_persist(store, from, payload.nonce, bytecode, gas_limit).await {
+                                Ok((_created, info, _persisted)) => {
+                                    outcome_by_sig.insert(
+                                        e.signature.clone(),
+                                        ApplyOutcome {
+                                            success: info.success,
+                                            gas_used: Some(info.gas_used),
+                                            return_data: Some(info.return_data.to_vec()),
+                                            error: info.error.clone(),
+                                        },
+                                    );
+                                }
+                                Err(err) => {
+                                    outcome_by_sig.insert(
+                                        e.signature.clone(),
+                                        ApplyOutcome {
+                                            success: false,
+                                            error: Some(err.to_string()),
+                                            ..Default::default()
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        EvmTxKind::Call { to, input } => {
+                            let to_addr = EvmAddress::from_slice(&to);
+                            match execute_call_and_persist(store, from, to_addr, payload.nonce, input, gas_limit).await {
+                                Ok((info, _persisted)) => {
+                                    outcome_by_sig.insert(
+                                        e.signature.clone(),
+                                        ApplyOutcome {
+                                            success: info.success,
+                                            gas_used: Some(info.gas_used),
+                                            return_data: Some(info.return_data.to_vec()),
+                                            error: info.error.clone(),
+                                        },
+                                    );
+                                }
+                                Err(err) => {
+                                    outcome_by_sig.insert(
+                                        e.signature.clone(),
+                                        ApplyOutcome {
+                                            success: false,
+                                            error: Some(err.to_string()),
+                                            ..Default::default()
+                                        },
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -287,6 +349,11 @@ async fn apply_lsu_to_storage_without_root_check(
         let bal = get_balance_i64(store, &e.public_key).await;
         let next = bal.saturating_add(e.amount);
         let _ = set_balance_i64(store, &e.public_key, next).await;
+
+        outcome_by_sig.entry(e.signature.clone()).or_insert(ApplyOutcome {
+            success: true,
+            ..Default::default()
+        });
     }
 
     // Nonce increments.
@@ -331,6 +398,60 @@ async fn apply_lsu_to_storage_without_root_check(
         let _ = store
             .set_metadata("consensus:last_applied_lsu_hash", &h)
             .await;
+    }
+
+    // Update per-tx receipts for this cycle (best-effort): mark Applied + attach outcomes.
+    let cycle = lsu.cycle_number;
+    let lsu_hash = catalyst_consensus::types::hash_data(lsu).unwrap_or([0u8; 32]);
+    let txids = load_cycle_txids(store, cycle).await;
+    for txid in txids {
+        let key = tx_meta_key(&txid);
+        let existing = store.get_metadata(&key).await.ok().flatten();
+        let mut meta = existing
+            .as_deref()
+            .and_then(|b| bincode::deserialize::<catalyst_core::protocol::TxMeta>(b).ok())
+            .unwrap_or_else(|| catalyst_core::protocol::TxMeta {
+                tx_id: txid,
+                status: catalyst_core::protocol::TxStatus::Pending,
+                received_at_ms: current_timestamp_ms(),
+                sender: None,
+                nonce: 0,
+                fees: 0,
+                selected_cycle: Some(cycle),
+                applied_cycle: None,
+                applied_lsu_hash: None,
+                applied_state_root: None,
+                applied_success: None,
+                applied_error: None,
+                evm_gas_used: None,
+                evm_return: None,
+            });
+        meta.status = catalyst_core::protocol::TxStatus::Applied;
+        meta.applied_cycle = Some(cycle);
+        meta.applied_lsu_hash = Some(lsu_hash);
+        meta.applied_state_root = Some(new_root);
+
+        if let Some(bytes) = store.get_metadata(&tx_raw_key(&txid)).await.ok().flatten() {
+            if let Ok(tx) = bincode::deserialize::<catalyst_core::protocol::Transaction>(&bytes) {
+                let sig = tx_boundary_signature(&tx);
+                if let Some(o) = outcome_by_sig.get(&sig) {
+                    meta.applied_success = Some(o.success);
+                    meta.applied_error = o.error.clone();
+                    meta.evm_gas_used = o.gas_used;
+                    meta.evm_return = o.return_data.clone();
+                } else {
+                    meta.applied_success = Some(true);
+                }
+            } else {
+                meta.applied_success = Some(true);
+            }
+        } else {
+            meta.applied_success = Some(true);
+        }
+
+        if let Ok(mbytes) = bincode::serialize(&meta) {
+            let _ = store.set_metadata(&key, &mbytes).await;
+        }
     }
 
     // Flush without recomputing.
@@ -547,6 +668,24 @@ fn tx_sender_pubkey(tx: &catalyst_core::protocol::Transaction) -> Option<[u8; 32
             }
             sender
         }
+    }
+}
+
+fn tx_boundary_signature(tx: &catalyst_core::protocol::Transaction) -> Vec<u8> {
+    match tx.core.tx_type {
+        catalyst_core::protocol::TransactionType::WorkerRegistration => {
+            let mut sig = b"WRKREG1".to_vec();
+            sig.extend_from_slice(&tx.signature.0);
+            sig
+        }
+        catalyst_core::protocol::TransactionType::SmartContract => {
+            let kind = bincode::deserialize::<EvmTxKind>(&tx.core.data)
+                .unwrap_or(EvmTxKind::Call { to: [0u8; 20], input: Vec::new() });
+            let payload = crate::evm::EvmTxPayload { nonce: tx.core.nonce, kind };
+            crate::evm::encode_evm_marker(&payload, &tx.signature.0)
+                .unwrap_or_else(|_| tx.signature.0.clone())
+        }
+        _ => tx.signature.0.clone(),
     }
 }
 
@@ -787,6 +926,10 @@ async fn persist_mempool_tx(store: &StorageManager, tx: &catalyst_core::protocol
                 applied_cycle: None,
                 applied_lsu_hash: None,
                 applied_state_root: None,
+                applied_success: None,
+                applied_error: None,
+                evm_gas_used: None,
+                evm_return: None,
             }
         });
     // Never regress terminal-ish states
@@ -851,6 +994,10 @@ async fn update_tx_meta_status_selected(store: &StorageManager, tx: &catalyst_co
             applied_cycle: None,
             applied_lsu_hash: None,
             applied_state_root: None,
+            applied_success: None,
+            applied_error: None,
+            evm_gas_used: None,
+            evm_return: None,
         });
     if !matches!(meta.status, catalyst_core::protocol::TxStatus::Applied) {
         meta.status = catalyst_core::protocol::TxStatus::Selected;
@@ -1010,6 +1157,17 @@ async fn apply_lsu_to_storage(
         return Ok(root);
     }
 
+    #[derive(Clone, Debug, Default)]
+    struct ApplyOutcome {
+        success: bool,
+        gas_used: Option<u64>,
+        return_data: Option<Vec<u8>>,
+        error: Option<String>,
+    }
+
+    let mut outcome_by_sig: std::collections::HashMap<Vec<u8>, ApplyOutcome> = std::collections::HashMap::new();
+    let mut executed_sigs: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+
     // Apply balance deltas from the LSU's ordered transaction entries.
     // Also apply worker registry markers into state under `workers:<pubkey>`.
     for e in &lsu.partial_update.transaction_entries {
@@ -1025,32 +1183,80 @@ async fn apply_lsu_to_storage(
             // Register worker (idempotent).
             let k = worker_key_for_pubkey(&e.public_key);
             let _ = store.set_state(&k, vec![1u8]).await;
+            outcome_by_sig.entry(e.signature.clone()).or_insert(ApplyOutcome {
+                success: true,
+                ..Default::default()
+            });
             continue;
         }
         if is_evm_marker(&e.signature) {
-            if let Some((payload, _sig64)) = decode_evm_marker(&e.signature) {
-                let from20 = pubkey_to_evm_addr20(&e.public_key);
-                let from = EvmAddress::from_slice(&from20);
-                let gas_limit = DEFAULT_EVM_GAS_LIMIT.max(21_000);
-                match payload.kind {
-                    EvmTxKind::Deploy { bytecode } => {
-                        match execute_deploy_and_persist(store, from, payload.nonce, bytecode, gas_limit).await {
-                            Ok((created, _ret, _persisted)) => {
-                                info!("EVM deploy applied addr=0x{}", hex::encode(created.as_slice()));
-                            }
-                            Err(err) => {
-                                tracing::warn!("EVM deploy failed: {err}");
+            // Execute EVM once per tx boundary (same signature bytes).
+            if !executed_sigs.contains(&e.signature) {
+                executed_sigs.insert(e.signature.clone());
+                if let Some((payload, _sig64)) = decode_evm_marker(&e.signature) {
+                    let from20 = pubkey_to_evm_addr20(&e.public_key);
+                    let from = EvmAddress::from_slice(&from20);
+                    let gas_limit = DEFAULT_EVM_GAS_LIMIT.max(21_000);
+                    match payload.kind {
+                        EvmTxKind::Deploy { bytecode } => {
+                            match execute_deploy_and_persist(store, from, payload.nonce, bytecode, gas_limit).await {
+                                Ok((created, info, _persisted)) => {
+                                    info!("EVM deploy applied addr=0x{} ok={} gas_used={}", hex::encode(created.as_slice()), info.success, info.gas_used);
+                                    outcome_by_sig.insert(
+                                        e.signature.clone(),
+                                        ApplyOutcome {
+                                            success: info.success,
+                                            gas_used: Some(info.gas_used),
+                                            return_data: Some(info.return_data.to_vec()),
+                                            error: info.error.clone(),
+                                        },
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::warn!("EVM deploy failed: {err}");
+                                    outcome_by_sig.insert(
+                                        e.signature.clone(),
+                                        ApplyOutcome {
+                                            success: false,
+                                            error: Some(err.to_string()),
+                                            ..Default::default()
+                                        },
+                                    );
+                                }
                             }
                         }
-                    }
-                    EvmTxKind::Call { to, input } => {
-                        let to_addr = EvmAddress::from_slice(&to);
-                        match execute_call_and_persist(store, from, to_addr, payload.nonce, input, gas_limit).await {
-                            Ok((ret, _persisted)) => {
-                                info!("EVM call applied to=0x{} ret_len={}", hex::encode(to_addr.as_slice()), ret.len());
-                            }
-                            Err(err) => {
-                                tracing::warn!("EVM call failed: {err}");
+                        EvmTxKind::Call { to, input } => {
+                            let to_addr = EvmAddress::from_slice(&to);
+                            match execute_call_and_persist(store, from, to_addr, payload.nonce, input, gas_limit).await {
+                                Ok((info, _persisted)) => {
+                                    info!(
+                                        "EVM call applied to=0x{} ok={} gas_used={} ret_len={}",
+                                        hex::encode(to_addr.as_slice()),
+                                        info.success,
+                                        info.gas_used,
+                                        info.return_data.len()
+                                    );
+                                    outcome_by_sig.insert(
+                                        e.signature.clone(),
+                                        ApplyOutcome {
+                                            success: info.success,
+                                            gas_used: Some(info.gas_used),
+                                            return_data: Some(info.return_data.to_vec()),
+                                            error: info.error.clone(),
+                                        },
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::warn!("EVM call failed: {err}");
+                                    outcome_by_sig.insert(
+                                        e.signature.clone(),
+                                        ApplyOutcome {
+                                            success: false,
+                                            error: Some(err.to_string()),
+                                            ..Default::default()
+                                        },
+                                    );
+                                }
                             }
                         }
                     }
@@ -1069,6 +1275,12 @@ async fn apply_lsu_to_storage(
 
         let next = cur.saturating_add(e.amount);
         store.set_state(&k, next.to_le_bytes().to_vec()).await?;
+
+        // Default: if it made it into an applied LSU, treat as successful (best-effort).
+        outcome_by_sig.entry(e.signature.clone()).or_insert(ApplyOutcome {
+            success: true,
+            ..Default::default()
+        });
     }
 
     // Update nonces: group by signature bytes (our current "tx boundary" marker).
@@ -1115,7 +1327,7 @@ async fn apply_lsu_to_storage(
     let state_root = store.commit().await?;
     let lsu_hash = hash_data(lsu).unwrap_or([0u8; 32]);
 
-    // Update per-tx receipts for this cycle (best-effort): mark Applied.
+    // Update per-tx receipts for this cycle (best-effort): mark Applied + attach execution outcomes.
     let cycle = lsu.cycle_number;
     let txids = load_cycle_txids(store, cycle).await;
     for txid in txids {
@@ -1135,11 +1347,35 @@ async fn apply_lsu_to_storage(
                 applied_cycle: None,
                 applied_lsu_hash: None,
                 applied_state_root: None,
+            applied_success: None,
+            applied_error: None,
+            evm_gas_used: None,
+            evm_return: None,
             });
         meta.status = catalyst_core::protocol::TxStatus::Applied;
         meta.applied_cycle = Some(cycle);
         meta.applied_lsu_hash = Some(lsu_hash);
         meta.applied_state_root = Some(state_root);
+
+        // Attach per-tx outcome using the tx boundary signature bytes.
+        if let Some(bytes) = store.get_metadata(&tx_raw_key(&txid)).await.ok().flatten() {
+            if let Ok(tx) = bincode::deserialize::<catalyst_core::protocol::Transaction>(&bytes) {
+                let sig = tx_boundary_signature(&tx);
+                if let Some(o) = outcome_by_sig.get(&sig) {
+                    meta.applied_success = Some(o.success);
+                    meta.applied_error = o.error.clone();
+                    meta.evm_gas_used = o.gas_used;
+                    meta.evm_return = o.return_data.clone();
+                } else {
+                    meta.applied_success = Some(true);
+                }
+            } else {
+                meta.applied_success = Some(true);
+            }
+        } else {
+            meta.applied_success = Some(true);
+        }
+
         if let Ok(mbytes) = bincode::serialize(&meta) {
             let _ = store.set_metadata(&key, &mbytes).await;
         }

@@ -165,6 +165,14 @@ pub struct EvmPersisted {
     pub touched_keys: Vec<Vec<u8>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct EvmExecInfo {
+    pub success: bool,
+    pub gas_used: u64,
+    pub return_data: Bytes,
+    pub error: Option<String>,
+}
+
 fn persist_state(store: &StorageManager, state: EvmState) -> impl std::future::Future<Output = Result<Vec<Vec<u8>>, EvmExecError>> + '_ {
     async move {
         let mut touched: Vec<Vec<u8>> = Vec::new();
@@ -220,7 +228,7 @@ pub async fn execute_deploy_and_persist(
     protocol_nonce: u64,
     init_code: Vec<u8>,
     gas_limit: u64,
-) -> Result<(Address, Bytes, EvmPersisted), EvmExecError> {
+) -> Result<(Address, EvmExecInfo, EvmPersisted), EvmExecError> {
     if protocol_nonce == 0 {
         return Err(EvmExecError::Invalid("protocol nonce must be >= 1".to_string()));
     }
@@ -279,6 +287,15 @@ pub async fn execute_deploy_and_persist(
         .unwrap_or_else(|| catalyst_runtime_evm::utils::calculate_ethereum_create_address(&from, evm_nonce));
     let return_data = out.result.output().cloned().unwrap_or_else(Bytes::new);
 
+    // Extract execution status and gas used (best-effort).
+    let success = out.result.is_success();
+    let gas_used = out.result.gas_used();
+    let error = if success {
+        None
+    } else {
+        Some(format!("{:?}", out.result))
+    };
+
     let mut touched = persist_state(store, out.state).await?;
 
     // Ensure runtime code is persisted in our address->code mapping so RPC `getCode` works and future CALLs can execute.
@@ -291,7 +308,16 @@ pub async fn execute_deploy_and_persist(
         touched.push(kc);
     }
 
-    Ok((created, return_data, EvmPersisted { touched_keys: touched }))
+    Ok((
+        created,
+        EvmExecInfo {
+            success,
+            gas_used,
+            return_data,
+            error,
+        },
+        EvmPersisted { touched_keys: touched },
+    ))
 }
 
 /// Execute a CALL and persist resulting state + return data.
@@ -302,7 +328,7 @@ pub async fn execute_call_and_persist(
     protocol_nonce: u64,
     input: Vec<u8>,
     gas_limit: u64,
-) -> Result<(Bytes, EvmPersisted), EvmExecError> {
+) -> Result<(EvmExecInfo, EvmPersisted), EvmExecError> {
     if protocol_nonce == 0 {
         return Err(EvmExecError::Invalid("protocol nonce must be >= 1".to_string()));
     }
@@ -334,6 +360,13 @@ pub async fn execute_call_and_persist(
     };
     let ret = out.result.output().cloned().unwrap_or_else(Bytes::new);
     let logs_ser = bincode::serialize(out.result.logs()).unwrap_or_default();
+    let success = out.result.is_success();
+    let gas_used = out.result.gas_used();
+    let error = if success {
+        None
+    } else {
+        Some(format!("{:?}", out.result))
+    };
 
     let mut touched = persist_state(store, out.state).await?;
     let kr = key_evm_last_return(&to);
@@ -349,6 +382,14 @@ pub async fn execute_call_and_persist(
         .map_err(|e| EvmExecError::Db(e.to_string()))?;
     touched.push(kl);
 
-    Ok((ret, EvmPersisted { touched_keys: touched }))
+    Ok((
+        EvmExecInfo {
+            success,
+            gas_used,
+            return_data: ret,
+            error,
+        },
+        EvmPersisted { touched_keys: touched },
+    ))
 }
 

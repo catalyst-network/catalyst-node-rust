@@ -156,6 +156,14 @@ pub struct TxMeta {
     pub applied_cycle: Option<u64>,
     pub applied_lsu_hash: Option<[u8; 32]>,
     pub applied_state_root: Option<[u8; 32]>,
+    /// Whether the tx executed successfully (best-effort).
+    pub applied_success: Option<bool>,
+    /// Optional error/revert string (best-effort).
+    pub applied_error: Option<String>,
+    /// EVM-only: gas used (if available).
+    pub evm_gas_used: Option<u64>,
+    /// EVM-only: return data (raw bytes).
+    pub evm_return: Option<Vec<u8>>,
 }
 
 impl Transaction {
