@@ -475,6 +475,85 @@ pub async fn sync_from_snapshot(
     Ok(())
 }
 
+pub async fn snapshot_make_latest(
+    data_dir: &Path,
+    out_base_dir: &Path,
+    archive_url_base: &str,
+    retain: usize,
+) -> Result<()> {
+    anyhow::ensure!(retain >= 1, "--retain must be >= 1");
+    std::fs::create_dir_all(out_base_dir)?;
+
+    let created_at_ms = catalyst_utils::utils::current_timestamp_ms();
+    let snapshot_dirname = format!("catalyst-snapshot-{created_at_ms}");
+    let snapshot_dir = out_base_dir.join(&snapshot_dirname);
+
+    let archive_name = format!("catalyst-snapshot-{created_at_ms}.tar");
+    let archive_path = out_base_dir.join(&archive_name);
+    let url_base = archive_url_base.trim_end_matches('/');
+    let archive_url = format!("{url_base}/{archive_name}");
+
+    db_backup(data_dir, &snapshot_dir, Some(&archive_path)).await?;
+    snapshot_publish(data_dir, &snapshot_dir, &archive_url, &archive_path).await?;
+
+    // Retention: keep newest N snapshots/archives (by timestamp in filename).
+    #[derive(Debug)]
+    struct Item {
+        ts: u64,
+        path: std::path::PathBuf,
+        is_dir: bool,
+    }
+
+    fn parse_ts(name: &str) -> Option<u64> {
+        if let Some(rest) = name.strip_prefix("catalyst-snapshot-") {
+            if let Some(num) = rest.strip_suffix(".tar") {
+                return num.parse::<u64>().ok();
+            }
+            return rest.parse::<u64>().ok();
+        }
+        None
+    }
+
+    let mut items: Vec<Item> = Vec::new();
+    for entry in std::fs::read_dir(out_base_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy().to_string();
+        let Some(ts) = parse_ts(&name) else { continue };
+        let ft = entry.file_type()?;
+        items.push(Item { ts, path, is_dir: ft.is_dir() });
+    }
+
+    // Determine timestamps to keep (newest first).
+    let mut timestamps: Vec<u64> = items.iter().map(|i| i.ts).collect();
+    timestamps.sort_unstable();
+    timestamps.dedup();
+    timestamps.sort_unstable_by(|a, b| b.cmp(a));
+    let keep: std::collections::HashSet<u64> = timestamps.into_iter().take(retain).collect();
+
+    let mut deleted = 0usize;
+    for item in items {
+        if keep.contains(&item.ts) {
+            continue;
+        }
+        if item.is_dir {
+            let _ = std::fs::remove_dir_all(&item.path);
+        } else {
+            let _ = std::fs::remove_file(&item.path);
+        }
+        deleted += 1;
+    }
+
+    println!("snapshot_ok: true");
+    println!("snapshot_dir: {}", snapshot_dir.display());
+    println!("archive_path: {}", archive_path.display());
+    println!("archive_url: {}", archive_url);
+    println!("retained: {}", retain);
+    println!("deleted: {}", deleted);
+    Ok(())
+}
+
 pub async fn show_receipt(tx_hash: &str, rpc_url: &str) -> Result<()> {
     get_receipt(tx_hash, rpc_url).await
 }

@@ -61,6 +61,21 @@ If your RPC node should advertise a downloadable snapshot to new nodes, publish 
 
 Then clients can query `catalyst_getSnapshotInfo` from RPC.
 
+### 3c) Recommended: one-shot create+archive+publish (with retention)
+
+This is the operator-friendly way to keep a “latest snapshot” published:
+
+```bash
+./target/release/catalyst-cli snapshot-make-latest \
+  --data-dir /var/lib/catalyst/eu/data \
+  --out-base-dir /var/lib/catalyst/eu/snapshots \
+  --archive-url-base https://<your-host>/snapshots \
+  --retain 3
+```
+
+You still need to serve `/var/lib/catalyst/eu/snapshots/*.tar` over HTTP(S) (e.g. nginx/caddy).
+After this runs, `catalyst_getSnapshotInfo` points at the newest archive URL.
+
 ### 4) Restore on the destination node
 
 Stop the node if it is running, then restore:

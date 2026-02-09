@@ -181,6 +181,21 @@ enum Commands {
         #[arg(long)]
         work_dir: Option<PathBuf>,
     },
+    /// Create+archive a new snapshot and publish it to RPC (with retention cleanup)
+    SnapshotMakeLatest {
+        /// Data directory (same as config.storage.data_dir) of the RPC node
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Base directory to write snapshot directories and tar archives into
+        #[arg(long)]
+        out_base_dir: PathBuf,
+        /// Base URL that serves files from out_base_dir (no trailing slash required)
+        #[arg(long)]
+        archive_url_base: String,
+        /// How many snapshots/archives to retain in out_base_dir
+        #[arg(long, default_value_t = 3)]
+        retain: usize,
+    },
     /// Show a transaction receipt/status (and inclusion proof when applied)
     Receipt {
         /// Transaction hash (tx_id)
@@ -416,6 +431,9 @@ async fn main() -> Result<()> {
         }
         Commands::SyncFromSnapshot { rpc_url, data_dir, work_dir } => {
             commands::sync_from_snapshot(&rpc_url, &data_dir, work_dir.as_deref()).await?;
+        }
+        Commands::SnapshotMakeLatest { data_dir, out_base_dir, archive_url_base, retain } => {
+            commands::snapshot_make_latest(&data_dir, &out_base_dir, &archive_url_base, retain).await?;
         }
         Commands::Receipt { tx_hash, rpc_url } => {
             commands::show_receipt(&tx_hash, &rpc_url).await?;
