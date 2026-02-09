@@ -5,6 +5,9 @@ use anyhow::Result;
 /// Complete node configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
+    /// Protocol / chain identity configuration
+    pub protocol: ProtocolConfig,
+    
     /// Node identity and role
     pub node: NodeIdentityConfig,
     
@@ -34,6 +37,15 @@ pub struct NodeConfig {
     
     /// Whether to run as validator
     pub validator: bool,
+}
+
+/// Protocol and chain identity configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtocolConfig {
+    /// Stable chain id (used for EVM domain separation and client tooling).
+    pub chain_id: u64,
+    /// Human-readable network id (e.g. "tna_testnet", "local", "mainnet").
+    pub network_id: String,
 }
 
 /// Node identity and basic settings
@@ -328,6 +340,10 @@ pub struct LoggingConfig {
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
+            protocol: ProtocolConfig {
+                chain_id: 31337,
+                network_id: "tna_testnet".to_string(),
+            },
             node: NodeIdentityConfig {
                 name: "catalyst-node".to_string(),
                 private_key_file: PathBuf::from("node.key"),
@@ -507,6 +523,13 @@ impl NodeConfig {
     
     /// Validate configuration
     pub fn validate(&self) -> Result<()> {
+        if self.protocol.chain_id == 0 {
+            return Err(anyhow::anyhow!("protocol.chain_id must be > 0"));
+        }
+        if self.protocol.network_id.trim().is_empty() {
+            return Err(anyhow::anyhow!("protocol.network_id must be non-empty"));
+        }
+
         // Validate network configuration
         if self.network.max_peers < self.network.min_peers {
             return Err(anyhow::anyhow!("max_peers must be >= min_peers"));

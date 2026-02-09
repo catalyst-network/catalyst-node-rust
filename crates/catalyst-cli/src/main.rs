@@ -133,6 +133,84 @@ enum Commands {
         #[arg(long, default_value = "http://localhost:8545")]
         rpc_url: String,
     },
+    /// Backup node database to a directory (snapshot export)
+    DbBackup {
+        /// Data directory (same as config.storage.data_dir)
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Output directory for the backup
+        #[arg(long)]
+        out_dir: PathBuf,
+        /// Optional tar archive output path for distribution
+        #[arg(long)]
+        archive: Option<PathBuf>,
+    },
+    /// Restore node database from a backup directory (snapshot import)
+    DbRestore {
+        /// Data directory (same as config.storage.data_dir)
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Backup directory to restore from
+        #[arg(long)]
+        from_dir: PathBuf,
+    },
+    /// Publish snapshot metadata into the node DB (served via RPC for fast-sync tooling)
+    SnapshotPublish {
+        /// Data directory (same as config.storage.data_dir) of the RPC node
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Snapshot directory created by `db-backup` (contains *.snapshot and *_data)
+        #[arg(long)]
+        snapshot_dir: PathBuf,
+        /// URL where the snapshot archive can be downloaded
+        #[arg(long)]
+        archive_url: String,
+        /// Path to the tar archive file (used to compute sha256/bytes)
+        #[arg(long)]
+        archive_path: PathBuf,
+        /// Optional TTL for this snapshot advertisement (seconds)
+        #[arg(long)]
+        ttl_seconds: Option<u64>,
+    },
+    /// Download the published snapshot archive and restore it locally
+    SyncFromSnapshot {
+        /// RPC endpoint to fetch snapshot info from
+        #[arg(long, default_value = "http://localhost:8545")]
+        rpc_url: String,
+        /// Data directory to restore into (same as config.storage.data_dir)
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Directory to download/extract into (defaults to /tmp)
+        #[arg(long)]
+        work_dir: Option<PathBuf>,
+    },
+    /// Create+archive a new snapshot and publish it to RPC (with retention cleanup)
+    SnapshotMakeLatest {
+        /// Data directory (same as config.storage.data_dir) of the RPC node
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Base directory to write snapshot directories and tar archives into
+        #[arg(long)]
+        out_base_dir: PathBuf,
+        /// Base URL that serves files from out_base_dir (no trailing slash required)
+        #[arg(long)]
+        archive_url_base: String,
+        /// How many snapshots/archives to retain in out_base_dir
+        #[arg(long, default_value_t = 3)]
+        retain: usize,
+        /// Optional TTL for the published snapshot advertisement (seconds)
+        #[arg(long)]
+        ttl_seconds: Option<u64>,
+    },
+    /// Serve snapshot archives over HTTP (simple sidecar, supports Range requests)
+    SnapshotServe {
+        /// Directory containing `*.tar` archives
+        #[arg(long)]
+        dir: PathBuf,
+        /// Bind address, e.g. 0.0.0.0:8090
+        #[arg(long, default_value = "0.0.0.0:8090")]
+        bind: String,
+    },
     /// Show a transaction receipt/status (and inclusion proof when applied)
     Receipt {
         /// Transaction hash (tx_id)
@@ -356,6 +434,24 @@ async fn main() -> Result<()> {
         }
         Commands::Peers { rpc_url } => {
             commands::show_peers(&rpc_url).await?;
+        }
+        Commands::DbBackup { data_dir, out_dir, archive } => {
+            commands::db_backup(&data_dir, &out_dir, archive.as_deref()).await?;
+        }
+        Commands::DbRestore { data_dir, from_dir } => {
+            commands::db_restore(&data_dir, &from_dir).await?;
+        }
+        Commands::SnapshotPublish { data_dir, snapshot_dir, archive_url, archive_path, ttl_seconds } => {
+            commands::snapshot_publish(&data_dir, &snapshot_dir, &archive_url, &archive_path, ttl_seconds).await?;
+        }
+        Commands::SyncFromSnapshot { rpc_url, data_dir, work_dir } => {
+            commands::sync_from_snapshot(&rpc_url, &data_dir, work_dir.as_deref()).await?;
+        }
+        Commands::SnapshotMakeLatest { data_dir, out_base_dir, archive_url_base, retain, ttl_seconds } => {
+            commands::snapshot_make_latest(&data_dir, &out_base_dir, &archive_url_base, retain, ttl_seconds).await?;
+        }
+        Commands::SnapshotServe { dir, bind } => {
+            commands::snapshot_serve(&dir, &bind).await?;
         }
         Commands::Receipt { tx_hash, rpc_url } => {
             commands::show_receipt(&tx_hash, &rpc_url).await?;

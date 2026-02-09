@@ -12,12 +12,45 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{BlockHash, NodeId, Timestamp};
 
+use catalyst_utils::{
+    CatalystDeserialize, CatalystSerialize, impl_catalyst_serialize,
+    error::{CatalystError, CatalystResult},
+};
+
+pub const TX_WIRE_MAGIC_V1: [u8; 4] = *b"CTX1";
+pub const TX_SIG_DOMAIN_V1: &[u8] = b"CATALYST_SIG_V1";
+
 /// Canonical signing payload for a transaction: `bincode(TransactionCore) || timestamp_le`.
 ///
 /// This is a temporary “real signature validation” step while aggregated signatures and
 /// signature-hash trees are still being completed across crates.
 pub fn transaction_signing_payload(core: &TransactionCore, timestamp: u64) -> Result<Vec<u8>, String> {
     let mut out = bincode::serialize(core).map_err(|e| format!("serialize core: {e}"))?;
+    out.extend_from_slice(&timestamp.to_le_bytes());
+    Ok(out)
+}
+
+/// V1 signing payload for external wallets: deterministic and domain-separated.
+///
+/// Format:
+/// - domain = "CATALYST_SIG_V1"
+/// - chain_id (u64 le)
+/// - genesis_hash (32 bytes)
+/// - core (CatalystSerialize)
+/// - timestamp (u64 le)
+pub fn transaction_signing_payload_v1(
+    core: &TransactionCore,
+    timestamp: u64,
+    chain_id: u64,
+    genesis_hash: [u8; 32],
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    out.extend_from_slice(TX_SIG_DOMAIN_V1);
+    out.extend_from_slice(&chain_id.to_le_bytes());
+    out.extend_from_slice(&genesis_hash);
+    let core_bytes = CatalystSerialize::serialize(core)
+        .map_err(|e| format!("serialize core v1: {e}"))?;
+    out.extend_from_slice(&core_bytes);
     out.extend_from_slice(&timestamp.to_le_bytes());
     Ok(out)
 }
@@ -46,6 +79,54 @@ pub enum TransactionType {
     WorkerRegistration,
 }
 
+impl CatalystSerialize for TransactionType {
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        let mut out = Vec::with_capacity(1);
+        self.serialize_to(&mut out)?;
+        Ok(out)
+    }
+
+    fn serialize_to<W: std::io::Write>(&self, writer: &mut W) -> CatalystResult<()> {
+        let tag: u8 = match self {
+            TransactionType::NonConfidentialTransfer => 0,
+            TransactionType::ConfidentialTransfer => 1,
+            TransactionType::DataStorageRequest => 2,
+            TransactionType::DataStorageRetrieve => 3,
+            TransactionType::SmartContract => 4,
+            TransactionType::WorkerRegistration => 5,
+        };
+        tag.serialize_to(writer)
+    }
+
+    fn serialized_size(&self) -> usize {
+        1
+    }
+}
+
+impl CatalystDeserialize for TransactionType {
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        let mut cursor = std::io::Cursor::new(data);
+        Self::deserialize_from(&mut cursor)
+    }
+
+    fn deserialize_from<R: std::io::Read>(reader: &mut R) -> CatalystResult<Self> {
+        let tag = u8::deserialize_from(reader)?;
+        Ok(match tag {
+            0 => TransactionType::NonConfidentialTransfer,
+            1 => TransactionType::ConfidentialTransfer,
+            2 => TransactionType::DataStorageRequest,
+            3 => TransactionType::DataStorageRetrieve,
+            4 => TransactionType::SmartContract,
+            5 => TransactionType::WorkerRegistration,
+            _ => {
+                return Err(CatalystError::Serialization(format!(
+                    "invalid TransactionType tag: {tag}"
+                )))
+            }
+        })
+    }
+}
+
 /// Amount component of an entry (§4.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryAmount {
@@ -61,6 +142,65 @@ pub enum EntryAmount {
     },
 }
 
+impl CatalystSerialize for EntryAmount {
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        let mut out = Vec::with_capacity(self.serialized_size());
+        self.serialize_to(&mut out)?;
+        Ok(out)
+    }
+
+    fn serialize_to<W: std::io::Write>(&self, writer: &mut W) -> CatalystResult<()> {
+        match self {
+            EntryAmount::NonConfidential(v) => {
+                0u8.serialize_to(writer)?;
+                v.serialize_to(writer)?;
+            }
+            EntryAmount::Confidential {
+                commitment,
+                range_proof,
+            } => {
+                1u8.serialize_to(writer)?;
+                commitment.serialize_to(writer)?;
+                range_proof.serialize_to(writer)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn serialized_size(&self) -> usize {
+        match self {
+            EntryAmount::NonConfidential(_) => 1 + 8,
+            EntryAmount::Confidential {
+                commitment: _,
+                range_proof,
+            } => 1 + 32 + range_proof.serialized_size(),
+        }
+    }
+}
+
+impl CatalystDeserialize for EntryAmount {
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        let mut cursor = std::io::Cursor::new(data);
+        Self::deserialize_from(&mut cursor)
+    }
+
+    fn deserialize_from<R: std::io::Read>(reader: &mut R) -> CatalystResult<Self> {
+        let tag = u8::deserialize_from(reader)?;
+        Ok(match tag {
+            0 => EntryAmount::NonConfidential(i64::deserialize_from(reader)?),
+            1 => EntryAmount::Confidential {
+                commitment: <[u8; 32]>::deserialize_from(reader)?,
+                range_proof: Vec::<u8>::deserialize_from(reader)?,
+            },
+            _ => {
+                return Err(CatalystError::Serialization(format!(
+                    "invalid EntryAmount tag: {tag}"
+                )))
+            }
+        })
+    }
+}
+
 /// Transaction entry (§4.3): public key + amount.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransactionEntry {
@@ -69,12 +209,38 @@ pub struct TransactionEntry {
     pub amount: EntryAmount,
 }
 
+impl_catalyst_serialize!(TransactionEntry, public_key, amount);
+
 /// Aggregated signature (§4.4). Opaque 64-byte signature for now.
 ///
 /// NOTE: We store this as `Vec<u8>` because `serde` doesn't implement (de)serialization
 /// for arrays > 32 by default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregatedSignature(pub Vec<u8>);
+
+impl CatalystSerialize for AggregatedSignature {
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        CatalystSerialize::serialize(&self.0)
+    }
+
+    fn serialize_to<W: std::io::Write>(&self, writer: &mut W) -> CatalystResult<()> {
+        self.0.serialize_to(writer)
+    }
+
+    fn serialized_size(&self) -> usize {
+        self.0.serialized_size()
+    }
+}
+
+impl CatalystDeserialize for AggregatedSignature {
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        Ok(Self(<Vec<u8> as CatalystDeserialize>::deserialize(data)?))
+    }
+
+    fn deserialize_from<R: std::io::Read>(reader: &mut R) -> CatalystResult<Self> {
+        Ok(Self(Vec::<u8>::deserialize_from(reader)?))
+    }
+}
 
 /// Transaction core message fields (§4.2) excluding signature and timestamp.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +257,8 @@ pub struct TransactionCore {
     pub data: Vec<u8>,
 }
 
+impl_catalyst_serialize!(TransactionCore, tx_type, entries, nonce, lock_time, fees, data);
+
 /// Catalyst transaction (§4.2): core + aggregated signature + timestamp.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
@@ -98,6 +266,36 @@ pub struct Transaction {
     pub signature: AggregatedSignature,
     /// Timestamp (paper uses 4 bytes). We keep u64 for convenience.
     pub timestamp: u64,
+}
+
+impl_catalyst_serialize!(Transaction, core, signature, timestamp);
+
+pub fn encode_wire_tx_v1(tx: &Transaction) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&TX_WIRE_MAGIC_V1);
+    let body = CatalystSerialize::serialize(tx).map_err(|e| format!("serialize tx v1: {e}"))?;
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+pub fn decode_wire_tx_any(bytes: &[u8]) -> Result<Transaction, String> {
+    if bytes.len() >= 4 && bytes[0..4] == TX_WIRE_MAGIC_V1 {
+        return <Transaction as CatalystDeserialize>::deserialize(&bytes[4..])
+            .map_err(|e| format!("decode v1 tx: {e}"));
+    }
+    // Legacy: bincode(Transaction)
+    bincode::deserialize::<Transaction>(bytes).map_err(|e| format!("decode legacy tx: {e}"))
+}
+
+pub fn tx_id_v1(tx: &Transaction) -> Result<[u8; 32], String> {
+    use blake2::{Blake2b512, Digest};
+    let bytes = encode_wire_tx_v1(tx)?;
+    let mut h = Blake2b512::new();
+    h.update(&bytes);
+    let out = h.finalize();
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&out[..32]);
+    Ok(id)
 }
 
 /// Deterministic minimum fee schedule for the current implementation.
@@ -206,6 +404,10 @@ impl Transaction {
 
     pub fn signing_payload(&self) -> Result<Vec<u8>, String> {
         transaction_signing_payload(&self.core, self.timestamp)
+    }
+
+    pub fn signing_payload_v1(&self, chain_id: u64, genesis_hash: [u8; 32]) -> Result<Vec<u8>, String> {
+        transaction_signing_payload_v1(&self.core, self.timestamp, chain_id, genesis_hash)
     }
 }
 
@@ -331,6 +533,42 @@ mod tests {
         // If we ask for more than we have, we should just get all of them.
         let all = select_producers_for_next_cycle(&workers, &seed, 999);
         assert_eq!(all.len(), workers.len());
+    }
+
+    #[test]
+    fn wallet_tx_v1_wire_roundtrip_and_txid_is_deterministic() {
+        let from = [1u8; 32];
+        let to = [2u8; 32];
+        let tx = Transaction {
+            core: TransactionCore {
+                tx_type: TransactionType::NonConfidentialTransfer,
+                entries: vec![
+                    TransactionEntry {
+                        public_key: from,
+                        amount: EntryAmount::NonConfidential(-7),
+                    },
+                    TransactionEntry {
+                        public_key: to,
+                        amount: EntryAmount::NonConfidential(7),
+                    },
+                ],
+                nonce: 1,
+                lock_time: 0,
+                fees: 3,
+                data: Vec::new(),
+            },
+            signature: AggregatedSignature(vec![0u8; 64]),
+            timestamp: 1_700_000_000_000u64,
+        };
+
+        let wire = encode_wire_tx_v1(&tx).unwrap();
+        assert!(wire.starts_with(&TX_WIRE_MAGIC_V1));
+        let decoded = decode_wire_tx_any(&wire).unwrap();
+        assert_eq!(decoded, tx);
+
+        let txid1 = tx_id_v1(&tx).unwrap();
+        let txid2 = tx_id_v1(&tx).unwrap();
+        assert_eq!(txid1, txid2);
     }
 }
 

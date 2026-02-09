@@ -393,14 +393,24 @@ pub struct Mempool {
     by_id: HashMap<Hash, MempoolItem>,
     ttl: Duration,
     max_txs: usize,
+    max_per_sender: usize,
+    drops_full: u64,
+    drops_per_sender: u64,
 }
 
 impl Mempool {
     pub fn new(ttl: Duration, max_txs: usize) -> Self {
+        let max_per_sender = std::env::var("CATALYST_MEMPOOL_MAX_PER_SENDER")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(64);
         Self {
             by_id: HashMap::new(),
             ttl,
             max_txs: max_txs.max(1),
+            max_per_sender: max_per_sender.max(1),
+            drops_full: 0,
+            drops_per_sender: 0,
         }
     }
 
@@ -434,10 +444,24 @@ impl Mempool {
 
         self.evict_expired();
         if self.by_id.len() >= self.max_txs {
+            self.drops_full = self.drops_full.saturating_add(1);
             return false;
         }
         if self.by_id.contains_key(&tx.tx_id) {
             return false;
+        }
+
+        if let Some(sender) = tx.sender_pubkey() {
+            let mut count = 0usize;
+            for item in self.by_id.values() {
+                if item.sender_pubkey == Some(sender) {
+                    count = count.saturating_add(1);
+                }
+            }
+            if count >= self.max_per_sender {
+                self.drops_per_sender = self.drops_per_sender.saturating_add(1);
+                return false;
+            }
         }
 
         self.by_id.insert(
@@ -517,6 +541,10 @@ impl Mempool {
 
     pub fn len(&self) -> usize {
         self.by_id.len()
+    }
+
+    pub fn drop_stats(&self) -> (u64, u64) {
+        (self.drops_full, self.drops_per_sender)
     }
 }
 

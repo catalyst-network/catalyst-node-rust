@@ -45,6 +45,13 @@ sha2 = "0.10"
 # Async runtime
 futures = "0.3"
 jsonrpsee = { version = "0.21", features = ["http-client"] }
+reqwest = { version = "0.13.2", features = ["json", "rustls", "stream"], default-features = false }
+tar = "0.4.44"
+hyper = { version = "1.8.1", features = ["http1", "server"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+http-body-util = "0.1.3"
+bytes = "1.11.1"
+tokio-util = { workspace = true, features = ["io"] }
 
 [features]
 default = []

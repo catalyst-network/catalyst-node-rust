@@ -225,6 +225,7 @@ fn persist_state(store: &StorageManager, state: EvmState) -> impl std::future::F
 pub async fn execute_deploy_and_persist(
     store: &StorageManager,
     from: Address,
+    chain_id: u64,
     protocol_nonce: u64,
     init_code: Vec<u8>,
     gas_limit: u64,
@@ -252,7 +253,7 @@ pub async fn execute_deploy_and_persist(
             .gas_price(0u128)
             .kind(TxKind::Create)
             .data(Bytes::from(init_code))
-            .chain_id(Some(31337))
+            .chain_id(Some(chain_id))
             .build_fill();
 
         let out = evm
@@ -325,6 +326,7 @@ pub async fn execute_call_and_persist(
     store: &StorageManager,
     from: Address,
     to: Address,
+    chain_id: u64,
     protocol_nonce: u64,
     input: Vec<u8>,
     gas_limit: u64,
@@ -352,7 +354,7 @@ pub async fn execute_call_and_persist(
             .gas_price(0u128)
             .kind(TxKind::Call(to))
             .data(Bytes::from(input))
-            .chain_id(Some(31337))
+            .chain_id(Some(chain_id))
             .build_fill();
 
         evm.transact(tx)

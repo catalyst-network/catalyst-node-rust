@@ -13,9 +13,17 @@ use jsonrpsee::{
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Mutex;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+const META_PROTOCOL_CHAIN_ID: &str = "protocol:chain_id";
+const META_PROTOCOL_NETWORK_ID: &str = "protocol:network_id";
+const META_PROTOCOL_GENESIS_HASH: &str = "protocol:genesis_hash";
+const META_SNAPSHOT_LATEST: &str = "snapshot:latest";
+
+const RPC_ERR_RATE_LIMITED_CODE: i32 = -32029;
 
 // Note: The initial scaffold referenced sub-modules (`methods`, `server`, `types`) that
 // aren't present yet. Keeping the RPC types and traits in this file for now so the
@@ -35,6 +43,8 @@ pub enum RpcServerError {
     AccountNotFound(String),
     #[error("Network error: {0}")]
     Network(String),
+    #[error("Rate limited")]
+    RateLimited,
 }
 
 impl From<RpcServerError> for ErrorObjectOwned {
@@ -46,6 +56,9 @@ impl From<RpcServerError> for ErrorObjectOwned {
         match err {
             RpcServerError::InvalidParams(msg) => {
                 ErrorObjectOwned::owned(INVALID_PARAMS_CODE, msg, None::<()>)
+            }
+            RpcServerError::RateLimited => {
+                ErrorObjectOwned::owned(RPC_ERR_RATE_LIMITED_CODE, err.to_string(), None::<()>)
             }
             RpcServerError::TransactionNotFound(_) |
             RpcServerError::BlockNotFound(_) |
@@ -90,6 +103,26 @@ impl Default for RpcConfig {
 /// Main RPC API trait defining all available methods
 #[rpc(server)]
 pub trait CatalystRpc {
+    /// Get the chain id (EVM domain separation; tooling identity).
+    #[method(name = "catalyst_chainId")]
+    async fn chain_id(&self) -> RpcResult<String>;
+
+    /// Get the network id (human-readable network identity).
+    #[method(name = "catalyst_networkId")]
+    async fn network_id(&self) -> RpcResult<String>;
+
+    /// Get the genesis hash (stable chain identity hash; best-effort for legacy DBs).
+    #[method(name = "catalyst_genesisHash")]
+    async fn genesis_hash(&self) -> RpcResult<String>;
+
+    /// Get sync/snapshot metadata needed for fast-sync verification.
+    #[method(name = "catalyst_getSyncInfo")]
+    async fn get_sync_info(&self) -> RpcResult<RpcSyncInfo>;
+
+    /// Get published snapshot info for fast sync (if the node operator published one).
+    #[method(name = "catalyst_getSnapshotInfo")]
+    async fn get_snapshot_info(&self) -> RpcResult<Option<RpcSnapshotInfo>>;
+
     /// Get the current block number
     #[method(name = "catalyst_blockNumber")]
     async fn block_number(&self) -> RpcResult<u64>;
@@ -209,6 +242,42 @@ pub struct RpcHead {
     pub applied_lsu_hash: String,
     pub applied_state_root: String,
     pub last_lsu_cid: Option<String>,
+}
+
+/// Sync metadata used by snapshot-based fast sync tooling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcSyncInfo {
+    pub chain_id: String,
+    pub network_id: String,
+    pub genesis_hash: String,
+    pub head: RpcHead,
+}
+
+/// Operator-published snapshot metadata for fast sync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcSnapshotInfo {
+    pub version: u32,
+    pub created_at_ms: u64,
+    /// When this snapshot was published/advertised by the operator.
+    #[serde(default)]
+    pub published_at_ms: u64,
+    /// Optional expiry time for this snapshot ad (clients should ignore if expired).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+    pub chain_id: String,
+    pub network_id: String,
+    pub genesis_hash: String,
+    pub applied_cycle: u64,
+    pub applied_lsu_hash: String,
+    pub applied_state_root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_lsu_cid: Option<String>,
+    /// Download URL for a tar archive that extracts to a snapshot directory.
+    pub archive_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_bytes: Option<u64>,
 }
 
 /// RPC transaction request structure
@@ -423,7 +492,11 @@ fn evm_storage_key(addr20: &[u8; 20], slot32: &[u8; 32]) -> Vec<u8> {
     k
 }
 
-fn verify_tx_signature(tx: &catalyst_core::protocol::Transaction) -> bool {
+fn verify_tx_signature_with_domain(
+    tx: &catalyst_core::protocol::Transaction,
+    chain_id: u64,
+    genesis_hash: [u8; 32],
+) -> bool {
     use catalyst_crypto::signatures::SignatureScheme;
 
     // Determine sender:
@@ -469,11 +542,18 @@ fn verify_tx_signature(tx: &catalyst_core::protocol::Transaction) -> bool {
         Ok(pk) => pk,
         Err(_) => return false,
     };
-    let payload = match tx.signing_payload() {
+
+    // Prefer v1 domain-separated payload; fall back to legacy.
+    if let Ok(p) = tx.signing_payload_v1(chain_id, genesis_hash) {
+        if SignatureScheme::new().verify(&p, &sig, &sender_pk).unwrap_or(false) {
+            return true;
+        }
+    }
+    let legacy = match tx.signing_payload() {
         Ok(p) => p,
         Err(_) => return false,
     };
-    SignatureScheme::new().verify(&payload, &sig, &sender_pk).unwrap_or(false)
+    SignatureScheme::new().verify(&legacy, &sig, &sender_pk).unwrap_or(false)
 }
 
 fn tx_sender_pubkey(tx: &catalyst_core::protocol::Transaction) -> Option<[u8; 32]> {
@@ -503,6 +583,49 @@ pub struct CatalystRpcImpl {
     storage: Arc<catalyst_storage::StorageManager>,
     network: Option<Arc<catalyst_network::NetworkService>>,
     tx_submit: Option<mpsc::UnboundedSender<catalyst_core::protocol::Transaction>>,
+    limiter: Arc<RpcLimiters>,
+    _global_rps: u32,
+    sender_rps: u32,
+}
+
+struct RpcLimiters {
+    global: Mutex<catalyst_utils::utils::RateLimiter>,
+    by_sender: Mutex<std::collections::HashMap<[u8; 32], catalyst_utils::utils::RateLimiter>>,
+    drops_global: AtomicU64,
+    drops_sender: AtomicU64,
+}
+
+impl RpcLimiters {
+    fn new(global_rps: u32, _sender_rps: u32) -> Self {
+        let global_rps = global_rps.max(1);
+        Self {
+            global: Mutex::new(catalyst_utils::utils::RateLimiter::new(global_rps, global_rps)),
+            by_sender: Mutex::new(std::collections::HashMap::new()),
+            drops_global: AtomicU64::new(0),
+            drops_sender: AtomicU64::new(0),
+        }
+    }
+
+    async fn acquire_global(&self, cost: u32) -> bool {
+        let mut g = self.global.lock().await;
+        let ok = g.try_acquire(cost.max(1));
+        if !ok {
+            self.drops_global.fetch_add(1, Ordering::Relaxed);
+        }
+        ok
+    }
+
+    async fn acquire_sender(&self, sender: [u8; 32], cost: u32, sender_rps: u32) -> bool {
+        let mut map = self.by_sender.lock().await;
+        let lim = map
+            .entry(sender)
+            .or_insert_with(|| catalyst_utils::utils::RateLimiter::new(sender_rps.max(1), sender_rps.max(1)));
+        let ok = lim.try_acquire(cost.max(1));
+        if !ok {
+            self.drops_sender.fetch_add(1, Ordering::Relaxed);
+        }
+        ok
+    }
 }
 
 impl CatalystRpcImpl {
@@ -510,17 +633,86 @@ impl CatalystRpcImpl {
         storage: Arc<catalyst_storage::StorageManager>,
         network: Option<Arc<catalyst_network::NetworkService>>,
         tx_submit: Option<mpsc::UnboundedSender<catalyst_core::protocol::Transaction>>,
+        global_rps: u32,
+        sender_rps: u32,
     ) -> Self {
         Self {
             storage,
             network,
             tx_submit,
+            limiter: Arc::new(RpcLimiters::new(global_rps, sender_rps)),
+            _global_rps: global_rps,
+            sender_rps,
         }
     }
 }
 
 #[async_trait]
 impl CatalystRpcServer for CatalystRpcImpl {
+    async fn chain_id(&self) -> RpcResult<String> {
+        let cid = self
+            .storage
+            .get_metadata(META_PROTOCOL_CHAIN_ID)
+            .await
+            .ok()
+            .flatten()
+            .map(|b| decode_u64_le(&b))
+            .unwrap_or(31337);
+        Ok(format!("0x{:x}", cid))
+    }
+
+    async fn network_id(&self) -> RpcResult<String> {
+        let nid = self
+            .storage
+            .get_metadata(META_PROTOCOL_NETWORK_ID)
+            .await
+            .ok()
+            .flatten()
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        Ok(nid)
+    }
+
+    async fn genesis_hash(&self) -> RpcResult<String> {
+        let gh = self
+            .storage
+            .get_metadata(META_PROTOCOL_GENESIS_HASH)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if gh.len() == 32 {
+            Ok(format!("0x{}", hex::encode(gh)))
+        } else {
+            Ok("0x0".to_string())
+        }
+    }
+
+    async fn get_sync_info(&self) -> RpcResult<RpcSyncInfo> {
+        Ok(RpcSyncInfo {
+            chain_id: self.chain_id().await?,
+            network_id: self.network_id().await?,
+            genesis_hash: self.genesis_hash().await?,
+            head: self.head().await?,
+        })
+    }
+
+    async fn get_snapshot_info(&self) -> RpcResult<Option<RpcSnapshotInfo>> {
+        let Some(bytes) = self
+            .storage
+            .get_metadata(META_SNAPSHOT_LATEST)
+            .await
+            .ok()
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        let s = String::from_utf8_lossy(&bytes).to_string();
+        let info = serde_json::from_str::<RpcSnapshotInfo>(&s)
+            .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())))?;
+        Ok(Some(info))
+    }
+
     async fn block_number(&self) -> RpcResult<u64> {
         let n = self
             .storage
@@ -566,6 +758,11 @@ impl CatalystRpcServer for CatalystRpcImpl {
         count: u64,
         full_transactions: bool,
     ) -> RpcResult<Vec<RpcBlock>> {
+        // Throttle proportional to requested work.
+        let cost = 1u32.saturating_add((count.min(10_000) / 100) as u32);
+        if !self.limiter.acquire_global(cost).await {
+            return Err(ErrorObjectOwned::from(RpcServerError::RateLimited));
+        }
         let mut out: Vec<RpcBlock> = Vec::new();
         let count = count.min(10_000); // hard cap to protect node
         for i in 0..count {
@@ -699,6 +896,10 @@ impl CatalystRpcServer for CatalystRpcImpl {
         from_cycle: Option<u64>,
         limit: u64,
     ) -> RpcResult<Vec<RpcTransactionSummary>> {
+        let cost = 1u32.saturating_add((limit.min(5_000) / 10) as u32);
+        if !self.limiter.acquire_global(cost).await {
+            return Err(ErrorObjectOwned::from(RpcServerError::RateLimited));
+        }
         let pk = parse_hex_32(&address).map_err(ErrorObjectOwned::from)?;
         let head = self.block_number().await.unwrap_or(0);
         let mut cycle = from_cycle.unwrap_or(head);
@@ -820,11 +1021,16 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn send_raw_transaction(&self, _data: String) -> RpcResult<String> {
-        // Accept hex-encoded bincode(Transaction) for now (dev transport).
+        // Global throttling: protect CPU/memory under load.
+        if !self.limiter.acquire_global(1).await {
+            return Err(ErrorObjectOwned::from(RpcServerError::RateLimited));
+        }
+
+        // Accept hex-encoded legacy bincode(Transaction) OR v1 canonical wire tx (CTX1...).
         let bytes = parse_hex_bytes(&_data).map_err(ErrorObjectOwned::from)?;
-        let tx: catalyst_core::protocol::Transaction = bincode::deserialize(&bytes).map_err(
-            |e: bincode::Error| ErrorObjectOwned::from(RpcServerError::InvalidParams(e.to_string())),
-        )?;
+        let tx: catalyst_core::protocol::Transaction =
+            catalyst_core::protocol::decode_wire_tx_any(&bytes)
+                .map_err(|e| ErrorObjectOwned::from(RpcServerError::InvalidParams(e)))?;
 
         // Basic format + fee floor checks.
         tx.validate_basic()
@@ -837,7 +1043,31 @@ impl CatalystRpcServer for CatalystRpcImpl {
             ))));
         }
 
-        if !verify_tx_signature(&tx) {
+        let chain_id = self
+            .storage
+            .get_metadata(META_PROTOCOL_CHAIN_ID)
+            .await
+            .ok()
+            .flatten()
+            .map(|b| decode_u64_le(&b))
+            .unwrap_or(31337);
+        let genesis_hash = self
+            .storage
+            .get_metadata(META_PROTOCOL_GENESIS_HASH)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| {
+                if b.len() != 32 {
+                    return None;
+                }
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&b);
+                Some(out)
+            })
+            .unwrap_or([0u8; 32]);
+
+        if !verify_tx_signature_with_domain(&tx, chain_id, genesis_hash) {
             return Err(ErrorObjectOwned::from(RpcServerError::InvalidParams(
                 "Invalid transaction signature".to_string(),
             )));
@@ -847,6 +1077,15 @@ impl CatalystRpcServer for CatalystRpcImpl {
         // - reject nonce <= committed nonce for sender
         // (node/mempool also enforces sequential nonces)
         if let Some(sender_pk) = tx_sender_pubkey(&tx) {
+            // Per-sender throttling: stop single-key spam even behind NAT.
+            if !self
+                .limiter
+                .acquire_sender(sender_pk, 1, self.sender_rps)
+                .await
+            {
+                return Err(ErrorObjectOwned::from(RpcServerError::RateLimited));
+            }
+
             let mut k = b"nonce:".to_vec();
             k.extend_from_slice(&sender_pk);
             let committed = self
@@ -863,8 +1102,9 @@ impl CatalystRpcServer for CatalystRpcImpl {
             }
         }
 
-        // tx_id = blake2b512(bincode(tx))[..32] (must match node/mempool).
-        let txid = tx_id_blake2b_32(&bytes);
+        // tx_id = blake2b512(CTX1 || canonical_tx_bytes)[..32]
+        let txid = catalyst_core::protocol::tx_id_v1(&tx)
+            .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e)))?;
         let tx_id = format!("0x{}", hex::encode(txid));
 
         // Persist tx raw + meta so clients can poll receipt immediately (best-effort).
@@ -888,7 +1128,11 @@ impl CatalystRpcServer for CatalystRpcImpl {
             evm_gas_used: None,
             evm_return: None,
         };
-        let _ = self.storage.set_metadata(&tx_raw_key(&txid), &bytes).await;
+        // Persist in internal format (bincode) for node/RPC decoding.
+        let ser = bincode::serialize(&tx).map_err(|e: bincode::Error| {
+            ErrorObjectOwned::from(RpcServerError::Server(e.to_string()))
+        })?;
+        let _ = self.storage.set_metadata(&tx_raw_key(&txid), &ser).await;
         if let Ok(mbytes) = bincode::serialize(&meta) {
             let _ = self.storage.set_metadata(&tx_meta_key(&txid), &mbytes).await;
         }
@@ -1166,16 +1410,6 @@ fn tx_participants(tx: &catalyst_core::protocol::Transaction) -> Vec<[u8; 32]> {
     }
 }
 
-fn tx_id_blake2b_32(bytes: &[u8]) -> [u8; 32] {
-    use blake2::{Blake2b512, Digest};
-    let mut h = Blake2b512::new();
-    h.update(bytes);
-    let out = h.finalize();
-    let mut id = [0u8; 32];
-    id.copy_from_slice(&out[..32]);
-    id
-}
-
 fn tx_raw_key(txid: &[u8; 32]) -> String {
     format!("tx:raw:{}", hex::encode(txid))
 }
@@ -1381,13 +1615,15 @@ pub async fn start_rpc_http(
     storage: Arc<catalyst_storage::StorageManager>,
     network: Option<Arc<catalyst_network::NetworkService>>,
     tx_submit: Option<mpsc::UnboundedSender<catalyst_core::protocol::Transaction>>,
+    global_rps: u32,
+    sender_rps: u32,
 ) -> Result<ServerHandle, RpcServerError> {
     let server = jsonrpsee::server::ServerBuilder::default()
         .build(bind_address)
         .await
         .map_err(|e| RpcServerError::Server(e.to_string()))?;
 
-    let rpc = CatalystRpcImpl::new(storage, network, tx_submit).into_rpc();
+    let rpc = CatalystRpcImpl::new(storage, network, tx_submit, global_rps, sender_rps).into_rpc();
     let handle = server.start(rpc);
 
     Ok(handle)
@@ -1481,5 +1717,11 @@ mod tests {
         let parts = tx_participants(&tx);
         assert!(parts.contains(&sender));
         assert!(parts.contains(&recv));
+    }
+
+    #[test]
+    fn chain_id_formats_as_hex() {
+        assert_eq!(format!("0x{:x}", 31337u64), "0x7a69");
+        assert_eq!(format!("0x{:x}", 1u64), "0x1");
     }
 }

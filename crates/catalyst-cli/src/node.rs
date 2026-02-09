@@ -11,6 +11,7 @@ use catalyst_network::{NetworkConfig as P2pConfig, NetworkService as P2pService,
 use catalyst_utils::{
     CatalystDeserialize, CatalystSerialize, MessageType, MessageEnvelope,
     utils::current_timestamp_ms,
+    impl_catalyst_serialize,
 };
 use catalyst_consensus::types::hash_data;
 use catalyst_utils::state::StateManager;
@@ -34,6 +35,10 @@ const DEFAULT_EVM_GAS_LIMIT: u64 = 8_000_000;
 // Dev/testnet faucet key (32-byte scalar); pubkey is derived and is a valid compressed Ristretto point.
 const FAUCET_PRIVATE_KEY_BYTES: [u8; 32] = [0xFA; 32];
 const FAUCET_INITIAL_BALANCE: i64 = 1_000_000;
+
+const META_PROTOCOL_CHAIN_ID: &str = "protocol:chain_id";
+const META_PROTOCOL_NETWORK_ID: &str = "protocol:network_id";
+const META_PROTOCOL_GENESIS_HASH: &str = "protocol:genesis_hash";
 
 fn balance_key_for_pubkey(pubkey: &[u8; 32]) -> Vec<u8> {
     let mut k = b"bal:".to_vec();
@@ -271,6 +276,8 @@ async fn apply_lsu_to_storage_without_root_check(
     let mut outcome_by_sig: std::collections::HashMap<Vec<u8>, ApplyOutcome> = std::collections::HashMap::new();
     let mut executed_sigs: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
 
+    let chain_id = load_chain_id_u64(store).await;
+
     // Apply balance / worker / EVM updates.
     for e in &lsu.partial_update.transaction_entries {
         if is_worker_reg_marker(&e.signature) {
@@ -291,7 +298,7 @@ async fn apply_lsu_to_storage_without_root_check(
                     let gas_limit = DEFAULT_EVM_GAS_LIMIT.max(21_000);
                     match payload.kind {
                         EvmTxKind::Deploy { bytecode } => {
-                            match execute_deploy_and_persist(store, from, payload.nonce, bytecode, gas_limit).await {
+                            match execute_deploy_and_persist(store, from, chain_id, payload.nonce, bytecode, gas_limit).await {
                                 Ok((_created, info, _persisted)) => {
                                     outcome_by_sig.insert(
                                         e.signature.clone(),
@@ -317,7 +324,7 @@ async fn apply_lsu_to_storage_without_root_check(
                         }
                         EvmTxKind::Call { to, input } => {
                             let to_addr = EvmAddress::from_slice(&to);
-                            match execute_call_and_persist(store, from, to_addr, payload.nonce, input, gas_limit).await {
+                            match execute_call_and_persist(store, from, to_addr, chain_id, payload.nonce, input, gas_limit).await {
                                 Ok((info, _persisted)) => {
                                     outcome_by_sig.insert(
                                         e.signature.clone(),
@@ -490,6 +497,124 @@ fn faucet_pubkey_bytes() -> [u8; 32] {
         .to_bytes()
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct GenesisDescriptor {
+    mode: String,
+    chain_id: u64,
+    network_id: String,
+    faucet_pubkey: [u8; 32],
+    faucet_balance: i64,
+}
+
+impl_catalyst_serialize!(GenesisDescriptor, mode, chain_id, network_id, faucet_pubkey, faucet_balance);
+
+async fn load_chain_id_u64(store: &StorageManager) -> u64 {
+    store
+        .get_metadata(META_PROTOCOL_CHAIN_ID)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|b| {
+            if b.len() != 8 {
+                return None;
+            }
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&b);
+            Some(u64::from_le_bytes(arr))
+        })
+        .unwrap_or(31337)
+}
+
+async fn ensure_chain_identity_and_genesis(store: &StorageManager, cfg: &crate::config::ProtocolConfig) {
+    // Chain id
+    let existing_chain_id = store.get_metadata(META_PROTOCOL_CHAIN_ID).await.ok().flatten();
+    if existing_chain_id.is_none() {
+        let _ = store
+            .set_metadata(META_PROTOCOL_CHAIN_ID, &cfg.chain_id.to_le_bytes())
+            .await;
+    }
+
+    // Network id
+    let existing_net = store.get_metadata(META_PROTOCOL_NETWORK_ID).await.ok().flatten();
+    if existing_net.is_none() {
+        let _ = store
+            .set_metadata(META_PROTOCOL_NETWORK_ID, cfg.network_id.as_bytes())
+            .await;
+    }
+
+    // Genesis hash: only apply genesis state on a fresh DB.
+    let existing_genesis = store.get_metadata(META_PROTOCOL_GENESIS_HASH).await.ok().flatten();
+    if existing_genesis.is_some() {
+        return;
+    }
+
+    let already = store
+        .get_metadata("consensus:last_applied_cycle")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|b| {
+            if b.len() != 8 {
+                return None;
+            }
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&b);
+            Some(u64::from_le_bytes(arr))
+        })
+        .unwrap_or(0);
+
+    let faucet_pk = faucet_pubkey_bytes();
+
+    if already == 0 {
+        // Fresh DB: apply a minimal deterministic genesis state (faucet funding).
+        let existing_balance = store
+            .get_state(&balance_key_for_pubkey(&faucet_pk))
+            .await
+            .ok()
+            .flatten();
+        if existing_balance.is_none() {
+            let _ = set_balance_i64(store, &faucet_pk, FAUCET_INITIAL_BALANCE).await;
+            let _ = set_nonce_u64(store, &faucet_pk, 0).await;
+        }
+        let _ = store.commit().await;
+
+        let g = GenesisDescriptor {
+            mode: "fresh".to_string(),
+            chain_id: cfg.chain_id,
+            network_id: cfg.network_id.clone(),
+            faucet_pubkey: faucet_pk,
+            faucet_balance: FAUCET_INITIAL_BALANCE,
+        };
+        let gh = hash_data(&g).unwrap_or([0u8; 32]);
+        let _ = store.set_metadata(META_PROTOCOL_GENESIS_HASH, &gh).await;
+        info!(
+            "Genesis initialized chain_id={} network_id={} genesis_hash=0x{} faucet_pk={} faucet_balance={}",
+            cfg.chain_id,
+            cfg.network_id,
+            hex_encode(&gh),
+            hex_encode(&faucet_pk),
+            FAUCET_INITIAL_BALANCE
+        );
+    } else {
+        // Legacy DB: do not mutate balances/consensus head; just stamp an identity hash.
+        let g = GenesisDescriptor {
+            mode: "legacy".to_string(),
+            chain_id: cfg.chain_id,
+            network_id: cfg.network_id.clone(),
+            faucet_pubkey: faucet_pk,
+            faucet_balance: FAUCET_INITIAL_BALANCE,
+        };
+        let gh = hash_data(&g).unwrap_or([0u8; 32]);
+        let _ = store.set_metadata(META_PROTOCOL_GENESIS_HASH, &gh).await;
+        info!(
+            "Stamped legacy genesis identity chain_id={} network_id={} genesis_hash=0x{} (no state reset)",
+            cfg.chain_id,
+            cfg.network_id,
+            hex_encode(&gh),
+        );
+    }
+}
+
 fn verify_protocol_tx_signature(tx: &catalyst_core::protocol::Transaction) -> bool {
     use catalyst_crypto::signatures::SignatureScheme;
 
@@ -544,6 +669,86 @@ fn verify_protocol_tx_signature(tx: &catalyst_core::protocol::Transaction) -> bo
     };
 
     SignatureScheme::new().verify(&payload, &sig, &sender_pk).unwrap_or(false)
+}
+
+async fn load_genesis_hash_32(store: &StorageManager) -> [u8; 32] {
+    let Some(bytes) = store
+        .get_metadata(META_PROTOCOL_GENESIS_HASH)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return [0u8; 32];
+    };
+    if bytes.len() != 32 {
+        return [0u8; 32];
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    out
+}
+
+async fn verify_protocol_tx_signature_with_domain(store: &StorageManager, tx: &catalyst_core::protocol::Transaction) -> bool {
+    use catalyst_crypto::signatures::SignatureScheme;
+
+    // Determine sender:
+    // - transfers: the (single) pubkey with negative NonConfidential amount
+    // - worker registration: entry[0].public_key
+    // - smart contract: entry[0].public_key
+    let sender_pk_bytes: [u8; 32] = match tx.core.tx_type {
+        catalyst_core::protocol::TransactionType::WorkerRegistration => {
+            let Some(e0) = tx.core.entries.get(0) else { return false };
+            e0.public_key
+        }
+        catalyst_core::protocol::TransactionType::SmartContract => {
+            let Some(e0) = tx.core.entries.get(0) else { return false };
+            e0.public_key
+        }
+        _ => {
+            let mut sender: Option<[u8; 32]> = None;
+            for e in &tx.core.entries {
+                if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
+                    if v < 0 {
+                        match sender {
+                            None => sender = Some(e.public_key),
+                            Some(pk) if pk == e.public_key => {}
+                            Some(_) => return false, // multi-sender not supported yet
+                        }
+                    }
+                }
+            }
+            let Some(sender) = sender else { return false };
+            sender
+        }
+    };
+
+    if tx.signature.0.len() != 64 {
+        return false;
+    }
+    let mut sig_bytes = [0u8; 64];
+    sig_bytes.copy_from_slice(&tx.signature.0);
+    let sig = match catalyst_crypto::signatures::Signature::from_bytes(sig_bytes) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let sender_pk = match catalyst_crypto::PublicKey::from_bytes(sender_pk_bytes) {
+        Ok(pk) => pk,
+        Err(_) => return false,
+    };
+
+    // Prefer v1 domain-separated payload; fall back to legacy for backward compatibility.
+    let chain_id = load_chain_id_u64(store).await;
+    let genesis_hash = load_genesis_hash_32(store).await;
+    if let Ok(p) = tx.signing_payload_v1(chain_id, genesis_hash) {
+        if SignatureScheme::new().verify(&p, &sig, &sender_pk).unwrap_or(false) {
+            return true;
+        }
+    }
+    let legacy = match tx.signing_payload() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    SignatureScheme::new().verify(&legacy, &sig, &sender_pk).unwrap_or(false)
 }
 
 async fn get_balance_i64(store: &StorageManager, pubkey: &[u8; 32]) -> i64 {
@@ -853,14 +1058,7 @@ async fn validate_and_select_protocol_txs_for_construction(
 }
 
 fn mempool_txid(tx: &catalyst_core::protocol::Transaction) -> Option<[u8; 32]> {
-    let bytes = bincode::serialize(tx).ok()?;
-    let mut hasher = blake2::Blake2b512::new();
-    use blake2::Digest;
-    hasher.update(&bytes);
-    let result = hasher.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&result[..32]);
-    Some(out)
+    catalyst_core::protocol::tx_id_v1(tx).ok()
 }
 
 fn mempool_tx_key(txid: &[u8; 32]) -> String {
@@ -1022,7 +1220,7 @@ async fn prune_persisted_mempool(store: &StorageManager) {
         };
 
         // Drop invalid or already-applied txs.
-        if tx.validate_basic().is_err() || !verify_protocol_tx_signature(&tx) {
+        if tx.validate_basic().is_err() || !verify_protocol_tx_signature_with_domain(store, &tx).await {
             delete_persisted_mempool_tx(store, &txid).await;
             continue;
         }
@@ -1056,7 +1254,7 @@ async fn rehydrate_mempool_from_storage(store: &StorageManager, mempool: &tokio:
         };
 
         // Basic gate: must still validate/signature-check.
-        if tx.validate_basic().is_err() || !verify_protocol_tx_signature(&tx) {
+        if tx.validate_basic().is_err() || !verify_protocol_tx_signature_with_domain(store, &tx).await {
             delete_persisted_mempool_tx(store, &txid).await;
             continue;
         }
@@ -1111,7 +1309,7 @@ async fn rebroadcast_persisted_mempool(
             continue;
         };
         // Only broadcast txs that still look valid (cheap checks).
-        if tx.validate_basic().is_err() || !verify_protocol_tx_signature(&tx) {
+        if tx.validate_basic().is_err() || !verify_protocol_tx_signature_with_domain(store, &tx).await {
             continue;
         }
         if tx.core.lock_time as u64 > now_secs {
@@ -1168,6 +1366,8 @@ async fn apply_lsu_to_storage(
     let mut outcome_by_sig: std::collections::HashMap<Vec<u8>, ApplyOutcome> = std::collections::HashMap::new();
     let mut executed_sigs: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
 
+    let chain_id = load_chain_id_u64(store).await;
+
     // Apply balance deltas from the LSU's ordered transaction entries.
     // Also apply worker registry markers into state under `workers:<pubkey>`.
     for e in &lsu.partial_update.transaction_entries {
@@ -1199,7 +1399,7 @@ async fn apply_lsu_to_storage(
                     let gas_limit = DEFAULT_EVM_GAS_LIMIT.max(21_000);
                     match payload.kind {
                         EvmTxKind::Deploy { bytecode } => {
-                            match execute_deploy_and_persist(store, from, payload.nonce, bytecode, gas_limit).await {
+                            match execute_deploy_and_persist(store, from, chain_id, payload.nonce, bytecode, gas_limit).await {
                                 Ok((created, info, _persisted)) => {
                                     info!("EVM deploy applied addr=0x{} ok={} gas_used={}", hex::encode(created.as_slice()), info.success, info.gas_used);
                                     outcome_by_sig.insert(
@@ -1227,7 +1427,7 @@ async fn apply_lsu_to_storage(
                         }
                         EvmTxKind::Call { to, input } => {
                             let to_addr = EvmAddress::from_slice(&to);
-                            match execute_call_and_persist(store, from, to_addr, payload.nonce, input, gas_limit).await {
+                            match execute_call_and_persist(store, from, to_addr, chain_id, payload.nonce, input, gas_limit).await {
                                 Ok((info, _persisted)) => {
                                     info!(
                                         "EVM call applied to=0x{} ok={} gas_used={} ret_len={}",
@@ -1654,6 +1854,11 @@ impl CatalystNode {
             None
         };
 
+        // Ensure chain identity + genesis are initialized (one-time, idempotent).
+        if let Some(store) = &storage {
+            ensure_chain_identity_and_genesis(store.as_ref(), &self.config.protocol).await;
+        }
+
         // Auto-register as a worker (on-chain) for validator nodes.
         if self.config.validator {
             if let Some(store) = &storage {
@@ -1713,26 +1918,6 @@ impl CatalystNode {
             rehydrate_mempool_from_storage(store.as_ref(), &mempool).await;
         }
 
-        // Initialize faucet (dev/testnet): create a deterministic funded account if missing.
-        if let Some(store) = &storage {
-            let faucet_pk = faucet_pubkey_bytes();
-            let existing = store
-                .get_state(&balance_key_for_pubkey(&faucet_pk))
-                .await
-                .ok()
-                .flatten();
-            if existing.is_none() {
-                let _ = set_balance_i64(store.as_ref(), &faucet_pk, FAUCET_INITIAL_BALANCE).await;
-                let _ = set_nonce_u64(store.as_ref(), &faucet_pk, 0).await;
-                let _ = store.commit().await;
-                info!(
-                    "Initialized faucet pubkey={} balance={}",
-                    hex_encode(&faucet_pk),
-                    FAUCET_INITIAL_BALANCE
-                );
-            }
-        }
-
         // --- RPC (HTTP JSON-RPC) ---
         if self.config.rpc.enabled {
             if let Some(store) = storage.clone() {
@@ -1743,7 +1928,14 @@ impl CatalystNode {
                 let bind: std::net::SocketAddr = format!("{}:{}", self.config.rpc.address, self.config.rpc.port)
                     .parse()
                     .map_err(|e| anyhow::anyhow!("invalid rpc bind addr: {e}"))?;
-                let handle = catalyst_rpc::start_rpc_http(bind, store.clone(), Some(network.clone()), Some(rpc_tx))
+                let handle = catalyst_rpc::start_rpc_http(
+                    bind,
+                    store.clone(),
+                    Some(network.clone()),
+                    Some(rpc_tx),
+                    self.config.rpc.rate_limit,
+                    self.config.rpc.rate_limit,
+                )
                     .await
                     .map_err(|e| anyhow::anyhow!("rpc start failed: {e}"))?;
                 info!("RPC server listening on http://{}", bind);
@@ -1758,7 +1950,7 @@ impl CatalystNode {
                         let now = current_timestamp_ms();
                         let now_secs = now / 1000;
                         if let Ok(msg) = ProtocolTxGossip::new(tx, now) {
-                            if !verify_protocol_tx_signature(&msg.tx) {
+                            if !verify_protocol_tx_signature_with_domain(storage.as_ref(), &msg.tx).await {
                                 continue;
                             }
                             // Nonce check (single-sender only).
@@ -1947,11 +2139,11 @@ impl CatalystNode {
                             // Prefer protocol-shaped txs; fall back to legacy TxGossip.
                             let now_secs = current_timestamp_ms() / 1000;
                             if let Ok(tx) = envelope.extract_message::<ProtocolTxGossip>() {
-                                if !verify_protocol_tx_signature(&tx.tx) {
-                                    continue;
-                                }
                                 // Nonce check (single-sender only, requires storage).
                                 if let Some(store) = &storage {
+                                    if !verify_protocol_tx_signature_with_domain(store.as_ref(), &tx.tx).await {
+                                        continue;
+                                    }
                                     let Some(sender_pk) = tx.sender_pubkey() else { continue };
                                     let pending_max = {
                                         let mp = mempool.read().await;
@@ -1970,15 +2162,21 @@ impl CatalystNode {
                                         let mut mp = mempool.write().await;
                                         if mp.insert_protocol(tx.clone(), now_secs) {
                                             persist_mempool_tx(store.as_ref(), &tx.tx).await;
+                                            // Help multi-hop propagation on WAN: rebroadcast when first seen.
+                                            let _ = net.broadcast_envelope(&envelope).await;
                                         }
                                     }
                                 } else {
                                     let mut mp = mempool.write().await;
-                                    let _ = mp.insert_protocol(tx, now_secs);
+                                    if mp.insert_protocol(tx, now_secs) {
+                                        let _ = net.broadcast_envelope(&envelope).await;
+                                    }
                                 }
                             } else if let Ok(tx) = envelope.extract_message::<TxGossip>() {
                                 let mut mp = mempool.write().await;
-                                let _ = mp.insert(tx);
+                                if mp.insert(tx) {
+                                    let _ = net.broadcast_envelope(&envelope).await;
+                                }
                             }
                         } else if envelope.message_type == MessageType::TransactionBatch {
                             // Prefer protocol tx batches (full signed txs), fallback to legacy entry batch.
