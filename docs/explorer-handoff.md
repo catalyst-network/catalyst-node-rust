@@ -17,6 +17,9 @@ Explorers should show these (and wallets must sign against them):
 - `catalyst_networkId` → string (e.g. `"tna_testnet"`)
 - `catalyst_genesisHash` → `0x` + 32-byte hex
 
+For this project’s public naming/numbering scheme (recommended `chain_id` / `network_id` assignments),
+see `docs/network-identity.md` in this repo.
+
 ### Addresses (canonical)
 
 - Address bytes are **32-byte public keys**.

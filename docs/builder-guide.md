@@ -20,6 +20,16 @@ Core:
 - `catalyst_networkId`
 - `catalyst_genesisHash`
 
+## Chain identity (clients)
+
+Clients should treat the tuple \(`chain_id`, `network_id`, `genesis_hash`\) as the network identity.
+
+- `chain_id` is used for wallet v1 signing and EVM domain separation.
+- `network_id` is a human-readable name.
+- `genesis_hash` is used in the wallet v1 signing payload and must be stable.
+
+See [`network-identity.md`](./network-identity.md) for the public numbering scheme used by this project.
+
 Accounts:
 - `catalyst_getBalance` (returns decimal string)
 - `catalyst_getBalanceProof` (balance + state root + Merkle proof steps)
