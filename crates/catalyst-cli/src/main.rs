@@ -168,6 +168,9 @@ enum Commands {
         /// Path to the tar archive file (used to compute sha256/bytes)
         #[arg(long)]
         archive_path: PathBuf,
+        /// Optional TTL for this snapshot advertisement (seconds)
+        #[arg(long)]
+        ttl_seconds: Option<u64>,
     },
     /// Download the published snapshot archive and restore it locally
     SyncFromSnapshot {
@@ -195,6 +198,18 @@ enum Commands {
         /// How many snapshots/archives to retain in out_base_dir
         #[arg(long, default_value_t = 3)]
         retain: usize,
+        /// Optional TTL for the published snapshot advertisement (seconds)
+        #[arg(long)]
+        ttl_seconds: Option<u64>,
+    },
+    /// Serve snapshot archives over HTTP (simple sidecar, supports Range requests)
+    SnapshotServe {
+        /// Directory containing `*.tar` archives
+        #[arg(long)]
+        dir: PathBuf,
+        /// Bind address, e.g. 0.0.0.0:8090
+        #[arg(long, default_value = "0.0.0.0:8090")]
+        bind: String,
     },
     /// Show a transaction receipt/status (and inclusion proof when applied)
     Receipt {
@@ -426,14 +441,17 @@ async fn main() -> Result<()> {
         Commands::DbRestore { data_dir, from_dir } => {
             commands::db_restore(&data_dir, &from_dir).await?;
         }
-        Commands::SnapshotPublish { data_dir, snapshot_dir, archive_url, archive_path } => {
-            commands::snapshot_publish(&data_dir, &snapshot_dir, &archive_url, &archive_path).await?;
+        Commands::SnapshotPublish { data_dir, snapshot_dir, archive_url, archive_path, ttl_seconds } => {
+            commands::snapshot_publish(&data_dir, &snapshot_dir, &archive_url, &archive_path, ttl_seconds).await?;
         }
         Commands::SyncFromSnapshot { rpc_url, data_dir, work_dir } => {
             commands::sync_from_snapshot(&rpc_url, &data_dir, work_dir.as_deref()).await?;
         }
-        Commands::SnapshotMakeLatest { data_dir, out_base_dir, archive_url_base, retain } => {
-            commands::snapshot_make_latest(&data_dir, &out_base_dir, &archive_url_base, retain).await?;
+        Commands::SnapshotMakeLatest { data_dir, out_base_dir, archive_url_base, retain, ttl_seconds } => {
+            commands::snapshot_make_latest(&data_dir, &out_base_dir, &archive_url_base, retain, ttl_seconds).await?;
+        }
+        Commands::SnapshotServe { dir, bind } => {
+            commands::snapshot_serve(&dir, &bind).await?;
         }
         Commands::Receipt { tx_hash, rpc_url } => {
             commands::show_receipt(&tx_hash, &rpc_url).await?;

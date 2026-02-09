@@ -258,6 +258,12 @@ pub struct RpcSyncInfo {
 pub struct RpcSnapshotInfo {
     pub version: u32,
     pub created_at_ms: u64,
+    /// When this snapshot was published/advertised by the operator.
+    #[serde(default)]
+    pub published_at_ms: u64,
+    /// Optional expiry time for this snapshot ad (clients should ignore if expired).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
     pub chain_id: String,
     pub network_id: String,
     pub genesis_hash: String,

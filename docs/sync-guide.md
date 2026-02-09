@@ -76,6 +76,18 @@ This is the operator-friendly way to keep a “latest snapshot” published:
 You still need to serve `/var/lib/catalyst/eu/snapshots/*.tar` over HTTP(S) (e.g. nginx/caddy).
 After this runs, `catalyst_getSnapshotInfo` points at the newest archive URL.
 
+### 3d) Optional: built-in snapshot HTTP sidecar
+
+If you don’t want nginx/caddy, you can run a simple HTTP sidecar that serves `*.tar` with Range support:
+
+```bash
+./target/release/catalyst-cli snapshot-serve \
+  --dir /var/lib/catalyst/eu/snapshots \
+  --bind 0.0.0.0:8090
+```
+
+Then you can set `--archive-url-base http://<your-host>:8090` when publishing snapshots.
+
 ### 4) Restore on the destination node
 
 Stop the node if it is running, then restore:

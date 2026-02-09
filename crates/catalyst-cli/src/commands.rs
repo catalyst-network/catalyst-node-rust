@@ -14,6 +14,7 @@ use crate::evm::EvmTxKind;
 use alloy_primitives::Address as EvmAddress;
 use catalyst_storage::{StorageConfig as StorageConfigLib, StorageManager};
 use tokio::io::AsyncWriteExt;
+use std::net::SocketAddr;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SnapshotMetaV1 {
@@ -369,6 +370,7 @@ pub async fn snapshot_publish(
     snapshot_dir: &Path,
     archive_url: &str,
     archive_path: &Path,
+    ttl_seconds: Option<u64>,
 ) -> Result<()> {
     // Load snapshot meta file produced by db-backup.
     let meta_path = snapshot_dir.join("catalyst_snapshot.json");
@@ -381,9 +383,14 @@ pub async fn snapshot_publish(
     h.update(&bytes);
     let sum = h.finalize();
 
+    let published_at_ms = catalyst_utils::utils::current_timestamp_ms();
+    let expires_at_ms = ttl_seconds.map(|s| published_at_ms.saturating_add(s.saturating_mul(1000)));
+
     let info = catalyst_rpc::RpcSnapshotInfo {
         version: 1,
         created_at_ms: meta.created_at_ms,
+        published_at_ms,
+        expires_at_ms,
         chain_id: format!("0x{:x}", meta.chain_id),
         network_id: meta.network_id.clone(),
         genesis_hash: meta.genesis_hash.clone(),
@@ -480,6 +487,7 @@ pub async fn snapshot_make_latest(
     out_base_dir: &Path,
     archive_url_base: &str,
     retain: usize,
+    ttl_seconds: Option<u64>,
 ) -> Result<()> {
     anyhow::ensure!(retain >= 1, "--retain must be >= 1");
     std::fs::create_dir_all(out_base_dir)?;
@@ -494,7 +502,7 @@ pub async fn snapshot_make_latest(
     let archive_url = format!("{url_base}/{archive_name}");
 
     db_backup(data_dir, &snapshot_dir, Some(&archive_path)).await?;
-    snapshot_publish(data_dir, &snapshot_dir, &archive_url, &archive_path).await?;
+    snapshot_publish(data_dir, &snapshot_dir, &archive_url, &archive_path, ttl_seconds).await?;
 
     // Retention: keep newest N snapshots/archives (by timestamp in filename).
     #[derive(Debug)]
@@ -556,6 +564,167 @@ pub async fn snapshot_make_latest(
 
 pub async fn show_receipt(tx_hash: &str, rpc_url: &str) -> Result<()> {
     get_receipt(tx_hash, rpc_url).await
+}
+
+pub async fn snapshot_serve(dir: &Path, bind: &str) -> Result<()> {
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Empty, Full, StreamBody, combinators::BoxBody};
+    use hyper::{Method, Request, Response, StatusCode};
+    use hyper::body::Frame;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use tokio::io::{AsyncSeekExt, AsyncReadExt};
+    use tokio::net::TcpListener;
+    use tokio_util::io::ReaderStream;
+    use futures::TryStreamExt;
+    use std::convert::Infallible;
+    use std::io;
+    use std::path::PathBuf;
+
+    fn boxed_empty() -> BoxBody<Bytes, io::Error> {
+        Empty::new()
+            .map_err(|_: Infallible| io::Error::new(io::ErrorKind::Other, "infallible"))
+            .boxed()
+    }
+
+    fn boxed_text(status: StatusCode, s: &str) -> Response<BoxBody<Bytes, io::Error>> {
+        let body = Full::new(Bytes::from(s.to_string()))
+            .map_err(|_: Infallible| io::Error::new(io::ErrorKind::Other, "infallible"))
+            .boxed();
+        Response::builder()
+            .status(status)
+            .header("content-type", "text/plain; charset=utf-8")
+            .header("cache-control", "no-store")
+            .body(body)
+            .unwrap()
+    }
+
+    fn reject(status: StatusCode, msg: &str) -> Response<BoxBody<Bytes, io::Error>> {
+        boxed_text(status, msg)
+    }
+
+    fn sanitize_filename(path: &str) -> Option<String> {
+        let p = path.trim_start_matches('/');
+        if p.is_empty() {
+            return None;
+        }
+        if p.contains('/') || p.contains('\\') || p.contains("..") {
+            return None;
+        }
+        if !p.ends_with(".tar") {
+            return None;
+        }
+        Some(p.to_string())
+    }
+
+    async fn handle_request(
+        req: Request<hyper::body::Incoming>,
+        base_dir: PathBuf,
+    ) -> Result<Response<BoxBody<Bytes, io::Error>>, io::Error> {
+        let method = req.method().clone();
+        if method != Method::GET && method != Method::HEAD {
+            return Ok(reject(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n"));
+        }
+
+        let Some(name) = sanitize_filename(req.uri().path()) else {
+            return Ok(reject(StatusCode::NOT_FOUND, "not found\n"));
+        };
+        let full_path = base_dir.join(&name);
+        let meta = match tokio::fs::metadata(&full_path).await {
+            Ok(m) => m,
+            Err(_) => return Ok(reject(StatusCode::NOT_FOUND, "not found\n")),
+        };
+        if !meta.is_file() {
+            return Ok(reject(StatusCode::NOT_FOUND, "not found\n"));
+        }
+        let total_len = meta.len();
+        if total_len == 0 {
+            return Ok(reject(StatusCode::NOT_FOUND, "empty file\n"));
+        }
+
+        // Parse Range: bytes=start-end (single range only).
+        let mut start: u64 = 0;
+        let mut end: u64 = total_len.saturating_sub(1);
+        let mut partial = false;
+        if let Some(range) = req.headers().get("range").and_then(|v| v.to_str().ok()) {
+            if let Some(spec) = range.strip_prefix("bytes=") {
+                if let Some((a, b)) = spec.split_once('-') {
+                    let a = a.trim();
+                    let b = b.trim();
+                    if !a.is_empty() {
+                        if let Ok(s) = a.parse::<u64>() {
+                            start = s;
+                        } else {
+                            start = total_len; // force 416
+                        }
+                    }
+                    if !b.is_empty() {
+                        if let Ok(e) = b.parse::<u64>() {
+                            end = e;
+                        } else {
+                            end = 0;
+                        }
+                    }
+                    partial = true;
+                }
+            }
+        }
+
+        if start >= total_len || end >= total_len || start > end {
+            let body = boxed_empty();
+            let resp = Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header("accept-ranges", "bytes")
+                .header("content-range", format!("bytes */{total_len}"))
+                .body(body)
+                .unwrap();
+            return Ok(resp);
+        }
+
+        let content_len = end - start + 1;
+        let mut builder = Response::builder()
+            .header("content-type", "application/x-tar")
+            .header("accept-ranges", "bytes")
+            .header("content-length", content_len.to_string())
+            .header("cache-control", "public, max-age=60");
+
+        if partial {
+            builder = builder
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header("content-range", format!("bytes {start}-{end}/{total_len}"));
+        } else {
+            builder = builder.status(StatusCode::OK);
+        }
+
+        if method == Method::HEAD {
+            return Ok(builder.body(boxed_empty()).unwrap());
+        }
+
+        let mut file = tokio::fs::File::open(&full_path).await?;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        let reader = file.take(content_len);
+        let stream = ReaderStream::new(reader).map_ok(Frame::data);
+        let body = http_body_util::BodyExt::boxed(StreamBody::new(stream));
+        Ok(builder.body(body).unwrap())
+    }
+
+    let addr: SocketAddr = bind.parse()?;
+    let listener = TcpListener::bind(addr).await?;
+    println!("snapshot_serve_ok: true");
+    println!("dir: {}", dir.display());
+    println!("bind: {}", bind);
+
+    let base_dir = dir.to_path_buf();
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let io = TokioIo::new(stream);
+        let bd = base_dir.clone();
+        tokio::spawn(async move {
+            let svc = service_fn(move |req| handle_request(req, bd.clone()));
+            let _ = http1::Builder::new().serve_connection(io, svc).await;
+        });
+    }
 }
 
 pub async fn send_transaction(
