@@ -28,7 +28,7 @@ use libp2p::{
     Multiaddr, PeerId, Swarm, Transport,
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -103,7 +103,8 @@ pub struct NetworkService {
 
     event_tx: Arc<RwLock<Vec<mpsc::UnboundedSender<NetworkEvent>>>>,
     stats: Arc<RwLock<NetworkStats>>,
-    peers: Arc<RwLock<HashSet<PeerId>>>,
+    /// Connection counts per peer id (multiple connections per peer can exist).
+    peer_conns: Arc<RwLock<HashMap<PeerId, usize>>>,
 
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     cmd_rx: Mutex<Option<mpsc::UnboundedReceiver<Cmd>>>,
@@ -192,7 +193,7 @@ impl NetworkService {
             topic,
             event_tx: Arc::new(RwLock::new(Vec::new())),
             stats: Arc::new(RwLock::new(NetworkStats::default())),
-            peers: Arc::new(RwLock::new(HashSet::new())),
+            peer_conns: Arc::new(RwLock::new(HashMap::new())),
             cmd_tx,
             cmd_rx: Mutex::new(Some(cmd_rx)),
             swarm: Mutex::new(Some(swarm)),
@@ -217,7 +218,7 @@ impl NetworkService {
 
         let event_tx = self.event_tx.clone();
         let stats = self.stats.clone();
-        let peers = self.peers.clone();
+        let peer_conns = self.peer_conns.clone();
         let topic = self.topic.clone();
 
         // Bootstrap dials (best-effort).
@@ -241,27 +242,16 @@ impl NetworkService {
                             SwarmEvent::Behaviour(BehaviourEvent::Mdns(e)) => match e {
                                 mdns::Event::Discovered(list) => {
                                     for (peer_id, addr) in list {
+                                        // Discovery hint: dial and (optionally) add as explicit gossip peer.
                                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                                         let _ = swarm.dial(addr.clone());
-                                        peers.write().await.insert(peer_id);
                                         let _ = emit(&event_tx, NetworkEvent::PeerConnected { peer_id, address: addr }).await;
-                                    }
-                                    // Update stats on peer set change.
-                                    {
-                                        let mut st = stats.write().await;
-                                        st.connected_peers = peers.read().await.len();
                                     }
                                 }
                                 mdns::Event::Expired(list) => {
                                     for (peer_id, _addr) in list {
                                         swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                                        peers.write().await.remove(&peer_id);
                                         let _ = emit(&event_tx, NetworkEvent::PeerDisconnected { peer_id, reason: "mdns expired".to_string() }).await;
-                                    }
-                                    // Update stats on peer set change.
-                                    {
-                                        let mut st = stats.write().await;
-                                        st.connected_peers = peers.read().await.len();
                                     }
                                 }
                             },
@@ -274,27 +264,34 @@ impl NetworkService {
                                     {
                                         let mut st = stats.write().await;
                                         st.messages_received += 1;
-                                        st.connected_peers = peers.read().await.len();
+                                        st.connected_peers = peer_conns.read().await.len();
                                     }
                                     let _ = emit(&event_tx, NetworkEvent::MessageReceived { envelope: env, from: propagation_source }).await;
                                 }
                             }
                             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                                peers.write().await.insert(peer_id);
                                 {
+                                    let mut m = peer_conns.write().await;
+                                    *m.entry(peer_id).or_insert(0) += 1;
                                     let mut st = stats.write().await;
-                                    st.connected_peers = peers.read().await.len();
+                                    st.connected_peers = m.len();
                                 }
                                 let addr = endpoint.get_remote_address().clone();
                                 let _ = emit(&event_tx, NetworkEvent::PeerConnected { peer_id, address: addr }).await;
                             }
                             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                                 swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                                peers.write().await.remove(&peer_id);
                                 {
+                                    let mut m = peer_conns.write().await;
+                                    if let Some(c) = m.get_mut(&peer_id) {
+                                        *c = c.saturating_sub(1);
+                                        if *c == 0 {
+                                            m.remove(&peer_id);
+                                        }
+                                    }
                                     let mut st = stats.write().await;
-                                    st.connected_peers = peers.read().await.len();
+                                    st.connected_peers = m.len();
                                 }
                                 let _ = emit(&event_tx, NetworkEvent::PeerDisconnected { peer_id, reason: format!("{:?}", cause) }).await;
                             }
@@ -313,7 +310,7 @@ impl NetworkService {
                                 let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), bytes);
                                 let mut st = stats.write().await;
                                 st.messages_sent += 1;
-                                st.connected_peers = peers.read().await.len();
+                                st.connected_peers = peer_conns.read().await.len();
                             }
                             Some(Cmd::Dial(addr)) => {
                                 let _ = swarm.dial(addr);
@@ -344,9 +341,9 @@ impl NetworkService {
     }
 
     pub async fn get_stats(&self) -> NetworkStats {
-        // Stats are best-effort; ensure peer count reflects live peer set even when idle.
+        // Stats are best-effort; ensure peer count reflects live connections even when idle.
         let mut st = self.stats.read().await.clone();
-        st.connected_peers = self.peers.read().await.len();
+        st.connected_peers = self.peer_conns.read().await.len();
         st
     }
 
