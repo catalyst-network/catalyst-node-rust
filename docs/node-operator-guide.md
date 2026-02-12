@@ -8,6 +8,25 @@ This guide covers running the current Rust node implementation (`catalyst-cli`).
 - **RPC**: HTTP JSON-RPC for clients (default `8545/tcp`)
 - **Validator**: runs the consensus loop (`catalyst-cli start --validator`)
 
+## Chain identity (required)
+
+Each network has a stable identity:
+- `protocol.chain_id` (u64): signing/execution domain separation (wallet v1 + EVM `chainId`)
+- `protocol.network_id` (string): human-readable name
+
+See [`network-identity.md`](./network-identity.md) for the numbering scheme and rules.
+
+In each node’s `config.toml`, ensure:
+
+```toml
+[protocol]
+chain_id = 200820092
+network_id = "catalyst-testnet"
+```
+
+Important:
+- **Do not change** these values for a running network. Changing them creates a **new chain**.
+
 ## Build
 
 From the repo root:
@@ -159,6 +178,23 @@ sleep 30
 ```
 
 `applied_cycle` should advance.
+
+## Resetting / launching a new network (hard reset)
+
+If you change `protocol.chain_id` / `protocol.network_id` (or intentionally restart from fresh genesis), you must treat it as a **new chain**:
+
+- **Keep**: `/var/lib/catalyst/<region>/node.key` (stable P2P identity)
+- **Wipe**: `/var/lib/catalyst/<region>/data` (chain DB/state)
+
+Recommended safe “wipe” (rename) per node:
+
+```bash
+sudo systemctl stop catalyst || true
+ts=$(date +%s)
+mv /var/lib/catalyst/<region>/data "/var/lib/catalyst/<region>/data.old.$ts"
+```
+
+Then start EU first, then the other validators.
 
 ## Troubleshooting
 

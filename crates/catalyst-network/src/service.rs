@@ -246,12 +246,22 @@ impl NetworkService {
                                         peers.write().await.insert(peer_id);
                                         let _ = emit(&event_tx, NetworkEvent::PeerConnected { peer_id, address: addr }).await;
                                     }
+                                    // Update stats on peer set change.
+                                    {
+                                        let mut st = stats.write().await;
+                                        st.connected_peers = peers.read().await.len();
+                                    }
                                 }
                                 mdns::Event::Expired(list) => {
                                     for (peer_id, _addr) in list {
                                         swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                                         peers.write().await.remove(&peer_id);
                                         let _ = emit(&event_tx, NetworkEvent::PeerDisconnected { peer_id, reason: "mdns expired".to_string() }).await;
+                                    }
+                                    // Update stats on peer set change.
+                                    {
+                                        let mut st = stats.write().await;
+                                        st.connected_peers = peers.read().await.len();
                                     }
                                 }
                             },
@@ -272,12 +282,20 @@ impl NetworkService {
                             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                                 peers.write().await.insert(peer_id);
+                                {
+                                    let mut st = stats.write().await;
+                                    st.connected_peers = peers.read().await.len();
+                                }
                                 let addr = endpoint.get_remote_address().clone();
                                 let _ = emit(&event_tx, NetworkEvent::PeerConnected { peer_id, address: addr }).await;
                             }
                             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                                 swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                                 peers.write().await.remove(&peer_id);
+                                {
+                                    let mut st = stats.write().await;
+                                    st.connected_peers = peers.read().await.len();
+                                }
                                 let _ = emit(&event_tx, NetworkEvent::PeerDisconnected { peer_id, reason: format!("{:?}", cause) }).await;
                             }
                             SwarmEvent::NewListenAddr { address, .. } => {

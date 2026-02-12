@@ -9,6 +9,10 @@ These docs are written against the current `catalyst-node-rust` implementation (
   - Build + run a 3-node public testnet (Vultr-style) with EU as boot + RPC
   - Firewall ports and common pitfalls
 
+- **Network identity**: [`network-identity.md`](./network-identity.md)
+  - `chain_id` / `network_id` meaning and rules
+  - Public numbering + naming scheme
+
 - **Users**: [`user-guide.md`](./user-guide.md)
   - Using the dev/test faucet
   - Sending a simple payment transaction

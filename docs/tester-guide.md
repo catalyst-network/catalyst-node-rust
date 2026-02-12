@@ -18,6 +18,17 @@ Expected:
 - `applied_cycle` increases
 - `applied_lsu_hash` / `last_lsu_cid` often change
 
+### 1b) Chain identity matches expectations
+
+Ensure you are testing the intended network (`chain_id`, `network_id`, `genesis_hash`):
+
+```bash
+curl -s -X POST http://<RPC_HOST>:8545 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"catalyst_getSyncInfo","params":[]}'
+```
+
+If these values don’t match what operators published for the testnet, you’re on the wrong chain (or the network was reset).
+
 ### 2) Peer count (best-effort)
 
 ```bash

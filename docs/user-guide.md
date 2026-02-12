@@ -7,6 +7,17 @@ This guide assumes there is a reachable RPC endpoint, e.g.:
 
 All commands below are client-side; you can run them from your laptop/desktop.
 
+## 0) Sanity check: you are on the intended network
+
+Before sending transactions, confirm chain identity:
+
+```bash
+curl -s -X POST "$RPC_URL" -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"catalyst_getSyncInfo","params":[]}'
+```
+
+Check `network_id` and `chain_id` match what operators published (see [`network-identity.md`](./network-identity.md)).
+
 ## 1) Faucet (dev/test implementation)
 
 In the current implementation, the faucet is **not** an ERC20 contract.

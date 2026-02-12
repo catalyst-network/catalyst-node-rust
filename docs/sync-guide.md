@@ -56,10 +56,14 @@ If your RPC node should advertise a downloadable snapshot to new nodes, publish 
   --data-dir /var/lib/catalyst/eu/data \
   --snapshot-dir /tmp/catalyst-snapshot \
   --archive-path /tmp/catalyst-snapshot.tar \
-  --archive-url https://<your-host>/catalyst-snapshot.tar
+  --archive-url https://<your-host>/catalyst-snapshot.tar \
+  --ttl-seconds 86400
 ```
 
 Then clients can query `catalyst_getSnapshotInfo` from RPC.
+
+Notes:
+- Snapshot advertisements include `published_at_ms` and optional `expires_at_ms`. If `expires_at_ms` is set and is in the past, clients should ignore that snapshot and fall back to other sync methods.
 
 ### 3c) Recommended: one-shot create+archive+publish (with retention)
 
@@ -70,7 +74,8 @@ This is the operator-friendly way to keep a “latest snapshot” published:
   --data-dir /var/lib/catalyst/eu/data \
   --out-base-dir /var/lib/catalyst/eu/snapshots \
   --archive-url-base https://<your-host>/snapshots \
-  --retain 3
+  --retain 3 \
+  --ttl-seconds 86400
 ```
 
 You still need to serve `/var/lib/catalyst/eu/snapshots/*.tar` over HTTP(S) (e.g. nginx/caddy).
