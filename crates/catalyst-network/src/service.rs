@@ -344,7 +344,10 @@ impl NetworkService {
     }
 
     pub async fn get_stats(&self) -> NetworkStats {
-        self.stats.read().await.clone()
+        // Stats are best-effort; ensure peer count reflects live peer set even when idle.
+        let mut st = self.stats.read().await.clone();
+        st.connected_peers = self.peers.read().await.len();
+        st
     }
 
     pub async fn broadcast_envelope(&self, envelope: &MessageEnvelope) -> NetworkResult<()> {
