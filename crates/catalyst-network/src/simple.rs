@@ -145,7 +145,10 @@ impl NetworkService {
     }
 
     pub async fn get_stats(&self) -> NetworkStats {
-        self.stats.read().await.clone()
+        // Stats are best-effort; ensure peer count reflects live connections even when idle.
+        let mut st = self.stats.read().await.clone();
+        st.connected_peers = self.peers.lock().await.len();
+        st
     }
 
     /// Broadcast a message envelope to all connected peers.
@@ -170,7 +173,12 @@ impl NetworkService {
         let svc = self.clone();
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        peers.lock().await.insert(peer_addr, out_tx);
+        {
+            let mut map = peers.lock().await;
+            map.insert(peer_addr, out_tx);
+            let mut st = stats.write().await;
+            st.connected_peers = map.len();
+        }
 
         let framed = Framed::new(stream, LengthDelimitedCodec::new());
         let (mut sink, mut stream) = framed.split();
@@ -203,7 +211,12 @@ impl NetworkService {
                     .await;
             }
 
-            peers.lock().await.remove(&peer_addr);
+            {
+                let mut map = peers.lock().await;
+                map.remove(&peer_addr);
+                let mut st = stats.write().await;
+                st.connected_peers = map.len();
+            }
             let _ = svc.emit(NetworkEvent::PeerDisconnected { addr: peer_addr }).await;
         });
 
