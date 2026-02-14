@@ -764,7 +764,11 @@ pub async fn send_transaction(
     anyhow::ensure!(amt > 0, "amount must be positive");
 
     let now_ms = catalyst_utils::utils::current_timestamp_ms();
-    let now_secs = (now_ms / 1000) as u32;
+    // `lock_time` is interpreted as unix seconds "not before".
+    //
+    // Default to 0 (immediately valid) to avoid liveness issues when client/server
+    // clocks are skewed.
+    let lock_time_secs: u32 = 0;
 
     let mut tx = catalyst_core::protocol::Transaction {
         core: catalyst_core::protocol::TransactionCore {
@@ -780,7 +784,7 @@ pub async fn send_transaction(
                 },
             ],
             nonce,
-            lock_time: now_secs,
+            lock_time: lock_time_secs,
             fees: 0,
             data: Vec::new(),
         },
@@ -841,7 +845,7 @@ pub async fn register_worker(key_file: &Path, rpc_url: &str) -> Result<()> {
     let nonce = cur_nonce.saturating_add(1);
 
     let now_ms = catalyst_utils::utils::current_timestamp_ms();
-    let now_secs = (now_ms / 1000) as u32;
+    let lock_time_secs: u32 = 0;
 
     let mut tx = catalyst_core::protocol::Transaction {
         core: catalyst_core::protocol::TransactionCore {
@@ -851,7 +855,7 @@ pub async fn register_worker(key_file: &Path, rpc_url: &str) -> Result<()> {
                 amount: catalyst_core::protocol::EntryAmount::NonConfidential(0),
             }],
             nonce,
-            lock_time: now_secs,
+            lock_time: lock_time_secs,
             fees: 0,
             data: Vec::new(),
         },
@@ -930,7 +934,7 @@ pub async fn deploy_contract(
     };
 
     let now_ms = catalyst_utils::utils::current_timestamp_ms();
-    let now_secs = (now_ms / 1000) as u32;
+    let lock_time_secs: u32 = 0;
     let kind = EvmTxKind::Deploy { bytecode: bytecode.clone() };
     let data = bincode::serialize(&kind)?;
 
@@ -942,7 +946,7 @@ pub async fn deploy_contract(
                 amount: catalyst_core::protocol::EntryAmount::NonConfidential(0),
             }],
             nonce,
-            lock_time: now_secs,
+            lock_time: lock_time_secs,
             fees: 0,
             data,
         },
@@ -1020,7 +1024,7 @@ pub async fn call_contract(
     let nonce = cur_nonce.saturating_add(1);
 
     let now_ms = catalyst_utils::utils::current_timestamp_ms();
-    let now_secs = (now_ms / 1000) as u32;
+    let lock_time_secs: u32 = 0;
     let kind = EvmTxKind::Call { to, input };
     let data = bincode::serialize(&kind)?;
 
@@ -1032,7 +1036,7 @@ pub async fn call_contract(
                 amount: catalyst_core::protocol::EntryAmount::NonConfidential(0),
             }],
             nonce,
-            lock_time: now_secs,
+            lock_time: lock_time_secs,
             fees: 0,
             data,
         },

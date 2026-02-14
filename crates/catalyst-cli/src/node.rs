@@ -975,8 +975,9 @@ async fn validate_and_select_protocol_txs_for_construction(
         if tx.core.lock_time as u64 > now_secs {
             continue;
         }
-        // Signature check (already done in mempool, but re-check at formation time)
-        if !verify_protocol_tx_signature(&tx) {
+        // Signature check (already done in mempool, but re-check at formation time).
+        // Must support v1 domain-separated signatures (wallet/CLI default).
+        if !verify_protocol_tx_signature_with_domain(store, &tx).await {
             continue;
         }
 
