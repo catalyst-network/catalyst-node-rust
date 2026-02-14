@@ -30,6 +30,10 @@ These docs are written against the current `catalyst-node-rust` implementation (
   - Canonical address format
   - v1 transaction signing payload + wire encoding
 
+- **Wallet builder handoff (testnet)**: [`wallet-builder-handoff-catalyst-testnet.md`](./wallet-builder-handoff-catalyst-testnet.md)
+  - Live `catalyst-testnet` endpoint + chain identity
+  - Practical RPC flow for wallets (account/nonce/fees/send/receipts)
+
 - **Explorer / Indexer handoff**: [`explorer-handoff.md`](./explorer-handoff.md)
   - Chain model + compatibility notes
   - Practical indexing loop (blocks-by-range + receipts)
