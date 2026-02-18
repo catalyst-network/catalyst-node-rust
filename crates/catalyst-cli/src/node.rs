@@ -31,6 +31,65 @@ use catalyst_storage::{StorageConfig as StorageConfigLib, StorageManager};
 
 use alloy_primitives::Address as EvmAddress;
 
+#[derive(Debug, Clone)]
+struct DialState {
+    next_at: Instant,
+    backoff: std::time::Duration,
+}
+
+fn jitter_ms(max_ms: u64) -> u64 {
+    if max_ms == 0 {
+        return 0;
+    }
+    // Good enough jitter; avoids synchronizing dials across nodes.
+    let r: u64 = rand::random();
+    r % (max_ms + 1)
+}
+
+#[derive(Debug, Default)]
+struct RelayCache {
+    seen: std::collections::HashMap<String, u64>,
+}
+
+impl RelayCache {
+    fn should_relay(&mut self, env: &MessageEnvelope, now_ms: u64) -> bool {
+        if env.is_expired() {
+            return false;
+        }
+        // Only relay broadcasts.
+        if env.target.is_some() {
+            return false;
+        }
+        if self.seen.contains_key(&env.id) {
+            return false;
+        }
+
+        self.seen.insert(env.id.clone(), now_ms);
+
+        // Prune old ids (best-effort).
+        let keep_after = now_ms.saturating_sub(10 * 60 * 1000);
+        self.seen.retain(|_, ts| *ts >= keep_after);
+
+        // Cap size to prevent unbounded growth under attack.
+        const MAX: usize = 5000;
+        const TARGET: usize = 4000;
+        if self.seen.len() > MAX {
+            let mut v: Vec<(String, u64)> = self
+                .seen
+                .iter()
+                .map(|(k, ts)| (k.clone(), *ts))
+                .collect();
+            v.sort_by_key(|(_, ts)| *ts);
+            let drop_n = v.len().saturating_sub(TARGET);
+            for (k, _) in v.into_iter().take(drop_n) {
+                self.seen.remove(&k);
+            }
+        }
+
+        true
+    }
+}
+
 const DEFAULT_EVM_GAS_LIMIT: u64 = 8_000_000;
 
 // Dev/testnet faucet key (32-byte scalar); pubkey is derived and is a valid compressed Ristretto point.
@@ -1908,20 +1967,33 @@ impl CatalystNode {
             }
         }
 
-        // Keep trying to connect to bootstrap peers. This makes local testnet resilient to
-        // restarting node1 (bootstrap) without having to restart all other nodes.
+        // Keep trying to connect to bootstrap peers. Use per-peer exponential backoff with jitter
+        // so dead peers don't cause tight retry loops.
         if !all_peers.is_empty() || !seeds.is_empty() {
             let net = network.clone();
             let mut shutdown_rx2 = shutdown_rx.clone();
             let handle = tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
                 let mut last_resolve = Instant::now() - std::time::Duration::from_secs(3600);
                 let mut peers_cached: Vec<String> = peers_from_dns.clone();
+
+                let mut dial: std::collections::HashMap<String, DialState> = std::collections::HashMap::new();
+
+                let success_retry = std::time::Duration::from_secs(30);
+                let backoff_min = std::time::Duration::from_secs(1);
+                let backoff_max = std::time::Duration::from_secs(60);
+
                 loop {
+                    tokio::select! {
+                        _ = tick.tick() => {},
+                        _ = shutdown_rx2.changed() => {},
+                    }
                     if *shutdown_rx2.borrow() {
                         break;
                     }
+
                     // Refresh DNS seeds periodically so IPs can rotate without restarts.
                     if !seeds.is_empty() && last_resolve.elapsed() >= std::time::Duration::from_secs(60) {
                         let mut out: Vec<String> = resolve_dns_seeds_to_bootstrap_multiaddrs(&seeds, 30333)
@@ -1935,14 +2007,52 @@ impl CatalystNode {
                         last_resolve = Instant::now();
                     }
 
-                    for p in peers_static.iter().chain(peers_cached.iter()) {
-                        if let Ok(ma) = p.parse::<Multiaddr>() {
-                            let _ = net.connect_multiaddr(&ma).await;
-                        }
+                    // Current desired peer set (static + dns).
+                    let mut peers: Vec<String> = Vec::new();
+                    peers.extend(peers_static.iter().cloned());
+                    peers.extend(peers_cached.iter().cloned());
+                    peers.sort();
+                    peers.dedup();
+
+                    let now = Instant::now();
+
+                    // Ensure dial state exists for all peers.
+                    for p in &peers {
+                        dial.entry(p.clone()).or_insert(DialState {
+                            next_at: now,
+                            backoff: backoff_min,
+                        });
                     }
-                    tokio::select! {
-                        _ = tick.tick() => {}
-                        _ = shutdown_rx2.changed() => {}
+
+                    // Limit dial attempts per tick to avoid long stalls if peer list grows.
+                    let mut attempts_left = 4usize;
+                    for p in peers {
+                        if attempts_left == 0 {
+                            break;
+                        }
+                        let Some(st) = dial.get_mut(&p) else { continue };
+                        if now < st.next_at {
+                            continue;
+                        }
+                        attempts_left = attempts_left.saturating_sub(1);
+
+                        if let Ok(ma) = p.parse::<Multiaddr>() {
+                            match net.connect_multiaddr(&ma).await {
+                                Ok(_) => {
+                                    st.backoff = success_retry;
+                                    st.next_at = now + success_retry + std::time::Duration::from_millis(jitter_ms(500));
+                                }
+                                Err(_) => {
+                                    let next = (st.backoff.as_secs().saturating_mul(2)).max(backoff_min.as_secs());
+                                    st.backoff = std::time::Duration::from_secs(next).min(backoff_max);
+                                    st.next_at = now + st.backoff + std::time::Duration::from_millis(jitter_ms(250));
+                                }
+                            }
+                        } else {
+                            // Bad peer string; backoff it.
+                            st.backoff = backoff_max;
+                            st.next_at = now + backoff_max;
+                        }
                     }
                 }
             });
@@ -2267,12 +2377,15 @@ impl CatalystNode {
 
             let last_lsu: Arc<tokio::sync::RwLock<std::collections::HashMap<u64, catalyst_consensus::types::LedgerStateUpdate>>> =
                 Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+            let relay_cache: Arc<tokio::sync::Mutex<RelayCache>> =
+                Arc::new(tokio::sync::Mutex::new(RelayCache::default()));
             let handle = tokio::spawn(async move {
                 while let Some(ev) = events.recv().await {
                     if let catalyst_network::NetworkEvent::MessageReceived { envelope, .. } = ev {
+                        let now_ms = current_timestamp_ms();
                         if envelope.message_type == MessageType::Transaction {
                             // Prefer protocol-shaped txs; fall back to legacy TxGossip.
-                            let now_secs = current_timestamp_ms() / 1000;
+                            let now_secs = now_ms / 1000;
                             if let Ok(tx) = envelope.extract_message::<ProtocolTxGossip>() {
                                 // Nonce check (single-sender only, requires storage).
                                 if let Some(store) = &storage {
@@ -2297,24 +2410,43 @@ impl CatalystNode {
                                         let mut mp = mempool.write().await;
                                         if mp.insert_protocol(tx.clone(), now_secs) {
                                             persist_mempool_tx(store.as_ref(), &tx.tx).await;
-                                            // Help multi-hop propagation on WAN: rebroadcast when first seen.
-                                            let _ = net.broadcast_envelope(&envelope).await;
+                                            // Help multi-hop propagation on WAN: relay when first seen.
+                                            let do_relay = {
+                                                let mut rc = relay_cache.lock().await;
+                                                rc.should_relay(&envelope, now_ms)
+                                            };
+                                            if do_relay {
+                                                let _ = net.broadcast_envelope(&envelope).await;
+                                            }
                                         }
                                     }
                                 } else {
                                     let mut mp = mempool.write().await;
                                     if mp.insert_protocol(tx, now_secs) {
-                                        let _ = net.broadcast_envelope(&envelope).await;
+                                        let do_relay = {
+                                            let mut rc = relay_cache.lock().await;
+                                            rc.should_relay(&envelope, now_ms)
+                                        };
+                                        if do_relay {
+                                            let _ = net.broadcast_envelope(&envelope).await;
+                                        }
                                     }
                                 }
                             } else if let Ok(tx) = envelope.extract_message::<TxGossip>() {
                                 let mut mp = mempool.write().await;
                                 if mp.insert(tx) {
-                                    let _ = net.broadcast_envelope(&envelope).await;
+                                    let do_relay = {
+                                        let mut rc = relay_cache.lock().await;
+                                        rc.should_relay(&envelope, now_ms)
+                                    };
+                                    if do_relay {
+                                        let _ = net.broadcast_envelope(&envelope).await;
+                                    }
                                 }
                             }
                         } else if envelope.message_type == MessageType::TransactionBatch {
                             // Prefer protocol tx batches (full signed txs), fallback to legacy entry batch.
+                            let mut accepted = false;
                             if let Ok(batch) = envelope.extract_message::<ProtocolTxBatch>() {
                                 if batch.verify_hash().unwrap_or(false) {
                                     if let Some(store) = &storage {
@@ -2331,6 +2463,7 @@ impl CatalystNode {
                                             update_tx_meta_status_selected(store.as_ref(), tx, batch.cycle).await;
                                         }
                                         tx_batches.write().await.insert(batch.cycle, entries);
+                                        accepted = true;
                                     }
                                 }
                             } else if let Ok(batch) = envelope.extract_message::<TxBatch>() {
@@ -2338,12 +2471,30 @@ impl CatalystNode {
                                 if let Ok(h) = catalyst_consensus::types::hash_data(&batch.entries) {
                                     if h == batch.batch_hash {
                                         tx_batches.write().await.insert(batch.cycle, batch.entries);
+                                        accepted = true;
                                     }
+                                }
+                            }
+                            if accepted {
+                                let do_relay = {
+                                    let mut rc = relay_cache.lock().await;
+                                    rc.should_relay(&envelope, now_ms)
+                                };
+                                if do_relay {
+                                    let _ = net.broadcast_envelope(&envelope).await;
                                 }
                             }
                         } else if envelope.message_type == MessageType::ConsensusSync {
                             // Prefer CID-based LSU sync; fallback to full LSU gossip.
                             if let Ok(ref_msg) = envelope.extract_message::<LsuCidGossip>() {
+                                // Relay LSU references even if we can't fetch/apply locally.
+                                let do_relay = {
+                                    let mut rc = relay_cache.lock().await;
+                                    rc.should_relay(&envelope, now_ms)
+                                };
+                                if do_relay {
+                                    let _ = net.broadcast_envelope(&envelope).await;
+                                }
                                 if let Some(dfs) = &dfs {
                                     if let Ok(_cid) = ContentId::from_string(&ref_msg.cid) {
                                         if let Ok(bytes) = dfs.get(&ref_msg.cid).await {
@@ -2560,10 +2711,26 @@ impl CatalystNode {
                                                     .await;
                                             }
                                         }
+                                        // Relay only after hash check.
+                                        let do_relay = {
+                                            let mut rc = relay_cache.lock().await;
+                                            rc.should_relay(&envelope, now_ms)
+                                        };
+                                        if do_relay {
+                                            let _ = net.broadcast_envelope(&envelope).await;
+                                        }
                                     }
                                 }
                             }
                         } else if envelope.message_type == MessageType::FileRequest {
+                            // Multi-hop relay is required for WAN topologies where requester isn't directly connected.
+                            let do_relay = {
+                                let mut rc = relay_cache.lock().await;
+                                rc.should_relay(&envelope, now_ms)
+                            };
+                            if do_relay {
+                                let _ = net.broadcast_envelope(&envelope).await;
+                            }
                             if let Ok(req) = envelope.extract_message::<FileRequestMsg>() {
                                 if let Some(dfs) = &dfs {
                                     if let Ok(bytes) = dfs.get(&req.cid).await {
@@ -2583,6 +2750,14 @@ impl CatalystNode {
                                 }
                             }
                         } else if envelope.message_type == MessageType::FileResponse {
+                            // Relay so the requester can receive even across multiple hops.
+                            let do_relay = {
+                                let mut rc = relay_cache.lock().await;
+                                rc.should_relay(&envelope, now_ms)
+                            };
+                            if do_relay {
+                                let _ = net.broadcast_envelope(&envelope).await;
+                            }
                             if let Ok(resp) = envelope.extract_message::<FileResponseMsg>() {
                                 if resp.requester != producer_id_self {
                                     continue;
@@ -2667,7 +2842,17 @@ impl CatalystNode {
                                 }
                             }
                         } else {
-                            let _ = in_tx.send(envelope);
+                            // Forward to consensus engine, and also relay broadcast envelopes to support multi-hop WAN gossip.
+                            // (Consensus messages don't have local validity checks at this layer.)
+                            let env = envelope;
+                            let _ = in_tx.send(env.clone());
+                            let do_relay = {
+                                let mut rc = relay_cache.lock().await;
+                                rc.should_relay(&env, now_ms)
+                            };
+                            if do_relay {
+                                let _ = net.broadcast_envelope(&env).await;
+                            }
                         }
                     }
                 }
