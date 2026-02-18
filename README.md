@@ -25,8 +25,8 @@ A truly decentralized blockchain node implementation that prioritizes accessibil
 │   File System   │ Virtual Machine │    Service Bus  │
 │   Module        │    Module       │    Module       │
 ├─────────────────┼─────────────────┼─────────────────┤
-│ IPFS-based      │ EVM/SVM/WASM    │ WebSocket +     │
-│ Distributed     │ Multi-runtime   │ Webhook Events  │
+│ Content-addressed│ EVM/SVM/WASM   │ WebSocket +     │
+│ DFS (CID sync)  │ Multi-runtime   │ Webhook Events  │
 └─────────────────┴─────────────────┴─────────────────┘
 ```
 
@@ -36,7 +36,7 @@ A truly decentralized blockchain node implementation that prioritizes accessibil
 
 - Rust 1.75+ ([install](https://rustup.rs/))
 - Git
-- IPFS ([install](https://ipfs.io/docs/install/))
+- IPFS: optional. The local testnet uses a built-in, local content store for CID-addressed data (no daemon required).
 
 #### Linux system packages (required for building)
 
@@ -58,8 +58,8 @@ Additionally, some GVFS/SMB mounts prevent Cargo from updating `Cargo.lock`. In 
 
 ```bash
 # Clone the repository
-git clone https://github.com/catalyst-network/catalyst-node
-cd catalyst-node
+git clone https://github.com/catalyst-network/catalyst-node-rust
+cd catalyst-node-rust
 
 # Set up development environment
 make setup
@@ -236,12 +236,31 @@ cargo run -p catalyst-cli -- start \
   --bootstrap-peers "/ip4/<HOST>/tcp/30333"
 ```
 
-### Smart contract dev scaffolding (current state)
+### Bootstrap via DNS seeds (optional)
 
-This repo currently has a **scaffolded** SmartContract transaction flow:
-- `catalyst deploy <bytecode_file>` stores contract bytecode under `evm:code:<addr20>`
-- `catalyst_getCode` returns that stored bytecode
-- `catalyst call` is a placeholder (no real EVM bytecode execution yet)
+Instead of hard-coding `--bootstrap-peers`, operators can set **DNS seeds** in the node config. Seeds resolve via:
+- **TXT records** (preferred): multiaddrs, `ip[:port]`, or host:port tokens
+- **A/AAAA fallback**: resolved IPs mapped to `/ip{4,6}/.../tcp/<port>`
+
+Config example:
+
+```toml
+[network]
+bootstrap_peers = ["/ip4/<HOST>/tcp/30333"]
+dns_seeds = ["seed1.example.org", "seed2.example.org"]
+```
+
+### Multi-hop WAN propagation
+
+Nodes will **relay broadcast envelopes with deduplication** to improve propagation in non-fully-meshed WAN topologies (e.g. A ↔ B ↔ C).
+Bootstrap dialing uses **per-peer exponential backoff with jitter** to avoid hammering unreachable peers.
+
+### Smart contract execution (current state)
+
+The repo supports **basic EVM execution** in the local testnet harness (see “Contract sanity check (EVM execution)”).
+The CLI provides:
+- `catalyst deploy <bytecode_file>`: deploy bytecode via RPC
+- `catalyst call <contract> "<sig(args)>"`: call a function (read-only or state-changing if `--key-file` is provided)
 
 
 ## 📋 Usage
@@ -304,7 +323,7 @@ catalyst call <contract_address> "transfer(address,uint256)" --key-file wallet.k
 ### Project Structure
 
 ```
-catalyst-node/
+catalyst-node-rust/
 ├── crates/
 │   ├── catalyst-core/         # Core traits and types
 │   ├── catalyst-consensus/    # Collaborative consensus implementation
@@ -313,7 +332,7 @@ catalyst-node/
 │   ├── catalyst-runtime-evm/  # Ethereum Virtual Machine runtime
 │   ├── catalyst-runtime-svm/  # Solana Virtual Machine runtime
 │   ├── catalyst-service-bus/  # Web2 integration service bus
-│   ├── catalyst-dfs/          # IPFS-based distributed file system
+│   ├── catalyst-dfs/          # Content-addressed DFS utilities
 │   ├── catalyst-crypto/       # Cryptographic utilities
 │   ├── catalyst-rpc/          # JSON-RPC server
 │   ├── catalyst-config/       # Configuration management
@@ -567,7 +586,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 🌍 Community
 
 - **Discord**: [Join our Discord](https://discord.gg/catalyst)
-- **GitHub**: [Contribute on GitHub](https://github.com/catalyst-network/catalyst-node)
+- **GitHub**: [Contribute on GitHub](https://github.com/catalyst-network/catalyst-node-rust)
 - **Forum**: [Community Forum](https://forum.catalyst.network)
 - **Documentation**: [docs.catalyst.network](https://docs.catalyst.network)
 
