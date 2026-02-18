@@ -1,7 +1,8 @@
 use anyhow::Result;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 
 use catalyst_core::{NodeId, NodeRole, ResourceProof, WorkerPass};
 use catalyst_core::protocol::select_producers_for_next_cycle;
@@ -39,6 +40,102 @@ const FAUCET_INITIAL_BALANCE: i64 = 1_000_000;
 const META_PROTOCOL_CHAIN_ID: &str = "protocol:chain_id";
 const META_PROTOCOL_NETWORK_ID: &str = "protocol:network_id";
 const META_PROTOCOL_GENESIS_HASH: &str = "protocol:genesis_hash";
+
+async fn resolve_dns_seeds_to_bootstrap_multiaddrs(seeds: &[String], default_port: u16) -> Vec<Multiaddr> {
+    if seeds.is_empty() {
+        return Vec::new();
+    }
+
+    let resolver: hickory_resolver::TokioResolver = match hickory_resolver::TokioResolver::builder_tokio() {
+        Ok(b) => b.build(),
+        Err(e) => {
+            warn!("dns_seeds: failed to init resolver from system conf: {e}");
+            return Vec::new();
+        }
+    };
+
+    let mut out: Vec<Multiaddr> = Vec::new();
+
+    for seed in seeds {
+        let name = seed.trim().trim_end_matches('.').to_string();
+        if name.is_empty() {
+            continue;
+        }
+
+        // Preferred: TXT records containing multiaddrs or ip[:port] tokens.
+        let mut found_any = false;
+        if let Ok(lookup) = resolver.txt_lookup(name.clone()).await {
+            for txt in lookup.iter() {
+                for chunk in txt.txt_data().iter() {
+                    let s = String::from_utf8_lossy(chunk).to_string();
+                    for token in s.split(|c: char| c == ',' || c.is_whitespace() || c == ';').map(|t| t.trim()).filter(|t| !t.is_empty()) {
+                        let addrs = parse_seed_token_to_multiaddrs(token, default_port);
+                        if !addrs.is_empty() {
+                            found_any = true;
+                            out.extend(addrs);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: resolve A/AAAA and convert to `/ip{4,6}/.../tcp/<port>`.
+        if !found_any {
+            if let Ok(ips) = resolver.lookup_ip(name.clone()).await {
+                for ip in ips.iter() {
+                    if let Ok(ma) = ip_to_multiaddr(ip, default_port) {
+                        out.push(ma);
+                    }
+                }
+            }
+        }
+    }
+
+    out.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+    out.dedup_by(|a, b| a.to_string() == b.to_string());
+    out
+}
+
+fn parse_seed_token_to_multiaddrs(token: &str, default_port: u16) -> Vec<Multiaddr> {
+    let t = token.trim();
+    if t.is_empty() {
+        return Vec::new();
+    }
+
+    // Multiaddr directly.
+    if t.starts_with('/') {
+        if let Ok(ma) = t.parse::<Multiaddr>() {
+            return vec![ma];
+        }
+        return Vec::new();
+    }
+
+    // SocketAddr (e.g. "45.32.177.248:30333" or "[2606:...]:30333").
+    if let Ok(sa) = t.parse::<std::net::SocketAddr>() {
+        if let Ok(ma) = ip_to_multiaddr(sa.ip(), sa.port()) {
+            return vec![ma];
+        }
+        return Vec::new();
+    }
+
+    // Bare IP (e.g. "45.32.177.248" or "2606:...").
+    if let Ok(ip) = t.parse::<std::net::IpAddr>() {
+        if let Ok(ma) = ip_to_multiaddr(ip, default_port) {
+            return vec![ma];
+        }
+        return Vec::new();
+    }
+
+    Vec::new()
+}
+
+fn ip_to_multiaddr(ip: std::net::IpAddr, port: u16) -> Result<Multiaddr, ()> {
+    let s = match ip {
+        std::net::IpAddr::V4(v4) => format!("/ip4/{}/tcp/{}", v4, port),
+        std::net::IpAddr::V6(v6) => format!("/ip6/{}/tcp/{}", v6, port),
+    };
+    s.parse::<Multiaddr>().map_err(|_| ())
+}
 
 fn balance_key_for_pubkey(pubkey: &[u8; 32]) -> Vec<u8> {
     let mut k = b"bal:".to_vec();
@@ -1781,8 +1878,31 @@ impl CatalystNode {
         let network = Arc::new(P2pService::new(net_cfg).await?);
         network.start().await?;
 
-        // Dial bootstrap peers from CLI config
-        for peer in &self.config.network.bootstrap_peers {
+        // Dial bootstrap peers from CLI config + optional DNS seeds.
+        let peers_static = self.config.network.bootstrap_peers.clone();
+        let seeds = self.config.network.dns_seeds.clone();
+
+        let peers_from_dns: Vec<String> = resolve_dns_seeds_to_bootstrap_multiaddrs(&seeds, 30333)
+            .await
+            .into_iter()
+            .map(|m| m.to_string())
+            .collect();
+
+        let mut all_peers: Vec<String> = Vec::new();
+        all_peers.extend(peers_static.clone());
+        all_peers.extend(peers_from_dns.clone());
+        all_peers.sort();
+        all_peers.dedup();
+
+        if !seeds.is_empty() {
+            info!(
+                "dns_seeds={} resolved_bootstrap_peers={}",
+                seeds.len(),
+                peers_from_dns.len()
+            );
+        }
+
+        for peer in &all_peers {
             if let Ok(ma) = peer.parse::<Multiaddr>() {
                 let _ = network.connect_multiaddr(&ma).await;
             }
@@ -1790,18 +1910,32 @@ impl CatalystNode {
 
         // Keep trying to connect to bootstrap peers. This makes local testnet resilient to
         // restarting node1 (bootstrap) without having to restart all other nodes.
-        if !self.config.network.bootstrap_peers.is_empty() {
-            let peers = self.config.network.bootstrap_peers.clone();
+        if !all_peers.is_empty() || !seeds.is_empty() {
             let net = network.clone();
             let mut shutdown_rx2 = shutdown_rx.clone();
             let handle = tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut last_resolve = Instant::now() - std::time::Duration::from_secs(3600);
+                let mut peers_cached: Vec<String> = peers_from_dns.clone();
                 loop {
                     if *shutdown_rx2.borrow() {
                         break;
                     }
-                    for p in &peers {
+                    // Refresh DNS seeds periodically so IPs can rotate without restarts.
+                    if !seeds.is_empty() && last_resolve.elapsed() >= std::time::Duration::from_secs(60) {
+                        let mut out: Vec<String> = resolve_dns_seeds_to_bootstrap_multiaddrs(&seeds, 30333)
+                            .await
+                            .into_iter()
+                            .map(|m| m.to_string())
+                            .collect();
+                        out.sort();
+                        out.dedup();
+                        peers_cached = out;
+                        last_resolve = Instant::now();
+                    }
+
+                    for p in peers_static.iter().chain(peers_cached.iter()) {
                         if let Ok(ma) = p.parse::<Multiaddr>() {
                             let _ = net.connect_multiaddr(&ma).await;
                         }
