@@ -9,6 +9,7 @@ node.key
 /testnet/
 /scripts/.cache/
 **/*.pid
+/txgen/
 
 # Local storage / rocksdb data (never commit)
 /crates/catalyst-storage/catalyst_data/

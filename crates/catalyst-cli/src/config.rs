@@ -69,6 +69,16 @@ pub struct NetworkConfig {
     
     /// Bootstrap peer addresses
     pub bootstrap_peers: Vec<String>,
+
+    /// Optional DNS seed domains (TXT/A/AAAA) used to discover bootstrap peers at runtime.
+    ///
+    /// TXT records may contain multiaddrs (preferred), IPs, or host:port entries.
+    /// Example TXT values:
+    /// - `/ip4/45.32.177.248/tcp/30333`
+    /// - `45.32.177.248:30333`
+    /// - `45.32.177.248`
+    #[serde(default)]
+    pub dns_seeds: Vec<String>,
     
     /// Maximum number of peers to connect to
     pub max_peers: u32,
@@ -355,6 +365,7 @@ impl Default for NodeConfig {
                     "/ip6/::/tcp/30333".to_string(),
                 ],
                 bootstrap_peers: vec![],
+                dns_seeds: vec![],
                 max_peers: 50,
                 min_peers: 5,
                 protocol_version: "catalyst/1.0".to_string(),

@@ -54,3 +54,23 @@ make devnet-up HOST=<public_ip_or_dns> P2P_PORT=30333 RPC_PORT=8545
 make devnet-status
 make devnet-down
 ```
+
+## `txgen_faucet.sh`
+
+Generates a small, random number of faucet-funded transfers per block so
+blocks don’t look empty (useful for public testnets + explorers).
+
+Run:
+
+```bash
+RPC_URL="http://<your-rpc-host>:8545" bash scripts/txgen_faucet.sh
+```
+
+Safety knobs (environment variables):
+- `MAX_TX_PER_BLOCK` (default `2`): each new block sends 0..MAX tiny transfers
+- `AMOUNT_MIN` / `AMOUNT_MAX` (defaults `1`..`3`)
+- `RECIP_COUNT` (default `25`): size of recipient pool
+- `STOP_AFTER_BLOCKS` (unset => run forever)
+
+State:
+- stores `faucet.key` + recipient pool under `./txgen/` by default (override with `STATE_DIR`)
