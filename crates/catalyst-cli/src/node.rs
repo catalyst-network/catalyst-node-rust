@@ -19,7 +19,10 @@ use catalyst_utils::state::StateManager;
 
 use crate::config::NodeConfig;
 use crate::tx::{Mempool, ProtocolTxBatch, ProtocolTxGossip, TxBatch, TxGossip};
-use crate::sync::{FileRequestMsg, FileResponseMsg, KeyProofChange, LsuCidGossip, LsuGossip, StateProofBundle};
+use crate::sync::{
+    FileRequestMsg, FileResponseMsg, KeyProofChange, LsuCidGossip, LsuGossip, LsuRangeRequest,
+    LsuRangeResponse, StateProofBundle,
+};
 use crate::evm::{decode_evm_marker, encode_evm_marker, EvmTxKind, EvmTxPayload};
 use crate::evm_revm::{execute_call_and_persist, execute_deploy_and_persist};
 
@@ -67,6 +70,39 @@ async fn local_applied_state_root(store: &catalyst_storage::StorageManager) -> [
             None
         })
         .unwrap_or([0u8; 32])
+}
+
+async fn local_applied_cycle(store: &catalyst_storage::StorageManager) -> u64 {
+    let Some(b) = store
+        .get_metadata("consensus:last_applied_cycle")
+        .await
+        .ok()
+        .flatten()
+    else {
+        return 0;
+    };
+    if b.len() != 8 {
+        return 0;
+    }
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(&b[..8]);
+    u64::from_le_bytes(arr)
+}
+
+async fn meta_32(store: &catalyst_storage::StorageManager, key: &str) -> Option<[u8; 32]> {
+    let b = store.get_metadata(key).await.ok().flatten()?;
+    if b.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&b[..32]);
+    Some(out)
+}
+
+async fn meta_string(store: &catalyst_storage::StorageManager, key: &str) -> Option<String> {
+    let b = store.get_metadata(key).await.ok().flatten()?;
+    let s = String::from_utf8_lossy(&b).to_string();
+    if s.is_empty() { None } else { Some(s) }
 }
 
 #[derive(Debug, Default)]
@@ -2402,6 +2438,13 @@ impl CatalystNode {
                 Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
             let relay_cache: Arc<tokio::sync::Mutex<RelayCache>> =
                 Arc::new(tokio::sync::Mutex::new(RelayCache::default()));
+            #[derive(Debug, Default)]
+            struct CatchupState {
+                observed_head_cycle: u64,
+                last_req_ms: u64,
+            }
+            let catchup: Arc<tokio::sync::Mutex<CatchupState>> =
+                Arc::new(tokio::sync::Mutex::new(CatchupState::default()));
             let handle = tokio::spawn(async move {
                 while let Some(ev) = events.recv().await {
                     if let catalyst_network::NetworkEvent::MessageReceived { envelope, .. } = ev {
@@ -2518,6 +2561,29 @@ impl CatalystNode {
                                 if do_relay {
                                     let _ = net.broadcast_envelope(&envelope).await;
                                 }
+                                // Track observed head and request backfill if we're behind.
+                                if let Some(store) = &storage {
+                                    let mut c = catchup.lock().await;
+                                    c.observed_head_cycle = c.observed_head_cycle.max(ref_msg.cycle);
+                                    let local_cycle = local_applied_cycle(store.as_ref()).await;
+                                    if local_cycle.saturating_add(1) < c.observed_head_cycle {
+                                        let should = now_ms.saturating_sub(c.last_req_ms) > 2000;
+                                        if should {
+                                            let start = local_cycle.saturating_add(1);
+                                            let remaining = c.observed_head_cycle.saturating_sub(start).saturating_add(1);
+                                            let count = remaining.min(256) as u32;
+                                            let req = LsuRangeRequest {
+                                                requester: producer_id_self.clone(),
+                                                start_cycle: start,
+                                                count,
+                                            };
+                                            if let Ok(env) = MessageEnvelope::from_message(&req, "lsu_range_req".to_string(), None) {
+                                                let _ = net.broadcast_envelope(&env).await;
+                                                c.last_req_ms = now_ms;
+                                            }
+                                        }
+                                    }
+                                }
                                 if let Some(dfs) = &dfs {
                                     if let Ok(_cid) = ContentId::from_string(&ref_msg.cid) {
                                         if let Ok(bytes) = dfs.get(&ref_msg.cid).await {
@@ -2544,6 +2610,26 @@ impl CatalystNode {
                                                                         hex_encode(&local_prev),
                                                                         hex_encode(&ref_msg.prev_state_root)
                                                                     );
+                                                                    // Request backfill starting from local+1 to observed head.
+                                                                    let mut c = catchup.lock().await;
+                                                                    c.observed_head_cycle = c.observed_head_cycle.max(ref_msg.cycle);
+                                                                    let local_cycle = local_applied_cycle(store.as_ref()).await;
+                                                                    if local_cycle.saturating_add(1) < c.observed_head_cycle
+                                                                        && now_ms.saturating_sub(c.last_req_ms) > 2000
+                                                                    {
+                                                                        let start = local_cycle.saturating_add(1);
+                                                                        let remaining = c.observed_head_cycle.saturating_sub(start).saturating_add(1);
+                                                                        let count = remaining.min(256) as u32;
+                                                                        let req = LsuRangeRequest {
+                                                                            requester: producer_id_self.clone(),
+                                                                            start_cycle: start,
+                                                                            count,
+                                                                        };
+                                                                        if let Ok(env) = MessageEnvelope::from_message(&req, "lsu_range_req".to_string(), None) {
+                                                                            let _ = net.broadcast_envelope(&env).await;
+                                                                            c.last_req_ms = now_ms;
+                                                                        }
+                                                                    }
                                                                     continue;
                                                                 }
                                                             }
@@ -2737,6 +2823,99 @@ impl CatalystNode {
                                         if do_relay {
                                             let _ = net.broadcast_envelope(&envelope).await;
                                         }
+                                    }
+                                }
+                            }
+                        } else if envelope.message_type == MessageType::StateRequest {
+                            if let Ok(req) = envelope.extract_message::<LsuRangeRequest>() {
+                                if req.requester == producer_id_self {
+                                    continue;
+                                }
+                                let Some(store) = &storage else {
+                                    continue;
+                                };
+                                let max = req.count.min(256) as u64;
+                                let mut refs: Vec<LsuCidGossip> = Vec::new();
+                                for i in 0..max {
+                                    let cycle = req.start_cycle.saturating_add(i);
+                                    let Some(cid) = meta_string(store.as_ref(), &format!("consensus:lsu_cid:{}", cycle)).await else {
+                                        break;
+                                    };
+                                    let Some(lsu_hash) = meta_32(store.as_ref(), &format!("consensus:lsu_hash:{}", cycle)).await else {
+                                        break;
+                                    };
+                                    let Some(state_root) = meta_32(store.as_ref(), &format!("consensus:lsu_state_root:{}", cycle)).await else {
+                                        break;
+                                    };
+                                    let prev_state_root = if cycle == 0 {
+                                        [0u8; 32]
+                                    } else {
+                                        meta_32(store.as_ref(), &format!("consensus:lsu_state_root:{}", cycle.saturating_sub(1)))
+                                            .await
+                                            .unwrap_or([0u8; 32])
+                                    };
+                                    refs.push(LsuCidGossip {
+                                        cycle,
+                                        lsu_hash,
+                                        cid,
+                                        prev_state_root,
+                                        state_root,
+                                        proof_cid: String::new(),
+                                    });
+                                }
+                                if refs.is_empty() {
+                                    continue;
+                                }
+                                let resp = LsuRangeResponse {
+                                    requester: req.requester,
+                                    refs,
+                                };
+                                if let Ok(env) = MessageEnvelope::from_message(&resp, "lsu_range_resp".to_string(), None) {
+                                    let _ = net.broadcast_envelope(&env).await;
+                                }
+                            }
+                        } else if envelope.message_type == MessageType::StateResponse {
+                            if let Ok(resp) = envelope.extract_message::<LsuRangeResponse>() {
+                                if resp.requester != producer_id_self {
+                                    continue;
+                                }
+                                // Update observed head based on response.
+                                if let Some(max_cycle) = resp.refs.iter().map(|r| r.cycle).max() {
+                                    let mut c = catchup.lock().await;
+                                    c.observed_head_cycle = c.observed_head_cycle.max(max_cycle);
+                                }
+                                // For each reference, if we don't have bytes locally, request via FileRequest.
+                                for r in resp.refs {
+                                    if let Some(store) = &storage {
+                                        // If we already have the LSU bytes in DB, skip requesting.
+                                        if store
+                                            .get_metadata(&format!("consensus:lsu:{}", r.cycle))
+                                            .await
+                                            .ok()
+                                            .flatten()
+                                            .is_some()
+                                        {
+                                            continue;
+                                        }
+                                    }
+                                    pending_lsu_fetch_inbound.write().await.insert(
+                                        r.cid.clone(),
+                                        PendingLsuFetch {
+                                            cycle: r.cycle,
+                                            lsu_hash: r.lsu_hash,
+                                            prev_state_root: r.prev_state_root,
+                                            expected_state_root: r.state_root,
+                                            proof_cid: r.proof_cid.clone(),
+                                            attempts: 0,
+                                            next_retry_at_ms: 0,
+                                        },
+                                    );
+                                    let req = FileRequestMsg {
+                                        requester: producer_id_self.clone(),
+                                        cid: r.cid.clone(),
+                                    };
+                                    if let Ok(env) = MessageEnvelope::from_message(&req, "file_req_backfill".to_string(), None) {
+                                        let _ = net.broadcast_envelope(&env).await;
                                     }
                                 }
                             }

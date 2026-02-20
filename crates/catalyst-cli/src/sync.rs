@@ -129,6 +129,72 @@ impl NetworkMessage for FileResponseMsg {
     }
 }
 
+/// Request a range of LSU CID references by cycle number.
+///
+/// This enables a node that missed historical LSU gossip (e.g. downtime/partition)
+/// to backfill missing cycles from peers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LsuRangeRequest {
+    pub requester: String,
+    pub start_cycle: u64,
+    pub count: u32,
+}
+
+impl_catalyst_serialize!(LsuRangeRequest, requester, start_cycle, count);
+
+impl NetworkMessage for LsuRangeRequest {
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        CatalystSerialize::serialize(self)
+    }
+
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        CatalystDeserialize::deserialize(data)
+    }
+
+    fn message_type(&self) -> MessageType {
+        MessageType::StateRequest
+    }
+
+    fn priority(&self) -> u8 {
+        MessagePriority::High as u8
+    }
+
+    fn ttl(&self) -> u32 {
+        30
+    }
+}
+
+/// Response to `LsuRangeRequest`: a compact list of `LsuCidGossip` references.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LsuRangeResponse {
+    pub requester: String,
+    pub refs: Vec<LsuCidGossip>,
+}
+
+impl_catalyst_serialize!(LsuRangeResponse, requester, refs);
+
+impl NetworkMessage for LsuRangeResponse {
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        CatalystSerialize::serialize(self)
+    }
+
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        CatalystDeserialize::deserialize(data)
+    }
+
+    fn message_type(&self) -> MessageType {
+        MessageType::StateResponse
+    }
+
+    fn priority(&self) -> u8 {
+        MessagePriority::High as u8
+    }
+
+    fn ttl(&self) -> u32 {
+        30
+    }
+}
+
 /// Gossip message carrying a full LSU for observers / late joiners.
 ///
 /// This is a stepping-stone toward DFS-based sync: later we will gossip a DFS address (CID)
