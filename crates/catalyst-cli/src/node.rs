@@ -46,6 +46,29 @@ fn jitter_ms(max_ms: u64) -> u64 {
     r % (max_ms + 1)
 }
 
+async fn local_applied_state_root(store: &catalyst_storage::StorageManager) -> [u8; 32] {
+    // Prefer the engine-provided cached root (restored on open), and fall back to the persisted
+    // metadata key used by older codepaths.
+    if let Some(r) = store.get_state_root() {
+        return r;
+    }
+    // Best-effort: older DBs may only have the metadata key.
+    // NOTE: this is sync code; failures should not panic.
+    store
+        .get_metadata("consensus:last_applied_state_root")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|b| if b.len() == 32 {
+            let mut r = [0u8; 32];
+            r.copy_from_slice(&b[..32]);
+            Some(r)
+        } else {
+            None
+        })
+        .unwrap_or([0u8; 32])
+}
+
 #[derive(Debug, Default)]
 struct RelayCache {
     seen: std::collections::HashMap<String, u64>,
@@ -2505,29 +2528,24 @@ impl CatalystNode {
                                                     if h == ref_msg.lsu_hash {
                                                         if let Some(store) = &storage {
                                                             // Ensure we're applying onto the expected previous root.
-                                                            let local_prev = store
-                                                                .get_metadata("consensus:last_applied_state_root")
-                                                                .await
-                                                                .ok()
-                                                                .flatten()
-                                                                .and_then(|b| if b.len() == 32 {
-                                                                    let mut r = [0u8; 32];
-                                                                    r.copy_from_slice(&b[..32]);
-                                                                    Some(r)
+                                                            //
+                                                            // IMPORTANT: do not apply onto an "unknown" root. The only
+                                                            // safe bypass is the explicit bootstrap case where both
+                                                            // local and expected prev roots are zero.
+                                                            let local_prev = local_applied_state_root(store.as_ref()).await;
+                                                            if local_prev != ref_msg.prev_state_root {
+                                                                if local_prev == [0u8; 32] && ref_msg.prev_state_root == [0u8; 32] {
+                                                                    // bootstrap ok
                                                                 } else {
-                                                                    None
-                                                                })
-                                                                .unwrap_or([0u8; 32]);
-
-                                                            if local_prev != ref_msg.prev_state_root && local_prev != [0u8; 32] {
-                                                                tracing::warn!(
-                                                                    "Skipping LSU cycle={} cid={} (prev_root mismatch local={} expected={})",
-                                                                    ref_msg.cycle,
-                                                                    ref_msg.cid,
-                                                                    hex_encode(&local_prev),
-                                                                    hex_encode(&ref_msg.prev_state_root)
-                                                                );
-                                                                continue;
+                                                                    tracing::warn!(
+                                                                        "Skipping LSU cycle={} cid={} (prev_root mismatch local={} expected={})",
+                                                                        ref_msg.cycle,
+                                                                        ref_msg.cid,
+                                                                        hex_encode(&local_prev),
+                                                                        hex_encode(&ref_msg.prev_state_root)
+                                                                    );
+                                                                    continue;
+                                                                }
                                                             }
 
                                                             // Proof-driven path: if we have a proof bundle CID locally, verify it and apply without recomputing root.
@@ -2779,21 +2797,17 @@ impl CatalystNode {
                                         }
                                         if let Some(store) = &storage {
                                             // Ensure we're applying onto the expected previous root.
-                                            let local_prev = store
-                                                .get_metadata("consensus:last_applied_state_root")
-                                                .await
-                                                .ok()
-                                                .flatten()
-                                                .and_then(|b| if b.len() == 32 {
-                                                    let mut r = [0u8; 32];
-                                                    r.copy_from_slice(&b[..32]);
-                                                    Some(r)
+                                            //
+                                            // IMPORTANT: do not apply onto an "unknown" root. The only
+                                            // safe bypass is the explicit bootstrap case where both
+                                            // local and expected prev roots are zero.
+                                            let local_prev = local_applied_state_root(store.as_ref()).await;
+                                            if local_prev != info.prev_state_root {
+                                                if local_prev == [0u8; 32] && info.prev_state_root == [0u8; 32] {
+                                                    // bootstrap ok
                                                 } else {
-                                                    None
-                                                })
-                                                .unwrap_or([0u8; 32]);
-                                            if local_prev != info.prev_state_root && local_prev != [0u8; 32] {
-                                                continue;
+                                                    continue;
+                                                }
                                             }
 
                                             // Proof-driven path if proof bundle is present locally.
