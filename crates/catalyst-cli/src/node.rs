@@ -105,6 +105,34 @@ async fn meta_string(store: &catalyst_storage::StorageManager, key: &str) -> Opt
     if s.is_empty() { None } else { Some(s) }
 }
 
+async fn persist_lsu_history(
+    store: &catalyst_storage::StorageManager,
+    cycle: u64,
+    lsu_bytes: &[u8],
+    lsu_hash: &[u8; 32],
+    cid: &str,
+    state_root: &[u8; 32],
+) {
+    // Per-cycle history used by RPC/indexers. Best-effort.
+    let _ = store
+        .set_metadata(&format!("consensus:lsu:{}", cycle), lsu_bytes)
+        .await;
+    let _ = store
+        .set_metadata(&format!("consensus:lsu_hash:{}", cycle), lsu_hash)
+        .await;
+    let _ = store
+        .set_metadata(&cycle_by_lsu_hash_key(lsu_hash), &cycle.to_le_bytes())
+        .await;
+    if !cid.is_empty() {
+        let _ = store
+            .set_metadata(&format!("consensus:lsu_cid:{}", cycle), cid.as_bytes())
+            .await;
+    }
+    let _ = store
+        .set_metadata(&format!("consensus:lsu_state_root:{}", cycle), state_root)
+        .await;
+}
+
 #[derive(Debug, Default)]
 struct RelayCache {
     seen: std::collections::HashMap<String, u64>,
@@ -2445,6 +2473,70 @@ impl CatalystNode {
             }
             let catchup: Arc<tokio::sync::Mutex<CatchupState>> =
                 Arc::new(tokio::sync::Mutex::new(CatchupState::default()));
+            // Background: repair "holes" in per-cycle LSU history for RPC/indexers.
+            // This can happen if a node applied forward but missed persisting some cycles.
+            let net_gap = net.clone();
+            let storage_gap = storage.clone();
+            let catchup_gap = catchup.clone();
+            let producer_id_gap = producer_id_self.clone();
+            let mut shutdown_rx_gap = shutdown_rx.clone();
+            let gap_handle = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {},
+                        _ = shutdown_rx_gap.changed() => {},
+                    }
+                    if *shutdown_rx_gap.borrow() {
+                        break;
+                    }
+                    let Some(store) = &storage_gap else { continue };
+
+                    let head = local_applied_cycle(store.as_ref()).await;
+                    if head == 0 {
+                        continue;
+                    }
+
+                    // Scan a recent window behind head; request backfill starting at the newest missing cycle.
+                    let window: u64 = 2048;
+                    let mut missing: Option<u64> = None;
+                    let start_scan = head.saturating_sub(window);
+                    for cycle in (start_scan..=head).rev() {
+                        if store
+                            .get_metadata(&format!("consensus:lsu:{}", cycle))
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_none()
+                        {
+                            missing = Some(cycle);
+                            break;
+                        }
+                    }
+                    let Some(miss) = missing else { continue };
+
+                    let now_ms = current_timestamp_ms();
+                    let mut c = catchup_gap.lock().await;
+                    let should = now_ms.saturating_sub(c.last_req_ms) > 2000;
+                    if !should {
+                        continue;
+                    }
+                    c.observed_head_cycle = c.observed_head_cycle.max(head);
+
+                    let remaining = head.saturating_sub(miss).saturating_add(1);
+                    let count = remaining.min(256) as u32;
+                    let req = LsuRangeRequest {
+                        requester: producer_id_gap.clone(),
+                        start_cycle: miss,
+                        count,
+                    };
+                    if let Ok(env) = MessageEnvelope::from_message(&req, "lsu_range_req_gap".to_string(), None) {
+                        let _ = net_gap.broadcast_envelope(&env).await;
+                        c.last_req_ms = now_ms;
+                    }
+                }
+            });
             let handle = tokio::spawn(async move {
                 while let Some(ev) = events.recv().await {
                     if let catalyst_network::NetworkEvent::MessageReceived { envelope, .. } = ev {
@@ -2593,6 +2685,18 @@ impl CatalystNode {
                                                 if let Ok(h) = catalyst_consensus::types::hash_data(&lsu) {
                                                     if h == ref_msg.lsu_hash {
                                                         if let Some(store) = &storage {
+                                                            // Always persist per-cycle LSU history for RPC/indexers,
+                                                            // even if we cannot apply (e.g. filling historical gaps).
+                                                            persist_lsu_history(
+                                                                store.as_ref(),
+                                                                ref_msg.cycle,
+                                                                &bytes,
+                                                                &ref_msg.lsu_hash,
+                                                                &ref_msg.cid,
+                                                                &ref_msg.state_root,
+                                                            )
+                                                            .await;
+
                                                             // Ensure we're applying onto the expected previous root.
                                                             //
                                                             // IMPORTANT: do not apply onto an "unknown" root. The only
@@ -2975,6 +3079,18 @@ impl CatalystNode {
                                             continue;
                                         }
                                         if let Some(store) = &storage {
+                                                // Always persist per-cycle LSU history for RPC/indexers (gap repair),
+                                                // regardless of whether we can apply it to current state.
+                                                persist_lsu_history(
+                                                    store.as_ref(),
+                                                    info.cycle,
+                                                    &resp.bytes,
+                                                    &info.lsu_hash,
+                                                    &resp.cid,
+                                                    &info.expected_state_root,
+                                                )
+                                                .await;
+
                                             // Ensure we're applying onto the expected previous root.
                                             //
                                             // IMPORTANT: do not apply onto an "unknown" root. The only
@@ -2985,6 +3101,12 @@ impl CatalystNode {
                                                 if local_prev == [0u8; 32] && info.prev_state_root == [0u8; 32] {
                                                     // bootstrap ok
                                                 } else {
+                                                        // History-only backfill: keep persisted per-cycle metadata but
+                                                        // do not attempt to apply onto a different root.
+                                                        info!(
+                                                            "Backfilled LSU bytes (history only) cycle={} cid={}",
+                                                            info.cycle, resp.cid
+                                                        );
                                                     continue;
                                                 }
                                             }
@@ -3051,6 +3173,7 @@ impl CatalystNode {
                 }
             });
             self.network_tasks.push(handle);
+            self.network_tasks.push(gap_handle);
         }
 
         // Outbound: optional dummy tx generator (dev/testnet helper).
