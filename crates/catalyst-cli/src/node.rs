@@ -2541,6 +2541,9 @@ impl CatalystNode {
                 while let Some(ev) = events.recv().await {
                     if let catalyst_network::NetworkEvent::MessageReceived { envelope, .. } = ev {
                         let now_ms = current_timestamp_ms();
+                        if envelope.is_expired() {
+                            continue;
+                        }
                         if envelope.message_type == MessageType::Transaction {
                             // Prefer protocol-shaped txs; fall back to legacy TxGossip.
                             let now_secs = now_ms / 1000;
