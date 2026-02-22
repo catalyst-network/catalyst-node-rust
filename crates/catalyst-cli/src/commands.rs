@@ -332,32 +332,64 @@ pub async fn db_restore(data_dir: &Path, from_dir: &Path) -> Result<()> {
         .ok()
         .and_then(|s| serde_json::from_str::<SnapshotMetaV1>(&s).ok());
 
-    let mut cfg = StorageConfigLib::default();
-    cfg.data_dir = data_dir.to_path_buf();
-    let store = StorageManager::new(cfg).await?;
-    store.restore_from_directory(from_dir).await?;
+    // Restore into a sibling temp directory, then atomically swap into place to avoid corrupting
+    // an existing data dir if restore fails partway.
+    let parent = data_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid data_dir (no parent): {}", data_dir.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let ts = catalyst_utils::utils::current_timestamp_ms();
+    let tmp_dir = parent.join(format!(
+        ".catalyst-restore-tmp-{}",
+        ts
+    ));
+    if tmp_dir.exists() {
+        std::fs::remove_dir_all(&tmp_dir)?;
+    }
+    std::fs::create_dir_all(&tmp_dir)?;
 
-    if let Some(m) = meta {
-        let chain_id = decode_u64_le_opt(store.get_metadata("protocol:chain_id").await.ok().flatten());
-        let genesis_hash = store
-            .get_metadata("protocol:genesis_hash")
-            .await
-            .ok()
-            .flatten()
-            .map(|b| format!("0x{}", hex::encode(b)))
-            .unwrap_or_else(|| "0x0".to_string());
-        anyhow::ensure!(
-            chain_id == m.chain_id,
-            "restore verification failed: chain_id mismatch (snapshot={} restored={})",
-            m.chain_id,
-            chain_id
-        );
-        anyhow::ensure!(
-            genesis_hash == m.genesis_hash,
-            "restore verification failed: genesis_hash mismatch (snapshot={} restored={})",
-            m.genesis_hash,
-            genesis_hash
-        );
+    {
+        let mut cfg = StorageConfigLib::default();
+        cfg.data_dir = tmp_dir.clone();
+        let store = StorageManager::new(cfg).await?;
+        store.restore_from_directory(from_dir).await?;
+
+        if let Some(m) = &meta {
+            let chain_id =
+                decode_u64_le_opt(store.get_metadata("protocol:chain_id").await.ok().flatten());
+            let genesis_hash = store
+                .get_metadata("protocol:genesis_hash")
+                .await
+                .ok()
+                .flatten()
+                .map(|b| format!("0x{}", hex::encode(b)))
+                .unwrap_or_else(|| "0x0".to_string());
+            anyhow::ensure!(
+                chain_id == m.chain_id,
+                "restore verification failed: chain_id mismatch (snapshot={} restored={})",
+                m.chain_id,
+                chain_id
+            );
+            anyhow::ensure!(
+                genesis_hash == m.genesis_hash,
+                "restore verification failed: genesis_hash mismatch (snapshot={} restored={})",
+                m.genesis_hash,
+                genesis_hash
+            );
+        }
+    } // drop store to release DB locks before renames
+
+    // Swap directories (best-effort cleanup).
+    if data_dir.exists() {
+        let backup_dir = parent.join(format!(".catalyst-restore-backup-{}", ts));
+        // Rename old data dir out of the way (atomic within same filesystem).
+        std::fs::rename(data_dir, &backup_dir)?;
+        // Rename restored tmp into place.
+        std::fs::rename(&tmp_dir, data_dir)?;
+        // Cleanup old backup dir (optional; if it fails, leave it for manual inspection).
+        let _ = std::fs::remove_dir_all(&backup_dir);
+    } else {
+        std::fs::rename(&tmp_dir, data_dir)?;
     }
 
     println!("restore_ok: true");
@@ -446,18 +478,29 @@ pub async fn sync_from_snapshot(
     let mut file = tokio::fs::File::create(&archive_path).await?;
     let mut stream = resp.bytes_stream();
     use futures::StreamExt;
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    let mut written: u64 = 0;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
+        written = written.saturating_add(chunk.len() as u64);
+        h.update(&chunk);
         file.write_all(&chunk).await?;
     }
     file.flush().await?;
 
+    // Verify byte size if provided.
+    if let Some(expect_bytes) = s.archive_bytes {
+        anyhow::ensure!(
+            written == expect_bytes,
+            "archive size mismatch: expected_bytes={} got_bytes={}",
+            expect_bytes,
+            written
+        );
+    }
+
     // Verify sha256 if provided.
     if let Some(expect) = &s.archive_sha256 {
-        use sha2::Digest;
-        let bytes = std::fs::read(&archive_path)?;
-        let mut h = sha2::Sha256::new();
-        h.update(&bytes);
         let got = format!("0x{}", hex::encode(h.finalize()));
         anyhow::ensure!(
             got.to_lowercase() == expect.to_lowercase(),
