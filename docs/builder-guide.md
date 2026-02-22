@@ -67,9 +67,13 @@ For external wallets/integrators, see [`wallet-interop.md`](./wallet-interop.md)
 
 ## Faucet model (dev/test)
 
-The faucet is a deterministic, pre-funded account initialized by the node:
-- private key bytes are `[0xFA; 32]`
-- initial balance is `1_000_000` (if missing in state)
+The node supports an optional faucet account seeded at genesis for dev/test usage:
+- **dev/local default**: deterministic faucet key (`[0xFA; 32]`) with a configurable initial balance
+- **public networks**: disable the deterministic faucet and configure a real faucet/treasury pubkey
+  and large initial balance in `protocol.*` config
+
+The deterministic faucet key is **public** (embedded in the repo), so it must not be used as the
+funding source for any long-lived public network.
 
 This is *not* a contract faucet (no ERC20, no mint function).
 

@@ -181,7 +181,6 @@ const DEFAULT_EVM_GAS_LIMIT: u64 = 8_000_000;
 
 // Dev/testnet faucet key (32-byte scalar); pubkey is derived and is a valid compressed Ristretto point.
 const FAUCET_PRIVATE_KEY_BYTES: [u8; 32] = [0xFA; 32];
-const FAUCET_INITIAL_BALANCE: i64 = 1_000_000;
 
 const META_PROTOCOL_CHAIN_ID: &str = "protocol:chain_id";
 const META_PROTOCOL_NETWORK_ID: &str = "protocol:network_id";
@@ -734,10 +733,47 @@ fn decode_u64(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(b))
 }
 
-fn faucet_pubkey_bytes() -> [u8; 32] {
-    catalyst_crypto::PrivateKey::from_bytes(FAUCET_PRIVATE_KEY_BYTES)
-        .public_key()
-        .to_bytes()
+fn parse_hex_32(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim();
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(s).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Some(out)
+}
+
+fn faucet_genesis_params(cfg: &crate::config::ProtocolConfig) -> anyhow::Result<([u8; 32], i64)> {
+    use crate::config::FaucetMode;
+
+    match cfg.faucet_mode {
+        FaucetMode::Deterministic => {
+            anyhow::ensure!(
+                cfg.allow_deterministic_faucet,
+                "deterministic faucet is disabled by config (set protocol.allow_deterministic_faucet=true to allow it)"
+            );
+            let pk = catalyst_crypto::PrivateKey::from_bytes(FAUCET_PRIVATE_KEY_BYTES)
+                .public_key()
+                .to_bytes();
+            anyhow::ensure!(cfg.faucet_balance > 0, "protocol.faucet_balance must be > 0");
+            Ok((pk, cfg.faucet_balance))
+        }
+        FaucetMode::Configured => {
+            let Some(s) = cfg.faucet_pubkey_hex.as_ref() else {
+                anyhow::bail!(
+                    "protocol.faucet_pubkey_hex must be set when protocol.faucet_mode=configured"
+                );
+            };
+            let pk = parse_hex_32(s).ok_or_else(|| {
+                anyhow::anyhow!("protocol.faucet_pubkey_hex must be 32 bytes hex (64 chars)")
+            })?;
+            anyhow::ensure!(cfg.faucet_balance > 0, "protocol.faucet_balance must be > 0");
+            Ok((pk, cfg.faucet_balance))
+        }
+        FaucetMode::Disabled => Ok(([0u8; 32], 0)),
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -768,7 +804,10 @@ async fn load_chain_id_u64(store: &StorageManager) -> u64 {
         .unwrap_or(31337)
 }
 
-async fn ensure_chain_identity_and_genesis(store: &StorageManager, cfg: &crate::config::ProtocolConfig) {
+async fn ensure_chain_identity_and_genesis(
+    store: &StorageManager,
+    cfg: &crate::config::ProtocolConfig,
+) -> anyhow::Result<()> {
     // Chain id
     let existing_chain_id = store.get_metadata(META_PROTOCOL_CHAIN_ID).await.ok().flatten();
     if existing_chain_id.is_none() {
@@ -788,7 +827,7 @@ async fn ensure_chain_identity_and_genesis(store: &StorageManager, cfg: &crate::
     // Genesis hash: only apply genesis state on a fresh DB.
     let existing_genesis = store.get_metadata(META_PROTOCOL_GENESIS_HASH).await.ok().flatten();
     if existing_genesis.is_some() {
-        return;
+        return Ok(());
     }
 
     let already = store
@@ -806,18 +845,20 @@ async fn ensure_chain_identity_and_genesis(store: &StorageManager, cfg: &crate::
         })
         .unwrap_or(0);
 
-    let faucet_pk = faucet_pubkey_bytes();
+    let (faucet_pk, faucet_balance) = faucet_genesis_params(cfg)?;
 
     if already == 0 {
-        // Fresh DB: apply a minimal deterministic genesis state (faucet funding).
-        let existing_balance = store
-            .get_state(&balance_key_for_pubkey(&faucet_pk))
-            .await
-            .ok()
-            .flatten();
-        if existing_balance.is_none() {
-            let _ = set_balance_i64(store, &faucet_pk, FAUCET_INITIAL_BALANCE).await;
-            let _ = set_nonce_u64(store, &faucet_pk, 0).await;
+        // Fresh DB: apply a minimal genesis state (optional faucet funding).
+        if faucet_balance > 0 && faucet_pk != [0u8; 32] {
+            let existing_balance = store
+                .get_state(&balance_key_for_pubkey(&faucet_pk))
+                .await
+                .ok()
+                .flatten();
+            if existing_balance.is_none() {
+                let _ = set_balance_i64(store, &faucet_pk, faucet_balance).await;
+                let _ = set_nonce_u64(store, &faucet_pk, 0).await;
+            }
         }
         let _ = store.commit().await;
 
@@ -826,7 +867,7 @@ async fn ensure_chain_identity_and_genesis(store: &StorageManager, cfg: &crate::
             chain_id: cfg.chain_id,
             network_id: cfg.network_id.clone(),
             faucet_pubkey: faucet_pk,
-            faucet_balance: FAUCET_INITIAL_BALANCE,
+            faucet_balance,
         };
         let gh = hash_data(&g).unwrap_or([0u8; 32]);
         let _ = store.set_metadata(META_PROTOCOL_GENESIS_HASH, &gh).await;
@@ -836,7 +877,7 @@ async fn ensure_chain_identity_and_genesis(store: &StorageManager, cfg: &crate::
             cfg.network_id,
             hex_encode(&gh),
             hex_encode(&faucet_pk),
-            FAUCET_INITIAL_BALANCE
+            faucet_balance
         );
     } else {
         // Legacy DB: do not mutate balances/consensus head; just stamp an identity hash.
@@ -845,7 +886,7 @@ async fn ensure_chain_identity_and_genesis(store: &StorageManager, cfg: &crate::
             chain_id: cfg.chain_id,
             network_id: cfg.network_id.clone(),
             faucet_pubkey: faucet_pk,
-            faucet_balance: FAUCET_INITIAL_BALANCE,
+            faucet_balance,
         };
         let gh = hash_data(&g).unwrap_or([0u8; 32]);
         let _ = store.set_metadata(META_PROTOCOL_GENESIS_HASH, &gh).await;
@@ -856,6 +897,8 @@ async fn ensure_chain_identity_and_genesis(store: &StorageManager, cfg: &crate::
             hex_encode(&gh),
         );
     }
+
+    Ok(())
 }
 
 fn verify_protocol_tx_signature(tx: &catalyst_core::protocol::Transaction) -> bool {
@@ -1904,18 +1947,6 @@ pub struct CatalystNode {
     rpc_handle: Option<jsonrpsee::server::ServerHandle>,
 }
 
-fn parse_hex_32(s: &str) -> Option<[u8; 32]> {
-    let s = s.trim();
-    let s = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(s).ok()?;
-    if bytes.len() != 32 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Some(out)
-}
-
 impl CatalystNode {
     /// Create a new Catalyst node.
     pub async fn new(config: NodeConfig, generate_txs: bool, tx_interval_ms: u64) -> Result<Self> {
@@ -2188,7 +2219,9 @@ impl CatalystNode {
 
         // Ensure chain identity + genesis are initialized (one-time, idempotent).
         if let Some(store) = &storage {
-            ensure_chain_identity_and_genesis(store.as_ref(), &self.config.protocol).await;
+            ensure_chain_identity_and_genesis(store.as_ref(), &self.config.protocol)
+                .await
+                .map_err(|e| anyhow::anyhow!("genesis/identity initialization failed: {e}"))?;
         }
 
         // Auto-register as a worker (on-chain) for validator nodes.
@@ -3179,8 +3212,10 @@ impl CatalystNode {
             self.network_tasks.push(gap_handle);
         }
 
-        // Outbound: optional dummy tx generator (dev/testnet helper).
+        // Outbound: optional dummy tx generator (dev/local helper).
         if self.generate_txs {
+            let allow_dummy = self.config.protocol.faucet_mode == crate::config::FaucetMode::Deterministic
+                && self.config.protocol.allow_deterministic_faucet;
             let net = network.clone();
             let my_node_id = public_key;
             let interval_ms = self.tx_interval_ms;
@@ -3188,6 +3223,12 @@ impl CatalystNode {
             let storage = storage.clone();
             let mut shutdown_rx2 = shutdown_rx.clone();
             let handle = tokio::spawn(async move {
+                if !allow_dummy {
+                    warn!(
+                        "generate_txs is enabled but deterministic faucet is disabled/configured; skipping dummy tx generation"
+                    );
+                    return;
+                }
                 let faucet_sk = catalyst_crypto::PrivateKey::from_bytes(FAUCET_PRIVATE_KEY_BYTES);
                 let faucet_pk = faucet_sk.public_key().to_bytes();
                 let mut counter: u64 = 0;
