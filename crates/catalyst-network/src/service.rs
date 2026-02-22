@@ -35,6 +35,32 @@ use std::{
 };
 use tokio::sync::{mpsc, Mutex, RwLock};
 
+// --- Safety limits (anti-DoS) ---
+// These are conservative defaults for public testnets.
+const MAX_GOSSIP_MESSAGE_BYTES: usize = 8 * 1024 * 1024; // 8 MiB hard cap per message
+const PER_PEER_MAX_MSGS_PER_SEC: u32 = 200;
+const PER_PEER_MAX_BYTES_PER_SEC: usize = 8 * 1024 * 1024; // 8 MiB/s per peer
+
+#[derive(Debug, Clone)]
+struct PeerBudget {
+    window_start: Instant,
+    msgs: u32,
+    bytes: usize,
+}
+
+impl PeerBudget {
+    fn allow(&mut self, now: Instant, size: usize) -> bool {
+        if now.duration_since(self.window_start) >= Duration::from_secs(1) {
+            self.window_start = now;
+            self.msgs = 0;
+            self.bytes = 0;
+        }
+        self.msgs = self.msgs.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(size);
+        self.msgs <= PER_PEER_MAX_MSGS_PER_SEC && self.bytes <= PER_PEER_MAX_BYTES_PER_SEC
+    }
+}
+
 /// Network events for external subscribers.
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
@@ -235,6 +261,7 @@ impl NetworkService {
 
         let handle = tokio::spawn(async move {
             let start = Instant::now();
+            let mut budgets: HashMap<PeerId, PeerBudget> = HashMap::new();
             loop {
                 tokio::select! {
                     ev = swarm.select_next_some() => {
@@ -257,6 +284,18 @@ impl NetworkService {
                             },
                             SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(e)) => {
                                 if let gossipsub::Event::Message { message, propagation_source, .. } = e {
+                                    if message.data.len() > MAX_GOSSIP_MESSAGE_BYTES {
+                                        continue;
+                                    }
+                                    let now = Instant::now();
+                                    let b = budgets.entry(propagation_source).or_insert(PeerBudget {
+                                        window_start: now,
+                                        msgs: 0,
+                                        bytes: 0,
+                                    });
+                                    if !b.allow(now, message.data.len()) {
+                                        continue;
+                                    }
                                     let env: MessageEnvelope = match bincode::deserialize(&message.data) {
                                         Ok(e) => e,
                                         Err(_) => continue,
@@ -282,6 +321,7 @@ impl NetworkService {
                             }
                             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                                 swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                                budgets.remove(&peer_id);
                                 {
                                     let mut m = peer_conns.write().await;
                                     if let Some(c) = m.get_mut(&peer_id) {

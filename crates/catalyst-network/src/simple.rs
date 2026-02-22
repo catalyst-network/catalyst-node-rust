@@ -23,6 +23,32 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+// --- Safety limits (anti-DoS) ---
+// These are conservative defaults for public testnets.
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024; // 8 MiB hard cap per frame
+const PER_CONN_MAX_MSGS_PER_SEC: u32 = 200;
+const PER_CONN_MAX_BYTES_PER_SEC: usize = 8 * 1024 * 1024; // 8 MiB/s per connection
+
+#[derive(Debug, Clone)]
+struct ConnBudget {
+    window_start: std::time::Instant,
+    msgs: u32,
+    bytes: usize,
+}
+
+impl ConnBudget {
+    fn allow(&mut self, now: std::time::Instant, size: usize) -> bool {
+        if now.duration_since(self.window_start) >= std::time::Duration::from_secs(1) {
+            self.window_start = now;
+            self.msgs = 0;
+            self.bytes = 0;
+        }
+        self.msgs = self.msgs.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(size);
+        self.msgs <= PER_CONN_MAX_MSGS_PER_SEC && self.bytes <= PER_CONN_MAX_BYTES_PER_SEC
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
     PeerConnected { addr: SocketAddr },
@@ -192,7 +218,19 @@ impl NetworkService {
         });
 
         let reader = tokio::spawn(async move {
+            let mut budget = ConnBudget {
+                window_start: std::time::Instant::now(),
+                msgs: 0,
+                bytes: 0,
+            };
             while let Some(Ok(bytes)) = stream.next().await {
+                if bytes.len() > MAX_FRAME_BYTES {
+                    continue;
+                }
+                let now = std::time::Instant::now();
+                if !budget.allow(now, bytes.len()) {
+                    continue;
+                }
                 let env: MessageEnvelope = match bincode::deserialize(&bytes) {
                     Ok(e) => e,
                     Err(_) => continue,
