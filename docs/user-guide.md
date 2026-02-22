@@ -22,9 +22,22 @@ Check `network_id` and `chain_id` match what operators published (see [`network-
 
 In the current implementation, the faucet is **not** an ERC20 contract.
 
-It is a deterministic, pre-funded account:
+### Local/dev convenience faucet
+
+For local developer networks, the node can optionally initialize a deterministic, pre-funded faucet
+account at genesis:
 - faucet private key bytes are `[0xFA; 32]`
-- on node startup, if missing from state, it is initialized with balance `1_000_000`
+- on fresh DB startup, if missing from state, it is initialized with `protocol.faucet_balance` (default `1_000_000`)
+
+Important:
+- This deterministic key is **public** (it is embedded in the repo). Do **not** rely on it for public testnets.
+
+### Public testnet faucet
+
+For a long-lived public testnet, operators should disable the deterministic faucet and configure a
+real faucet/treasury pubkey in `config.toml` (`protocol.faucet_mode = "configured"`). The public
+faucet web app/service should distribute from a **separate hot wallet** that is periodically topped
+up by the private treasury key.
 
 Create the faucet key file (exactly 64 hex chars; no `0x` prefix needed):
 

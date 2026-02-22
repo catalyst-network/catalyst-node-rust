@@ -46,6 +46,50 @@ pub struct ProtocolConfig {
     pub chain_id: u64,
     /// Human-readable network id (e.g. "tna_testnet", "local", "mainnet").
     pub network_id: String,
+
+    /// Faucet funding mode for genesis initialization (dev/test convenience).
+    ///
+    /// - `deterministic`: use the built-in deterministic dev faucet key (`[0xFA; 32]`)
+    /// - `configured`: use `faucet_pubkey_hex` and `faucet_balance`
+    /// - `disabled`: do not fund any faucet account at genesis
+    #[serde(default)]
+    pub faucet_mode: FaucetMode,
+
+    /// If false, the node will refuse to use the deterministic faucet key for genesis funding.
+    ///
+    /// Set this to false for any public network.
+    #[serde(default = "default_allow_deterministic_faucet")]
+    pub allow_deterministic_faucet: bool,
+
+    /// Faucet pubkey (32 bytes hex) used when `faucet_mode = "configured"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faucet_pubkey_hex: Option<String>,
+
+    /// Faucet initial balance used when `faucet_mode != "disabled"`.
+    #[serde(default = "default_faucet_balance")]
+    pub faucet_balance: i64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FaucetMode {
+    Deterministic,
+    Configured,
+    Disabled,
+}
+
+impl Default for FaucetMode {
+    fn default() -> Self {
+        FaucetMode::Deterministic
+    }
+}
+
+fn default_allow_deterministic_faucet() -> bool {
+    true
+}
+
+fn default_faucet_balance() -> i64 {
+    1_000_000
 }
 
 /// Node identity and basic settings
@@ -353,6 +397,10 @@ impl Default for NodeConfig {
             protocol: ProtocolConfig {
                 chain_id: 31337,
                 network_id: "tna_testnet".to_string(),
+                faucet_mode: FaucetMode::Deterministic,
+                allow_deterministic_faucet: true,
+                faucet_pubkey_hex: None,
+                faucet_balance: default_faucet_balance(),
             },
             node: NodeIdentityConfig {
                 name: "catalyst-node".to_string(),
@@ -539,6 +587,40 @@ impl NodeConfig {
         }
         if self.protocol.network_id.trim().is_empty() {
             return Err(anyhow::anyhow!("protocol.network_id must be non-empty"));
+        }
+
+        // Faucet config validation
+        match self.protocol.faucet_mode {
+            FaucetMode::Deterministic => {
+                if !self.protocol.allow_deterministic_faucet {
+                    return Err(anyhow::anyhow!(
+                        "protocol.allow_deterministic_faucet=false but protocol.faucet_mode=deterministic"
+                    ));
+                }
+                if self.protocol.faucet_balance <= 0 {
+                    return Err(anyhow::anyhow!("protocol.faucet_balance must be > 0"));
+                }
+            }
+            FaucetMode::Configured => {
+                let Some(pk) = self.protocol.faucet_pubkey_hex.as_ref() else {
+                    return Err(anyhow::anyhow!(
+                        "protocol.faucet_pubkey_hex must be set when protocol.faucet_mode=configured"
+                    ));
+                };
+                // Basic format check: 32-byte hex (optionally 0x-prefixed)
+                let s = pk.trim().strip_prefix("0x").unwrap_or(pk.trim());
+                let bytes = hex::decode(s)
+                    .map_err(|_| anyhow::anyhow!("protocol.faucet_pubkey_hex must be valid hex"))?;
+                if bytes.len() != 32 {
+                    return Err(anyhow::anyhow!(
+                        "protocol.faucet_pubkey_hex must be 32 bytes (64 hex chars)"
+                    ));
+                }
+                if self.protocol.faucet_balance <= 0 {
+                    return Err(anyhow::anyhow!("protocol.faucet_balance must be > 0"));
+                }
+            }
+            FaucetMode::Disabled => {}
         }
 
         // Validate network configuration

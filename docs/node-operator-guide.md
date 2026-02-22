@@ -27,6 +27,42 @@ network_id = "catalyst-testnet"
 Important:
 - **Do not change** these values for a running network. Changing them creates a **new chain**.
 
+## Faucet genesis funding (dev vs public testnet)
+
+This node can optionally seed a faucet/treasury account at genesis (fresh DB only). For **local/dev**
+networks you can use the deterministic faucet key, but for any **public** testnet you must configure
+a real pubkey and disable the deterministic faucet.
+
+### Local/dev (default)
+
+```toml
+[protocol]
+chain_id = 31337
+network_id = "local"
+faucet_mode = "deterministic"
+allow_deterministic_faucet = true
+faucet_balance = 1000000
+```
+
+### Public testnet (recommended)
+
+Pick a private treasury key (never publish it), derive its 32-byte pubkey hex, then configure:
+
+```toml
+[protocol]
+chain_id = 200820092
+network_id = "catalyst-testnet"
+faucet_mode = "configured"
+allow_deterministic_faucet = false
+faucet_pubkey_hex = "0x<32-byte-pubkey-hex>"
+faucet_balance = 1000000000000
+```
+
+Notes:
+- `faucet_balance` is an `i64`; choose a very large value for long-lived testnets.
+- Your public faucet web app/service should spend from a **hot wallet**, topped up from this
+  treasury pubkey as needed.
+
 ## Build
 
 From the repo root:
