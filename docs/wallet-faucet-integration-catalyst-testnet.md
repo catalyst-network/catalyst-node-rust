@@ -64,7 +64,7 @@ This repo currently implements option (3) in docs; option (1) is easy for wallet
      - faucet pubkey: `-amount`
      - user pubkey: `+amount`
    - `timestamp` = now (ms)
-   - `lock_time` = now (seconds)
+   - `lock_time` = `0` (recommended: immediately valid; avoids client/server clock skew)
    - `fees`:
      - easiest: call `catalyst_estimateFee(...)` and set `fees` to that value
 

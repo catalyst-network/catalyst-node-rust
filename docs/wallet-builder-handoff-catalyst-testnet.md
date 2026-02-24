@@ -143,7 +143,7 @@ Wallet should set:
 
 Wallet sets:
 - `tx.timestamp` = current time in **milliseconds**
-- `tx.core.lock_time` = current time in **seconds** (best-effort anti-replay window in this scaffold)
+- `tx.core.lock_time` = `0` (recommended: immediately valid; avoids client/server clock skew)
 
 ### Fees
 
