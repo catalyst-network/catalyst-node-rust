@@ -976,6 +976,7 @@ async fn load_genesis_hash_32(store: &StorageManager) -> [u8; 32] {
 
 async fn verify_protocol_tx_signature_with_domain(store: &StorageManager, tx: &catalyst_core::protocol::Transaction) -> bool {
     use catalyst_crypto::signatures::SignatureScheme;
+    use catalyst_core::protocol::sig_scheme;
 
     // Determine sender:
     // - transfers: the (single) pubkey with negative NonConfidential amount
@@ -1008,6 +1009,13 @@ async fn verify_protocol_tx_signature_with_domain(store: &StorageManager, tx: &c
         }
     };
 
+    // Forward-compat: only Schnorr is accepted for now.
+    if tx.signature_scheme != sig_scheme::SCHNORR_V1 {
+        return false;
+    }
+    if tx.sender_pubkey.is_some() {
+        return false;
+    }
     if tx.signature.0.len() != 64 {
         return false;
     }
@@ -1022,9 +1030,14 @@ async fn verify_protocol_tx_signature_with_domain(store: &StorageManager, tx: &c
         Err(_) => return false,
     };
 
-    // Prefer v1 domain-separated payload; fall back to legacy for backward compatibility.
+    // Prefer v2 domain-separated payload; fall back to v1 + legacy for backward compatibility.
     let chain_id = load_chain_id_u64(store).await;
     let genesis_hash = load_genesis_hash_32(store).await;
+    if let Ok(p) = tx.signing_payload_v2(chain_id, genesis_hash) {
+        if SignatureScheme::new().verify(&p, &sig, &sender_pk).unwrap_or(false) {
+            return true;
+        }
+    }
     if let Ok(p) = tx.signing_payload_v1(chain_id, genesis_hash) {
         if SignatureScheme::new().verify(&p, &sig, &sender_pk).unwrap_or(false) {
             return true;
@@ -1345,7 +1358,7 @@ async fn validate_and_select_protocol_txs_for_construction(
 }
 
 fn mempool_txid(tx: &catalyst_core::protocol::Transaction) -> Option<[u8; 32]> {
-    catalyst_core::protocol::tx_id_v1(tx).ok()
+    catalyst_core::protocol::tx_id_v2(tx).ok()
 }
 
 fn mempool_tx_key(txid: &[u8; 32]) -> String {
@@ -2251,12 +2264,20 @@ impl CatalystNode {
                             fees: 0,
                             data: Vec::new(),
                         },
+                        signature_scheme: catalyst_core::protocol::sig_scheme::SCHNORR_V1,
                         signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
+                        sender_pubkey: None,
                         timestamp: now_ms,
                     };
                     tx.core.fees = catalyst_core::protocol::min_fee(&tx);
 
-                    let payload = tx.signing_payload().map_err(anyhow::Error::msg)?;
+                    let chain_id = load_chain_id_u64(store.as_ref()).await;
+                    let genesis_hash = load_genesis_hash_32(store.as_ref()).await;
+                    let payload = tx
+                        .signing_payload_v2(chain_id, genesis_hash)
+                        .or_else(|_| tx.signing_payload_v1(chain_id, genesis_hash))
+                        .or_else(|_| tx.signing_payload())
+                        .map_err(anyhow::Error::msg)?;
                     let scheme = catalyst_crypto::signatures::SignatureScheme::new();
                     let mut rng = rand::rngs::OsRng;
                     let sig: catalyst_crypto::signatures::Signature = scheme.sign(&mut rng, &node_sk, &payload)?;
@@ -3287,17 +3308,28 @@ impl CatalystNode {
                             fees: 0,
                             data: Vec::new(),
                         },
+                        signature_scheme: catalyst_core::protocol::sig_scheme::SCHNORR_V1,
                         signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
+                        sender_pubkey: None,
                         timestamp: now,
                     };
                     let mut tx = tx;
                     tx.core.fees = catalyst_core::protocol::min_fee(&tx);
 
                     // Real signature
-                    let payload = match tx.signing_payload() {
-                        Ok(p) => p,
-                        Err(_) => continue,
+                    let payload = if let Some(store) = &storage {
+                        let chain_id = load_chain_id_u64(store.as_ref()).await;
+                        let genesis_hash = load_genesis_hash_32(store.as_ref()).await;
+                        tx.signing_payload_v2(chain_id, genesis_hash)
+                            .or_else(|_| tx.signing_payload_v1(chain_id, genesis_hash))
+                            .or_else(|_| tx.signing_payload())
+                            .unwrap_or_else(|_| Vec::new())
+                    } else {
+                        tx.signing_payload().unwrap_or_else(|_| Vec::new())
                     };
+                    if payload.is_empty() {
+                        continue;
+                    }
                     let mut rng = rand::rngs::OsRng;
                     let scheme = catalyst_crypto::signatures::SignatureScheme::new();
                     let sig = match scheme.sign(&mut rng, &faucet_sk, &payload) {

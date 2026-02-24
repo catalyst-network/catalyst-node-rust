@@ -248,6 +248,59 @@ impl CatalystDeserialize for u64 {
     }
 }
 
+// --- Option<T> codec (used for forward-compatible protocol fields) ---
+impl<T> CatalystSerialize for Option<T>
+where
+    T: CatalystSerialize,
+{
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        let mut out = Vec::new();
+        self.serialize_to(&mut out)?;
+        Ok(out)
+    }
+
+    fn serialize_to<W: Write>(&self, writer: &mut W) -> CatalystResult<()> {
+        match self {
+            None => {
+                0u8.serialize_to(writer)?;
+            }
+            Some(v) => {
+                1u8.serialize_to(writer)?;
+                v.serialize_to(writer)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn serialized_size(&self) -> usize {
+        match self {
+            None => 1,
+            Some(v) => 1 + v.serialized_size(),
+        }
+    }
+}
+
+impl<T> CatalystDeserialize for Option<T>
+where
+    T: CatalystDeserialize,
+{
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        let mut cursor = Cursor::new(data);
+        Self::deserialize_from(&mut cursor)
+    }
+
+    fn deserialize_from<R: Read>(reader: &mut R) -> CatalystResult<Self> {
+        let tag = u8::deserialize_from(reader)?;
+        match tag {
+            0 => Ok(None),
+            1 => Ok(Some(T::deserialize_from(reader)?)),
+            _ => Err(CatalystError::Serialization(format!(
+                "invalid Option tag: {tag}"
+            ))),
+        }
+    }
+}
+
 impl CatalystSerialize for i64 {
     fn serialize(&self) -> CatalystResult<Vec<u8>> {
         Ok(self.to_le_bytes().to_vec())

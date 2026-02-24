@@ -68,15 +68,17 @@ This repo currently implements option (3) in docs; option (1) is easy for wallet
    - `fees`:
      - easiest: call `catalyst_estimateFee(...)` and set `fees` to that value
 
-5) **Sign** using Catalyst v1 signing payload:
-   - domain `"CATALYST_SIG_V1"`
+5) **Sign** using Catalyst v2 signing payload:
+   - domain `"CATALYST_SIG_V2"`
    - `chain_id` (u64 le)
    - `genesis_hash` (32 bytes)
+   - `signature_scheme` (u8): `0` (Schnorr)
+   - `sender_pubkey` (Option<Vec<u8>>): `None` (reserved for PQ)
    - canonical serialized `TransactionCore`
    - `timestamp` (u64 le)
 
-6) **Submit** as v1 wire bytes:
-   - `"CTX1" || canonical_serialize(Transaction)`
+6) **Submit** as v2 wire bytes:
+   - `"CTX2" || canonical_serialize(Transaction)`
    - `catalyst_sendRawTransaction("0x" + hex(bytes))`
 
 7) **Track inclusion**:
@@ -102,7 +104,7 @@ Submit raw tx:
 
 ```bash
 curl -s -X POST "$RPC_URL" -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"catalyst_sendRawTransaction","params":["0x<CTX1_WIRE_HEX>"]}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"catalyst_sendRawTransaction","params":["0x<CTX2_WIRE_HEX>"]}'
 ```
 
 Get receipt:

@@ -1,4 +1,4 @@
-## Wallet interoperability (standards + v1 encoding)
+## Wallet interoperability (standards + v2 encoding)
 
 This document defines **stable, wallet-facing conventions** for Catalyst V2 testnets.
 
@@ -20,34 +20,40 @@ Wallets should bind signatures to the target chain using:
 - `chain_id`: returned by RPC `catalyst_chainId` (hex string, e.g. `"0x7a69"`).
 - `genesis_hash`: returned by RPC `catalyst_genesisHash` (32-byte hex string).
 
-### Transaction signing payload (v1)
+### Transaction signing payload (v2)
 
-To sign a `Transaction` (Schnorr), wallets sign the **v1 signing payload**:
+To sign a `Transaction` (Schnorr), wallets sign the **v2 signing payload**:
 
-- `domain` = ASCII `"CATALYST_SIG_V1"`
+- `domain` = ASCII `"CATALYST_SIG_V2"`
 - `chain_id` = u64 little-endian
 - `genesis_hash` = 32 bytes
+- `signature_scheme` = u8 (currently only `0` supported)
+- `sender_pubkey` = Option<Vec<u8>> (currently must be `None`; reserved for PQ)
 - `core_bytes` = canonical serialization of `TransactionCore` (see below)
 - `timestamp` = u64 little-endian
 
-### Transaction wire encoding (v1)
+### Transaction wire encoding (v2)
 
 RPC accepts a **canonical wire encoding** for `catalyst_sendRawTransaction`:
 
-- 4-byte magic prefix: ASCII `"CTX1"`
+- 4-byte magic prefix: ASCII `"CTX2"`
 - followed by canonical serialization of `Transaction` (see below)
 
-### Transaction hash / tx_id (v1)
+Notes:
+- For backward compatibility, the node may also accept `"CTX1"` (v1) wire txs, but it will return
+  the canonical tx id computed over the v2 form.
+
+### Transaction hash / tx_id (v2)
 
 The tx hash returned by the node is:
 
 \[
-\text{tx\_id} = \text{blake2b512}(\text{"CTX1"} \,\|\, \text{tx\_bytes})[0..32]
+\text{tx\_id} = \text{blake2b512}(\text{"CTX2"} \,\|\, \text{tx\_bytes})[0..32]
 \]
 
 Returned in RPC as a 0x-prefixed 32-byte hex string.
 
-### Canonical serialization rules (v1)
+### Canonical serialization rules (v2)
 
 All integers are **little-endian**.
 
@@ -73,7 +79,15 @@ Vectors/bytes are encoded as:
 
 For now, the node/RPC also accepts the legacy dev transport:
 
-- hex-encoded `bincode(Transaction)`
+- hex-encoded `bincode(TransactionV1)`
 
-but wallets **should** use v1 wire encoding + v1 signing payload going forward.
+but wallets **should** use v2 wire encoding + v2 signing payload going forward.
+
+### Safety limits (anti-DoS)
+
+The node enforces conservative caps:
+- max raw tx bytes (hex-decoded, including magic): **64 KiB**
+- max signature bytes: **8 KiB**
+- max sender pubkey blob bytes: **4 KiB**
+- unknown `signature_scheme` ids are rejected
 

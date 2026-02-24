@@ -128,12 +128,13 @@ RPC may rate-limit (error code `-32029`). Indexers should:
 Tx id:
 
 \[
-\text{tx\_id} = \text{blake2b512}(\text{"CTX1"} \,\|\, \text{tx\_bytes})[0..32]
+\text{tx\_id} = \text{blake2b512}(\text{"CTX2"} \,\|\, \text{tx\_bytes})[0..32]
 \]
 
 Tx submission (`catalyst_sendRawTransaction`) accepts:
-- v1: `0x` + hex(`"CTX1"` + canonical serialized `Transaction`)
-- legacy: `0x` + hex(`bincode(Transaction)`)
+- v2 (preferred): `0x` + hex(`"CTX2"` + canonical serialized `Transaction`)
+- v1 (accepted): `0x` + hex(`"CTX1"` + canonical serialized `TransactionV1`)
+- legacy: `0x` + hex(`bincode(TransactionV1)`)
 
 ## Fast sync / snapshots (optional)
 

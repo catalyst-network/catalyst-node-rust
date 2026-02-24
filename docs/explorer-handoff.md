@@ -30,7 +30,7 @@ see `docs/network-identity.md` in this repo.
 The tx id returned by RPC is:
 
 \[
-\text{tx\_id} = \text{blake2b512}(\text{"CTX1"} \,\|\, \text{tx\_bytes})[0..32]
+\text{tx\_id} = \text{blake2b512}(\text{"CTX2"} \,\|\, \text{tx\_bytes})[0..32]
 \]
 
 Returned as `0x` + 32-byte hex.
@@ -39,8 +39,9 @@ Returned as `0x` + 32-byte hex.
 
 `catalyst_sendRawTransaction(data)` accepts:
 
-- **Preferred v1**: `0x` + hex(`"CTX1"` + canonical serialized `Transaction` bytes)
-- **Legacy**: `0x` + hex(`bincode(Transaction)`)
+- **Preferred v2**: `0x` + hex(`"CTX2"` + canonical serialized `Transaction` bytes)
+- **Accepted v1**: `0x` + hex(`"CTX1"` + canonical serialized `TransactionV1` bytes)
+- **Legacy**: `0x` + hex(`bincode(TransactionV1)`)
 
 ### Receipts (how explorers should track state)
 

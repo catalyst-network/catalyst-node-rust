@@ -19,6 +19,22 @@ use catalyst_utils::{
 
 pub const TX_WIRE_MAGIC_V1: [u8; 4] = *b"CTX1";
 pub const TX_SIG_DOMAIN_V1: &[u8] = b"CATALYST_SIG_V1";
+pub const TX_WIRE_MAGIC_V2: [u8; 4] = *b"CTX2";
+pub const TX_SIG_DOMAIN_V2: &[u8] = b"CATALYST_SIG_V2";
+
+// Safety limits for tx parsing/validation (anti-DoS).
+// These are conservative defaults for public testnets.
+pub const MAX_TX_WIRE_BYTES: usize = 64 * 1024; // 64 KiB (hex decoded, including magic)
+pub const MAX_TX_SIGNATURE_BYTES: usize = 8 * 1024; // room for PQ sigs later
+pub const MAX_TX_SENDER_PUBKEY_BYTES: usize = 4 * 1024; // room for PQ pubkeys later
+
+/// Signature scheme id (forward-compatible).
+///
+/// For now, only Schnorr is accepted by consensus/RPC.
+pub mod sig_scheme {
+    /// Schnorr signature over Catalyst v1/v2 signing payload (current).
+    pub const SCHNORR_V1: u8 = 0;
+}
 
 /// Canonical signing payload for a transaction: `bincode(TransactionCore) || timestamp_le`.
 ///
@@ -50,6 +66,39 @@ pub fn transaction_signing_payload_v1(
     out.extend_from_slice(&genesis_hash);
     let core_bytes = CatalystSerialize::serialize(core)
         .map_err(|e| format!("serialize core v1: {e}"))?;
+    out.extend_from_slice(&core_bytes);
+    out.extend_from_slice(&timestamp.to_le_bytes());
+    Ok(out)
+}
+
+/// V2 signing payload for external wallets: deterministic and forward-compatible.
+///
+/// Format:
+/// - domain = "CATALYST_SIG_V2"
+/// - chain_id (u64 le)
+/// - genesis_hash (32 bytes)
+/// - signature_scheme (u8)
+/// - sender_pubkey (Option<Vec<u8>>)   (reserved for PQ / non-32-byte pubkeys)
+/// - core (CatalystSerialize)
+/// - timestamp (u64 le)
+pub fn transaction_signing_payload_v2(
+    core: &TransactionCore,
+    timestamp: u64,
+    chain_id: u64,
+    genesis_hash: [u8; 32],
+    signature_scheme: u8,
+    sender_pubkey: &Option<Vec<u8>>,
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    out.extend_from_slice(TX_SIG_DOMAIN_V2);
+    out.extend_from_slice(&chain_id.to_le_bytes());
+    out.extend_from_slice(&genesis_hash);
+    out.push(signature_scheme);
+    let pk_bytes = catalyst_utils::CatalystSerialize::serialize(sender_pubkey)
+        .map_err(|e| format!("serialize sender_pubkey: {e}"))?;
+    out.extend_from_slice(&pk_bytes);
+    let core_bytes = CatalystSerialize::serialize(core)
+        .map_err(|e| format!("serialize core v2: {e}"))?;
     out.extend_from_slice(&core_bytes);
     out.extend_from_slice(&timestamp.to_le_bytes());
     Ok(out)
@@ -261,35 +310,100 @@ impl_catalyst_serialize!(TransactionCore, tx_type, entries, nonce, lock_time, fe
 
 /// Catalyst transaction (§4.2): core + aggregated signature + timestamp.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Transaction {
+pub struct TransactionV1 {
     pub core: TransactionCore,
     pub signature: AggregatedSignature,
     /// Timestamp (paper uses 4 bytes). We keep u64 for convenience.
     pub timestamp: u64,
 }
 
-impl_catalyst_serialize!(Transaction, core, signature, timestamp);
+impl_catalyst_serialize!(TransactionV1, core, signature, timestamp);
+
+/// Catalyst transaction v2: adds signature scheme id and optional sender pubkey blob (for PQ).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transaction {
+    pub core: TransactionCore,
+    /// Signature scheme id (see `sig_scheme`).
+    pub signature_scheme: u8,
+    pub signature: AggregatedSignature,
+    /// Optional sender public key blob (used when sender address is a hash of a larger key).
+    pub sender_pubkey: Option<Vec<u8>>,
+    /// Timestamp (paper uses 4 bytes). We keep u64 for convenience.
+    pub timestamp: u64,
+}
+
+impl_catalyst_serialize!(Transaction, core, signature_scheme, signature, sender_pubkey, timestamp);
 
 pub fn encode_wire_tx_v1(tx: &Transaction) -> Result<Vec<u8>, String> {
+    // v1 wire format is defined over TransactionV1.
+    let v1 = TransactionV1 {
+        core: tx.core.clone(),
+        signature: tx.signature.clone(),
+        timestamp: tx.timestamp,
+    };
     let mut out = Vec::new();
     out.extend_from_slice(&TX_WIRE_MAGIC_V1);
-    let body = CatalystSerialize::serialize(tx).map_err(|e| format!("serialize tx v1: {e}"))?;
+    let body = CatalystSerialize::serialize(&v1).map_err(|e| format!("serialize tx v1: {e}"))?;
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+pub fn encode_wire_tx_v2(tx: &Transaction) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&TX_WIRE_MAGIC_V2);
+    let body = CatalystSerialize::serialize(tx).map_err(|e| format!("serialize tx v2: {e}"))?;
     out.extend_from_slice(&body);
     Ok(out)
 }
 
 pub fn decode_wire_tx_any(bytes: &[u8]) -> Result<Transaction, String> {
-    if bytes.len() >= 4 && bytes[0..4] == TX_WIRE_MAGIC_V1 {
+    if bytes.len() > MAX_TX_WIRE_BYTES {
+        return Err(format!(
+            "tx too large: bytes={} max={}",
+            bytes.len(),
+            MAX_TX_WIRE_BYTES
+        ));
+    }
+    if bytes.len() >= 4 && bytes[0..4] == TX_WIRE_MAGIC_V2 {
         return <Transaction as CatalystDeserialize>::deserialize(&bytes[4..])
-            .map_err(|e| format!("decode v1 tx: {e}"));
+            .map_err(|e| format!("decode v2 tx: {e}"));
+    }
+    if bytes.len() >= 4 && bytes[0..4] == TX_WIRE_MAGIC_V1 {
+        let v1 = <TransactionV1 as CatalystDeserialize>::deserialize(&bytes[4..])
+            .map_err(|e| format!("decode v1 tx: {e}"))?;
+        return Ok(Transaction {
+            core: v1.core,
+            signature_scheme: sig_scheme::SCHNORR_V1,
+            signature: v1.signature,
+            sender_pubkey: None,
+            timestamp: v1.timestamp,
+        });
     }
     // Legacy: bincode(Transaction)
-    bincode::deserialize::<Transaction>(bytes).map_err(|e| format!("decode legacy tx: {e}"))
+    let v1 = bincode::deserialize::<TransactionV1>(bytes).map_err(|e| format!("decode legacy tx: {e}"))?;
+    Ok(Transaction {
+        core: v1.core,
+        signature_scheme: sig_scheme::SCHNORR_V1,
+        signature: v1.signature,
+        sender_pubkey: None,
+        timestamp: v1.timestamp,
+    })
 }
 
 pub fn tx_id_v1(tx: &Transaction) -> Result<[u8; 32], String> {
     use blake2::{Blake2b512, Digest};
     let bytes = encode_wire_tx_v1(tx)?;
+    let mut h = Blake2b512::new();
+    h.update(&bytes);
+    let out = h.finalize();
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&out[..32]);
+    Ok(id)
+}
+
+pub fn tx_id_v2(tx: &Transaction) -> Result<[u8; 32], String> {
+    use blake2::{Blake2b512, Digest};
+    let bytes = encode_wire_tx_v2(tx)?;
     let mut h = Blake2b512::new();
     h.update(&bytes);
     let out = h.finalize();
@@ -399,6 +513,23 @@ impl Transaction {
         if self.core.data.len() > 60 {
             return Err("Transaction data field must be <= 60 bytes".to_string());
         }
+        // Forward-compat: reject unknown/disabled signature schemes early.
+        if self.signature_scheme != sig_scheme::SCHNORR_V1 {
+            return Err(format!(
+                "Unsupported signature scheme id: {}",
+                self.signature_scheme
+            ));
+        }
+        // Until PQ is enabled, Schnorr must remain fixed-size and must not carry extra pubkey blobs.
+        if self.sender_pubkey.is_some() {
+            return Err("sender_pubkey is not allowed for Schnorr transactions".to_string());
+        }
+        if self.signature.0.len() != 64 {
+            return Err("Schnorr signature must be exactly 64 bytes".to_string());
+        }
+        if self.signature.0.len() > MAX_TX_SIGNATURE_BYTES {
+            return Err("Transaction signature is too large".to_string());
+        }
         Ok(())
     }
 
@@ -408,6 +539,17 @@ impl Transaction {
 
     pub fn signing_payload_v1(&self, chain_id: u64, genesis_hash: [u8; 32]) -> Result<Vec<u8>, String> {
         transaction_signing_payload_v1(&self.core, self.timestamp, chain_id, genesis_hash)
+    }
+
+    pub fn signing_payload_v2(&self, chain_id: u64, genesis_hash: [u8; 32]) -> Result<Vec<u8>, String> {
+        transaction_signing_payload_v2(
+            &self.core,
+            self.timestamp,
+            chain_id,
+            genesis_hash,
+            self.signature_scheme,
+            &self.sender_pubkey,
+        )
     }
 }
 
@@ -536,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn wallet_tx_v1_wire_roundtrip_and_txid_is_deterministic() {
+    fn wallet_tx_v2_wire_roundtrip_and_txid_is_deterministic() {
         let from = [1u8; 32];
         let to = [2u8; 32];
         let tx = Transaction {
@@ -557,17 +699,19 @@ mod tests {
                 fees: 3,
                 data: Vec::new(),
             },
+            signature_scheme: sig_scheme::SCHNORR_V1,
             signature: AggregatedSignature(vec![0u8; 64]),
+            sender_pubkey: None,
             timestamp: 1_700_000_000_000u64,
         };
 
-        let wire = encode_wire_tx_v1(&tx).unwrap();
-        assert!(wire.starts_with(&TX_WIRE_MAGIC_V1));
+        let wire = encode_wire_tx_v2(&tx).unwrap();
+        assert!(wire.starts_with(&TX_WIRE_MAGIC_V2));
         let decoded = decode_wire_tx_any(&wire).unwrap();
         assert_eq!(decoded, tx);
 
-        let txid1 = tx_id_v1(&tx).unwrap();
-        let txid2 = tx_id_v1(&tx).unwrap();
+        let txid1 = tx_id_v2(&tx).unwrap();
+        let txid2 = tx_id_v2(&tx).unwrap();
         assert_eq!(txid1, txid2);
     }
 }

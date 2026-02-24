@@ -498,6 +498,7 @@ fn verify_tx_signature_with_domain(
     genesis_hash: [u8; 32],
 ) -> bool {
     use catalyst_crypto::signatures::SignatureScheme;
+    use catalyst_core::protocol::sig_scheme;
 
     // Determine sender:
     // - transfers: (single) pubkey with negative NonConfidential amount
@@ -529,6 +530,13 @@ fn verify_tx_signature_with_domain(
         }
     };
 
+    // Forward-compat: only Schnorr is accepted for now.
+    if tx.signature_scheme != sig_scheme::SCHNORR_V1 {
+        return false;
+    }
+    if tx.sender_pubkey.is_some() {
+        return false;
+    }
     if tx.signature.0.len() != 64 {
         return false;
     }
@@ -543,7 +551,12 @@ fn verify_tx_signature_with_domain(
         Err(_) => return false,
     };
 
-    // Prefer v1 domain-separated payload; fall back to legacy.
+    // Prefer v2 domain-separated payload; fall back to v1 + legacy.
+    if let Ok(p) = tx.signing_payload_v2(chain_id, genesis_hash) {
+        if SignatureScheme::new().verify(&p, &sig, &sender_pk).unwrap_or(false) {
+            return true;
+        }
+    }
     if let Ok(p) = tx.signing_payload_v1(chain_id, genesis_hash) {
         if SignatureScheme::new().verify(&p, &sig, &sender_pk).unwrap_or(false) {
             return true;
@@ -1026,7 +1039,17 @@ impl CatalystRpcServer for CatalystRpcImpl {
             return Err(ErrorObjectOwned::from(RpcServerError::RateLimited));
         }
 
-        // Accept hex-encoded legacy bincode(Transaction) OR v1 canonical wire tx (CTX1...).
+        // Accept hex-encoded legacy bincode(TransactionV1) OR canonical wire tx (CTX1/CTX2...).
+        // Defensive: reject obviously huge inputs before hex decoding.
+        let hex = _data.strip_prefix("0x").unwrap_or(&_data);
+        let max_hex_chars = catalyst_core::protocol::MAX_TX_WIRE_BYTES.saturating_mul(2);
+        if hex.len() > max_hex_chars {
+            return Err(ErrorObjectOwned::from(RpcServerError::InvalidParams(format!(
+                "tx too large: hex_chars={} max={}",
+                hex.len(),
+                max_hex_chars
+            ))));
+        }
         let bytes = parse_hex_bytes(&_data).map_err(ErrorObjectOwned::from)?;
         let tx: catalyst_core::protocol::Transaction =
             catalyst_core::protocol::decode_wire_tx_any(&bytes)
@@ -1103,7 +1126,7 @@ impl CatalystRpcServer for CatalystRpcImpl {
         }
 
         // tx_id = blake2b512(CTX1 || canonical_tx_bytes)[..32]
-        let txid = catalyst_core::protocol::tx_id_v1(&tx)
+        let txid = catalyst_core::protocol::tx_id_v2(&tx)
             .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e)))?;
         let tx_id = format!("0x{}", hex::encode(txid));
 
@@ -1711,7 +1734,9 @@ mod tests {
                 fees: 1,
                 data: Vec::new(),
             },
+            signature_scheme: catalyst_core::protocol::sig_scheme::SCHNORR_V1,
             signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
+            sender_pubkey: None,
             timestamp: 0,
         };
         let parts = tx_participants(&tx);
