@@ -39,9 +39,10 @@ Accounts:
 Tx submission:
 - `catalyst_sendRawTransaction`
 - payload is either:
-  - **v1 canonical wire tx**: `0x` + hex(`"CTX1"` + canonical `Transaction` bytes)
-  - legacy dev transport: `0x` + hex(`bincode(Transaction)`)
-- returns a `tx_id` (32-byte hex): `blake2b512(CTX1||tx_bytes)[..32]`
+  - **v2 canonical wire tx** (preferred): `0x` + hex(`"CTX2"` + canonical `Transaction` bytes)
+  - v1 wire tx (accepted for compatibility): `0x` + hex(`"CTX1"` + canonical `TransactionV1` bytes)
+  - legacy dev transport: `0x` + hex(`bincode(TransactionV1)`)
+- returns a `tx_id` (32-byte hex): `blake2b512(CTX2||tx_bytes)[..32]`
 
 Tx query / receipts:
 - `catalyst_getTransactionByHash`
@@ -57,13 +58,13 @@ EVM helpers (dev/test):
 
 ## Transaction model (current)
 
-The CLI constructs `catalyst_core::protocol::Transaction` objects and submits them as **v1 canonical wire bytes**.
+The CLI constructs `catalyst_core::protocol::Transaction` objects and submits them as **v2 canonical wire bytes**.
 
 Important behavior:
 - RPC verifies Schnorr signature and rejects “nonce too low”.
 - Inclusion happens via validator consensus cycles; acceptance at RPC does not guarantee immediate inclusion.
 
-For external wallets/integrators, see [`wallet-interop.md`](./wallet-interop.md) for the v1 encoding + signing payload.
+For external wallets/integrators, see [`wallet-interop.md`](./wallet-interop.md) for the v2 encoding + signing payload.
 
 ## Faucet model (dev/test)
 

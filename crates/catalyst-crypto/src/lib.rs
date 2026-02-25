@@ -16,12 +16,14 @@ pub mod keys;
 pub mod signatures;
 pub mod commitments;
 pub mod utils;
+pub mod txauth;
 
 pub use errors::{CryptoError, CryptoResult};
 pub use hash::{blake2b_hash, blake2b_hash_multiple, Hash256, HASH_SIZE}; // Added blake2b_hash_multiple
 pub use keys::{PrivateKey, PublicKey, KeyPair, Curve25519KeyPair};
 pub use signatures::{Signature, MuSigSignature, SignatureScheme};
 pub use commitments::{PedersenCommitment, CommitmentScheme};
+pub use txauth::{TxAuthError, verify_tx_signature_with_domain, tx_sender_pubkey_32};
 
 // Re-export commonly used types
 pub use curve25519_dalek::{

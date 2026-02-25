@@ -497,85 +497,11 @@ fn verify_tx_signature_with_domain(
     chain_id: u64,
     genesis_hash: [u8; 32],
 ) -> bool {
-    use catalyst_crypto::signatures::SignatureScheme;
-
-    // Determine sender:
-    // - transfers: (single) pubkey with negative NonConfidential amount
-    // - worker registration: entry[0].public_key
-    let sender_pk_bytes: [u8; 32] = match tx.core.tx_type {
-        catalyst_core::protocol::TransactionType::WorkerRegistration => {
-            let Some(e0) = tx.core.entries.get(0) else { return false };
-            e0.public_key
-        }
-        catalyst_core::protocol::TransactionType::SmartContract => {
-            let Some(e0) = tx.core.entries.get(0) else { return false };
-            e0.public_key
-        }
-        _ => {
-            let mut sender: Option<[u8; 32]> = None;
-            for e in &tx.core.entries {
-                if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
-                    if v < 0 {
-                        match sender {
-                            None => sender = Some(e.public_key),
-                            Some(pk) if pk == e.public_key => {}
-                            Some(_) => return false,
-                        }
-                    }
-                }
-            }
-            let Some(sender) = sender else { return false };
-            sender
-        }
-    };
-
-    if tx.signature.0.len() != 64 {
-        return false;
-    }
-    let mut sig_bytes = [0u8; 64];
-    sig_bytes.copy_from_slice(&tx.signature.0);
-    let sig = match catalyst_crypto::signatures::Signature::from_bytes(sig_bytes) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let sender_pk = match catalyst_crypto::PublicKey::from_bytes(sender_pk_bytes) {
-        Ok(pk) => pk,
-        Err(_) => return false,
-    };
-
-    // Prefer v1 domain-separated payload; fall back to legacy.
-    if let Ok(p) = tx.signing_payload_v1(chain_id, genesis_hash) {
-        if SignatureScheme::new().verify(&p, &sig, &sender_pk).unwrap_or(false) {
-            return true;
-        }
-    }
-    let legacy = match tx.signing_payload() {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    SignatureScheme::new().verify(&legacy, &sig, &sender_pk).unwrap_or(false)
+    catalyst_crypto::verify_tx_signature_with_domain(tx, chain_id, genesis_hash).is_ok()
 }
 
 fn tx_sender_pubkey(tx: &catalyst_core::protocol::Transaction) -> Option<[u8; 32]> {
-    match tx.core.tx_type {
-        catalyst_core::protocol::TransactionType::WorkerRegistration => tx.core.entries.get(0).map(|e| e.public_key),
-        catalyst_core::protocol::TransactionType::SmartContract => tx.core.entries.get(0).map(|e| e.public_key),
-        _ => {
-            let mut sender: Option<[u8; 32]> = None;
-            for e in &tx.core.entries {
-                if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
-                    if v < 0 {
-                        match sender {
-                            None => sender = Some(e.public_key),
-                            Some(pk) if pk == e.public_key => {}
-                            Some(_) => return None,
-                        }
-                    }
-                }
-            }
-            sender
-        }
-    }
+    catalyst_crypto::tx_sender_pubkey_32(tx)
 }
 
 /// Minimal RPC implementation backed by `catalyst-storage`.
@@ -1026,7 +952,17 @@ impl CatalystRpcServer for CatalystRpcImpl {
             return Err(ErrorObjectOwned::from(RpcServerError::RateLimited));
         }
 
-        // Accept hex-encoded legacy bincode(Transaction) OR v1 canonical wire tx (CTX1...).
+        // Accept hex-encoded legacy bincode(TransactionV1) OR canonical wire tx (CTX1/CTX2...).
+        // Defensive: reject obviously huge inputs before hex decoding.
+        let hex = _data.strip_prefix("0x").unwrap_or(&_data);
+        let max_hex_chars = catalyst_core::protocol::MAX_TX_WIRE_BYTES.saturating_mul(2);
+        if hex.len() > max_hex_chars {
+            return Err(ErrorObjectOwned::from(RpcServerError::InvalidParams(format!(
+                "tx too large: hex_chars={} max={}",
+                hex.len(),
+                max_hex_chars
+            ))));
+        }
         let bytes = parse_hex_bytes(&_data).map_err(ErrorObjectOwned::from)?;
         let tx: catalyst_core::protocol::Transaction =
             catalyst_core::protocol::decode_wire_tx_any(&bytes)
@@ -1103,7 +1039,7 @@ impl CatalystRpcServer for CatalystRpcImpl {
         }
 
         // tx_id = blake2b512(CTX1 || canonical_tx_bytes)[..32]
-        let txid = catalyst_core::protocol::tx_id_v1(&tx)
+        let txid = catalyst_core::protocol::tx_id_v2(&tx)
             .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e)))?;
         let tx_id = format!("0x{}", hex::encode(txid));
 
@@ -1711,7 +1647,9 @@ mod tests {
                 fees: 1,
                 data: Vec::new(),
             },
+            signature_scheme: catalyst_core::protocol::sig_scheme::SCHNORR_V1,
             signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
+            sender_pubkey: None,
             timestamp: 0,
         };
         let parts = tx_participants(&tx);

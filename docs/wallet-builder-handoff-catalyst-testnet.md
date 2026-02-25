@@ -60,7 +60,7 @@ The node currently verifies a **Schnorr signature over Ristretto**:
 
 Reference implementation: `crates/catalyst-crypto/src/signatures.rs`.
 
-## Wallet transaction format (v1)
+## Wallet transaction format (v2)
 
 This is the stable wallet-facing format used by:
 - `catalyst_sendRawTransaction`
@@ -69,38 +69,40 @@ This is the stable wallet-facing format used by:
 
 See also: `docs/wallet-interop.md`.
 
-### 1) Canonical signing payload (v1)
+### 1) Canonical signing payload (v2)
 
 Wallets sign:
 
-- `domain` = ASCII `"CATALYST_SIG_V1"`
+- `domain` = ASCII `"CATALYST_SIG_V2"`
 - `chain_id` = u64 little-endian
 - `genesis_hash` = 32 bytes
+- `signature_scheme` = u8 (currently only `0` supported)
+- `sender_pubkey` = Option<Vec<u8>> (currently must be `None`; reserved for PQ)
 - `core_bytes` = canonical serialization of `TransactionCore`
 - `timestamp` = u64 little-endian (milliseconds since epoch; same value used in `Transaction.timestamp`)
 
-### 2) Canonical wire encoding (v1)
+### 2) Canonical wire encoding (v2)
 
 RPC expects `data` for `catalyst_sendRawTransaction`:
 
-- bytes = `"CTX1" || canonical_serialize(Transaction)`
+- bytes = `"CTX2" || canonical_serialize(Transaction)`
 - hex string = `0x` + hex(bytes)
 
-### 3) Transaction id (tx hash) (v1)
+### 3) Transaction id (tx hash) (v2)
 
 \[
-\text{tx\_id} = \text{blake2b512}(\text{"CTX1"} \,\|\, \text{tx\_bytes})[0..32]
+\text{tx\_id} = \text{blake2b512}(\text{"CTX2"} \,\|\, \text{tx\_bytes})[0..32]
 \]
 
 Returned as `0x` + 32-byte hex.
 
-### 4) Canonical serialization rules (v1)
+### 4) Canonical serialization rules (v2)
 
 Canonical serialization is defined in `docs/wallet-interop.md` and implemented in:
 - `crates/catalyst-core/src/protocol.rs`
 
 Wallet test vectors are in:
-- `testdata/wallet/v1_vectors.json`
+- `testdata/wallet/v1_vectors.json` (legacy; update pending)
 
 ## Building a simple transfer (recommended wallet MVP)
 
@@ -141,7 +143,7 @@ Wallet should set:
 
 Wallet sets:
 - `tx.timestamp` = current time in **milliseconds**
-- `tx.core.lock_time` = current time in **seconds** (best-effort anti-replay window in this scaffold)
+- `tx.core.lock_time` = `0` (recommended: immediately valid; avoids client/server clock skew)
 
 ### Fees
 
@@ -164,7 +166,7 @@ For a transfer, use a request like:
 ```
 
 Notes:
-- `catalyst_estimateFee` is a convenience; the actual transaction submitted is the Catalyst v1 wire tx described above.
+- `catalyst_estimateFee` is a convenience; the actual transaction submitted is the Catalyst v2 wire tx described above.
 
 ## RPC flow summary (wallet)
 
@@ -185,12 +187,12 @@ Notes:
 
 ### 3) Sign and submit
 
-- build `Transaction` (v1 rules)
-- compute v1 signing payload using `chain_id` + `genesis_hash`
+- build `Transaction` (v2 rules)
+- compute v2 signing payload using `chain_id` + `genesis_hash`
 - sign using Schnorr scheme above (64 bytes)
 - set `tx.signature` to the 64-byte signature
 - send:
-  - `catalyst_sendRawTransaction("0x" + hex("CTX1" + canonical_serialize(tx)))`
+  - `catalyst_sendRawTransaction("0x" + hex("CTX2" + canonical_serialize(tx)))`
 
 ### 4) Track status
 

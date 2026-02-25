@@ -831,14 +831,17 @@ pub async fn send_transaction(
             fees: 0,
             data: Vec::new(),
         },
+        signature_scheme: catalyst_core::protocol::sig_scheme::SCHNORR_V1,
         signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
+        sender_pubkey: None,
         timestamp: now_ms,
     };
     tx.core.fees = catalyst_core::protocol::min_fee(&tx);
 
-    // Real signature: prefer v1 domain-separated payload; fall back to legacy.
+    // Real signature: prefer v2 domain-separated payload; fall back to v1 + legacy.
     let payload = if let Some((chain_id, genesis_hash)) = fetch_chain_domain(rpc_url).await {
-        tx.signing_payload_v1(chain_id, genesis_hash)
+        tx.signing_payload_v2(chain_id, genesis_hash)
+            .or_else(|_| tx.signing_payload_v1(chain_id, genesis_hash))
             .map_err(anyhow::Error::msg)?
     } else {
         tx.signing_payload().map_err(anyhow::Error::msg)?
@@ -857,7 +860,7 @@ pub async fn send_transaction(
         }
     }
 
-    let hex_data = match catalyst_core::protocol::encode_wire_tx_v1(&tx) {
+    let hex_data = match catalyst_core::protocol::encode_wire_tx_v2(&tx) {
         Ok(bytes) => format!("0x{}", hex::encode(bytes)),
         Err(_) => {
             let bytes = bincode::serialize(&tx)?;
@@ -902,14 +905,17 @@ pub async fn register_worker(key_file: &Path, rpc_url: &str) -> Result<()> {
             fees: 0,
             data: Vec::new(),
         },
+        signature_scheme: catalyst_core::protocol::sig_scheme::SCHNORR_V1,
         signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
+        sender_pubkey: None,
         timestamp: now_ms,
     };
     tx.core.fees = catalyst_core::protocol::min_fee(&tx);
 
-    // Real signature: prefer v1 domain-separated payload; fall back to legacy.
+    // Real signature: prefer v2 domain-separated payload; fall back to v1 + legacy.
     let payload = if let Some((chain_id, genesis_hash)) = fetch_chain_domain(rpc_url).await {
-        tx.signing_payload_v1(chain_id, genesis_hash)
+        tx.signing_payload_v2(chain_id, genesis_hash)
+            .or_else(|_| tx.signing_payload_v1(chain_id, genesis_hash))
             .map_err(anyhow::Error::msg)?
     } else {
         tx.signing_payload().map_err(anyhow::Error::msg)?
@@ -919,7 +925,7 @@ pub async fn register_worker(key_file: &Path, rpc_url: &str) -> Result<()> {
     let sig: Signature = scheme.sign(&mut rng, &sk, &payload)?;
     tx.signature = catalyst_core::protocol::AggregatedSignature(sig.to_bytes().to_vec());
 
-    let hex_data = match catalyst_core::protocol::encode_wire_tx_v1(&tx) {
+    let hex_data = match catalyst_core::protocol::encode_wire_tx_v2(&tx) {
         Ok(bytes) => format!("0x{}", hex::encode(bytes)),
         Err(_) => {
             let bytes = bincode::serialize(&tx)?;
@@ -993,13 +999,16 @@ pub async fn deploy_contract(
             fees: 0,
             data,
         },
+        signature_scheme: catalyst_core::protocol::sig_scheme::SCHNORR_V1,
         signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
+        sender_pubkey: None,
         timestamp: now_ms,
     };
     tx.core.fees = catalyst_core::protocol::min_fee(&tx);
 
     let payload = if let Some((chain_id, genesis_hash)) = fetch_chain_domain(rpc_url).await {
-        tx.signing_payload_v1(chain_id, genesis_hash)
+        tx.signing_payload_v2(chain_id, genesis_hash)
+            .or_else(|_| tx.signing_payload_v1(chain_id, genesis_hash))
             .map_err(anyhow::Error::msg)?
     } else {
         tx.signing_payload().map_err(anyhow::Error::msg)?
@@ -1009,7 +1018,7 @@ pub async fn deploy_contract(
     let sig: Signature = scheme.sign(&mut rng, &sk, &payload)?;
     tx.signature = catalyst_core::protocol::AggregatedSignature(sig.to_bytes().to_vec());
 
-    let hex_data = match catalyst_core::protocol::encode_wire_tx_v1(&tx) {
+    let hex_data = match catalyst_core::protocol::encode_wire_tx_v2(&tx) {
         Ok(bytes) => format!("0x{}", hex::encode(bytes)),
         Err(_) => {
             let bytes = bincode::serialize(&tx)?;
@@ -1083,13 +1092,16 @@ pub async fn call_contract(
             fees: 0,
             data,
         },
+        signature_scheme: catalyst_core::protocol::sig_scheme::SCHNORR_V1,
         signature: catalyst_core::protocol::AggregatedSignature(vec![0u8; 64]),
+        sender_pubkey: None,
         timestamp: now_ms,
     };
     tx.core.fees = catalyst_core::protocol::min_fee(&tx);
 
     let payload = if let Some((chain_id, genesis_hash)) = fetch_chain_domain(rpc_url).await {
-        tx.signing_payload_v1(chain_id, genesis_hash)
+        tx.signing_payload_v2(chain_id, genesis_hash)
+            .or_else(|_| tx.signing_payload_v1(chain_id, genesis_hash))
             .map_err(anyhow::Error::msg)?
     } else {
         tx.signing_payload().map_err(anyhow::Error::msg)?
@@ -1099,7 +1111,7 @@ pub async fn call_contract(
     let sig: Signature = scheme.sign(&mut rng, &sk, &payload)?;
     tx.signature = catalyst_core::protocol::AggregatedSignature(sig.to_bytes().to_vec());
 
-    let hex_data = match catalyst_core::protocol::encode_wire_tx_v1(&tx) {
+    let hex_data = match catalyst_core::protocol::encode_wire_tx_v2(&tx) {
         Ok(bytes) => format!("0x{}", hex::encode(bytes)),
         Err(_) => {
             let bytes = bincode::serialize(&tx)?;

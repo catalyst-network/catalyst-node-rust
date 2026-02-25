@@ -101,14 +101,9 @@ impl NetworkMessage for ProtocolTxGossip {
 
 impl ProtocolTxGossip {
     pub fn new(tx: corep::Transaction, received_at_ms: u64) -> CatalystResult<Self> {
-        // Stable tx id for deduplication: hash bincode(tx)
-        let bytes = bincode::serialize(&tx)
-            .map_err(|e| catalyst_utils::error::CatalystError::Serialization(e.to_string()))?;
-        let mut hasher = blake2::Blake2b512::new();
-        hasher.update(&bytes);
-        let result = hasher.finalize();
-        let mut tx_id = [0u8; 32];
-        tx_id.copy_from_slice(&result[..32]);
+        // Stable tx id for deduplication: canonical wire hash (CTX2...) truncated to 32 bytes.
+        let tx_id = corep::tx_id_v2(&tx)
+            .map_err(|e| catalyst_utils::error::CatalystError::Serialization(e))?;
 
         Ok(Self { tx_id, tx, received_at_ms })
     }
@@ -258,7 +253,9 @@ mod fee_tests {
                 fees: 0,
                 data: Vec::new(),
             },
+            signature_scheme: corep::sig_scheme::SCHNORR_V1,
             signature: corep::AggregatedSignature(vec![9u8; 64]),
+            sender_pubkey: None,
             timestamp: now_ms,
         };
         tx.core.fees = corep::min_fee(&tx);
