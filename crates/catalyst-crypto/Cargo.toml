@@ -13,6 +13,7 @@ thiserror = "1.0"
 zeroize = { version = "1.7", features = ["zeroize_derive"] }
 subtle = "2.5"
 hex = "0.4"
+catalyst-core = { path = "../catalyst-core" }
 
 [dev-dependencies]
 proptest = "1.4"

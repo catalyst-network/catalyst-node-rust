@@ -1258,6 +1258,7 @@ name = "catalyst-crypto"
 version = "0.1.0"
 dependencies = [
  "blake2",
+ "catalyst-core",
  "criterion",
  "curve25519-dalek",
  "ed25519-dalek",

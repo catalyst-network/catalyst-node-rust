@@ -497,98 +497,11 @@ fn verify_tx_signature_with_domain(
     chain_id: u64,
     genesis_hash: [u8; 32],
 ) -> bool {
-    use catalyst_crypto::signatures::SignatureScheme;
-    use catalyst_core::protocol::sig_scheme;
-
-    // Determine sender:
-    // - transfers: (single) pubkey with negative NonConfidential amount
-    // - worker registration: entry[0].public_key
-    let sender_pk_bytes: [u8; 32] = match tx.core.tx_type {
-        catalyst_core::protocol::TransactionType::WorkerRegistration => {
-            let Some(e0) = tx.core.entries.get(0) else { return false };
-            e0.public_key
-        }
-        catalyst_core::protocol::TransactionType::SmartContract => {
-            let Some(e0) = tx.core.entries.get(0) else { return false };
-            e0.public_key
-        }
-        _ => {
-            let mut sender: Option<[u8; 32]> = None;
-            for e in &tx.core.entries {
-                if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
-                    if v < 0 {
-                        match sender {
-                            None => sender = Some(e.public_key),
-                            Some(pk) if pk == e.public_key => {}
-                            Some(_) => return false,
-                        }
-                    }
-                }
-            }
-            let Some(sender) = sender else { return false };
-            sender
-        }
-    };
-
-    // Forward-compat: only Schnorr is accepted for now.
-    if tx.signature_scheme != sig_scheme::SCHNORR_V1 {
-        return false;
-    }
-    if tx.sender_pubkey.is_some() {
-        return false;
-    }
-    if tx.signature.0.len() != 64 {
-        return false;
-    }
-    let mut sig_bytes = [0u8; 64];
-    sig_bytes.copy_from_slice(&tx.signature.0);
-    let sig = match catalyst_crypto::signatures::Signature::from_bytes(sig_bytes) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let sender_pk = match catalyst_crypto::PublicKey::from_bytes(sender_pk_bytes) {
-        Ok(pk) => pk,
-        Err(_) => return false,
-    };
-
-    // Prefer v2 domain-separated payload; fall back to v1 + legacy.
-    if let Ok(p) = tx.signing_payload_v2(chain_id, genesis_hash) {
-        if SignatureScheme::new().verify(&p, &sig, &sender_pk).unwrap_or(false) {
-            return true;
-        }
-    }
-    if let Ok(p) = tx.signing_payload_v1(chain_id, genesis_hash) {
-        if SignatureScheme::new().verify(&p, &sig, &sender_pk).unwrap_or(false) {
-            return true;
-        }
-    }
-    let legacy = match tx.signing_payload() {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    SignatureScheme::new().verify(&legacy, &sig, &sender_pk).unwrap_or(false)
+    catalyst_crypto::verify_tx_signature_with_domain(tx, chain_id, genesis_hash).is_ok()
 }
 
 fn tx_sender_pubkey(tx: &catalyst_core::protocol::Transaction) -> Option<[u8; 32]> {
-    match tx.core.tx_type {
-        catalyst_core::protocol::TransactionType::WorkerRegistration => tx.core.entries.get(0).map(|e| e.public_key),
-        catalyst_core::protocol::TransactionType::SmartContract => tx.core.entries.get(0).map(|e| e.public_key),
-        _ => {
-            let mut sender: Option<[u8; 32]> = None;
-            for e in &tx.core.entries {
-                if let catalyst_core::protocol::EntryAmount::NonConfidential(v) = e.amount {
-                    if v < 0 {
-                        match sender {
-                            None => sender = Some(e.public_key),
-                            Some(pk) if pk == e.public_key => {}
-                            Some(_) => return None,
-                        }
-                    }
-                }
-            }
-            sender
-        }
-    }
+    catalyst_crypto::tx_sender_pubkey_32(tx)
 }
 
 /// Minimal RPC implementation backed by `catalyst-storage`.

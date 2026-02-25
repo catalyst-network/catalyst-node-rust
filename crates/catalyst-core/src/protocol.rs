@@ -513,22 +513,17 @@ impl Transaction {
         if self.core.data.len() > 60 {
             return Err("Transaction data field must be <= 60 bytes".to_string());
         }
-        // Forward-compat: reject unknown/disabled signature schemes early.
-        if self.signature_scheme != sig_scheme::SCHNORR_V1 {
-            return Err(format!(
-                "Unsupported signature scheme id: {}",
-                self.signature_scheme
-            ));
-        }
-        // Until PQ is enabled, Schnorr must remain fixed-size and must not carry extra pubkey blobs.
-        if self.sender_pubkey.is_some() {
-            return Err("sender_pubkey is not allowed for Schnorr transactions".to_string());
-        }
-        if self.signature.0.len() != 64 {
-            return Err("Schnorr signature must be exactly 64 bytes".to_string());
+        // Generic safety caps (anti-DoS). Scheme-specific validation belongs in `catalyst-crypto::txauth`.
+        if self.signature.0.is_empty() {
+            return Err("Transaction signature must be non-empty".to_string());
         }
         if self.signature.0.len() > MAX_TX_SIGNATURE_BYTES {
             return Err("Transaction signature is too large".to_string());
+        }
+        if let Some(pk) = &self.sender_pubkey {
+            if pk.len() > MAX_TX_SENDER_PUBKEY_BYTES {
+                return Err("Transaction sender_pubkey is too large".to_string());
+            }
         }
         Ok(())
     }
