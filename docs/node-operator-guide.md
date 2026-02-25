@@ -232,6 +232,75 @@ mv /var/lib/catalyst/<region>/data "/var/lib/catalyst/<region>/data.old.$ts"
 
 Then start EU first, then the other validators.
 
+## Storage growth / history pruning (recommended for long-running networks)
+
+By default, nodes retain historical block + transaction metadata indefinitely (useful for explorers),
+which means disk usage grows without bound over time.
+
+For “regular validator nodes” on long-running public networks, it’s recommended to run in **pruned**
+mode and keep only a sliding window of recent history. This does **not** affect current balances or
+EVM state (authenticated state lives in the RocksDB `accounts` column family); it only prunes old
+RPC/indexer metadata such as:
+- `consensus:lsu:*` per-cycle history
+- `tx:*` per-cycle tx indices and raw/meta blobs
+
+Example config (keep last 7 days at 1 cycle/sec):
+
+```toml
+[storage]
+history_prune_enabled = true
+history_keep_cycles = 604800                # 7 * 24 * 60 * 60
+history_prune_interval_seconds = 300        # run at most every 5 minutes
+history_prune_batch_cycles = 1000           # prune up to 1000 cycles per run
+```
+
+Notes:
+- If you run a public explorer/indexer, keep at least one **archival** node (set `history_prune_enabled = false`).
+- In pruned mode, very old `catalyst_getBlockByNumber` / `catalyst_getTransactionByHash` calls may return `null`.
+
+### Useful maintenance commands
+
+Inspect local DB growth hot-spots (key counts per column family + RocksDB stats):
+
+```bash
+./target/release/catalyst-cli db-stats --data-dir /var/lib/catalyst/<region>/data
+```
+
+Force a maintenance pass (flush + manual compaction + snapshot cleanup):
+
+```bash
+./target/release/catalyst-cli db-maintenance --data-dir /var/lib/catalyst/<region>/data
+```
+
+## Upgrades, backups, and rollback safety
+
+For long-running public networks, treat upgrades as potentially stateful operations.
+
+Recommended workflow:
+
+- **Before upgrading**:
+  - take a snapshot backup:
+
+```bash
+./target/release/catalyst-cli db-backup \
+  --data-dir /var/lib/catalyst/<region>/data \
+  --out-dir "/var/lib/catalyst/<region>/backup.$(date +%s)"
+```
+
+- **If an upgrade goes wrong**:
+  - stop the service
+  - restore from the backup directory:
+
+```bash
+./target/release/catalyst-cli db-restore \
+  --data-dir /var/lib/catalyst/<region>/data \
+  --from-dir "/var/lib/catalyst/<region>/backup.<ts>"
+```
+
+Notes:
+- The storage layer records an informational on-disk version marker (`storage:version`) to help detect mismatches across upgrades.
+- For public networks, prefer snapshot-based recovery rather than ad-hoc manual edits to the DB directory.
+
 ## Troubleshooting
 
 ### “Insufficient data collected: got 1, required 2”

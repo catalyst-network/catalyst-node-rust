@@ -178,6 +178,40 @@ pub struct StorageConfig {
     
     /// Enable database compression
     pub compression_enabled: bool,
+
+    /// Enable pruning of historical RPC/indexer metadata (blocks/tx history).
+    ///
+    /// When enabled, the node will delete old `metadata` keys for cycles older than
+    /// `history_keep_cycles` behind the applied head. Authenticated account state is not affected.
+    #[serde(default)]
+    pub history_prune_enabled: bool,
+
+    /// Number of cycles (seconds) of history to retain behind head when pruning is enabled.
+    ///
+    /// `0` means "keep all history" (no pruning), even if `history_prune_enabled=true`.
+    #[serde(default = "default_history_keep_cycles")]
+    pub history_keep_cycles: u64,
+
+    /// Minimum time between prune runs.
+    #[serde(default = "default_history_prune_interval_seconds")]
+    pub history_prune_interval_seconds: u64,
+
+    /// Maximum number of cycles to prune per run (bounds runtime overhead).
+    #[serde(default = "default_history_prune_batch_cycles")]
+    pub history_prune_batch_cycles: u64,
+}
+
+fn default_history_keep_cycles() -> u64 {
+    // Default retention window for pruned nodes: 7 days at 1 cycle/sec.
+    7 * 24 * 60 * 60
+}
+
+fn default_history_prune_interval_seconds() -> u64 {
+    300
+}
+
+fn default_history_prune_batch_cycles() -> u64 {
+    1_000
 }
 
 /// Consensus configuration
@@ -433,6 +467,10 @@ impl Default for NodeConfig {
                 write_buffer_size_mb: 64,
                 max_open_files: 1000,
                 compression_enabled: true,
+                history_prune_enabled: false,
+                history_keep_cycles: default_history_keep_cycles(),
+                history_prune_interval_seconds: default_history_prune_interval_seconds(),
+                history_prune_batch_cycles: default_history_prune_batch_cycles(),
             },
             consensus: ConsensusConfig {
                 cycle_duration_seconds: 60,
@@ -648,6 +686,18 @@ impl NodeConfig {
         // Validate storage configuration
         if self.storage.capacity_gb == 0 && self.storage.enabled {
             return Err(anyhow::anyhow!("Storage capacity must be > 0 when storage is enabled"));
+        }
+        if self.storage.history_prune_enabled {
+            if self.storage.history_prune_interval_seconds == 0 {
+                return Err(anyhow::anyhow!(
+                    "storage.history_prune_interval_seconds must be > 0 when pruning is enabled"
+                ));
+            }
+            if self.storage.history_prune_batch_cycles == 0 {
+                return Err(anyhow::anyhow!(
+                    "storage.history_prune_batch_cycles must be > 0 when pruning is enabled"
+                ));
+            }
         }
         
         // Validate RPC configuration

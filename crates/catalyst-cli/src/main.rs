@@ -11,6 +11,7 @@ mod commands;
 mod config;
 mod tx;
 mod sync;
+mod pruning;
 mod dfs_store;
 mod identity;
 mod evm;
@@ -153,6 +154,18 @@ enum Commands {
         /// Backup directory to restore from
         #[arg(long)]
         from_dir: PathBuf,
+    },
+    /// Show local DB stats for a data directory
+    DbStats {
+        /// Data directory (same as config.storage.data_dir)
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Run DB maintenance (flush, compact, snapshot cleanup)
+    DbMaintenance {
+        /// Data directory (same as config.storage.data_dir)
+        #[arg(long)]
+        data_dir: PathBuf,
     },
     /// Publish snapshot metadata into the node DB (served via RPC for fast-sync tooling)
     SnapshotPublish {
@@ -440,6 +453,12 @@ async fn main() -> Result<()> {
         }
         Commands::DbRestore { data_dir, from_dir } => {
             commands::db_restore(&data_dir, &from_dir).await?;
+        }
+        Commands::DbStats { data_dir } => {
+            commands::db_stats(&data_dir).await?;
+        }
+        Commands::DbMaintenance { data_dir } => {
+            commands::db_maintenance(&data_dir).await?;
         }
         Commands::SnapshotPublish { data_dir, snapshot_dir, archive_url, archive_path, ttl_seconds } => {
             commands::snapshot_publish(&data_dir, &snapshot_dir, &archive_url, &archive_path, ttl_seconds).await?;

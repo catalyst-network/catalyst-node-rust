@@ -325,6 +325,52 @@ pub async fn db_backup(data_dir: &Path, out_dir: &Path, archive: Option<&Path>) 
     Ok(())
 }
 
+/// Print RocksDB/storage statistics for an existing node data directory.
+pub async fn db_stats(data_dir: &Path) -> Result<()> {
+    let mut cfg = StorageConfigLib::default();
+    cfg.data_dir = data_dir.to_path_buf();
+    let store = StorageManager::new(cfg).await?;
+
+    let st = store.get_statistics().await?;
+    println!(
+        "state_root: {}",
+        st.current_state_root
+            .map(|h| format!("0x{}", hex::encode(h)))
+            .unwrap_or_else(|| "null".to_string())
+    );
+    println!("pending_transactions: {}", st.pending_transactions);
+
+    // Column-family key counts are a simple proxy for growth hotspots.
+    let mut cfs: Vec<(String, u64)> = st.column_family_stats.into_iter().collect();
+    cfs.sort_by(|a, b| a.0.cmp(&b.0));
+    for (cf, n) in cfs {
+        println!("cf_keys.{}: {}", cf, n);
+    }
+
+    // Memory usage estimates.
+    let mut mem: Vec<(String, u64)> = st.memory_usage.into_iter().collect();
+    mem.sort_by(|a, b| a.0.cmp(&b.0));
+    for (k, v) in mem {
+        println!("mem.{}: {}", k, v);
+    }
+
+    if let Some(stats) = st.database_stats {
+        println!("rocksdb_stats:\n{}", stats);
+    }
+    Ok(())
+}
+
+/// Run maintenance (flush + manual compaction + snapshot cleanup).
+pub async fn db_maintenance(data_dir: &Path) -> Result<()> {
+    let mut cfg = StorageConfigLib::default();
+    cfg.data_dir = data_dir.to_path_buf();
+    let store = StorageManager::new(cfg).await?;
+
+    store.maintenance().await?;
+    println!("maintenance_ok: true");
+    Ok(())
+}
+
 pub async fn db_restore(data_dir: &Path, from_dir: &Path) -> Result<()> {
     // Optional pre-flight: if metadata is present, load it for post-restore verification.
     let meta_path = from_dir.join("catalyst_snapshot.json");
