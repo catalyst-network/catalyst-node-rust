@@ -426,6 +426,9 @@ async fn main() -> Result<()> {
                     .collect();
             }
 
+            // Enforce bounded, safe parameters before starting.
+            node_config.validate()?;
+
             start_node(node_config, generate_txs, tx_interval_ms).await?;
         }
         Commands::GenerateIdentity { output } => {
