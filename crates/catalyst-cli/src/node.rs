@@ -133,12 +133,37 @@ async fn persist_lsu_history(
         .await;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
+struct RelayCacheCfg {
+    max_entries: usize,
+    target_entries: usize,
+    retention_ms: u64,
+}
+
+impl Default for RelayCacheCfg {
+    fn default() -> Self {
+        Self {
+            max_entries: 5000,
+            target_entries: 4000,
+            retention_ms: 10 * 60 * 1000,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct RelayCache {
+    cfg: RelayCacheCfg,
     seen: std::collections::HashMap<String, u64>,
 }
 
 impl RelayCache {
+    fn new(cfg: RelayCacheCfg) -> Self {
+        Self {
+            cfg,
+            seen: std::collections::HashMap::new(),
+        }
+    }
+
     fn should_relay(&mut self, env: &MessageEnvelope, now_ms: u64) -> bool {
         if env.is_expired() {
             return false;
@@ -154,20 +179,18 @@ impl RelayCache {
         self.seen.insert(env.id.clone(), now_ms);
 
         // Prune old ids (best-effort).
-        let keep_after = now_ms.saturating_sub(10 * 60 * 1000);
+        let keep_after = now_ms.saturating_sub(self.cfg.retention_ms);
         self.seen.retain(|_, ts| *ts >= keep_after);
 
         // Cap size to prevent unbounded growth under attack.
-        const MAX: usize = 5000;
-        const TARGET: usize = 4000;
-        if self.seen.len() > MAX {
+        if self.seen.len() > self.cfg.max_entries {
             let mut v: Vec<(String, u64)> = self
                 .seen
                 .iter()
                 .map(|(k, ts)| (k.clone(), *ts))
                 .collect();
             v.sort_by_key(|(_, ts)| *ts);
-            let drop_n = v.len().saturating_sub(TARGET);
+            let drop_n = v.len().saturating_sub(self.cfg.target_entries);
             for (k, _) in v.into_iter().take(drop_n) {
                 self.seen.remove(&k);
             }
@@ -1946,6 +1969,20 @@ impl CatalystNode {
 
         // Put keypair in node dir (even if unused by simple transport).
         net_cfg.peer.keypair_path = Some(self.config.storage.data_dir.join("p2p_keypair"));
+        net_cfg.peer.max_peers = self.config.network.max_peers as usize;
+        net_cfg.peer.min_peers = self.config.network.min_peers as usize;
+
+        // Wire safety limits from node config.
+        net_cfg.safety_limits.max_gossip_message_bytes = self.config.network.safety_limits.max_gossip_message_bytes;
+        net_cfg.safety_limits.per_peer_max_msgs_per_sec = self.config.network.safety_limits.per_peer_max_msgs_per_sec;
+        net_cfg.safety_limits.per_peer_max_bytes_per_sec = self.config.network.safety_limits.per_peer_max_bytes_per_sec;
+        net_cfg.safety_limits.max_tcp_frame_bytes = self.config.network.safety_limits.max_tcp_frame_bytes;
+        net_cfg.safety_limits.per_conn_max_msgs_per_sec = self.config.network.safety_limits.per_conn_max_msgs_per_sec;
+        net_cfg.safety_limits.per_conn_max_bytes_per_sec = self.config.network.safety_limits.per_conn_max_bytes_per_sec;
+        net_cfg.safety_limits.max_hops = self.config.network.safety_limits.max_hops;
+        net_cfg.safety_limits.dedup_cache_max_entries = self.config.network.safety_limits.dedup_cache_max_entries;
+        net_cfg.safety_limits.dial_jitter_max_ms = self.config.network.safety_limits.dial_jitter_max_ms;
+        net_cfg.safety_limits.dial_backoff_max_ms = self.config.network.safety_limits.dial_backoff_max_ms;
         net_cfg.peer.bootstrap_peers = Vec::new();
 
         let network = Arc::new(P2pService::new(net_cfg).await?);
@@ -2431,8 +2468,13 @@ impl CatalystNode {
 
             let last_lsu: Arc<tokio::sync::RwLock<std::collections::HashMap<u64, catalyst_consensus::types::LedgerStateUpdate>>> =
                 Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+            let relay_cfg = RelayCacheCfg {
+                max_entries: self.config.network.relay_cache.max_entries,
+                target_entries: self.config.network.relay_cache.target_entries,
+                retention_ms: self.config.network.relay_cache.retention_seconds.saturating_mul(1000),
+            };
             let relay_cache: Arc<tokio::sync::Mutex<RelayCache>> =
-                Arc::new(tokio::sync::Mutex::new(RelayCache::default()));
+                Arc::new(tokio::sync::Mutex::new(RelayCache::new(relay_cfg)));
             #[derive(Debug, Default)]
             struct CatchupState {
                 observed_head_cycle: u64,

@@ -35,11 +35,6 @@ use std::{
 };
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-// --- Safety limits (anti-DoS) ---
-// These are conservative defaults for public testnets.
-const MAX_GOSSIP_MESSAGE_BYTES: usize = 8 * 1024 * 1024; // 8 MiB hard cap per message
-const PER_PEER_MAX_MSGS_PER_SEC: u32 = 200;
-const PER_PEER_MAX_BYTES_PER_SEC: usize = 8 * 1024 * 1024; // 8 MiB/s per peer
 const IDENTIFY_PROTOCOL_VERSION: &str = "catalyst/1";
 
 #[derive(Debug, Clone)]
@@ -62,7 +57,7 @@ struct PeerBudget {
 }
 
 impl PeerBudget {
-    fn allow(&mut self, now: Instant, size: usize) -> bool {
+    fn allow(&mut self, now: Instant, size: usize, max_msgs: u32, max_bytes: usize) -> bool {
         if now.duration_since(self.window_start) >= Duration::from_secs(1) {
             self.window_start = now;
             self.msgs = 0;
@@ -70,7 +65,7 @@ impl PeerBudget {
         }
         self.msgs = self.msgs.saturating_add(1);
         self.bytes = self.bytes.saturating_add(size);
-        self.msgs <= PER_PEER_MAX_MSGS_PER_SEC && self.bytes <= PER_PEER_MAX_BYTES_PER_SEC
+        self.msgs <= max_msgs && self.bytes <= max_bytes
     }
 }
 
@@ -259,6 +254,7 @@ impl NetworkService {
         let stats = self.stats.clone();
         let peer_conns = self.peer_conns.clone();
         let topic = self.topic.clone();
+        let limits = self.config.safety_limits.clone();
 
         // Bootstrap dial manager (WAN-hardening): retry with backoff+jitter until we meet `min_peers`.
         let bootstrap: Vec<(PeerId, Multiaddr)> = self.config.peer.bootstrap_peers.clone();
@@ -296,8 +292,9 @@ impl NetworkService {
 
                             // Schedule next attempt before dialing to avoid tight loops.
                             let attempts = dial_backoff.get(pid).map(|s| s.attempts).unwrap_or(0) + 1;
-                            let backoff = compute_backoff(base_backoff, attempts).unwrap_or(base_backoff);
-                            let jitter = jitter_ms(pid, attempts);
+                            let backoff = compute_backoff(base_backoff, attempts, limits.dial_backoff_max_ms)
+                                .unwrap_or(base_backoff);
+                            let jitter = jitter_ms(pid, attempts, limits.dial_jitter_max_ms);
                             dial_backoff.insert(*pid, DialBackoff {
                                 attempts,
                                 next_at: now + backoff + Duration::from_millis(jitter),
@@ -327,7 +324,7 @@ impl NetworkService {
                             },
                             SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(e)) => {
                                 if let gossipsub::Event::Message { message, propagation_source, .. } = e {
-                                    if message.data.len() > MAX_GOSSIP_MESSAGE_BYTES {
+                                    if message.data.len() > limits.max_gossip_message_bytes {
                                         continue;
                                     }
                                     let now = Instant::now();
@@ -336,7 +333,12 @@ impl NetworkService {
                                         msgs: 0,
                                         bytes: 0,
                                     });
-                                    if !b.allow(now, message.data.len()) {
+                                    if !b.allow(
+                                        now,
+                                        message.data.len(),
+                                        limits.per_peer_max_msgs_per_sec,
+                                        limits.per_peer_max_bytes_per_sec,
+                                    ) {
                                         continue;
                                     }
                                     let env: MessageEnvelope = match decode_envelope_wire(&message.data) {
@@ -471,21 +473,24 @@ impl NetworkService {
     }
 }
 
-fn compute_backoff(base: Duration, attempts: u32) -> Option<Duration> {
+fn compute_backoff(base: Duration, attempts: u32, max_ms: u64) -> Option<Duration> {
     let pow = attempts.saturating_sub(1).min(10);
     let mult = 1u64.checked_shl(pow)?;
     let ms = base.as_millis().saturating_mul(mult as u128);
-    let ms = ms.min(60_000);
+    let ms = ms.min(max_ms as u128);
     Some(Duration::from_millis(ms as u64))
 }
 
-fn jitter_ms(peer_id: &PeerId, attempts: u32) -> u64 {
+fn jitter_ms(peer_id: &PeerId, attempts: u32, max_ms: u64) -> u64 {
+    if max_ms == 0 {
+        return 0;
+    }
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     peer_id.hash(&mut h);
     attempts.hash(&mut h);
     let v = h.finish();
-    (v % 250) as u64
+    (v % (max_ms + 1)) as u64
 }
 
 fn load_or_generate_keypair(path: &Path) -> NetworkResult<identity::Keypair> {

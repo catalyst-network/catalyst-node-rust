@@ -141,6 +141,62 @@ pub struct NetworkConfig {
     
     /// Network timeouts
     pub timeouts: NetworkTimeouts,
+
+    /// P2P safety limits (DoS bounding) applied by the networking layer.
+    #[serde(default)]
+    pub safety_limits: P2pSafetyLimits,
+
+    /// Relay cache bounds (used for multi-hop rebroadcast + dedup).
+    #[serde(default)]
+    pub relay_cache: RelayCacheConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct P2pSafetyLimits {
+    pub max_gossip_message_bytes: usize,
+    pub per_peer_max_msgs_per_sec: u32,
+    pub per_peer_max_bytes_per_sec: usize,
+    pub max_tcp_frame_bytes: usize,
+    pub per_conn_max_msgs_per_sec: u32,
+    pub per_conn_max_bytes_per_sec: usize,
+    pub max_hops: u8,
+    pub dedup_cache_max_entries: usize,
+    pub dial_jitter_max_ms: u64,
+    pub dial_backoff_max_ms: u64,
+}
+
+impl Default for P2pSafetyLimits {
+    fn default() -> Self {
+        Self {
+            max_gossip_message_bytes: 8 * 1024 * 1024,
+            per_peer_max_msgs_per_sec: 200,
+            per_peer_max_bytes_per_sec: 8 * 1024 * 1024,
+            max_tcp_frame_bytes: 8 * 1024 * 1024,
+            per_conn_max_msgs_per_sec: 200,
+            per_conn_max_bytes_per_sec: 8 * 1024 * 1024,
+            max_hops: 10,
+            dedup_cache_max_entries: 20_000,
+            dial_jitter_max_ms: 250,
+            dial_backoff_max_ms: 60_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayCacheConfig {
+    pub max_entries: usize,
+    pub target_entries: usize,
+    pub retention_seconds: u64,
+}
+
+impl Default for RelayCacheConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 5000,
+            target_entries: 4000,
+            retention_seconds: 10 * 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -458,6 +514,8 @@ impl Default for NodeConfig {
                     request_timeout: 10,
                     keep_alive_interval: 30,
                 },
+                safety_limits: P2pSafetyLimits::default(),
+                relay_cache: RelayCacheConfig::default(),
             },
             storage: StorageConfig {
                 data_dir: PathBuf::from("data"),
@@ -668,6 +726,51 @@ impl NodeConfig {
         
         if self.network.listen_addresses.is_empty() {
             return Err(anyhow::anyhow!("At least one listen address must be specified"));
+        }
+
+        // Validate P2P safety limits
+        {
+            let sl = &self.network.safety_limits;
+            if sl.max_gossip_message_bytes == 0
+                || sl.max_tcp_frame_bytes == 0
+                || sl.per_peer_max_msgs_per_sec == 0
+                || sl.per_conn_max_msgs_per_sec == 0
+                || sl.per_peer_max_bytes_per_sec == 0
+                || sl.per_conn_max_bytes_per_sec == 0
+            {
+                return Err(anyhow::anyhow!("network.safety_limits values must be > 0"));
+            }
+            if sl.max_hops == 0 {
+                return Err(anyhow::anyhow!("network.safety_limits.max_hops must be > 0"));
+            }
+            if sl.dedup_cache_max_entries == 0 {
+                return Err(anyhow::anyhow!(
+                    "network.safety_limits.dedup_cache_max_entries must be > 0"
+                ));
+            }
+            if sl.dial_backoff_max_ms == 0 {
+                return Err(anyhow::anyhow!(
+                    "network.safety_limits.dial_backoff_max_ms must be > 0"
+                ));
+            }
+        }
+
+        // Validate relay cache bounds
+        {
+            let rc = &self.network.relay_cache;
+            if rc.max_entries == 0 || rc.target_entries == 0 {
+                return Err(anyhow::anyhow!("network.relay_cache max/target must be > 0"));
+            }
+            if rc.max_entries < rc.target_entries {
+                return Err(anyhow::anyhow!(
+                    "network.relay_cache.max_entries must be >= target_entries"
+                ));
+            }
+            if rc.retention_seconds == 0 {
+                return Err(anyhow::anyhow!(
+                    "network.relay_cache.retention_seconds must be > 0"
+                ));
+            }
         }
         
         // Validate consensus configuration

@@ -103,6 +103,9 @@ pub struct NetworkConfig {
     
     /// Gossip protocol configuration
     pub gossip: GossipConfig,
+
+    /// Safety limits (DoS bounding) applied by transports.
+    pub safety_limits: SafetyLimitsConfig,
     
     /// Discovery configuration
     pub discovery: DiscoveryConfig,
@@ -118,6 +121,40 @@ pub struct NetworkConfig {
     
     /// Monitoring configuration
     pub monitoring: MonitoringConfig,
+}
+
+/// Transport-agnostic DoS safety limits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafetyLimitsConfig {
+    /// Maximum gossipsub message bytes accepted by the libp2p transport.
+    pub max_gossip_message_bytes: usize,
+
+    /// Per-peer message rate limit (msgs/sec) for libp2p transport.
+    pub per_peer_max_msgs_per_sec: u32,
+
+    /// Per-peer bandwidth cap (bytes/sec) for libp2p transport.
+    pub per_peer_max_bytes_per_sec: usize,
+
+    /// Maximum TCP frame bytes accepted by the simple transport.
+    pub max_tcp_frame_bytes: usize,
+
+    /// Per-connection message rate limit (msgs/sec) for simple transport.
+    pub per_conn_max_msgs_per_sec: u32,
+
+    /// Per-connection bandwidth cap (bytes/sec) for simple transport.
+    pub per_conn_max_bytes_per_sec: usize,
+
+    /// Maximum hops for multi-hop rebroadcast.
+    pub max_hops: u8,
+
+    /// Maximum number of recently seen envelope ids stored for deduplication.
+    pub dedup_cache_max_entries: usize,
+
+    /// Maximum dial jitter (milliseconds) applied to backoff scheduling.
+    pub dial_jitter_max_ms: u64,
+
+    /// Maximum backoff cap (milliseconds) applied to exponential dial backoff.
+    pub dial_backoff_max_ms: u64,
 }
 
 /// Peer-specific configuration
@@ -1727,11 +1764,30 @@ impl Default for NetworkConfig {
             peer: PeerConfig::default(),
             transport: TransportConfig::default(),
             gossip: GossipConfig::default(),
+            safety_limits: SafetyLimitsConfig::default(),
             discovery: DiscoveryConfig::default(),
             security: SecurityConfig::default(),
             bandwidth: BandwidthConfig::default(),
             reputation: ReputationConfig::default(),
             monitoring: MonitoringConfig::default(),
+        }
+    }
+}
+
+impl Default for SafetyLimitsConfig {
+    fn default() -> Self {
+        Self {
+            // Match the previously hard-coded defaults in the transports.
+            max_gossip_message_bytes: 8 * 1024 * 1024,
+            per_peer_max_msgs_per_sec: 200,
+            per_peer_max_bytes_per_sec: 8 * 1024 * 1024,
+            max_tcp_frame_bytes: 8 * 1024 * 1024,
+            per_conn_max_msgs_per_sec: 200,
+            per_conn_max_bytes_per_sec: 8 * 1024 * 1024,
+            max_hops: 10,
+            dedup_cache_max_entries: 20_000,
+            dial_jitter_max_ms: 250,
+            dial_backoff_max_ms: 60_000,
         }
     }
 }
@@ -2534,6 +2590,38 @@ impl NetworkConfig {
         if self.peer.max_peers < self.peer.min_peers {
             return Err(NetworkError::ConfigError(
                 "max_peers must be greater than or equal to min_peers".to_string()
+            ));
+        }
+
+        // Validate safety limits
+        let sl = &self.safety_limits;
+        if sl.max_gossip_message_bytes == 0 || sl.max_tcp_frame_bytes == 0 {
+            return Err(NetworkError::ConfigError(
+                "safety_limits max message/frame bytes must be > 0".to_string(),
+            ));
+        }
+        if sl.per_peer_max_msgs_per_sec == 0
+            || sl.per_conn_max_msgs_per_sec == 0
+            || sl.per_peer_max_bytes_per_sec == 0
+            || sl.per_conn_max_bytes_per_sec == 0
+        {
+            return Err(NetworkError::ConfigError(
+                "safety_limits per-peer/per-conn budgets must be > 0".to_string(),
+            ));
+        }
+        if sl.max_hops == 0 {
+            return Err(NetworkError::ConfigError(
+                "safety_limits.max_hops must be > 0".to_string(),
+            ));
+        }
+        if sl.dedup_cache_max_entries == 0 {
+            return Err(NetworkError::ConfigError(
+                "safety_limits.dedup_cache_max_entries must be > 0".to_string(),
+            ));
+        }
+        if sl.dial_backoff_max_ms == 0 {
+            return Err(NetworkError::ConfigError(
+                "safety_limits.dial_backoff_max_ms must be > 0".to_string(),
             ));
         }
 
