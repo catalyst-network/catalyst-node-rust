@@ -20,7 +20,6 @@ This project uses Git tags and GitHub releases to produce deployable artifacts f
 
 GitHub Actions runs:
 
-- `cargo fmt --all -- --check`
 - `cargo test --workspace --locked`
 
 See `.github/workflows/ci.yml`.
@@ -33,6 +32,20 @@ See `.github/workflows/ci.yml`.
 - v2 signing payload (`CATALYST_SIG_V2`)
 
 Any change to canonical serialization will fail CI until the vectors are updated intentionally.
+
+## Network wire versioning (MessageEnvelope)
+
+`MessageEnvelope` is encoded on the network using a **versioned** wrapper:
+
+- **magic**: `CENV`
+- **version**: `PROTOCOL_VERSION` (u32 LE)
+- **payload**: `bincode(MessageEnvelope)`
+
+Nodes reject unknown versions, and libp2p identify advertises a matching protocol string (`catalyst/1`).
+
+Version bump policy (current):
+- **Bump `PROTOCOL_VERSION`** only for intentionally breaking, network-wide changes to envelope decoding.
+- Keep the identify protocol string in sync with the major version (`catalyst/<PROTOCOL_VERSION>`).
 
 ## Creating a release
 

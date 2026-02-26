@@ -56,6 +56,60 @@ pub trait NetworkMessage: Send + Sync + Clone {
 /// for all `NetworkMessage` implementations unless overridden.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Magic prefix for the canonical `MessageEnvelope` wire encoding.
+///
+/// This helps nodes reject random/invalid payloads cleanly and allows versioned decoding.
+pub const ENVELOPE_WIRE_MAGIC: [u8; 4] = *b"CENV";
+
+/// Versioned wire encoding for `MessageEnvelope`.
+///
+/// Layout:
+/// - magic: 4 bytes (`ENVELOPE_WIRE_MAGIC`)
+/// - version: u32 LE (currently `PROTOCOL_VERSION`)
+/// - payload: `bincode(MessageEnvelope)`
+pub fn encode_envelope_wire(envelope: &MessageEnvelope) -> CatalystResult<Vec<u8>> {
+    let payload = bincode::serialize(envelope)
+        .map_err(|e| CatalystError::Serialization(format!("envelope encode failed: {e}")))?;
+
+    let mut out = Vec::with_capacity(ENVELOPE_WIRE_MAGIC.len() + 4 + payload.len());
+    out.extend_from_slice(&ENVELOPE_WIRE_MAGIC);
+    out.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum EnvelopeWireError {
+    #[error("wire bytes too short (len={len})")]
+    TooShort { len: usize },
+    #[error("invalid envelope magic")]
+    BadMagic,
+    #[error("unsupported envelope version (got={got}, local={local})")]
+    UnsupportedVersion { got: u32, local: u32 },
+    #[error("envelope decode failed: {0}")]
+    DecodeFailed(String),
+}
+
+pub fn decode_envelope_wire(bytes: &[u8]) -> Result<MessageEnvelope, EnvelopeWireError> {
+    if bytes.len() < 8 {
+        return Err(EnvelopeWireError::TooShort { len: bytes.len() });
+    }
+    if bytes[0..4] != ENVELOPE_WIRE_MAGIC {
+        return Err(EnvelopeWireError::BadMagic);
+    }
+    let mut ver = [0u8; 4];
+    ver.copy_from_slice(&bytes[4..8]);
+    let got = u32::from_le_bytes(ver);
+    if got != PROTOCOL_VERSION {
+        return Err(EnvelopeWireError::UnsupportedVersion {
+            got,
+            local: PROTOCOL_VERSION,
+        });
+    }
+    bincode::deserialize(&bytes[8..])
+        .map_err(|e| EnvelopeWireError::DecodeFailed(e.to_string()))
+}
+
 /// Message types used in the Catalyst network protocol
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MessageType {
@@ -568,6 +622,44 @@ mod tests {
         assert_eq!(envelope.target, Some("node2".to_string()));
         assert_eq!(envelope.payload, payload);
         assert!(!envelope.is_expired());
+    }
+
+    #[test]
+    fn test_envelope_wire_roundtrip() {
+        let env = MessageEnvelope::new(
+            MessageType::ConsensusSync,
+            "node_a".to_string(),
+            None,
+            b"hello".to_vec(),
+        );
+        let wire = encode_envelope_wire(&env).unwrap();
+        let decoded = decode_envelope_wire(&wire).unwrap();
+        assert_eq!(decoded.message_type, env.message_type);
+        assert_eq!(decoded.sender, env.sender);
+        assert_eq!(decoded.target, env.target);
+        assert_eq!(decoded.payload, env.payload);
+        assert_eq!(decoded.version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn test_envelope_wire_version_mismatch_rejected() {
+        let env = MessageEnvelope::new(
+            MessageType::ConsensusSync,
+            "node_a".to_string(),
+            None,
+            b"hello".to_vec(),
+        );
+        let mut wire = encode_envelope_wire(&env).unwrap();
+        // Overwrite version with an unsupported one.
+        wire[4..8].copy_from_slice(&(PROTOCOL_VERSION + 1).to_le_bytes());
+        let err = decode_envelope_wire(&wire).unwrap_err();
+        match err {
+            EnvelopeWireError::UnsupportedVersion { got, local } => {
+                assert_eq!(got, PROTOCOL_VERSION + 1);
+                assert_eq!(local, PROTOCOL_VERSION);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
     
     #[test]
