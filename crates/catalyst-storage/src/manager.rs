@@ -69,6 +69,37 @@ impl StorageManager {
         
         // Run any pending migrations
         migration_manager.run_migrations().await?;
+
+        // Record storage version marker (best-effort) to make upgrades easier to reason about.
+        // This is informational today (we don't hard-fail), but it helps operators detect when a
+        // data directory was created by a different storage version.
+        {
+            const META_STORAGE_VERSION: &str = "storage:version";
+            let key = state_keys::metadata_key(META_STORAGE_VERSION);
+            let existing = engine
+                .get("metadata", &key)
+                .ok()
+                .flatten()
+                .and_then(|b| {
+                    if b.len() != 4 {
+                        return None;
+                    }
+                    let mut arr = [0u8; 4];
+                    arr.copy_from_slice(&b);
+                    Some(u32::from_le_bytes(arr))
+                });
+            if let Some(v) = existing {
+                if v != crate::STORAGE_VERSION {
+                    log_warn!(
+                        LogCategory::Storage,
+                        "Storage version mismatch (db={} code={}); consider snapshot restore if you see unexpected behavior",
+                        v,
+                        crate::STORAGE_VERSION
+                    );
+                }
+            }
+            let _ = engine.put("metadata", &key, &crate::STORAGE_VERSION.to_le_bytes());
+        }
         
         // Create transaction semaphore
         let transaction_semaphore = Arc::new(Semaphore::new(

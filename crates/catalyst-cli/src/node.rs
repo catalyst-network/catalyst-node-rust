@@ -703,6 +703,12 @@ async fn apply_lsu_to_storage_without_root_check(
         }
     }
 
+    // Prune persisted mempool against updated nonces.
+    prune_persisted_mempool(store).await;
+
+    // Opportunistic disk-bounding: prune old historical metadata (if enabled).
+    crate::pruning::maybe_prune_history(store).await;
+
     // Flush without recomputing.
     for cf_name in store.engine().cf_names() {
         let _ = store.engine().flush_cf(&cf_name);
@@ -1775,6 +1781,9 @@ async fn apply_lsu_to_storage(
     // Prune persisted mempool against updated nonces.
     prune_persisted_mempool(store).await;
 
+    // Opportunistic disk-bounding: prune old historical metadata (if enabled).
+    crate::pruning::maybe_prune_history(store).await;
+
     Ok(state_root)
 }
 
@@ -2109,6 +2118,36 @@ impl CatalystNode {
             ensure_chain_identity_and_genesis(store.as_ref(), &self.config.protocol)
                 .await
                 .map_err(|e| anyhow::anyhow!("genesis/identity initialization failed: {e}"))?;
+        }
+
+        // Persist storage pruning knobs into DB metadata so apply paths can enforce bounded disk
+        // growth without needing to thread config through every callsite.
+        if let Some(store) = &storage {
+            let enabled: u8 = if self.config.storage.history_prune_enabled { 1 } else { 0 };
+            let _ = store
+                .set_metadata("storage:history_prune_enabled", &[enabled])
+                .await;
+            let _ = store
+                .set_metadata(
+                    "storage:history_keep_cycles",
+                    &self.config.storage.history_keep_cycles.to_le_bytes(),
+                )
+                .await;
+            let _ = store
+                .set_metadata(
+                    "storage:history_prune_interval_seconds",
+                    &self.config
+                        .storage
+                        .history_prune_interval_seconds
+                        .to_le_bytes(),
+                )
+                .await;
+            let _ = store
+                .set_metadata(
+                    "storage:history_prune_batch_cycles",
+                    &self.config.storage.history_prune_batch_cycles.to_le_bytes(),
+                )
+                .await;
         }
 
         // Auto-register as a worker (on-chain) for validator nodes.

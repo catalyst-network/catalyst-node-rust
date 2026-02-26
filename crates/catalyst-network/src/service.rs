@@ -11,7 +11,7 @@ use crate::{
 };
 
 use catalyst_utils::logging::*;
-use catalyst_utils::network::MessageEnvelope;
+use catalyst_utils::network::{decode_envelope_wire, encode_envelope_wire, EnvelopeWireError, MessageEnvelope};
 
 use futures::StreamExt;
 use libp2p::{
@@ -40,6 +40,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 const MAX_GOSSIP_MESSAGE_BYTES: usize = 8 * 1024 * 1024; // 8 MiB hard cap per message
 const PER_PEER_MAX_MSGS_PER_SEC: u32 = 200;
 const PER_PEER_MAX_BYTES_PER_SEC: usize = 8 * 1024 * 1024; // 8 MiB/s per peer
+const IDENTIFY_PROTOCOL_VERSION: &str = "catalyst/1";
 
 #[derive(Debug, Clone)]
 struct PeerBudget {
@@ -186,7 +187,7 @@ impl NetworkService {
 
         // Identify + Ping
         let identify = identify::Behaviour::new(identify::Config::new(
-            "catalyst/1.0".to_string(),
+            IDENTIFY_PROTOCOL_VERSION.to_string(),
             id_keys.public(),
         ));
         let ping = ping::Behaviour::new(ping::Config::new());
@@ -296,8 +297,18 @@ impl NetworkService {
                                     if !b.allow(now, message.data.len()) {
                                         continue;
                                     }
-                                    let env: MessageEnvelope = match bincode::deserialize(&message.data) {
+                                    let env: MessageEnvelope = match decode_envelope_wire(&message.data) {
                                         Ok(e) => e,
+                                        Err(EnvelopeWireError::UnsupportedVersion { got, local }) => {
+                                            log_warn!(
+                                                LogCategory::Network,
+                                                "Dropping message from {} due to unsupported envelope version (got={} local={})",
+                                                propagation_source,
+                                                got,
+                                                local
+                                            );
+                                            continue;
+                                        }
                                         Err(_) => continue,
                                     };
                                     {
@@ -306,6 +317,21 @@ impl NetworkService {
                                         st.connected_peers = peer_conns.read().await.len();
                                     }
                                     let _ = emit(&event_tx, NetworkEvent::MessageReceived { envelope: env, from: propagation_source }).await;
+                                }
+                            }
+                            SwarmEvent::Behaviour(BehaviourEvent::Identify(e)) => {
+                                if let identify::Event::Received { peer_id, info } = e {
+                                    let pv = info.protocol_version;
+                                    if pv != IDENTIFY_PROTOCOL_VERSION {
+                                        log_warn!(
+                                            LogCategory::Network,
+                                            "Disconnecting peer {}: incompatible protocol_version={} (local={})",
+                                            peer_id,
+                                            pv,
+                                            IDENTIFY_PROTOCOL_VERSION
+                                        );
+                                        swarm.disconnect_peer_id(peer_id);
+                                    }
                                 }
                             }
                             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
@@ -388,7 +414,8 @@ impl NetworkService {
     }
 
     pub async fn broadcast_envelope(&self, envelope: &MessageEnvelope) -> NetworkResult<()> {
-        let bytes = bincode::serialize(envelope).map_err(|e| NetworkError::SerializationFailed(e.to_string()))?;
+        let bytes = encode_envelope_wire(envelope)
+            .map_err(|e| NetworkError::SerializationFailed(e.to_string()))?;
         let _ = self.cmd_tx.send(Cmd::Publish(bytes));
         Ok(())
     }
