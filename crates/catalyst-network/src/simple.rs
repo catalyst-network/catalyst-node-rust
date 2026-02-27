@@ -454,6 +454,38 @@ fn jitter_ms(addr: SocketAddr, attempts: u32, max_ms: u64) -> u64 {
     (v % (max_ms + 1)) as u64
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conn_budget_enforces_msgs_and_bytes() {
+        let now = std::time::Instant::now();
+        let mut b = ConnBudget {
+            window_start: now,
+            msgs: 0,
+            bytes: 0,
+            max_msgs: 2,
+            max_bytes: 20,
+        };
+
+        assert!(b.allow(now, 10));
+        assert!(b.allow(now, 10));
+        assert!(!b.allow(now, 1));
+    }
+
+    #[test]
+    fn backoff_and_jitter_are_bounded() {
+        let base = std::time::Duration::from_millis(100);
+        let b = compute_backoff(base, 100, 1_000).unwrap();
+        assert!(b <= std::time::Duration::from_millis(1_000));
+
+        let addr: SocketAddr = "127.0.0.1:30333".parse().unwrap();
+        let j = jitter_ms(addr, 5, 250);
+        assert!(j <= 250);
+    }
+}
+
 fn multiaddr_to_socketaddr(addr: &Multiaddr) -> Option<SocketAddr> {
     // Support: /ip4/x.x.x.x/tcp/port (and /ip6/.../tcp/port)
     let mut ip: Option<IpAddr> = None;
