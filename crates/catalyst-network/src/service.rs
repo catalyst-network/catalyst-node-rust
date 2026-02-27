@@ -493,6 +493,39 @@ fn jitter_ms(peer_id: &PeerId, attempts: u32, max_ms: u64) -> u64 {
     (v % (max_ms + 1)) as u64
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libp2p::PeerId;
+
+    #[test]
+    fn peer_budget_enforces_msgs_and_bytes() {
+        let now = Instant::now();
+        let mut b = PeerBudget {
+            window_start: now,
+            msgs: 0,
+            bytes: 0,
+        };
+
+        // Allow exactly 2 messages of 10 bytes each.
+        assert!(b.allow(now, 10, 2, 20));
+        assert!(b.allow(now, 10, 2, 20));
+        // Third message denied by msg cap.
+        assert!(!b.allow(now, 1, 2, 20));
+    }
+
+    #[test]
+    fn backoff_and_jitter_are_bounded() {
+        let base = Duration::from_millis(100);
+        let b = compute_backoff(base, 100, 1_000).unwrap();
+        assert!(b <= Duration::from_millis(1_000));
+
+        let pid = PeerId::random();
+        let j = jitter_ms(&pid, 5, 250);
+        assert!(j <= 250);
+    }
+}
+
 fn load_or_generate_keypair(path: &Path) -> NetworkResult<identity::Keypair> {
     if let Ok(bytes) = std::fs::read(path) {
         if let Ok(kp) = identity::Keypair::from_protobuf_encoding(&bytes) {
