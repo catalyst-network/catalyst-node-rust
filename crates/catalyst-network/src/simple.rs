@@ -25,17 +25,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-// --- Safety limits (anti-DoS) ---
-// These are conservative defaults for public testnets.
-const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024; // 8 MiB hard cap per frame
-const PER_CONN_MAX_MSGS_PER_SEC: u32 = 200;
-const PER_CONN_MAX_BYTES_PER_SEC: usize = 8 * 1024 * 1024; // 8 MiB/s per connection
-
 #[derive(Debug, Clone)]
 struct ConnBudget {
     window_start: std::time::Instant,
     msgs: u32,
     bytes: usize,
+    max_msgs: u32,
+    max_bytes: usize,
 }
 
 impl ConnBudget {
@@ -47,7 +43,7 @@ impl ConnBudget {
         }
         self.msgs = self.msgs.saturating_add(1);
         self.bytes = self.bytes.saturating_add(size);
-        self.msgs <= PER_CONN_MAX_MSGS_PER_SEC && self.bytes <= PER_CONN_MAX_BYTES_PER_SEC
+        self.msgs <= self.max_msgs && self.bytes <= self.max_bytes
     }
 }
 
@@ -196,6 +192,7 @@ impl NetworkService {
         let local_id = self.local_id.clone();
         let seen = self.seen.clone();
         let dedup_window = self.config.gossip.duplicate_detection_window;
+        let limits = self.config.safety_limits.clone();
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         {
@@ -221,9 +218,11 @@ impl NetworkService {
                 window_start: std::time::Instant::now(),
                 msgs: 0,
                 bytes: 0,
+                max_msgs: limits.per_conn_max_msgs_per_sec,
+                max_bytes: limits.per_conn_max_bytes_per_sec,
             };
             while let Some(Ok(bytes)) = stream.next().await {
-                if bytes.len() > MAX_FRAME_BYTES {
+                if bytes.len() > limits.max_tcp_frame_bytes {
                     continue;
                 }
                 let now = std::time::Instant::now();
@@ -249,6 +248,9 @@ impl NetworkService {
                 {
                     let mut s = seen.lock().await;
                     s.retain(|_, t| now.duration_since(*t) <= dedup_window);
+                    if s.len() > limits.dedup_cache_max_entries {
+                        s.clear();
+                    }
                     if s.contains_key(&env.id) {
                         continue;
                     }
@@ -270,7 +272,7 @@ impl NetworkService {
                 // Multi-hop rebroadcast: forward broadcast envelopes to all peers except sender
                 // with hop/loop limits.
                 if env.target.is_none() && should_forward(&env, &local_id) {
-                    if let Some(fwd) = forwarded(env, &local_id) {
+                    if let Some(fwd) = forwarded(env, &local_id, limits.max_hops) {
                         let bytes = match encode_envelope_wire(&fwd) {
                             Ok(b) => b,
                             Err(_) => continue,
@@ -316,6 +318,7 @@ impl NetworkService {
         let mut incompatible: HashSet<SocketAddr> = HashSet::new();
 
         let base = self.config.peer.retry_backoff;
+        let limits = self.config.safety_limits.clone();
         let max_attempts = self.config.peer.max_retry_attempts;
         let mut tick = tokio::time::interval(self.config.discovery.bootstrap_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -345,8 +348,8 @@ impl NetworkService {
                 let socket = *addr;
                 let svc = self.clone();
                 let attempts_next = attempts.saturating_add(1);
-                let delay = compute_backoff(base, attempts_next).unwrap_or(base);
-                let jitter = jitter_ms(socket, attempts_next);
+                let delay = compute_backoff(base, attempts_next, limits.dial_backoff_max_ms).unwrap_or(base);
+                let jitter = jitter_ms(socket, attempts_next, limits.dial_jitter_max_ms);
                 backoff.insert(
                     *addr,
                     (
@@ -409,11 +412,15 @@ fn should_forward(env: &MessageEnvelope, local_id: &str) -> bool {
     true
 }
 
-fn forwarded(mut env: MessageEnvelope, local_id: &str) -> Option<MessageEnvelope> {
+fn forwarded(mut env: MessageEnvelope, local_id: &str, default_max_hops: u8) -> Option<MessageEnvelope> {
     if env.is_expired() {
         return None;
     }
-    let mut r = env.routing_info.take().unwrap_or_else(|| RoutingInfo::new(10));
+    // Preserve configured max_hops if the sender already attached routing info.
+    let mut r = env
+        .routing_info
+        .take()
+        .unwrap_or_else(|| RoutingInfo::new(default_max_hops));
     if r.hop_count >= r.max_hops {
         return None;
     }
@@ -426,22 +433,25 @@ fn forwarded(mut env: MessageEnvelope, local_id: &str) -> Option<MessageEnvelope
     Some(env)
 }
 
-fn compute_backoff(base: std::time::Duration, attempts: u32) -> Option<std::time::Duration> {
-    // base * 2^(attempts-1), clamped to 60s
+fn compute_backoff(base: std::time::Duration, attempts: u32, max_ms: u64) -> Option<std::time::Duration> {
+    // base * 2^(attempts-1), clamped to max_ms
     let pow = attempts.saturating_sub(1).min(10); // 2^10 = 1024x
     let mult = 1u64.checked_shl(pow)?;
     let ms = base.as_millis().saturating_mul(mult as u128);
-    let ms = ms.min(60_000);
+    let ms = ms.min(max_ms as u128);
     Some(std::time::Duration::from_millis(ms as u64))
 }
 
-fn jitter_ms(addr: SocketAddr, attempts: u32) -> u64 {
+fn jitter_ms(addr: SocketAddr, attempts: u32, max_ms: u64) -> u64 {
+    if max_ms == 0 {
+        return 0;
+    }
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     addr.hash(&mut h);
     attempts.hash(&mut h);
     let v = h.finish();
-    (v % 250) as u64
+    (v % (max_ms + 1)) as u64
 }
 
 fn multiaddr_to_socketaddr(addr: &Multiaddr) -> Option<SocketAddr> {
