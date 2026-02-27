@@ -137,6 +137,12 @@ status_json() {
   sudo ip netns exec "${ns}" bash -lc "\"${CLI}\" status --rpc-url \"http://${ip}:8545\" 2>/dev/null || true"
 }
 
+extract_applied_cycle() {
+  # Expects `catalyst-cli status` output; extracts the first `applied_cycle: <n>` value.
+  # Returns empty string if not present.
+  sed -nE 's/^[[:space:]]*applied_cycle:[[:space:]]*([0-9]+).*$/\1/p' | head -n 1
+}
+
 echo "t=0 starting poll loop" | tee -a "${OUT_DIR}/run.meta"
 
 START_TS="$(date +%s)"
@@ -175,10 +181,26 @@ PARTITION_DONE=0
 RESTART_DONE=0
 PARTITION_OFF_AT=0
 
-LAST_N1=""
-LAST_N2=""
-LAST_N3=""
-GAPS=0
+LAST_C1=""
+LAST_C2=""
+LAST_C3=""
+STALL_SECS_1=0
+STALL_SECS_2=0
+STALL_SECS_3=0
+LONGEST_STALL_1=0
+LONGEST_STALL_2=0
+LONGEST_STALL_3=0
+CUR_STALL_1=0
+CUR_STALL_2=0
+CUR_STALL_3=0
+
+PARTITION_OFF_ELAPSED=""
+PARTITION_RESUME_SECS=""
+
+RESTART_ELAPSED=""
+RESTART_RESUME_SECS=""
+
+POLL_SECS=2
 
 while [[ "$(date +%s)" -lt "${END_TS}" ]]; do
   NOW="$(date +%s)"
@@ -193,32 +215,103 @@ while [[ "$(date +%s)" -lt "${END_TS}" ]]; do
   if [[ "${PARTITION_DONE}" -eq 1 && "${PARTITION_OFF_AT}" -gt 0 && "${ELAPSED}" -ge "${PARTITION_OFF_AT}" ]]; then
     partition_off
     PARTITION_OFF_AT=0
+    PARTITION_OFF_ELAPSED="${ELAPSED}"
   fi
 
   if [[ -n "${RESTART_AT_SECS}" && "${RESTART_DONE}" -eq 0 && "${ELAPSED}" -ge "${RESTART_AT_SECS}" ]]; then
     restart_node "${RESTART_NODE}"
     RESTART_DONE=1
+    RESTART_ELAPSED="${ELAPSED}"
   fi
 
-  s1="$(status_json "${NS_PREFIX}1" "10.70.0.1" | tr '\n' ' ')"
-  s2="$(status_json "${NS_PREFIX}2" "10.70.0.2" | tr '\n' ' ')"
-  s3="$(status_json "${NS_PREFIX}3" "10.70.0.3" | tr '\n' ' ')"
+  raw1="$(status_json "${NS_PREFIX}1" "10.70.0.1")"
+  raw2="$(status_json "${NS_PREFIX}2" "10.70.0.2")"
+  raw3="$(status_json "${NS_PREFIX}3" "10.70.0.3")"
+
+  s1="$(echo "${raw1}" | tr '\n' ' ')"
+  s2="$(echo "${raw2}" | tr '\n' ' ')"
+  s3="$(echo "${raw3}" | tr '\n' ' ')"
+
+  c1="$(echo "${raw1}" | extract_applied_cycle || true)"
+  c2="$(echo "${raw2}" | extract_applied_cycle || true)"
+  c3="$(echo "${raw3}" | extract_applied_cycle || true)"
 
   echo "t=${ELAPSED} n1=${s1} n2=${s2} n3=${s3}" >> "${OUT_DIR}/status.log"
+  echo "t=${ELAPSED} applied_cycle n1=${c1:-na} n2=${c2:-na} n3=${c3:-na}" >> "${OUT_DIR}/cycles.log"
 
-  # Extremely simple liveness heuristic: if status output is identical for >20s across all nodes,
-  # count as a “gap” (likely stalled).
-  if [[ "${s1}" == "${LAST_N1}" && "${s2}" == "${LAST_N2}" && "${s3}" == "${LAST_N3}" ]]; then
-    GAPS=$((GAPS + 1))
+  # Stall accounting per node (only when `applied_cycle` is present).
+  if [[ -n "${c1}" ]]; then
+    if [[ -n "${LAST_C1}" && "${c1}" == "${LAST_C1}" ]]; then
+      STALL_SECS_1=$((STALL_SECS_1 + POLL_SECS))
+      CUR_STALL_1=$((CUR_STALL_1 + POLL_SECS))
+      if [[ "${CUR_STALL_1}" -gt "${LONGEST_STALL_1}" ]]; then LONGEST_STALL_1="${CUR_STALL_1}"; fi
+    else
+      CUR_STALL_1=0
+    fi
+    LAST_C1="${c1}"
   fi
-  LAST_N1="${s1}"
-  LAST_N2="${s2}"
-  LAST_N3="${s3}"
+  if [[ -n "${c2}" ]]; then
+    if [[ -n "${LAST_C2}" && "${c2}" == "${LAST_C2}" ]]; then
+      STALL_SECS_2=$((STALL_SECS_2 + POLL_SECS))
+      CUR_STALL_2=$((CUR_STALL_2 + POLL_SECS))
+      if [[ "${CUR_STALL_2}" -gt "${LONGEST_STALL_2}" ]]; then LONGEST_STALL_2="${CUR_STALL_2}"; fi
+    else
+      CUR_STALL_2=0
+    fi
+    LAST_C2="${c2}"
+  fi
+  if [[ -n "${c3}" ]]; then
+    if [[ -n "${LAST_C3}" && "${c3}" == "${LAST_C3}" ]]; then
+      STALL_SECS_3=$((STALL_SECS_3 + POLL_SECS))
+      CUR_STALL_3=$((CUR_STALL_3 + POLL_SECS))
+      if [[ "${CUR_STALL_3}" -gt "${LONGEST_STALL_3}" ]]; then LONGEST_STALL_3="${CUR_STALL_3}"; fi
+    else
+      CUR_STALL_3=0
+    fi
+    LAST_C3="${c3}"
+  fi
 
-  sleep 2
+  # Time-to-resume after partition heal: first time all nodes advance at least once after heal.
+  if [[ -n "${PARTITION_OFF_ELAPSED}" && -z "${PARTITION_RESUME_SECS}" ]]; then
+    # We define "resumed" as: all nodes have a cycle value and none are currently stalled.
+    if [[ -n "${c1}" && -n "${c2}" && -n "${c3}" && "${CUR_STALL_1}" -eq 0 && "${CUR_STALL_2}" -eq 0 && "${CUR_STALL_3}" -eq 0 ]]; then
+      PARTITION_RESUME_SECS=$((ELAPSED - PARTITION_OFF_ELAPSED))
+    fi
+  fi
+
+  # Time-to-resume after restart: first time the restarted node advances at least once post-restart.
+  if [[ -n "${RESTART_ELAPSED}" && -z "${RESTART_RESUME_SECS}" ]]; then
+    if [[ "${RESTART_NODE}" == "n1" && "${CUR_STALL_1}" -eq 0 && -n "${c1}" ]]; then
+      RESTART_RESUME_SECS=$((ELAPSED - RESTART_ELAPSED))
+    fi
+    if [[ "${RESTART_NODE}" == "n2" && "${CUR_STALL_2}" -eq 0 && -n "${c2}" ]]; then
+      RESTART_RESUME_SECS=$((ELAPSED - RESTART_ELAPSED))
+    fi
+    if [[ "${RESTART_NODE}" == "n3" && "${CUR_STALL_3}" -eq 0 && -n "${c3}" ]]; then
+      RESTART_RESUME_SECS=$((ELAPSED - RESTART_ELAPSED))
+    fi
+  fi
+
+  sleep "${POLL_SECS}"
 done
 
-echo "gaps_observed: ${GAPS}" | tee "${OUT_DIR}/report.txt"
+{
+  echo "stalled_seconds.n1: ${STALL_SECS_1}"
+  echo "stalled_seconds.n2: ${STALL_SECS_2}"
+  echo "stalled_seconds.n3: ${STALL_SECS_3}"
+  echo "longest_stall_seconds.n1: ${LONGEST_STALL_1}"
+  echo "longest_stall_seconds.n2: ${LONGEST_STALL_2}"
+  echo "longest_stall_seconds.n3: ${LONGEST_STALL_3}"
+  if [[ -n "${PARTITION_OFF_ELAPSED}" ]]; then
+    echo "partition_heal_at_seconds: ${PARTITION_OFF_ELAPSED}"
+    echo "partition_time_to_resume_seconds: ${PARTITION_RESUME_SECS:-na}"
+  fi
+  if [[ -n "${RESTART_ELAPSED}" ]]; then
+    echo "restart_at_seconds: ${RESTART_ELAPSED}"
+    echo "restart_node: ${RESTART_NODE}"
+    echo "restart_time_to_resume_seconds: ${RESTART_RESUME_SECS:-na}"
+  fi
+} | tee "${OUT_DIR}/report.txt"
 echo "out_dir: ${OUT_DIR}" | tee -a "${OUT_DIR}/report.txt"
 echo "report_ok: true" | tee -a "${OUT_DIR}/report.txt"
 
