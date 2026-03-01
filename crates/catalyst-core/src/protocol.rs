@@ -28,6 +28,14 @@ pub const MAX_TX_WIRE_BYTES: usize = 64 * 1024; // 64 KiB (hex decoded, includin
 pub const MAX_TX_SIGNATURE_BYTES: usize = 8 * 1024; // room for PQ sigs later
 pub const MAX_TX_SENDER_PUBKEY_BYTES: usize = 4 * 1024; // room for PQ pubkeys later
 
+// Bound `TransactionCore.data` separately for clearer errors.
+//
+// - Most tx types should not carry large blobs in `data` (keep small to reduce DoS surface).
+// - SmartContract txs must carry EVM deploy bytecode / calldata, so allow a larger (still bounded)
+//   payload that fits comfortably within `MAX_TX_WIRE_BYTES`.
+pub const MAX_TX_DATA_BYTES_SMALL: usize = 60;
+pub const MAX_TX_DATA_BYTES_SMART_CONTRACT: usize = 48 * 1024;
+
 /// Signature scheme id (forward-compatible).
 ///
 /// For now, only Schnorr is accepted by consensus/RPC.
@@ -510,8 +518,16 @@ impl Transaction {
         if self.core.nonce == 0 {
             return Err("Transaction nonce must be > 0".to_string());
         }
-        if self.core.data.len() > 60 {
-            return Err("Transaction data field must be <= 60 bytes".to_string());
+        let max_data = match self.core.tx_type {
+            TransactionType::SmartContract => MAX_TX_DATA_BYTES_SMART_CONTRACT,
+            _ => MAX_TX_DATA_BYTES_SMALL,
+        };
+        if self.core.data.len() > max_data {
+            return Err(format!(
+                "Transaction data field must be <= {} bytes (got={})",
+                max_data,
+                self.core.data.len()
+            ));
         }
         // Generic safety caps (anti-DoS). Scheme-specific validation belongs in `catalyst-crypto::txauth`.
         if self.signature.0.is_empty() {
