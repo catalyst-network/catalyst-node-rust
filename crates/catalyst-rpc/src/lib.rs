@@ -115,6 +115,13 @@ pub trait CatalystRpc {
     #[method(name = "catalyst_genesisHash")]
     async fn genesis_hash(&self) -> RpcResult<String>;
 
+    /// Get the chain domain used for transaction signing/verifying.
+    ///
+    /// This is the preferred method for tooling/SDKs because it returns all domain
+    /// parameters in a single RPC call (avoids load-balancer backend skew).
+    #[method(name = "catalyst_getTxDomain")]
+    async fn get_tx_domain(&self) -> RpcResult<RpcTxDomain>;
+
     /// Get sync/snapshot metadata needed for fast-sync verification.
     #[method(name = "catalyst_getSyncInfo")]
     async fn get_sync_info(&self) -> RpcResult<RpcSyncInfo>;
@@ -251,6 +258,21 @@ pub struct RpcSyncInfo {
     pub network_id: String,
     pub genesis_hash: String,
     pub head: RpcHead,
+}
+
+/// Transaction signing domain for CTX2 transactions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcTxDomain {
+    /// Hex string `0x...` (u64) used in domain separation.
+    pub chain_id: String,
+    /// Network id string (human-readable).
+    pub network_id: String,
+    /// Hex string `0x...` (32 bytes) used in domain separation.
+    pub genesis_hash: String,
+    /// Envelope wire version (`catalyst-utils` `MessageEnvelope` wire).
+    pub protocol_version: u32,
+    /// Transaction wire version (currently 2 for `CTX2`).
+    pub tx_wire_version: u32,
 }
 
 /// Operator-published snapshot metadata for fast sync.
@@ -612,6 +634,20 @@ impl CatalystRpcServer for CatalystRpcImpl {
         } else {
             Ok("0x0".to_string())
         }
+    }
+
+    async fn get_tx_domain(&self) -> RpcResult<RpcTxDomain> {
+        let chain_id = self.chain_id().await?;
+        let network_id = self.network_id().await?;
+        let genesis_hash = self.genesis_hash().await?;
+
+        Ok(RpcTxDomain {
+            chain_id,
+            network_id,
+            genesis_hash,
+            protocol_version: catalyst_utils::network::PROTOCOL_VERSION,
+            tx_wire_version: 2,
+        })
     }
 
     async fn get_sync_info(&self) -> RpcResult<RpcSyncInfo> {

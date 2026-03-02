@@ -272,7 +272,7 @@ enum Commands {
     },
     /// Deploy a smart contract
     Deploy {
-        /// Contract bytecode file
+        /// Contract bytecode file (hex/raw) or a Foundry/Hardhat artifact JSON
         contract: PathBuf,
 
         /// Constructor arguments (hex)
@@ -290,6 +290,22 @@ enum Commands {
         /// Runtime type (evm, svm, wasm)
         #[arg(long, default_value = "evm")]
         runtime: String,
+
+        /// Wait for the transaction to be applied (poll receipt)
+        #[arg(long)]
+        wait: bool,
+
+        /// When waiting, fail if deployed code is empty (`catalyst_getCode` == `0x`)
+        #[arg(long)]
+        verify_code: bool,
+
+        /// When waiting, maximum time to wait for apply
+        #[arg(long, default_value = "180")]
+        timeout_secs: u64,
+
+        /// When waiting, receipt poll interval (milliseconds)
+        #[arg(long, default_value = "1500")]
+        poll_ms: u64,
     },
     /// Call a smart contract function
     Call {
@@ -499,8 +515,23 @@ async fn main() -> Result<()> {
             key_file,
             rpc_url,
             runtime,
+            wait,
+            verify_code,
+            timeout_secs,
+            poll_ms,
         } => {
-            commands::deploy_contract(&contract, args.as_deref(), &key_file, &rpc_url, &runtime).await?;
+            commands::deploy_contract(
+                &contract,
+                args.as_deref(),
+                &key_file,
+                &rpc_url,
+                &runtime,
+                wait,
+                verify_code,
+                timeout_secs,
+                poll_ms,
+            )
+            .await?;
         }
         Commands::Call {
             contract,
