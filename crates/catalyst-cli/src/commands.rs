@@ -6,6 +6,7 @@
 use anyhow::Result;
 use std::path::Path;
 
+use jsonrpsee::http_client::HttpClient;
 use jsonrpsee::http_client::HttpClientBuilder;
 use jsonrpsee::core::client::ClientT;
 
@@ -53,16 +54,26 @@ fn parse_u64_hex(s: &str) -> Option<u64> {
     u64::from_str_radix(s, 16).ok()
 }
 
-async fn fetch_chain_domain(rpc_url: &str) -> Option<(u64, [u8; 32])> {
-    let client = HttpClientBuilder::default().build(rpc_url).ok()?;
-    let chain_id_hex: String = client
-        .request("catalyst_chainId", jsonrpsee::rpc_params![])
+async fn fetch_chain_domain(client: &HttpClient) -> Option<(u64, [u8; 32])> {
+    #[derive(serde::Deserialize)]
+    struct RpcTxDomainLite {
+        chain_id: String,
+        genesis_hash: String,
+    }
+
+    // Preferred: single call to avoid backend skew behind load balancers.
+    if let Ok(dom) = client
+        .request::<RpcTxDomainLite, _>("catalyst_getTxDomain", jsonrpsee::rpc_params![])
         .await
-        .ok()?;
-    let genesis_hex: String = client
-        .request("catalyst_genesisHash", jsonrpsee::rpc_params![])
-        .await
-        .ok()?;
+    {
+        let chain_id = parse_u64_hex(&dom.chain_id)?;
+        let genesis_hash = parse_hex_32(&dom.genesis_hash).ok().unwrap_or([0u8; 32]);
+        return Some((chain_id, genesis_hash));
+    }
+
+    // Fallback for older nodes.
+    let chain_id_hex: String = client.request("catalyst_chainId", jsonrpsee::rpc_params![]).await.ok()?;
+    let genesis_hex: String = client.request("catalyst_genesisHash", jsonrpsee::rpc_params![]).await.ok()?;
     let chain_id = parse_u64_hex(&chain_id_hex)?;
     let genesis_hash = parse_hex_32(&genesis_hex).ok().unwrap_or([0u8; 32]);
     Some((chain_id, genesis_hash))
@@ -109,8 +120,20 @@ fn verify_merkle_proof(root: &[u8; 32], leaf: &[u8; 32], steps: &[String]) -> an
 }
 
 pub async fn generate_identity(output: &Path) -> Result<()> {
-    let _ = output;
-    // TODO: implement persistent identity generation.
+    anyhow::ensure!(
+        !output.exists(),
+        "refusing to overwrite existing key file: {}",
+        output.display()
+    );
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut rng = rand::rngs::OsRng;
+    let sk = catalyst_crypto::PrivateKey::generate(&mut rng);
+    crate::identity::save_private_key_hex(output, &sk)?;
+    let pk = crate::identity::public_key_bytes(&sk);
+    println!("wrote: {}", output.display());
+    println!("pubkey: 0x{}", hex::encode(pk));
     Ok(())
 }
 
@@ -885,7 +908,7 @@ pub async fn send_transaction(
     tx.core.fees = catalyst_core::protocol::min_fee(&tx);
 
     // Real signature: prefer v2 domain-separated payload; fall back to v1 + legacy.
-    let payload = if let Some((chain_id, genesis_hash)) = fetch_chain_domain(rpc_url).await {
+    let payload = if let Some((chain_id, genesis_hash)) = fetch_chain_domain(&client).await {
         tx.signing_payload_v2(chain_id, genesis_hash)
             .or_else(|_| tx.signing_payload_v1(chain_id, genesis_hash))
             .map_err(anyhow::Error::msg)?
@@ -959,7 +982,7 @@ pub async fn register_worker(key_file: &Path, rpc_url: &str) -> Result<()> {
     tx.core.fees = catalyst_core::protocol::min_fee(&tx);
 
     // Real signature: prefer v2 domain-separated payload; fall back to v1 + legacy.
-    let payload = if let Some((chain_id, genesis_hash)) = fetch_chain_domain(rpc_url).await {
+    let payload = if let Some((chain_id, genesis_hash)) = fetch_chain_domain(&client).await {
         tx.signing_payload_v2(chain_id, genesis_hash)
             .or_else(|_| tx.signing_payload_v1(chain_id, genesis_hash))
             .map_err(anyhow::Error::msg)?
@@ -998,9 +1021,83 @@ pub async fn deploy_contract(
     key_file: &Path,
     rpc_url: &str,
     runtime: &str,
+    wait: bool,
+    verify_code: bool,
+    timeout_secs: u64,
+    poll_ms: u64,
 ) -> Result<()> {
-    let _ = (args, runtime);
+    let _ = runtime;
     let client = HttpClientBuilder::default().build(rpc_url)?;
+
+    fn decode_hex_bytes_any(s: &str) -> anyhow::Result<Vec<u8>> {
+        let s = s.trim();
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        if s.is_empty() {
+            return Ok(Vec::new());
+        }
+        anyhow::ensure!(
+            s.chars().all(|c| c.is_ascii_hexdigit()) && s.len() % 2 == 0,
+            "expected hex string"
+        );
+        Ok(hex::decode(s)?)
+    }
+
+    fn extract_artifact_bytecode(v: &serde_json::Value) -> Option<String> {
+        // Foundry/Hardhat commonly use:
+        // - { "bytecode": { "object": "0x..." } }
+        // - { "bytecode": "0x..." }
+        // Try those first.
+        if let Some(b) = v.get("bytecode") {
+            if let Some(s) = b.as_str() {
+                return Some(s.to_string());
+            }
+            if let Some(obj) = b.get("object").and_then(|o| o.as_str()) {
+                return Some(obj.to_string());
+            }
+        }
+        // Some toolchains nest further under "data".
+        if let Some(data) = v.get("data") {
+            if let Some(b) = data.get("bytecode") {
+                if let Some(s) = b.as_str() {
+                    return Some(s.to_string());
+                }
+                if let Some(obj) = b.get("object").and_then(|o| o.as_str()) {
+                    return Some(obj.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn read_contract_initcode(path: &Path, ctor_args_hex: Option<&str>) -> anyhow::Result<Vec<u8>> {
+        let raw = std::fs::read(path)?;
+        let mut bytecode: Vec<u8> = if let Ok(s) = std::str::from_utf8(&raw) {
+            let s = s.trim();
+            if s.starts_with('{') {
+                let v: serde_json::Value = serde_json::from_str(s)?;
+                let hexb = extract_artifact_bytecode(&v)
+                    .ok_or_else(|| anyhow::anyhow!("artifact JSON missing `bytecode`"))?;
+                decode_hex_bytes_any(&hexb)?
+            } else {
+                // hex text or raw bytes stored in a file.
+                let maybe = s.strip_prefix("0x").unwrap_or(s);
+                if maybe.chars().all(|c| c.is_ascii_hexdigit()) && maybe.len() % 2 == 0 {
+                    hex::decode(maybe)?
+                } else {
+                    raw
+                }
+            }
+        } else {
+            raw
+        };
+
+        if let Some(args_hex) = ctor_args_hex {
+            let args_bytes = decode_hex_bytes_any(args_hex)?;
+            bytecode.extend_from_slice(&args_bytes);
+        }
+        anyhow::ensure!(!bytecode.is_empty(), "contract bytecode is empty");
+        Ok(bytecode)
+    }
 
     // Load sender key
     let sk = crate::identity::load_or_generate_private_key(key_file, true)?;
@@ -1014,19 +1111,11 @@ pub async fn deploy_contract(
         .unwrap_or(0);
     let nonce = cur_nonce.saturating_add(1);
 
-    // Read bytecode: accept a file containing hex (0x...) or raw bytes.
-    let raw = std::fs::read(contract)?;
-    let bytecode = if let Ok(s) = std::str::from_utf8(&raw) {
-        let s = s.trim();
-        let s = s.strip_prefix("0x").unwrap_or(s);
-        if s.chars().all(|c| c.is_ascii_hexdigit()) && s.len() % 2 == 0 {
-            hex::decode(s)?
-        } else {
-            raw
-        }
-    } else {
-        raw
-    };
+    // Read initcode from:
+    // - hex/raw file OR
+    // - Foundry/Hardhat artifact JSON.
+    // If `--args` is provided, append it (hex) to bytecode.
+    let bytecode = read_contract_initcode(contract, args)?;
 
     let now_ms = catalyst_utils::utils::current_timestamp_ms();
     let lock_time_secs: u32 = 0;
@@ -1052,7 +1141,7 @@ pub async fn deploy_contract(
     };
     tx.core.fees = catalyst_core::protocol::min_fee(&tx);
 
-    let payload = if let Some((chain_id, genesis_hash)) = fetch_chain_domain(rpc_url).await {
+    let payload = if let Some((chain_id, genesis_hash)) = fetch_chain_domain(&client).await {
         tx.signing_payload_v2(chain_id, genesis_hash)
             .or_else(|_| tx.signing_payload_v1(chain_id, genesis_hash))
             .map_err(anyhow::Error::msg)?
@@ -1085,6 +1174,39 @@ pub async fn deploy_contract(
 
     println!("tx_id: {tx_id}");
     println!("contract_address: 0x{}", hex::encode(created.as_slice()));
+
+    if wait {
+        use tokio::time::{sleep, Duration, Instant};
+        let start = Instant::now();
+        let tx_hash = tx_id.clone();
+        loop {
+            let receipt: Option<catalyst_rpc::RpcTxReceipt> = client
+                .request("catalyst_getTransactionReceipt", jsonrpsee::rpc_params![tx_hash.clone()])
+                .await?;
+            if let Some(r) = receipt {
+                if r.status == "applied" || r.status == "failed" {
+                    println!("receipt_status: {}", r.status);
+                    if verify_code {
+                        let addr = format!("0x{}", hex::encode(created.as_slice()));
+                        let code: String = client
+                            .request("catalyst_getCode", jsonrpsee::rpc_params![addr])
+                            .await?;
+                        if code.trim() == "0x" {
+                            anyhow::bail!("deployment applied but `catalyst_getCode` returned empty code");
+                        }
+                        println!("code_verified: true");
+                    }
+                    break;
+                }
+            }
+
+            if start.elapsed() > Duration::from_secs(timeout_secs.max(1)) {
+                anyhow::bail!("timed out waiting for tx to be applied (tx_id={tx_hash})");
+            }
+            sleep(Duration::from_millis(poll_ms.max(100))).await;
+        }
+    }
+
     Ok(())
 }
 
@@ -1145,7 +1267,7 @@ pub async fn call_contract(
     };
     tx.core.fees = catalyst_core::protocol::min_fee(&tx);
 
-    let payload = if let Some((chain_id, genesis_hash)) = fetch_chain_domain(rpc_url).await {
+    let payload = if let Some((chain_id, genesis_hash)) = fetch_chain_domain(&client).await {
         tx.signing_payload_v2(chain_id, genesis_hash)
             .or_else(|_| tx.signing_payload_v1(chain_id, genesis_hash))
             .map_err(anyhow::Error::msg)?
