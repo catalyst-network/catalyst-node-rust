@@ -38,10 +38,20 @@ It is structured as:
 
 ### 1) Token identity (product / ecosystem)
 
-- **token_name**: `TBD` (e.g. “Catalyst”)
-- **token_symbol**: `TBD` (e.g. “CAT”)
-- **token_decimals**: **recommended** `9`
-  - Rationale: consistent with many systems; enough precision without huge numbers.
+- **token_name**: **Kat**
+- **token_symbol**: **KAT**
+- **token_decimals**: **9** (1 KAT = 1,000,000,000 ATOM)
+
+#### Display units (recommended)
+
+These are UI-friendly subdivisions for wallets/explorers/SDKs. Only **ATOM** is the on-ledger integer unit.
+
+| Unit | Name | Value (KAT) | Atoms |
+|---|---|---:|---:|
+| KAT | Kat | 1 | 1,000,000,000 |
+| KIT | Kit | 0.001 | 1,000,000 |
+| BYTE | Byte | 0.000001 | 1,000 |
+| ATOM | Atom | 0.000000001 | 1 |
 
 ### 2) Supply model (economic policy)
 
@@ -116,6 +126,70 @@ Decide a single deterministic policy for v1:
 
 Rationale: with **no treasury**, the simplest non-custodial policy is to **burn fees** (anti-spam without a custodian).
 If desired later, fees can be routed to producers to further reward block production.
+
+### 4.1) Fee credits (earn-to-spend; “everyone in the pool earns”)
+
+If the network goal is “anyone can run a node” and participation grows faster than per-cycle rewards, **selection-based rewards alone** can become too small or too infrequent to feel meaningful for most users.
+
+A practical v1 lever is to let contributors **earn fee credits** that can pay for **their own** transaction fees. This preserves anti-spam economics (fees still exist), but lets long-lived contributors avoid paying cash fees out of pocket.
+
+**Key idea:** fee credits are **non-transferable**, **capped**, and **earned over time** (with warm-up + decay), so they can’t be farmed quickly or turned into a secondary currency.
+
+#### Parameters (values to decide)
+
+- **fee_credits_enabled**: `TBD` (recommended `true` on mainnet v1 if “everyone earns” is a core objective)
+- **fee_credits_unit**: ATOM (integer)
+- **fee_credits_warmup_days**: `TBD` (recommended `7–30`)
+  - Credits only begin accruing after sustained participation.
+- **fee_credits_accrual_atoms_per_day**: `TBD`
+  - A per-identity/day budget earned while eligible.
+- **fee_credits_max_balance_atoms**: `TBD`
+  - Cap to prevent indefinite banking.
+- **fee_credits_decay_bps_per_day**: `TBD` (recommended small, e.g. `10–100` bps/day) or `0` if you prefer only a hard cap.
+- **fee_credits_daily_spend_cap_atoms**: `TBD`
+  - Limits how much credit can be spent per day to control abuse.
+- **fee_credits_eligibility_min_uptime**: `TBD` (e.g. `0.8–0.95` over a rolling window)
+- **fee_credits_churn_penalty_days**: `TBD` (recommended `1–7`)
+  - If a node drops out, it must wait before accruing again (discourages “join only when I’m using the network”).
+
+#### Eligibility (high level)
+
+Define what it means to be “in the pool” for credit accrual. Examples:
+
+- Registered worker identity in good standing (per whatever worker/producer admission rules exist)
+- Meets uptime and behavior requirements (not rate-limited/banned)
+- Maintains a stable identity for long enough (warm-up / aging)
+
+The exact anti-sybil gate is a separate launch-blocking item, but fee credits should be designed to work with it (time-based aging, good-standing, churn penalties).
+
+#### Spending rule (how credits pay fees)
+
+At apply-time (or admission-time), interpret payment as:
+
+1) Compute `min_fee(tx)` as usual (still required).
+2) Determine `fee_due = tx.fees` (must be \(\ge\) `min_fee(tx)`).
+3) If `fee_credits_enabled` and sender has credits:
+   - `credit_spend = min(fee_due, sender_credits, daily_spend_cap_remaining)`
+   - debit `credit_spend` from sender’s credit balance
+   - remaining `fee_due - credit_spend` is paid from the sender’s token balance (if any)
+4) Fee routing (burn/route) applies to the total paid fee as usual.
+
+**Important constraint:** credits should only pay fees for transactions authorized by the same identity (no delegation/transfer).
+
+#### Abuse controls (recommended)
+
+- **Warm-up**: no instant benefits for new identities.
+- **Churn penalty**: prevents joining only when needing to transact.
+- **Cap + decay**: prevents long-term hoarding.
+- **Daily spend cap**: prevents credits being used for sustained spam.
+- **Good standing**: repeated rate limits / misbehavior disables accrual/spend.
+
+#### Invariants
+
+- Credits are **non-transferable**.
+- Credits cannot make `min_fee(tx)` optional; they only change the source of payment.
+- Credit spending is deterministic and replay-safe (same tx cannot be “paid twice”).
+- Credit balances are bounded: `0 <= credits <= max_balance`.
 
 ### 5) Rewards (validators/producers/workers)
 
@@ -222,10 +296,11 @@ Per your goals, recommended v1 mainnet baseline:
 
 ## Open questions checklist (fill these in)
 
-1) Token name/symbol/decimals: `TBD`  
+1) Token name/symbol/decimals: **KAT / 9 decimals**  
 2) Genesis recipient of the 1 token (or sink): `TBD`  
 3) Reward recipients rule (leader-only vs producer-set split vs witness split): `TBD`  
 4) Sybil-resistance mechanism for worker registration / producer selection: `TBD` (launch blocker)  
 5) Do we want per-byte fees at launch? `TBD`  
 6) Should fees be burned forever, or partially routed to producers later? `TBD`  
+7) Fee credits v1 parameters (warm-up, accrual, cap, decay, spend cap, eligibility): `TBD`
 
