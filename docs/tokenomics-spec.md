@@ -121,11 +121,24 @@ At apply-time, require `tx.fees >= min_fee(tx)` and then:
 
 Decide a single deterministic policy for v1:
 
-- **fee_burn_bps**: **recommended** `10000` (burn all fees)
-- **fee_route_to_producers_bps**: **recommended** `0` initially
+- **fee_burn_bps**: **recommended** `7000` (burn 70% of fees)
+- **fee_to_reward_pool_bps**: **recommended** `3000` (route 30% of fees to node rewards)
+- **fee_to_treasury_bps**: `0` (no treasury in v1)
+- **invariant**: `fee_burn_bps + fee_to_reward_pool_bps + fee_to_treasury_bps = 10000`
 
-Rationale: with **no treasury**, the simplest non-custodial policy is to **burn fees** (anti-spam without a custodian).
-If desired later, fees can be routed to producers to further reward block production.
+Rationale: this keeps anti-spam pressure strong via burning while still making fees a meaningful long-term operator incentive as network usage grows. It also matches the project goal of no custodial treasury at launch.
+
+#### Fee scaling and burn-risk guardrail
+
+At higher adoption, fees can exceed fixed issuance, which is acceptable if intentional. Track:
+
+\[
+\text{net\_issuance\_per\_cycle} = \text{block\_reward\_atoms} - \text{fees\_burned\_atoms}
+\]
+
+- If `fees_burned_atoms` is below 1 KAT per cycle on average, supply remains net-inflationary.
+- If `fees_burned_atoms` rises above 1 KAT per cycle for sustained periods, supply becomes net-deflationary.
+- Recommended operational guardrail: monitor a rolling 90-day ratio; if burn persistently exceeds issuance and operator incentives weaken, lower `fee_burn_bps` and increase `fee_to_reward_pool_bps` via a coordinated protocol upgrade.
 
 ### 4.1) Fee credits (earn-to-spend; “everyone in the pool earns”)
 
@@ -137,20 +150,25 @@ A practical v1 lever is to let contributors **earn fee credits** that can pay fo
 
 #### Parameters (values to decide)
 
-- **fee_credits_enabled**: `TBD` (recommended `true` on mainnet v1 if “everyone earns” is a core objective)
+- **fee_credits_enabled**: `true`
 - **fee_credits_unit**: ATOM (integer)
-- **fee_credits_warmup_days**: `TBD` (recommended `7–30`)
+- **fee_credits_warmup_days**: `14`
   - Credits only begin accruing after sustained participation.
-- **fee_credits_accrual_atoms_per_day**: `TBD`
+- **fee_credits_accrual_atoms_per_day**: `200`
   - A per-identity/day budget earned while eligible.
-- **fee_credits_max_balance_atoms**: `TBD`
+- **fee_credits_max_balance_atoms**: `6000`
   - Cap to prevent indefinite banking.
-- **fee_credits_decay_bps_per_day**: `TBD` (recommended small, e.g. `10–100` bps/day) or `0` if you prefer only a hard cap.
-- **fee_credits_daily_spend_cap_atoms**: `TBD`
+- **fee_credits_decay_bps_per_day**: `25` (0.25%/day)
+- **fee_credits_daily_spend_cap_atoms**: `300`
   - Limits how much credit can be spent per day to control abuse.
-- **fee_credits_eligibility_min_uptime**: `TBD` (e.g. `0.8–0.95` over a rolling window)
-- **fee_credits_churn_penalty_days**: `TBD` (recommended `1–7`)
+- **fee_credits_eligibility_min_uptime**: `0.90` over a rolling 14-day window
+- **fee_credits_churn_penalty_days**: `3`
   - If a node drops out, it must wait before accruing again (discourages “join only when I’m using the network”).
+
+Interpretation of the recommended numbers:
+- An eligible node can accumulate up to ~30 days of typical credit accrual (`6000 / 200 = 30`).
+- Daily spend cap (`300`) allows normal use but constrains burst spam.
+- Small decay keeps credits circulating rather than hoarded forever.
 
 #### Eligibility (high level)
 
@@ -197,7 +215,22 @@ If **Option A (fair launch constant emission)** is chosen, define precisely:
 
 - **block_reward_tokens**: `1 TOKEN` (fixed)
 - **reward_event**: “on successful cycle application” (i.e. when a new LSU is applied and `applied_cycle` increments)
-- **reward_recipients_rule_v1** (choose one):
+- **reward_recipients_rule_v1**: **Rule 2 (split equally among the cycle producer set)**
+- **reward_split_bps_v1**:
+  - `producer_set_reward_bps = 7000` (70% of block reward)
+  - `eligible_waiting_pool_reward_bps = 3000` (30% of block reward)
+  - invariant: `producer_set_reward_bps + eligible_waiting_pool_reward_bps = 10000`
+
+Fees are **on top of** fixed issuance:
+- The 1 TOKEN/cycle is minted deterministically every successful cycle.
+- A configured fraction of transaction fees (`fee_to_reward_pool_bps`) is additionally routed into rewards.
+- Therefore, total operator compensation per cycle is:
+\[
+\text{operator\_payout} = \text{issuance\_reward} + \text{routed\_fees}
+\]
+As network transaction volume grows, routed fees are expected to become a larger share of total node economics.
+
+- **reward_recipients_rule options** (for future revisions):
 
 **Rule 1 — Cycle leader only (simplest)**  
 Pick a deterministic leader for cycle \(n\) (e.g. producer set index 0, or the one that finalizes the LSU) and credit `1 TOKEN` to that leader’s account.
@@ -269,8 +302,10 @@ Future (v2):
 Per your goals, recommended v1 mainnet baseline:
 - Choose **Option A (fair launch constant emission)**.
 - Set `genesis_supply_tokens = 1` and `block_reward_tokens = 1`.
-- Enable fees with conservative floors (anti-spam) and **burn** them initially.
-- Use **reward rule 2** (split across producer set) if feasible; otherwise rule 1 (leader only) is acceptable as a first implementation.
+- Set average cycle duration target to **20 seconds** (about **1,576,800 blocks/year**).
+- Enable fees with conservative floors (anti-spam); route `70%` to burn and `30%` to rewards.
+- Use **reward rule 2** (split across producer set), with 70/30 split between producer set and eligible waiting pool.
+- Enable fee credits with warm-up, cap, decay, and daily spend limits.
 - Prioritize Sybil-resistance in worker registration / producer selection as a launch blocker (otherwise emissions can be captured cheaply).
 
 ## Invariants (must be test-covered)
@@ -297,10 +332,10 @@ Per your goals, recommended v1 mainnet baseline:
 ## Open questions checklist (fill these in)
 
 1) Token name/symbol/decimals: **KAT / 9 decimals**  
-2) Genesis recipient of the 1 token (or sink): `TBD`  
-3) Reward recipients rule (leader-only vs producer-set split vs witness split): `TBD`  
+2) Genesis recipient of the 1 token (or sink): **operator wallet (to be configured)**  
+3) Reward recipients rule (leader-only vs producer-set split vs witness split): **producer-set split (Rule 2)**  
 4) Sybil-resistance mechanism for worker registration / producer selection: `TBD` (launch blocker)  
 5) Do we want per-byte fees at launch? `TBD`  
-6) Should fees be burned forever, or partially routed to producers later? `TBD`  
-7) Fee credits v1 parameters (warm-up, accrual, cap, decay, spend cap, eligibility): `TBD`
+6) Fee routing at launch: **70% burn / 30% reward pool / 0% treasury**  
+7) Fee credits v1 parameters: **set in section 4.1 (warm-up 14d, accrual 200/day, cap 6000, decay 25 bps/day, spend cap 300/day, uptime >= 90%, churn penalty 3d**
 
