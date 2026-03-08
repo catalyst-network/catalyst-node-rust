@@ -209,6 +209,17 @@ const META_PROTOCOL_CHAIN_ID: &str = "protocol:chain_id";
 const META_PROTOCOL_NETWORK_ID: &str = "protocol:network_id";
 const META_PROTOCOL_GENESIS_HASH: &str = "protocol:genesis_hash";
 
+// Tokenomics v1 constants (aligned with docs/tokenomics-spec.md).
+const TOKENOMICS_BLOCK_REWARD_ATOMS: u64 = 1;
+const TOKENOMICS_FEE_TO_REWARD_POOL_BPS: u64 = 3_000;
+const TOKENOMICS_WAITING_POOL_REWARD_BPS: u64 = 3_000;
+const TOKENOMICS_FEE_CREDITS_ENABLED: bool = true;
+const TOKENOMICS_FEE_CREDITS_WARMUP_DAYS: u64 = 14;
+const TOKENOMICS_FEE_CREDITS_ACCRUAL_ATOMS_PER_DAY: u64 = 200;
+const TOKENOMICS_FEE_CREDITS_MAX_BALANCE_ATOMS: u64 = 6_000;
+const TOKENOMICS_FEE_CREDITS_DAILY_SPEND_CAP_ATOMS: u64 = 300;
+const TOKENOMICS_CYCLE_SECONDS: u64 = 20;
+
 async fn resolve_dns_seeds_to_bootstrap_multiaddrs(seeds: &[String], default_port: u16) -> Vec<Multiaddr> {
     if seeds.is_empty() {
         return Vec::new();
@@ -315,6 +326,125 @@ fn worker_key_for_pubkey(pubkey: &[u8; 32]) -> Vec<u8> {
     let mut k = b"workers:".to_vec();
     k.extend_from_slice(pubkey);
     k
+}
+
+fn fee_credit_balance_key_for_pubkey(pubkey: &[u8; 32]) -> Vec<u8> {
+    let mut k = b"feecred:bal:".to_vec();
+    k.extend_from_slice(pubkey);
+    k
+}
+
+fn fee_credit_first_seen_cycle_key_for_pubkey(pubkey: &[u8; 32]) -> String {
+    format!("workers:first_seen_cycle:{}", hex_encode(pubkey))
+}
+
+fn fee_credit_daily_spend_key_for_pubkey(pubkey: &[u8; 32]) -> String {
+    format!("feecred:daily_spend:{}", hex_encode(pubkey))
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct FeeCreditDailySpend {
+    day_bucket: u64,
+    spent_atoms: u64,
+}
+
+fn cycles_per_day() -> u64 {
+    let secs = TOKENOMICS_CYCLE_SECONDS.max(1);
+    (86_400 / secs).max(1)
+}
+
+fn fee_credit_day_bucket(cycle: u64) -> u64 {
+    cycle / cycles_per_day()
+}
+
+async fn get_fee_credit_balance_u64(store: &StorageManager, pubkey: &[u8; 32]) -> u64 {
+    store
+        .get_state(&fee_credit_balance_key_for_pubkey(pubkey))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|b| decode_u64(&b))
+        .unwrap_or(0)
+}
+
+async fn set_fee_credit_balance_u64(store: &StorageManager, pubkey: &[u8; 32], v: u64) -> Result<()> {
+    store
+        .set_state(&fee_credit_balance_key_for_pubkey(pubkey), encode_u64(v))
+        .await?;
+    Ok(())
+}
+
+async fn get_fee_credit_daily_spend(store: &StorageManager, pubkey: &[u8; 32]) -> FeeCreditDailySpend {
+    let Some(bytes) = store
+        .get_metadata(&fee_credit_daily_spend_key_for_pubkey(pubkey))
+        .await
+        .ok()
+        .flatten()
+    else {
+        return FeeCreditDailySpend::default();
+    };
+    bincode::deserialize::<FeeCreditDailySpend>(&bytes).unwrap_or_default()
+}
+
+async fn set_fee_credit_daily_spend(
+    store: &StorageManager,
+    pubkey: &[u8; 32],
+    daily: &FeeCreditDailySpend,
+) {
+    if let Ok(bytes) = bincode::serialize(daily) {
+        let _ = store
+            .set_metadata(&fee_credit_daily_spend_key_for_pubkey(pubkey), &bytes)
+            .await;
+    }
+}
+
+async fn fee_credit_spendable_for_cycle(
+    store: &StorageManager,
+    pubkey: &[u8; 32],
+    fee_due_atoms: u64,
+    cycle: u64,
+) -> u64 {
+    if !TOKENOMICS_FEE_CREDITS_ENABLED || fee_due_atoms == 0 {
+        return 0;
+    }
+    let bal = get_fee_credit_balance_u64(store, pubkey).await;
+    if bal == 0 {
+        return 0;
+    }
+    let day = fee_credit_day_bucket(cycle);
+    let daily = get_fee_credit_daily_spend(store, pubkey).await;
+    let spent_today = if daily.day_bucket == day { daily.spent_atoms } else { 0 };
+    let daily_remaining =
+        TOKENOMICS_FEE_CREDITS_DAILY_SPEND_CAP_ATOMS.saturating_sub(spent_today);
+    fee_due_atoms.min(bal).min(daily_remaining)
+}
+
+async fn apply_fee_credit_spend_for_cycle(
+    store: &StorageManager,
+    pubkey: &[u8; 32],
+    spend_atoms: u64,
+    cycle: u64,
+) -> u64 {
+    if spend_atoms == 0 {
+        return 0;
+    }
+    let allowed = fee_credit_spendable_for_cycle(store, pubkey, spend_atoms, cycle).await;
+    if allowed == 0 {
+        return 0;
+    }
+    let bal = get_fee_credit_balance_u64(store, pubkey).await;
+    let next_bal = bal.saturating_sub(allowed);
+    let _ = set_fee_credit_balance_u64(store, pubkey, next_bal).await;
+
+    let day = fee_credit_day_bucket(cycle);
+    let mut daily = get_fee_credit_daily_spend(store, pubkey).await;
+    if daily.day_bucket != day {
+        daily.day_bucket = day;
+        daily.spent_atoms = 0;
+    }
+    daily.spent_atoms = daily.spent_atoms.saturating_add(allowed);
+    set_fee_credit_daily_spend(store, pubkey, &daily).await;
+    allowed
 }
 
 fn is_worker_reg_marker(sig: &[u8]) -> bool {
@@ -548,6 +678,7 @@ async fn apply_lsu_to_storage_without_root_check(
         if is_worker_reg_marker(&e.signature) {
             let k = worker_key_for_pubkey(&e.public_key);
             let _ = store.set_state(&k, vec![1u8]).await;
+            ensure_worker_first_seen_cycle(store, &e.public_key, lsu.cycle_number).await;
             outcome_by_sig.entry(e.signature.clone()).or_insert(ApplyOutcome {
                 success: true,
                 ..Default::default()
@@ -628,6 +759,15 @@ async fn apply_lsu_to_storage_without_root_check(
         });
     }
 
+    // Apply producer compensation entries (issuance + producer fee share).
+    for c in &lsu.compensation_entries {
+        if c.amount == 0 {
+            continue;
+        }
+        let cur = get_balance_i64(store, &c.public_key).await;
+        let _ = set_balance_i64(store, &c.public_key, cur.saturating_add(c.amount as i64)).await;
+    }
+
     // Nonce increments.
     use std::collections::BTreeMap;
     let mut by_sig: BTreeMap<Vec<u8>, Vec<&catalyst_consensus::types::TransactionEntry>> = BTreeMap::new();
@@ -657,6 +797,10 @@ async fn apply_lsu_to_storage_without_root_check(
             let _ = set_nonce_u64(store, &pk, cur.saturating_add(1)).await;
         }
     }
+
+    // Fee-credit spend reimbursement and waiting-pool rewards/credits are deterministic from cycle LSU.
+    settle_fee_credit_spend_for_applied_cycle(store, lsu.cycle_number).await;
+    distribute_waiting_pool_rewards_and_fee_credits(store, lsu).await;
 
     // Persist head metadata (trusted).
     store.set_state_root_cache(new_root);
@@ -1021,6 +1165,53 @@ async fn tx_is_funded(store: &StorageManager, entries: &[catalyst_consensus::typ
     true
 }
 
+async fn protocol_tx_is_funded_with_fee_credits(
+    store: &StorageManager,
+    tx: &catalyst_core::protocol::Transaction,
+    cycle: u64,
+) -> bool {
+    use std::collections::HashMap;
+    let Some(sender) = tx_sender_pubkey(tx) else {
+        return false;
+    };
+    let mut deltas: HashMap<[u8; 32], i64> = HashMap::new();
+    for e in &tx.core.entries {
+        let v = match e.amount {
+            catalyst_core::protocol::EntryAmount::NonConfidential(v) => v,
+            catalyst_core::protocol::EntryAmount::Confidential { .. } => return false,
+        };
+        *deltas.entry(e.public_key).or_insert(0) =
+            deltas.get(&e.public_key).copied().unwrap_or(0).saturating_add(v);
+    }
+
+    let mut fee_due = tx.core.fees;
+    if TOKENOMICS_FEE_CREDITS_ENABLED && fee_due > 0 {
+        let spendable = fee_credit_spendable_for_cycle(store, &sender, fee_due, cycle).await;
+        fee_due = fee_due.saturating_sub(spendable);
+    }
+    if let Ok(fee_i64) = i64::try_from(fee_due) {
+        if fee_i64 > 0 {
+            *deltas.entry(sender).or_insert(0) = deltas
+                .get(&sender)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(fee_i64);
+        }
+    } else {
+        return false;
+    }
+
+    for (pk, d) in deltas {
+        if d < 0 {
+            let bal = get_balance_i64(store, &pk).await;
+            if bal.saturating_add(d) < 0 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 async fn tx_nonce_expected_next(
     store: &StorageManager,
     sender: &[u8; 32],
@@ -1054,6 +1245,110 @@ fn load_workers_from_state(store: &StorageManager) -> Vec<[u8; 32]> {
     out.sort();
     out.dedup();
     out
+}
+
+fn parse_producer_id_pubkey(producer_id: &str) -> Option<[u8; 32]> {
+    parse_hex_32(producer_id)
+}
+
+async fn ensure_worker_first_seen_cycle(store: &StorageManager, pubkey: &[u8; 32], cycle: u64) {
+    let key = fee_credit_first_seen_cycle_key_for_pubkey(pubkey);
+    if store.get_metadata(&key).await.ok().flatten().is_none() {
+        let _ = store.set_metadata(&key, &cycle.to_le_bytes()).await;
+    }
+}
+
+async fn get_worker_first_seen_cycle(store: &StorageManager, pubkey: &[u8; 32]) -> Option<u64> {
+    let bytes = store
+        .get_metadata(&fee_credit_first_seen_cycle_key_for_pubkey(pubkey))
+        .await
+        .ok()
+        .flatten()?;
+    decode_u64(&bytes)
+}
+
+async fn distribute_waiting_pool_rewards_and_fee_credits(
+    store: &StorageManager,
+    lsu: &catalyst_consensus::types::LedgerStateUpdate,
+) {
+    let mut producers: std::collections::BTreeSet<[u8; 32]> = std::collections::BTreeSet::new();
+    for id in &lsu.producer_list {
+        if let Some(pk) = parse_producer_id_pubkey(id) {
+            producers.insert(pk);
+        }
+    }
+
+    let total_fees = lsu.partial_update.total_fees;
+    let reward_from_fees = total_fees.saturating_mul(TOKENOMICS_FEE_TO_REWARD_POOL_BPS) / 10_000;
+    let total_reward_pool = TOKENOMICS_BLOCK_REWARD_ATOMS.saturating_add(reward_from_fees);
+    let waiting_pool_from_formula =
+        total_reward_pool.saturating_mul(TOKENOMICS_WAITING_POOL_REWARD_BPS) / 10_000;
+    let paid_to_producers: u64 = lsu.compensation_entries.iter().map(|e| e.amount).sum();
+    let waiting_pool = waiting_pool_from_formula.min(total_reward_pool.saturating_sub(paid_to_producers));
+    if waiting_pool == 0 && !TOKENOMICS_FEE_CREDITS_ENABLED {
+        return;
+    }
+
+    let mut workers = load_workers_from_state(store);
+    workers.sort();
+    workers.dedup();
+    let waiting: Vec<[u8; 32]> = workers
+        .into_iter()
+        .filter(|pk| !producers.contains(pk))
+        .collect();
+    if waiting.is_empty() {
+        return;
+    }
+
+    let n = waiting.len() as u64;
+    let per = waiting_pool / n;
+    let mut rem = waiting_pool % n;
+    for pk in waiting {
+        if per > 0 || rem > 0 {
+            let bonus = if rem > 0 {
+                rem -= 1;
+                1
+            } else {
+                0
+            };
+            let add = per.saturating_add(bonus);
+            let cur = get_balance_i64(store, &pk).await;
+            let _ = set_balance_i64(store, &pk, cur.saturating_add(add as i64)).await;
+        }
+
+        if TOKENOMICS_FEE_CREDITS_ENABLED {
+            if let Some(first_seen) = get_worker_first_seen_cycle(store, &pk).await {
+                let warmup_cycles = TOKENOMICS_FEE_CREDITS_WARMUP_DAYS.saturating_mul(cycles_per_day());
+                if lsu.cycle_number >= first_seen.saturating_add(warmup_cycles) {
+                    let cur = get_fee_credit_balance_u64(store, &pk).await;
+                    let next = cur
+                        .saturating_add(TOKENOMICS_FEE_CREDITS_ACCRUAL_ATOMS_PER_DAY)
+                        .min(TOKENOMICS_FEE_CREDITS_MAX_BALANCE_ATOMS);
+                    let _ = set_fee_credit_balance_u64(store, &pk, next).await;
+                }
+            }
+        }
+    }
+}
+
+async fn settle_fee_credit_spend_for_applied_cycle(store: &StorageManager, cycle: u64) {
+    let txids = load_cycle_txids(store, cycle).await;
+    for txid in txids {
+        let Some(raw) = store.get_metadata(&tx_raw_key(&txid)).await.ok().flatten() else {
+            continue;
+        };
+        let Ok(tx) = bincode::deserialize::<catalyst_core::protocol::Transaction>(&raw) else {
+            continue;
+        };
+        let Some(sender) = tx_sender_pubkey(&tx) else {
+            continue;
+        };
+        let spend = apply_fee_credit_spend_for_cycle(store, &sender, tx.core.fees, cycle).await;
+        if spend > 0 {
+            let cur = get_balance_i64(store, &sender).await;
+            let _ = set_balance_i64(store, &sender, cur.saturating_add(spend as i64)).await;
+        }
+    }
 }
 
 fn tx_sender_pubkey(tx: &catalyst_core::protocol::Transaction) -> Option<[u8; 32]> {
@@ -1142,6 +1437,7 @@ fn tx_to_consensus_entries(tx: &catalyst_core::protocol::Transaction) -> Vec<cat
 
 async fn validate_and_select_protocol_txs_for_construction(
     store: &StorageManager,
+    cycle: u64,
     txs: Vec<catalyst_core::protocol::Transaction>,
     max_entries: usize,
 ) -> Vec<catalyst_core::protocol::Transaction> {
@@ -1150,6 +1446,8 @@ async fn validate_and_select_protocol_txs_for_construction(
     // Local simulation state.
     let mut balances: HashMap<[u8; 32], i64> = HashMap::new();
     let mut nonces: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut fee_credit_balances: HashMap<[u8; 32], u64> = HashMap::new();
+    let mut fee_credit_spent_today: HashMap<[u8; 32], u64> = HashMap::new();
 
     let mut out: Vec<catalyst_core::protocol::Transaction> = Vec::new();
     let mut used_entries = 0usize;
@@ -1219,8 +1517,31 @@ async fn validate_and_select_protocol_txs_for_construction(
         if !ok {
             continue;
         }
-        // Fee debit is burned (no sink credit yet).
-        if let Ok(fee_i64) = i64::try_from(tx.core.fees) {
+        let mut fee_due_tokens = tx.core.fees;
+        if TOKENOMICS_FEE_CREDITS_ENABLED && fee_due_tokens > 0 {
+            let bal = if let Some(v) = fee_credit_balances.get(&sender).copied() {
+                v
+            } else {
+                let v = get_fee_credit_balance_u64(store, &sender).await;
+                fee_credit_balances.insert(sender, v);
+                v
+            };
+            let day = fee_credit_day_bucket(cycle);
+            let spent = if let Some(v) = fee_credit_spent_today.get(&sender).copied() {
+                v
+            } else {
+                let daily = get_fee_credit_daily_spend(store, &sender).await;
+                let v = if daily.day_bucket == day { daily.spent_atoms } else { 0 };
+                fee_credit_spent_today.insert(sender, v);
+                v
+            };
+            let remaining = TOKENOMICS_FEE_CREDITS_DAILY_SPEND_CAP_ATOMS.saturating_sub(spent);
+            let credit_spend = fee_due_tokens.min(bal).min(remaining);
+            if credit_spend > 0 {
+                fee_due_tokens = fee_due_tokens.saturating_sub(credit_spend);
+            }
+        }
+        if let Ok(fee_i64) = i64::try_from(fee_due_tokens) {
             if fee_i64 > 0 {
                 deltas.push((sender, -fee_i64));
             }
@@ -1251,6 +1572,13 @@ async fn validate_and_select_protocol_txs_for_construction(
         for (pk, d) in deltas {
             let cur = *balances.get(&pk).unwrap_or(&0);
             balances.insert(pk, cur.saturating_add(d));
+        }
+        if TOKENOMICS_FEE_CREDITS_ENABLED && tx.core.fees > fee_due_tokens {
+            let credit_spend = tx.core.fees.saturating_sub(fee_due_tokens);
+            let cur_bal = fee_credit_balances.get(&sender).copied().unwrap_or(0);
+            fee_credit_balances.insert(sender, cur_bal.saturating_sub(credit_spend));
+            let cur_spent = fee_credit_spent_today.get(&sender).copied().unwrap_or(0);
+            fee_credit_spent_today.insert(sender, cur_spent.saturating_add(credit_spend));
         }
         nonces.insert(sender, tx.core.nonce);
         used_entries += entry_count;
@@ -1586,6 +1914,7 @@ async fn apply_lsu_to_storage(
             // Register worker (idempotent).
             let k = worker_key_for_pubkey(&e.public_key);
             let _ = store.set_state(&k, vec![1u8]).await;
+            ensure_worker_first_seen_cycle(store, &e.public_key, lsu.cycle_number).await;
             outcome_by_sig.entry(e.signature.clone()).or_insert(ApplyOutcome {
                 success: true,
                 ..Default::default()
@@ -1686,6 +2015,15 @@ async fn apply_lsu_to_storage(
         });
     }
 
+    // Apply producer compensation entries (issuance + producer fee share).
+    for c in &lsu.compensation_entries {
+        if c.amount == 0 {
+            continue;
+        }
+        let cur = get_balance_i64(store, &c.public_key).await;
+        let _ = set_balance_i64(store, &c.public_key, cur.saturating_add(c.amount as i64)).await;
+    }
+
     // Update nonces: group by signature bytes (our current "tx boundary" marker).
     use std::collections::BTreeMap;
     let mut by_sig: BTreeMap<Vec<u8>, Vec<&catalyst_consensus::types::TransactionEntry>> = BTreeMap::new();
@@ -1725,6 +2063,10 @@ async fn apply_lsu_to_storage(
             let _ = set_nonce_u64(store, &pk, cur.saturating_add(1)).await;
         }
     }
+
+    // Fee-credit spend reimbursement and waiting-pool rewards/credits are deterministic from cycle LSU.
+    settle_fee_credit_spend_for_applied_cycle(store, lsu.cycle_number).await;
+    distribute_waiting_pool_rewards_and_fee_credits(store, lsu).await;
 
     // Flush + compute a state root that commits the applied balances.
     let state_root = store.commit().await?;
@@ -2304,7 +2646,8 @@ impl CatalystNode {
                             if !tx_is_sane(&entries) {
                                 continue;
                             }
-                            if !tx_is_funded(storage.as_ref(), &entries).await {
+                            let next_cycle = local_applied_cycle(storage.as_ref()).await.saturating_add(1);
+                            if !protocol_tx_is_funded_with_fee_credits(storage.as_ref(), &msg.tx, next_cycle).await {
                                 continue;
                             }
                             {
@@ -2576,7 +2919,15 @@ impl CatalystNode {
                                 // Enforce basic sufficient-funds using current storage.
                                 if let Some(store) = &storage {
                                     let entries = tx.to_consensus_entries();
-                                    if tx_is_sane(&entries) && tx_is_funded(store.as_ref(), &entries).await {
+                                    let next_cycle = local_applied_cycle(store.as_ref()).await.saturating_add(1);
+                                    if tx_is_sane(&entries)
+                                        && protocol_tx_is_funded_with_fee_credits(
+                                            store.as_ref(),
+                                            &tx.tx,
+                                            next_cycle,
+                                        )
+                                        .await
+                                    {
                                         let mut mp = mempool.write().await;
                                         if mp.insert_protocol(tx.clone(), now_secs) {
                                             persist_mempool_tx(store.as_ref(), &tx.tx).await;
@@ -2621,7 +2972,13 @@ impl CatalystNode {
                                 if batch.verify_hash().unwrap_or(false) {
                                     if let Some(store) = &storage {
                                         let valid =
-                                            validate_and_select_protocol_txs_for_construction(store.as_ref(), batch.txs, max_entries_per_cycle_cfg).await;
+                                            validate_and_select_protocol_txs_for_construction(
+                                                store.as_ref(),
+                                                batch.cycle,
+                                                batch.txs,
+                                                max_entries_per_cycle_cfg,
+                                            )
+                                            .await;
                                         let mut entries: Vec<catalyst_consensus::types::TransactionEntry> = Vec::new();
                                         for tx in &valid {
                                             entries.extend(tx_to_consensus_entries(tx));
@@ -3439,6 +3796,7 @@ impl CatalystNode {
                         let txs = if let Some(store) = &storage {
                             validate_and_select_protocol_txs_for_construction(
                                 store.as_ref(),
+                                cycle,
                                 candidate_txs,
                                 max_entries_per_cycle,
                             )
