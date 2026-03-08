@@ -180,9 +180,10 @@ mod integration_tests {
         }
 
         let reward_config = RewardConfig {
-            producer_reward: 1000,
-            voter_reward: 100,
-            total_new_tokens: 10000,
+            block_reward: 1,
+            fee_to_reward_pool_bps: 3000,
+            producer_set_reward_bps: 7000,
+            waiting_pool_reward_bps: 3000,
         };
 
         let result = voting.execute(2, 0.6, &reward_config).await;

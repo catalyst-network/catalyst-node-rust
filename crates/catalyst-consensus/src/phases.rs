@@ -664,21 +664,40 @@ impl VotingPhase {
         if producer_list.is_empty() {
             return Ok(entries);
         }
-
-        let reward_per_producer = reward_config.producer_reward / producer_list.len() as u64;
+        let total_fees = self
+            .producer
+            .partial_update
+            .as_ref()
+            .map(|p| p.total_fees)
+            .unwrap_or(0);
+        let reward_from_fees = total_fees
+            .saturating_mul(reward_config.fee_to_reward_pool_bps as u64)
+            / 10_000;
+        let total_reward_pool = reward_config
+            .block_reward
+            .saturating_add(reward_from_fees);
+        let producer_reward_pool = total_reward_pool
+            .saturating_mul(reward_config.producer_set_reward_bps as u64)
+            / 10_000;
+        let reward_per_producer = producer_reward_pool / producer_list.len() as u64;
+        let mut remainder = producer_reward_pool % producer_list.len() as u64;
         
         // Deterministic ordering (this list is hashed as part of LSU).
         let mut sorted = producer_list.to_vec();
         sorted.sort();
         for producer_id in &sorted {
-            // In a real implementation, we'd look up the producer's public key
-            // For now, we'll use a placeholder
-            let public_key = [0u8; 32]; // Placeholder
+            let public_key = parse_hex_32(producer_id).unwrap_or([0u8; 32]);
+            let bonus = if remainder > 0 {
+                remainder -= 1;
+                1
+            } else {
+                0
+            };
             
             entries.push(CompensationEntry {
                 producer_id: producer_id.clone(),
                 public_key,
-                amount: reward_per_producer,
+                amount: reward_per_producer.saturating_add(bonus),
             });
         }
 
@@ -1028,17 +1047,30 @@ mod synchronization_tests {
 /// Reward configuration for compensation entries
 #[derive(Debug, Clone)]
 pub struct RewardConfig {
-    pub producer_reward: u64,
-    pub voter_reward: u64,
-    pub total_new_tokens: u64,
+    pub block_reward: u64,
+    pub fee_to_reward_pool_bps: u16,
+    pub producer_set_reward_bps: u16,
+    pub waiting_pool_reward_bps: u16,
 }
 
 impl Default for RewardConfig {
     fn default() -> Self {
         Self {
-            producer_reward: 1000,
-            voter_reward: 100,
-            total_new_tokens: 10000,
+            block_reward: 1,
+            fee_to_reward_pool_bps: 3000,
+            producer_set_reward_bps: 7000,
+            waiting_pool_reward_bps: 3000,
         }
     }
+}
+
+fn parse_hex_32(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim().strip_prefix("0x").unwrap_or(s.trim());
+    let bytes = hex::decode(s).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Some(out)
 }
