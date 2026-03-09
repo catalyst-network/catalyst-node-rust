@@ -61,6 +61,10 @@ If you are writing long-form/public docs, use `docs/tokenomics-model.md` as the 
 
 Use `docs/tokenomics-testnet-validation.md` for reset + issuance validation + regression checks.
 
+Current issuance observability surface:
+
+- RPC `catalyst_getTokenomicsInfo` (applied cycle, fixed reward, issued estimate, total positive balances)
+
 ## Remaining work tracked in GitHub
 
 - `#184` tracks remaining hardening for tokenomics v1 implementation.

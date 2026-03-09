@@ -22,6 +22,7 @@ const META_PROTOCOL_CHAIN_ID: &str = "protocol:chain_id";
 const META_PROTOCOL_NETWORK_ID: &str = "protocol:network_id";
 const META_PROTOCOL_GENESIS_HASH: &str = "protocol:genesis_hash";
 const META_SNAPSHOT_LATEST: &str = "snapshot:latest";
+const TOKENOMICS_BLOCK_REWARD_ATOMS: u64 = 1;
 
 const RPC_ERR_RATE_LIMITED_CODE: i32 = -32029;
 
@@ -221,6 +222,10 @@ pub trait CatalystRpc {
     #[method(name = "catalyst_head")]
     async fn head(&self) -> RpcResult<RpcHead>;
 
+    /// Get tokenomics/issuance summary for operator validation.
+    #[method(name = "catalyst_getTokenomicsInfo")]
+    async fn get_tokenomics_info(&self) -> RpcResult<RpcTokenomicsInfo>;
+
     /// Get EVM contract bytecode for a 20-byte hex address.
     #[method(name = "catalyst_getCode")]
     async fn get_code(&self, address: String) -> RpcResult<String>;
@@ -249,6 +254,14 @@ pub struct RpcHead {
     pub applied_lsu_hash: String,
     pub applied_state_root: String,
     pub last_lsu_cid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcTokenomicsInfo {
+    pub applied_cycle: u64,
+    pub block_reward_atoms: u64,
+    pub estimated_issued_atoms: u64,
+    pub total_positive_balances_atoms: u64,
 }
 
 /// Sync metadata used by snapshot-based fast sync tooling.
@@ -1215,6 +1228,38 @@ impl CatalystRpcServer for CatalystRpcImpl {
             applied_lsu_hash,
             applied_state_root,
             last_lsu_cid,
+        })
+    }
+
+    async fn get_tokenomics_info(&self) -> RpcResult<RpcTokenomicsInfo> {
+        let applied_cycle = self.block_number().await?;
+        let estimated_issued_atoms = applied_cycle.saturating_mul(TOKENOMICS_BLOCK_REWARD_ATOMS);
+
+        // Sum positive account balances from the `accounts` CF for `bal:<pubkey>` keys.
+        let mut total_positive_balances_atoms: u64 = 0;
+        let iter = self
+            .storage
+            .engine()
+            .iterator("accounts")
+            .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())))?;
+        for item in iter {
+            let (k, v) = item
+                .map_err(|e| ErrorObjectOwned::from(RpcServerError::Server(e.to_string())))?;
+            if !k.starts_with(b"bal:") {
+                continue;
+            }
+            let bal = decode_i64(&v);
+            if bal > 0 {
+                total_positive_balances_atoms =
+                    total_positive_balances_atoms.saturating_add(bal as u64);
+            }
+        }
+
+        Ok(RpcTokenomicsInfo {
+            applied_cycle,
+            block_reward_atoms: TOKENOMICS_BLOCK_REWARD_ATOMS,
+            estimated_issued_atoms,
+            total_positive_balances_atoms,
         })
     }
 

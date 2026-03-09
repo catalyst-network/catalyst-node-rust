@@ -51,7 +51,22 @@ Expected outcome:
 - `applied_cycle` increases between checks
 - this confirms post-genesis cycle production is active on the reset testnet
 
-## 5) Validate issuance logic path with tests
+## 5) Validate issuance observability
+
+Query tokenomics summary:
+
+```bash
+curl -s -X POST http://127.0.0.1:8545 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"catalyst_getTokenomicsInfo","params":[]}'
+```
+
+Expected outcome:
+
+- `applied_cycle` is non-zero and increasing over time
+- `block_reward_atoms` matches configured fixed reward (`1`)
+- `estimated_issued_atoms` increases as `applied_cycle` increases
+
+## 6) Validate issuance logic path with tests
 
 Run consensus tests (includes compensation/reward logic paths):
 
@@ -63,11 +78,7 @@ Expected outcome:
 
 - tests pass, confirming deterministic consensus/reward logic behavior in code paths
 
-Note:
-
-- A dedicated RPC/metrics issuance assertion surface is tracked in issue `#258`.
-
-## 6) Regression checks
+## 7) Regression checks
 
 Run baseline functional tests against the running testnet:
 
@@ -78,7 +89,7 @@ CC=gcc-13 CXX=g++-13 make testnet-contract-test
 
 If either command fails, treat it as a regression signal and capture logs before rollout.
 
-## 7) Teardown
+## 8) Teardown
 
 ```bash
 make testnet-down

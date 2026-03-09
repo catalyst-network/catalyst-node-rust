@@ -59,6 +59,7 @@ testnet_up() {
       testnet/shared_dfs \
       testnet/node1/logs testnet/node2/logs testnet/node3/logs \
       testnet/validators.toml || true
+    rm -f testnet/node1/config.toml testnet/node2/config.toml testnet/node3/config.toml || true
   fi
 
   mkdir -p testnet/node1/{logs,data,dfs_cache} testnet/node2/{logs,data,dfs_cache} testnet/node3/{logs,data,dfs_cache}
@@ -127,8 +128,8 @@ testnet_status() {
   local rpc="http://127.0.0.1:8545"
   if wait_tcp "127.0.0.1:8545" 1; then
     echo "rpc: reachable ($rpc)"
-    echo "head: $(rpc_call "$rpc" catalyst_head '[]' | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"result\"))' 2>/dev/null || true)"
-    echo "peers: $(rpc_call "$rpc" catalyst_peerCount '[]' | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"result\"))' 2>/dev/null || true)"
+    echo "head: $(rpc_call "$rpc" catalyst_head '[]' | python3 -c 'import sys,json; print(json.load(sys.stdin).get("result"))' 2>/dev/null || true)"
+    echo "peers: $(rpc_call "$rpc" catalyst_peerCount '[]' | python3 -c 'import sys,json; print(json.load(sys.stdin).get("result"))' 2>/dev/null || true)"
   else
     echo "rpc: NOT reachable ($rpc)"
   fi
@@ -167,17 +168,47 @@ testnet_test_basic() {
   echo "sending faucet -> node1 (amount 3)"
   cargo run -q -p catalyst-cli -- send "$node1_pubkey" 3 --key-file testnet/faucet.key --rpc-url "$rpc"
 
-  echo "head: $(rpc_call "$rpc" catalyst_head '[]' | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"result\"))' 2>/dev/null || true)"
-  echo "balance(node1): $(rpc_call "$rpc" catalyst_getBalance "[\"${node1_pubkey}\"]" | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"result\"))')"
+  echo "head: $(rpc_call "$rpc" catalyst_head '[]' | python3 -c 'import sys,json; print(json.load(sys.stdin).get("result"))' 2>/dev/null || true)"
+  echo "balance(node1): $(rpc_call "$rpc" catalyst_getBalance "[\"${node1_pubkey}\"]" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("result"))')"
+}
+
+wait_for_balance_at_least() {
+  local rpc="$1"
+  local addr="$2"
+  local min_balance="$3"
+  local timeout_secs="${4:-90}"
+  local deadline=$(( $(date +%s) + timeout_secs ))
+  while true; do
+    local bal
+    bal="$(rpc_call "$rpc" catalyst_getBalance "[\"${addr}\"]" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("result","0"))')"
+    if [ "${bal:-0}" -ge "$min_balance" ]; then
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      return 1
+    fi
+    sleep 2
+  done
 }
 
 testnet_test_contract() {
   local rpc="http://127.0.0.1:8545"
   testnet_wait_rpc "$rpc" 90
 
+  # Use a fresh wallet for EVM deploy/call to avoid faucet nonce interaction pitfalls.
+  local evm_wallet="testnet/evm_wallet.key"
+  python3 -c 'import os,binascii; print(binascii.hexlify(os.urandom(32)).decode())' > "$evm_wallet"
+  local evm_pk
+  evm_pk="$("$BIN" --log-level error pubkey --key-file "$evm_wallet" | tail -n 1)"
+  [ -n "$evm_pk" ] || die "could not derive evm wallet pubkey"
+
+  echo "Funding fresh EVM wallet from faucet..."
+  cargo run -q -p catalyst-cli -- send "$evm_pk" 100 --key-file testnet/faucet.key --rpc-url "$rpc"
+  wait_for_balance_at_least "$rpc" "$evm_pk" 1 120 || die "evm wallet funding not observed"
+
   echo "Deploying deterministic initcode contract (returns 0x2a)..."
   local out
-  out="$(cargo run -q -p catalyst-cli -- deploy testdata/evm/return_2a_initcode.hex --key-file testnet/faucet.key --rpc-url "$rpc" --runtime evm)"
+  out="$(cargo run -q -p catalyst-cli -- deploy testdata/evm/return_2a_initcode.hex --key-file "$evm_wallet" --rpc-url "$rpc" --runtime evm --wait --verify-code --timeout-secs 240 --poll-ms 1000)"
   echo "$out"
   local addr
   addr="$(echo "$out" | awk '/contract_address:/{print $2}')"
@@ -199,7 +230,7 @@ testnet_test_contract() {
   done
 
   echo "Calling contract (empty calldata)..."
-  cargo run -q -p catalyst-cli -- call "$addr" 0x --key-file testnet/faucet.key --rpc-url "$rpc" --value 0
+  cargo run -q -p catalyst-cli -- call "$addr" 0x --key-file "$evm_wallet" --rpc-url "$rpc" --value 0
 
   echo "Waiting for last return to equal 32-byte 0x2a..."
   deadline=$(( $(date +%s) + 90 ))
