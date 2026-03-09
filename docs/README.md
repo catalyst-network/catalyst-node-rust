@@ -31,6 +31,11 @@ These docs are written against the current `catalyst-node-rust` implementation (
   - Locked `0 KAT` genesis policy + fixed issuance model
   - Implementation mapping for engineering and documentation agents
 
+- **Tokenomics validation**: [`tokenomics-testnet-validation.md`](./tokenomics-testnet-validation.md)
+  - Clean testnet reset workflow
+  - Issuance/reward verification checks
+  - Regression checks to confirm nothing else broke
+
 - **Wallets / Integrators**: [`wallet-interop.md`](./wallet-interop.md)
   - Canonical address format
   - v1 transaction signing payload + wire encoding

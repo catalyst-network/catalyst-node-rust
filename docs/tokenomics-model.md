@@ -115,3 +115,8 @@ Dev/test networks can still opt into faucet funding by setting:
 - governance process for runtime parameter changes
 
 These can be introduced in a later protocol version once operational telemetry and governance controls are mature.
+
+## Related docs
+
+- `docs/tokenomics-spec.md` (implementation-facing v1 spec/checklist)
+- `docs/tokenomics-testnet-validation.md` (reset + issuance + regression validation flow)
