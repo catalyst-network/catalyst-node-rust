@@ -69,7 +69,8 @@ For external wallets/integrators, see [`wallet-interop.md`](./wallet-interop.md)
 ## Faucet model (dev/test)
 
 The node supports an optional faucet account seeded at genesis for dev/test usage:
-- **dev/local default**: deterministic faucet key (`[0xFA; 32]`) with a configurable initial balance
+- **protocol default**: faucet disabled (`0 KAT` genesis funding)
+- **dev/local opt-in**: deterministic faucet key (`[0xFA; 32]`) with configurable initial balance
 - **public networks**: disable the deterministic faucet and configure a real faucet/treasury pubkey
   and large initial balance in `protocol.*` config
 
@@ -97,15 +98,10 @@ you can hit nonce mismatches. The recommended workflow is:
 
 See [`user-guide.md`](./user-guide.md).
 
-## Tokenomics / fees (current)
+## Tokenomics / fees (current baseline)
 
-Current behavior is scaffolding-oriented:
-- balances are integer values stored under `bal:<pubkey>`
-- transfers are validated with a simple “no negative balances” rule
-- transaction `fees` are enforced via a deterministic minimum fee schedule
-- EVM executes with `gas_price = 0` (fee charging is at the protocol layer for now)
-
-There is no implemented issuance schedule, staking rewards, inflation, or burn mechanics in this repo snapshot.
+Current implementation includes a fixed-issuance baseline with waiting-pool incentives.
+See `docs/tokenomics-model.md` for canonical parameters and policy decisions.
 
 ## Known limitations
 

@@ -476,9 +476,12 @@ catalyst deploy MyContract.sol --runtime evm --args "constructor_arg"
 ### Token Model (KAT)
 
 - **Fair Launch**: No pre-mine, no ICO
+- **Genesis Supply**: `0 KAT` (issuance starts after genesis)
 - **Work-Based Rewards**: Earn through network contribution
-- **Dynamic Supply**: 1-2% annual inflation based on network needs
+- **Fixed Issuance Baseline**: `1 KAT` per successful cycle (v1 model)
 - **Low Fees**: Optimized for usage, not speculation
+
+Canonical parameter details live in `docs/tokenomics-model.md`.
 
 ### Earning Opportunities
 

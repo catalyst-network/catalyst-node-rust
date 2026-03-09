@@ -33,7 +33,7 @@ This node can optionally seed a faucet/treasury account at genesis (fresh DB onl
 networks you can use the deterministic faucet key, but for any **public** testnet you must configure
 a real pubkey and disable the deterministic faucet.
 
-### Local/dev (default)
+### Local/dev (explicit deterministic faucet example)
 
 ```toml
 [protocol]

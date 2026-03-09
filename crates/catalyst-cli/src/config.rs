@@ -80,7 +80,7 @@ pub enum FaucetMode {
 
 impl Default for FaucetMode {
     fn default() -> Self {
-        FaucetMode::Deterministic
+        FaucetMode::Disabled
     }
 }
 
@@ -89,7 +89,7 @@ fn default_allow_deterministic_faucet() -> bool {
 }
 
 fn default_faucet_balance() -> i64 {
-    1_000_000
+    0
 }
 
 /// Node identity and basic settings
@@ -487,7 +487,7 @@ impl Default for NodeConfig {
             protocol: ProtocolConfig {
                 chain_id: 31337,
                 network_id: "tna_testnet".to_string(),
-                faucet_mode: FaucetMode::Deterministic,
+                faucet_mode: FaucetMode::Disabled,
                 allow_deterministic_faucet: true,
                 faucet_pubkey_hex: None,
                 faucet_balance: default_faucet_balance(),
@@ -653,6 +653,13 @@ impl NodeConfig {
             cfg.dfs.cache_dir = dir.join("dfs_cache");
             cfg.logging.file_path = dir.join("logs").join("catalyst.log");
             cfg.node.private_key_file = dir.join("node.key");
+        }
+
+        // Local testnet harnesses expect a funded deterministic faucet for convenience.
+        if path_contains_component(path, "testnet") {
+            cfg.protocol.faucet_mode = FaucetMode::Deterministic;
+            cfg.protocol.allow_deterministic_faucet = true;
+            cfg.protocol.faucet_balance = 1_000_000;
         }
 
         // If the path contains `nodeN` (e.g. testnet/node2/config.toml), derive unique ports.
@@ -861,4 +868,9 @@ fn extract_node_index(path: &Path) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+fn path_contains_component(path: &Path, needle: &str) -> bool {
+    path.components()
+        .any(|c| c.as_os_str().to_string_lossy() == needle)
 }

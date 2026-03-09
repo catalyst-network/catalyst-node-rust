@@ -27,7 +27,8 @@ In the current implementation, the faucet is **not** an ERC20 contract.
 For local developer networks, the node can optionally initialize a deterministic, pre-funded faucet
 account at genesis:
 - faucet private key bytes are `[0xFA; 32]`
-- on fresh DB startup, if missing from state, it is initialized with `protocol.faucet_balance` (default `1_000_000`)
+- on fresh DB startup, if missing from state, it is initialized with `protocol.faucet_balance`
+  when `protocol.faucet_mode = "deterministic"` and `faucet_balance > 0`
 
 Important:
 - This deterministic key is **public** (it is embedded in the repo). Do **not** rely on it for public testnets.

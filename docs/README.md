@@ -26,6 +26,11 @@ These docs are written against the current `catalyst-node-rust` implementation (
   - RPC methods currently implemented
   - Contract/runtime notes and current limitations
 
+- **Tokenomics model**: [`tokenomics-model.md`](./tokenomics-model.md)
+  - Canonical v1 economics parameters
+  - Locked `0 KAT` genesis policy + fixed issuance model
+  - Implementation mapping for engineering and documentation agents
+
 - **Wallets / Integrators**: [`wallet-interop.md`](./wallet-interop.md)
   - Canonical address format
   - v1 transaction signing payload + wire encoding
@@ -45,6 +50,6 @@ These docs are written against the current `catalyst-node-rust` implementation (
 ## Important implementation notes (current state)
 
 - **Consensus traffic is P2P on `30333/tcp`**, not RPC. RPC is only for client interaction.
-- **Faucet** is *not* an ERC20 contract. It’s a deterministic, pre-funded account used for dev/test flows.
-- **Tokenomics / fees** are currently minimal scaffolding (see Builder guide).
+- **Faucet** is optional and disabled by default in protocol config (fair-launch / `0 KAT` genesis baseline).
+- **Tokenomics** baseline is documented in `docs/tokenomics-model.md`.
 
