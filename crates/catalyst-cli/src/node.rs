@@ -220,6 +220,7 @@ const TOKENOMICS_FEE_CREDITS_WARMUP_DAYS: u64 = 14;
 const TOKENOMICS_FEE_CREDITS_ACCRUAL_ATOMS_PER_DAY: u64 = 200;
 const TOKENOMICS_FEE_CREDITS_MAX_BALANCE_ATOMS: u64 = 6_000;
 const TOKENOMICS_FEE_CREDITS_DAILY_SPEND_CAP_ATOMS: u64 = 300;
+const TOKENOMICS_WAITING_ELIGIBILITY_CHURN_PENALTY_DAYS: u64 = 3;
 const TOKENOMICS_CYCLE_SECONDS: u64 = 20;
 
 fn split_cycle_fees(total_fees: u64) -> (u64, u64, u64) {
@@ -289,6 +290,7 @@ mod tokenomics_tests {
             .await
             .unwrap();
         ensure_worker_first_seen_cycle(&store, &worker, 1).await;
+        set_worker_last_registration_cycle(&store, &worker, 1).await;
 
         let warmup_cycles = TOKENOMICS_FEE_CREDITS_WARMUP_DAYS.saturating_mul(cycles_per_day());
         let before = 1u64.saturating_add(warmup_cycles).saturating_sub(1);
@@ -298,7 +300,7 @@ mod tokenomics_tests {
             partial_update: PartialLedgerStateUpdate {
                 transaction_entries: Vec::new(),
                 transaction_signatures_hash: [0u8; 32],
-                total_fees: 0,
+                total_fees: 10, // ensures non-zero waiting-pool reward in v1 split math
                 timestamp: 0,
             },
             compensation_entries: Vec::new(),
@@ -307,13 +309,55 @@ mod tokenomics_tests {
             vote_list: Vec::new(),
         };
 
+        let bal0 = get_balance_i64(&store, &worker).await;
         distribute_waiting_pool_rewards_and_fee_credits(&store, &mk_lsu(before)).await;
         let bal_before = get_fee_credit_balance_u64(&store, &worker).await;
         assert_eq!(bal_before, 0);
+        assert_eq!(get_balance_i64(&store, &worker).await, bal0);
 
         distribute_waiting_pool_rewards_and_fee_credits(&store, &mk_lsu(at)).await;
         let bal_at = get_fee_credit_balance_u64(&store, &worker).await;
         assert_eq!(bal_at, TOKENOMICS_FEE_CREDITS_ACCRUAL_ATOMS_PER_DAY);
+        assert_eq!(get_balance_i64(&store, &worker).await, bal0.saturating_add(1));
+    }
+
+    #[tokio::test]
+    async fn waiting_eligibility_churn_penalty_blocks_rewards_and_credits() {
+        let td = TempDir::new().unwrap();
+        let mut cfg = StorageConfigLib::default();
+        cfg.data_dir = td.path().to_path_buf();
+        let store = StorageManager::new(cfg).await.unwrap();
+
+        let worker = [8u8; 32];
+        store
+            .set_state(&worker_key_for_pubkey(&worker), vec![1u8])
+            .await
+            .unwrap();
+
+        // Old enough identity, but with a very recent registration cycle.
+        let first_seen = 1u64;
+        ensure_worker_first_seen_cycle(&store, &worker, first_seen).await;
+        let cycle = first_seen
+            .saturating_add(TOKENOMICS_FEE_CREDITS_WARMUP_DAYS.saturating_mul(cycles_per_day()))
+            .saturating_add(10);
+        set_worker_last_registration_cycle(&store, &worker, cycle.saturating_sub(1)).await;
+
+        let lsu = LedgerStateUpdate {
+            partial_update: PartialLedgerStateUpdate {
+                transaction_entries: Vec::new(),
+                transaction_signatures_hash: [0u8; 32],
+                total_fees: 10,
+                timestamp: 0,
+            },
+            compensation_entries: Vec::new(),
+            cycle_number: cycle,
+            producer_list: Vec::new(),
+            vote_list: Vec::new(),
+        };
+
+        distribute_waiting_pool_rewards_and_fee_credits(&store, &lsu).await;
+        assert_eq!(get_fee_credit_balance_u64(&store, &worker).await, 0);
+        assert_eq!(get_balance_i64(&store, &worker).await, 0);
     }
 }
 
@@ -433,6 +477,10 @@ fn fee_credit_balance_key_for_pubkey(pubkey: &[u8; 32]) -> Vec<u8> {
 
 fn fee_credit_first_seen_cycle_key_for_pubkey(pubkey: &[u8; 32]) -> String {
     format!("workers:first_seen_cycle:{}", hex_encode(pubkey))
+}
+
+fn worker_last_registration_cycle_key_for_pubkey(pubkey: &[u8; 32]) -> String {
+    format!("workers:last_registration_cycle:{}", hex_encode(pubkey))
 }
 
 fn fee_credit_daily_spend_key_for_pubkey(pubkey: &[u8; 32]) -> String {
@@ -776,6 +824,7 @@ async fn apply_lsu_to_storage_without_root_check(
             let k = worker_key_for_pubkey(&e.public_key);
             let _ = store.set_state(&k, vec![1u8]).await;
             ensure_worker_first_seen_cycle(store, &e.public_key, lsu.cycle_number).await;
+            set_worker_last_registration_cycle(store, &e.public_key, lsu.cycle_number).await;
             outcome_by_sig.entry(e.signature.clone()).or_insert(ApplyOutcome {
                 success: true,
                 ..Default::default()
@@ -1355,6 +1404,21 @@ async fn ensure_worker_first_seen_cycle(store: &StorageManager, pubkey: &[u8; 32
     }
 }
 
+async fn set_worker_last_registration_cycle(store: &StorageManager, pubkey: &[u8; 32], cycle: u64) {
+    let _ = store
+        .set_metadata(&worker_last_registration_cycle_key_for_pubkey(pubkey), &cycle.to_le_bytes())
+        .await;
+}
+
+async fn get_worker_last_registration_cycle(store: &StorageManager, pubkey: &[u8; 32]) -> Option<u64> {
+    let bytes = store
+        .get_metadata(&worker_last_registration_cycle_key_for_pubkey(pubkey))
+        .await
+        .ok()
+        .flatten()?;
+    decode_u64(&bytes)
+}
+
 async fn get_worker_first_seen_cycle(store: &StorageManager, pubkey: &[u8; 32]) -> Option<u64> {
     let bytes = store
         .get_metadata(&fee_credit_first_seen_cycle_key_for_pubkey(pubkey))
@@ -1362,6 +1426,31 @@ async fn get_worker_first_seen_cycle(store: &StorageManager, pubkey: &[u8; 32]) 
         .ok()
         .flatten()?;
     decode_u64(&bytes)
+}
+
+async fn waiting_worker_is_eligible(
+    store: &StorageManager,
+    pubkey: &[u8; 32],
+    cycle: u64,
+) -> bool {
+    // Sybil resistance baseline for v1:
+    // - identity must age through warmup before earning waiting-pool rewards/credits
+    // - newly re-registered identities are blocked for a churn penalty window
+    let Some(first_seen) = get_worker_first_seen_cycle(store, pubkey).await else {
+        return false;
+    };
+    let warmup_cycles = TOKENOMICS_FEE_CREDITS_WARMUP_DAYS.saturating_mul(cycles_per_day());
+    if cycle < first_seen.saturating_add(warmup_cycles) {
+        return false;
+    }
+    if let Some(last_reg) = get_worker_last_registration_cycle(store, pubkey).await {
+        let churn_cycles =
+            TOKENOMICS_WAITING_ELIGIBILITY_CHURN_PENALTY_DAYS.saturating_mul(cycles_per_day());
+        if cycle < last_reg.saturating_add(churn_cycles) {
+            return false;
+        }
+    }
+    true
 }
 
 async fn distribute_waiting_pool_rewards_and_fee_credits(
@@ -1389,10 +1478,15 @@ async fn distribute_waiting_pool_rewards_and_fee_credits(
     let mut workers = load_workers_from_state(store);
     workers.sort();
     workers.dedup();
-    let waiting: Vec<[u8; 32]> = workers
-        .into_iter()
-        .filter(|pk| !producers.contains(pk))
-        .collect();
+    let mut waiting: Vec<[u8; 32]> = Vec::new();
+    for pk in workers {
+        if producers.contains(&pk) {
+            continue;
+        }
+        if waiting_worker_is_eligible(store, &pk, lsu.cycle_number).await {
+            waiting.push(pk);
+        }
+    }
     if waiting.is_empty() {
         return;
     }
@@ -1414,16 +1508,11 @@ async fn distribute_waiting_pool_rewards_and_fee_credits(
         }
 
         if TOKENOMICS_FEE_CREDITS_ENABLED {
-            if let Some(first_seen) = get_worker_first_seen_cycle(store, &pk).await {
-                let warmup_cycles = TOKENOMICS_FEE_CREDITS_WARMUP_DAYS.saturating_mul(cycles_per_day());
-                if lsu.cycle_number >= first_seen.saturating_add(warmup_cycles) {
-                    let cur = get_fee_credit_balance_u64(store, &pk).await;
-                    let next = cur
-                        .saturating_add(TOKENOMICS_FEE_CREDITS_ACCRUAL_ATOMS_PER_DAY)
-                        .min(TOKENOMICS_FEE_CREDITS_MAX_BALANCE_ATOMS);
-                    let _ = set_fee_credit_balance_u64(store, &pk, next).await;
-                }
-            }
+            let cur = get_fee_credit_balance_u64(store, &pk).await;
+            let next = cur
+                .saturating_add(TOKENOMICS_FEE_CREDITS_ACCRUAL_ATOMS_PER_DAY)
+                .min(TOKENOMICS_FEE_CREDITS_MAX_BALANCE_ATOMS);
+            let _ = set_fee_credit_balance_u64(store, &pk, next).await;
         }
     }
 }
@@ -1979,6 +2068,7 @@ async fn apply_lsu_to_storage(
             let k = worker_key_for_pubkey(&e.public_key);
             let _ = store.set_state(&k, vec![1u8]).await;
             ensure_worker_first_seen_cycle(store, &e.public_key, lsu.cycle_number).await;
+            set_worker_last_registration_cycle(store, &e.public_key, lsu.cycle_number).await;
             outcome_by_sig.entry(e.signature.clone()).or_insert(ApplyOutcome {
                 success: true,
                 ..Default::default()

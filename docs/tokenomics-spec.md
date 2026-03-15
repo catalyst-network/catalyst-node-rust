@@ -51,7 +51,11 @@ If you are writing long-form/public docs, use `docs/tokenomics-model.md` as the 
   - `TOKENOMICS_FEE_CREDITS_ACCRUAL_ATOMS_PER_DAY = 200`
   - `TOKENOMICS_FEE_CREDITS_MAX_BALANCE_ATOMS = 6000`
   - `TOKENOMICS_FEE_CREDITS_DAILY_SPEND_CAP_ATOMS = 300`
+  - `TOKENOMICS_WAITING_ELIGIBILITY_CHURN_PENALTY_DAYS = 3`
   - cycle reference `20s` for day-bucket math
+- waiting-pool reward + fee-credit eligibility is gated by:
+  - first-seen identity warmup
+  - churn-penalty window based on recent registration cycle metadata
 
 ## Determinism and safety invariants
 

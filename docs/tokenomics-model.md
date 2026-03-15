@@ -96,6 +96,9 @@ Fee credits are non-transferable credits used only to pay the sender's own trans
 - Credits are bounded by max balance.
 - Daily spend cap limits burst usage.
 - Credits are non-transferable and cannot be delegated.
+- Eligibility gates include:
+  - identity-aging warmup window
+  - churn-penalty window after registration events
 
 ## Genesis behavior and config
 

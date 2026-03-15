@@ -74,7 +74,7 @@ Use this wording:
 
 - "Fee credits accrue to eligible waiting workers (not selected producers for that cycle)."
 - "Fee credits are non-transferable and only pay the sender's own fees."
-- "Credits have warmup, max balance, and daily spend caps."
+- "Credits have warmup, max balance, daily spend caps, and a churn-penalty eligibility window."
 
 Avoid this wording:
 
