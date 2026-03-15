@@ -15,7 +15,7 @@ Core:
 - `catalyst_version`
 - `catalyst_peerCount`
 - `catalyst_head`
-- `catalyst_getTokenomicsInfo`
+- `catalyst_getTokenomicsInfo` (issuance + fee-routing/reward-split parameters)
 - `catalyst_blockNumber` (mapped to applied cycle)
 - `catalyst_chainId`
 - `catalyst_networkId`

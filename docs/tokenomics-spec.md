@@ -36,6 +36,10 @@ If you are writing long-form/public docs, use `docs/tokenomics-model.md` as the 
     - `producer_set_reward_bps = 7000`
     - `waiting_pool_reward_bps = 3000`
 - `crates/catalyst-cli/src/node.rs`
+  - fee-routing constants:
+    - `TOKENOMICS_FEE_BURN_BPS = 7000`
+    - `TOKENOMICS_FEE_TO_REWARD_POOL_BPS = 3000`
+    - `TOKENOMICS_FEE_TO_TREASURY_BPS = 0`
   - applies compensation entries
   - computes waiting pool share and fee-credit accrual/spend paths
 
@@ -63,7 +67,10 @@ Use `docs/tokenomics-testnet-validation.md` for reset + issuance validation + re
 
 Current issuance observability surface:
 
-- RPC `catalyst_getTokenomicsInfo` (applied cycle, fixed reward, issued estimate, total positive balances)
+- RPC `catalyst_getTokenomicsInfo` includes:
+  - issuance summary (`applied_cycle`, `block_reward_atoms`, `estimated_issued_atoms`)
+  - fee-routing params (`fee_burn_bps`, `fee_to_reward_pool_bps`, `fee_to_treasury_bps`)
+  - reward-split params (`producer_set_reward_bps`, `waiting_pool_reward_bps`)
 
 ## Remaining work tracked in GitHub
 

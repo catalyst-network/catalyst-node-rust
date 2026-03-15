@@ -23,6 +23,11 @@ const META_PROTOCOL_NETWORK_ID: &str = "protocol:network_id";
 const META_PROTOCOL_GENESIS_HASH: &str = "protocol:genesis_hash";
 const META_SNAPSHOT_LATEST: &str = "snapshot:latest";
 const TOKENOMICS_BLOCK_REWARD_ATOMS: u64 = 1;
+const TOKENOMICS_FEE_BURN_BPS: u64 = 7_000;
+const TOKENOMICS_FEE_TO_REWARD_POOL_BPS: u64 = 3_000;
+const TOKENOMICS_FEE_TO_TREASURY_BPS: u64 = 0;
+const TOKENOMICS_PRODUCER_SET_REWARD_BPS: u64 = 7_000;
+const TOKENOMICS_WAITING_POOL_REWARD_BPS: u64 = 3_000;
 
 const RPC_ERR_RATE_LIMITED_CODE: i32 = -32029;
 
@@ -262,6 +267,21 @@ pub struct RpcTokenomicsInfo {
     pub block_reward_atoms: u64,
     pub estimated_issued_atoms: u64,
     pub total_positive_balances_atoms: u64,
+    pub fee_burn_bps: u64,
+    pub fee_to_reward_pool_bps: u64,
+    pub fee_to_treasury_bps: u64,
+    pub producer_set_reward_bps: u64,
+    pub waiting_pool_reward_bps: u64,
+}
+
+#[cfg(test)]
+fn split_cycle_fees(total_fees: u64) -> (u64, u64, u64) {
+    // Deterministic floor-division split; any remainder stays in burn.
+    let to_rewards = total_fees.saturating_mul(TOKENOMICS_FEE_TO_REWARD_POOL_BPS) / 10_000;
+    let to_treasury = total_fees.saturating_mul(TOKENOMICS_FEE_TO_TREASURY_BPS) / 10_000;
+    let used = to_rewards.saturating_add(to_treasury).min(total_fees);
+    let burned = total_fees.saturating_sub(used);
+    (burned, to_rewards, to_treasury)
 }
 
 /// Sync metadata used by snapshot-based fast sync tooling.
@@ -1260,6 +1280,11 @@ impl CatalystRpcServer for CatalystRpcImpl {
             block_reward_atoms: TOKENOMICS_BLOCK_REWARD_ATOMS,
             estimated_issued_atoms,
             total_positive_balances_atoms,
+            fee_burn_bps: TOKENOMICS_FEE_BURN_BPS,
+            fee_to_reward_pool_bps: TOKENOMICS_FEE_TO_REWARD_POOL_BPS,
+            fee_to_treasury_bps: TOKENOMICS_FEE_TO_TREASURY_BPS,
+            producer_set_reward_bps: TOKENOMICS_PRODUCER_SET_REWARD_BPS,
+            waiting_pool_reward_bps: TOKENOMICS_WAITING_POOL_REWARD_BPS,
         })
     }
 
@@ -1742,5 +1767,33 @@ mod tests {
     fn chain_id_formats_as_hex() {
         assert_eq!(format!("0x{:x}", 31337u64), "0x7a69");
         assert_eq!(format!("0x{:x}", 1u64), "0x1");
+    }
+
+    #[test]
+    fn tokenomics_fee_split_remainder_goes_to_burn() {
+        let (burned, to_rewards, to_treasury) = split_cycle_fees(1);
+        assert_eq!(to_rewards, 0);
+        assert_eq!(to_treasury, 0);
+        assert_eq!(burned, 1);
+    }
+
+    #[test]
+    fn tokenomics_info_roundtrip_includes_routing_fields() {
+        let info = RpcTokenomicsInfo {
+            applied_cycle: 7,
+            block_reward_atoms: TOKENOMICS_BLOCK_REWARD_ATOMS,
+            estimated_issued_atoms: 7,
+            total_positive_balances_atoms: 42,
+            fee_burn_bps: TOKENOMICS_FEE_BURN_BPS,
+            fee_to_reward_pool_bps: TOKENOMICS_FEE_TO_REWARD_POOL_BPS,
+            fee_to_treasury_bps: TOKENOMICS_FEE_TO_TREASURY_BPS,
+            producer_set_reward_bps: TOKENOMICS_PRODUCER_SET_REWARD_BPS,
+            waiting_pool_reward_bps: TOKENOMICS_WAITING_POOL_REWARD_BPS,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let decoded: RpcTokenomicsInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.fee_burn_bps, TOKENOMICS_FEE_BURN_BPS);
+        assert_eq!(decoded.fee_to_reward_pool_bps, TOKENOMICS_FEE_TO_REWARD_POOL_BPS);
+        assert_eq!(decoded.fee_to_treasury_bps, TOKENOMICS_FEE_TO_TREASURY_BPS);
     }
 }

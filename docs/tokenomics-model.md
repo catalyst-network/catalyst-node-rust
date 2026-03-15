@@ -45,8 +45,10 @@ Per successful cycle:
 
 ### Parameters
 
+- `fee_burn_bps = 7000` (70% of fees)
 - `block_reward_atoms = 1`
 - `fee_to_reward_pool_bps = 3000` (30% of fees)
+- `fee_to_treasury_bps = 0`
 - `producer_set_reward_bps = 7000`
 - `waiting_pool_reward_bps = 3000`
 
@@ -61,7 +63,19 @@ v1 fee routing intent:
 
 - fees remain mandatory for anti-spam
 - a portion of fees are routed back to rewards (`fee_to_reward_pool_bps`)
-- remaining fee-routing policy (e.g. burn share) is deterministic and parameterized in implementation/spec
+- remaining fees are burned (`fee_burn_bps`)
+- treasury routing is disabled in v1 (`fee_to_treasury_bps = 0`)
+
+### Why burn 70% of fees in v1
+
+The 70% burn policy is a launch-phase anti-spam and simplicity choice.
+
+- **Anti-spam cost is real**: burned fees are unrecoverable, so abusive transaction volume has a hard economic cost.
+- **No treasury complexity**: keeping treasury at zero avoids introducing custodial/governance routing at launch.
+- **Deterministic and auditable**: fixed routing is easy for operators and external tools to verify.
+- **Balanced incentives**: 30% of fees still flows to rewards, so active and waiting participants continue to benefit.
+
+This is a v1 baseline, not a forever rule. It can be revisited in a later, explicit protocol upgrade once enough production telemetry exists.
 
 ## Fee credits (waiting-node utility)
 

@@ -211,7 +211,9 @@ const META_PROTOCOL_GENESIS_HASH: &str = "protocol:genesis_hash";
 
 // Tokenomics v1 constants (aligned with docs/tokenomics-spec.md).
 const TOKENOMICS_BLOCK_REWARD_ATOMS: u64 = 1;
+const TOKENOMICS_FEE_BURN_BPS: u64 = 7_000;
 const TOKENOMICS_FEE_TO_REWARD_POOL_BPS: u64 = 3_000;
+const TOKENOMICS_FEE_TO_TREASURY_BPS: u64 = 0;
 const TOKENOMICS_WAITING_POOL_REWARD_BPS: u64 = 3_000;
 const TOKENOMICS_FEE_CREDITS_ENABLED: bool = true;
 const TOKENOMICS_FEE_CREDITS_WARMUP_DAYS: u64 = 14;
@@ -219,6 +221,15 @@ const TOKENOMICS_FEE_CREDITS_ACCRUAL_ATOMS_PER_DAY: u64 = 200;
 const TOKENOMICS_FEE_CREDITS_MAX_BALANCE_ATOMS: u64 = 6_000;
 const TOKENOMICS_FEE_CREDITS_DAILY_SPEND_CAP_ATOMS: u64 = 300;
 const TOKENOMICS_CYCLE_SECONDS: u64 = 20;
+
+fn split_cycle_fees(total_fees: u64) -> (u64, u64, u64) {
+    // Deterministic floor-division split; any remainder is assigned to burn.
+    let to_rewards = total_fees.saturating_mul(TOKENOMICS_FEE_TO_REWARD_POOL_BPS) / 10_000;
+    let to_treasury = total_fees.saturating_mul(TOKENOMICS_FEE_TO_TREASURY_BPS) / 10_000;
+    let used = to_rewards.saturating_add(to_treasury).min(total_fees);
+    let burned = total_fees.saturating_sub(used);
+    (burned, to_rewards, to_treasury)
+}
 
 async fn resolve_dns_seeds_to_bootstrap_multiaddrs(seeds: &[String], default_port: u16) -> Vec<Multiaddr> {
     if seeds.is_empty() {
@@ -1279,7 +1290,7 @@ async fn distribute_waiting_pool_rewards_and_fee_credits(
     }
 
     let total_fees = lsu.partial_update.total_fees;
-    let reward_from_fees = total_fees.saturating_mul(TOKENOMICS_FEE_TO_REWARD_POOL_BPS) / 10_000;
+    let (_burned_fees, reward_from_fees, _to_treasury) = split_cycle_fees(total_fees);
     let total_reward_pool = TOKENOMICS_BLOCK_REWARD_ATOMS.saturating_add(reward_from_fees);
     let waiting_pool_from_formula =
         total_reward_pool.saturating_mul(TOKENOMICS_WAITING_POOL_REWARD_BPS) / 10_000;
@@ -1392,47 +1403,14 @@ fn tx_boundary_signature(tx: &catalyst_core::protocol::Transaction) -> Vec<u8> {
 }
 
 fn tx_to_consensus_entries(tx: &catalyst_core::protocol::Transaction) -> Vec<catalyst_consensus::types::TransactionEntry> {
-    if tx.core.tx_type == catalyst_core::protocol::TransactionType::WorkerRegistration {
-        let pk = tx.core.entries.get(0).map(|e| e.public_key).unwrap_or([0u8; 32]);
-        let mut sig = b"WRKREG1".to_vec();
-        sig.extend_from_slice(&tx.signature.0);
-        return vec![catalyst_consensus::types::TransactionEntry {
-            public_key: pk,
-            amount: 0,
-            signature: sig,
-        }];
-    }
-
-    if tx.core.tx_type == catalyst_core::protocol::TransactionType::SmartContract {
-        let pk = tx.core.entries.get(0).map(|e| e.public_key).unwrap_or([0u8; 32]);
-        let kind = bincode::deserialize::<EvmTxKind>(&tx.core.data)
-            .unwrap_or(EvmTxKind::Call { to: [0u8; 20], input: Vec::new() });
-        let payload = EvmTxPayload {
-            nonce: tx.core.nonce,
-            kind,
-        };
-        let marker = encode_evm_marker(&payload, &tx.signature.0).unwrap_or_else(|_| tx.signature.0.clone());
-        return vec![catalyst_consensus::types::TransactionEntry {
-            public_key: pk,
-            amount: 0,
-            signature: marker,
-        }];
-    }
-
-    let sig = tx.signature.0.clone();
-    let mut out = Vec::new();
-    for e in &tx.core.entries {
-        let amount = match &e.amount {
-            catalyst_core::protocol::EntryAmount::NonConfidential(v) => *v,
-            catalyst_core::protocol::EntryAmount::Confidential { .. } => continue,
-        };
-        out.push(catalyst_consensus::types::TransactionEntry {
-            public_key: e.public_key,
-            amount,
-            signature: sig.clone(),
-        });
-    }
-    out
+    // Reuse the canonical protocol->consensus conversion to keep fee-debit handling
+    // consistent across mempool admission and cycle construction.
+    let msg = ProtocolTxGossip {
+        tx_id: [0u8; 32],
+        tx: tx.clone(),
+        received_at_ms: tx.timestamp,
+    };
+    msg.to_consensus_entries()
 }
 
 async fn validate_and_select_protocol_txs_for_construction(

@@ -36,6 +36,11 @@ These docs are written against the current `catalyst-node-rust` implementation (
   - Issuance/reward verification checks
   - Regression checks to confirm nothing else broke
 
+- **Tokenomics website/docs handoff**: [`tokenomics-explainer-handoff.md`](./tokenomics-explainer-handoff.md)
+  - Copy-ready explainer and FAQ points
+  - Canonical parameter list + phrasing guidance for agents
+  - Operator verification snippet using RPC
+
 - **Wallets / Integrators**: [`wallet-interop.md`](./wallet-interop.md)
   - Canonical address format
   - v1 transaction signing payload + wire encoding

@@ -65,6 +65,8 @@ Expected outcome:
 - `applied_cycle` is non-zero and increasing over time
 - `block_reward_atoms` matches configured fixed reward (`1`)
 - `estimated_issued_atoms` increases as `applied_cycle` increases
+- `fee_burn_bps = 7000`, `fee_to_reward_pool_bps = 3000`, `fee_to_treasury_bps = 0`
+- `producer_set_reward_bps = 7000`, `waiting_pool_reward_bps = 3000`
 
 ## 6) Validate issuance logic path with tests
 
