@@ -23,6 +23,7 @@ Catalyst v1 uses a fair-launch model with `0 KAT` at genesis and fixed issuance 
 
 - `genesis_supply = 0 KAT`
 - `fixed_block_reward = 1 KAT` per successful cycle
+- `atoms_per_kat = 1_000_000_000`
 - `cycle_target = 20s`
 - `fee_burn_bps = 7000` (70%)
 - `fee_to_reward_pool_bps = 3000` (30%)

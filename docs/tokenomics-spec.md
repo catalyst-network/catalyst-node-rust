@@ -11,6 +11,7 @@ If you are writing long-form/public docs, use `docs/tokenomics-model.md` as the 
 - No premine / no token sale
 - Issuance starts on successful post-genesis cycles
 - Fixed issuance: `1 KAT` per successful cycle
+- Unit scale: `1 KAT = 1_000_000_000 atoms`
 - Reward split includes:
   - selected producer set
   - eligible waiting worker pool
@@ -31,7 +32,7 @@ If you are writing long-form/public docs, use `docs/tokenomics-model.md` as the 
 
 - `crates/catalyst-consensus/src/phases.rs`
   - `RewardConfig` defaults:
-    - `block_reward = 1`
+    - `block_reward = 1_000_000_000` (1 KAT in atoms)
     - `fee_to_reward_pool_bps = 3000`
     - `producer_set_reward_bps = 7000`
     - `waiting_pool_reward_bps = 3000`

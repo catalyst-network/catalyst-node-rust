@@ -210,7 +210,8 @@ const META_PROTOCOL_NETWORK_ID: &str = "protocol:network_id";
 const META_PROTOCOL_GENESIS_HASH: &str = "protocol:genesis_hash";
 
 // Tokenomics v1 constants (aligned with docs/tokenomics-spec.md).
-const TOKENOMICS_BLOCK_REWARD_ATOMS: u64 = 1;
+// 1 KAT = 1_000_000_000 atoms so reward splits don't floor to zero.
+const TOKENOMICS_BLOCK_REWARD_ATOMS: u64 = 1_000_000_000;
 const TOKENOMICS_FEE_BURN_BPS: u64 = 7_000;
 const TOKENOMICS_FEE_TO_REWARD_POOL_BPS: u64 = 3_000;
 const TOKENOMICS_FEE_TO_TREASURY_BPS: u64 = 0;
@@ -318,7 +319,15 @@ mod tokenomics_tests {
         distribute_waiting_pool_rewards_and_fee_credits(&store, &mk_lsu(at)).await;
         let bal_at = get_fee_credit_balance_u64(&store, &worker).await;
         assert_eq!(bal_at, TOKENOMICS_FEE_CREDITS_ACCRUAL_ATOMS_PER_DAY);
-        assert_eq!(get_balance_i64(&store, &worker).await, bal0.saturating_add(1));
+        let reward_from_fees = 10u64.saturating_mul(TOKENOMICS_FEE_TO_REWARD_POOL_BPS) / 10_000;
+        let expected_waiting_reward = TOKENOMICS_BLOCK_REWARD_ATOMS
+            .saturating_add(reward_from_fees)
+            .saturating_mul(TOKENOMICS_WAITING_POOL_REWARD_BPS)
+            / 10_000;
+        assert_eq!(
+            get_balance_i64(&store, &worker).await,
+            bal0.saturating_add(expected_waiting_reward as i64)
+        );
     }
 
     #[tokio::test]

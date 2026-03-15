@@ -1112,7 +1112,8 @@ pub struct RewardConfig {
 impl Default for RewardConfig {
     fn default() -> Self {
         Self {
-            block_reward: 1,
+            // 1 KAT in atom units (1 KAT = 1_000_000_000 atoms).
+            block_reward: 1_000_000_000,
             fee_to_reward_pool_bps: 3000,
             producer_set_reward_bps: 7000,
             waiting_pool_reward_bps: 3000,

@@ -63,7 +63,7 @@ curl -s -X POST http://127.0.0.1:8545 -H 'content-type: application/json' \
 Expected outcome:
 
 - `applied_cycle` is non-zero and increasing over time
-- `block_reward_atoms` matches configured fixed reward (`1`)
+- `block_reward_atoms` matches configured fixed reward (`1000000000`)
 - `estimated_issued_atoms` increases as `applied_cycle` increases
 - `fee_burn_bps = 7000`, `fee_to_reward_pool_bps = 3000`, `fee_to_treasury_bps = 0`
 - `producer_set_reward_bps = 7000`, `waiting_pool_reward_bps = 3000`

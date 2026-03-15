@@ -26,6 +26,7 @@ It does **not** define future adaptive/dynamic monetary policy.
 - **Issuance start**: first successful cycle after genesis
 - **Cycle target**: `20 seconds`
 - **Fixed block reward**: `1 KAT` per successful cycle
+- **Unit scale**: `1 KAT = 1_000_000_000 atoms`
 
 Rationale:
 
@@ -46,7 +47,7 @@ Per successful cycle:
 ### Parameters
 
 - `fee_burn_bps = 7000` (70% of fees)
-- `block_reward_atoms = 1`
+- `block_reward_atoms = 1_000_000_000`
 - `fee_to_reward_pool_bps = 3000` (30% of fees)
 - `fee_to_treasury_bps = 0`
 - `producer_set_reward_bps = 7000`
