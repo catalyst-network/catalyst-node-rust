@@ -1,93 +1,138 @@
-# Security threat model (working)
+# Security threat model (mainnet v1 baseline)
 
-This document is a living threat model for Catalyst mainnet readiness. It focuses on realistic adversaries and measurable failure modes.
+This document captures the security assumptions and threat model for mainnet readiness.
+It is the canonical input for:
+
+- `#262` epic: security threat model and adversarial test gate
+- `#271`: publish mainnet threat model and attack assumptions
+- `#272`: adversarial test execution evidence
+- `#273`: external review scope and remediation checklist
 
 ## Security goals
 
-- **Safety**: nodes should not accept or produce invalid state transitions.
-- **Liveness**: the network should continue producing cycles under WAN conditions and moderate adversarial pressure.
-- **Bounded resource usage**: hostile peers should not cause unbounded CPU/memory/disk growth.
-- **Operator recoverability**: clear runbooks for rollback/restore and for key compromise response.
+- **Safety**: honest nodes reject invalid state transitions and preserve deterministic state convergence.
+- **Liveness**: the network continues advancing applied cycles under WAN conditions and bounded adversarial pressure.
+- **Resource bounds**: untrusted traffic cannot cause unbounded CPU, memory, disk, or connection growth.
+- **Recoverability**: operators can restore/rejoin safely after failures without silent state drift.
 
-## Non-goals (for now)
+## Assumptions and trust boundaries
 
-- Perfect privacy / traffic analysis resistance (see `#198`).
-- Full economic security analysis (see `#184` / `#185`).
+### Assumptions
 
-## Trust boundaries + assets
+- At least one honest connectivity path exists between non-faulty nodes over time.
+- Honest operators run released binaries with intended configuration.
+- Private keys for validator/operator identities are not broadly compromised.
+- Adversaries can control public internet traffic to their own endpoints but not global routing everywhere at once.
 
-- **Consensus / state**: LSU application, `prev_state_root` continuity, account state root.
-- **P2P network**: peer connections, message relay/rebroadcast, discovery.
-- **RPC surface**: public read APIs, tx submission, snapshot info.
-- **Storage**: RocksDB data directory, snapshots, pruning.
-- **Keys**: node identity key, validator key material, faucet custody keys.
+### Trust boundaries
 
-## Adversary model
+- **Consensus/state boundary**: LSU validation and deterministic application path.
+- **P2P boundary**: all inbound peers and gossip messages are untrusted by default.
+- **RPC boundary**: all client requests are untrusted, including transaction submissions.
+- **Storage boundary**: local RocksDB state/snapshots are trusted only with integrity checks and operational controls.
+- **Operator boundary**: third-party RPC/indexer operators may be malicious or faulty.
 
-- **Remote internet attacker**: can connect to public P2P/RPC endpoints and send arbitrary messages at scale.
-- **Sybil**: can create many peers/identities and attempt to dominate connectivity.
-- **Eclipse attacker**: attempts to isolate a victim node by controlling its peer set.
-- **Partition**: network splits due to BGP/routing/NAT/firewall or intentional interference.
-- **Malicious operator**: runs a public RPC/indexer with modified code, logs, or data access.
+### Protected assets
 
-## Major threats and current mitigations
+- state root continuity and LSU chain integrity
+- account balances/nonces and replay safety
+- node availability and cycle progression
+- key material and launch configuration
+- operator runbooks and recovery artifacts (snapshots/backups)
 
-### DoS via oversized or high-rate messages
+## Adversary classes
 
-- **Threat**: send huge payloads or many small payloads to exhaust CPU/memory/bandwidth.
-- **Mitigations**:
-  - per-peer/per-connection **rate budgets** and **payload caps** in networking layer
-  - configurable safety limits in `[network.safety_limits]` (see `#246`)
+- **Remote internet attacker**: sends arbitrary high-rate traffic to public P2P/RPC surfaces.
+- **Sybil attacker**: creates many identities/peers to bias connectivity or economic eligibility.
+- **Eclipse attacker**: attempts to isolate target nodes behind attacker-controlled peers.
+- **Partition attacker/event**: creates or exploits temporary network splits.
+- **Malicious integrator/operator**: serves incorrect RPC/indexer views or withholds data.
 
-### DoS via unbounded rebroadcast/dedup state
+## Threat matrix (v1)
 
-- **Threat**: force multi-hop rebroadcast caches to grow without bound.
-- **Mitigations**:
-  - relay/dedup caches are bounded and configurable (`[network.relay_cache]`, `[network.safety_limits.dedup_cache_max_entries]`)
+### 1) P2P message flood / oversized payload DoS
 
-### Replay / downgrade / incompatible wire payloads
+- **Impact**: CPU/memory exhaustion, degraded liveness.
+- **Current controls**:
+  - message and payload limits
+  - relay/dedup cache bounds
+  - hop/TTL constraints and rate budgets
+- **Verification path**: adversarial load scenarios in `#272`.
 
-- **Threat**: replay old messages or send incompatible wire payloads to cause confusion/crashes.
-- **Mitigations**:
-  - versioned envelope wire wrapper (`CENV` + `PROTOCOL_VERSION`)
-  - libp2p identify protocol gating (`catalyst/1`)
+### 2) Rebroadcast amplification / cache-bloat DoS
 
-### Eclipse / Sybil
+- **Impact**: memory growth and excessive relay overhead.
+- **Current controls**:
+  - bounded relay cache and dedup tables
+  - deterministic relay suppression
+- **Verification path**: flood + amplification scenarios in `#272`.
 
-- **Threat**: attacker controls victim’s peer set, preventing honest connectivity.
-- **Mitigations (partial, current)**:
-  - bootstrap peer + DNS seed support
-  - min peer maintenance with dial backoff + jitter (`#200`)
-- **Gaps**:
-  - stronger peer selection diversity (IP/subnet caps, scoring, verified bootstrap sets)
-  - explicit capability/feature negotiation beyond identify string
+### 3) Replay / downgrade / wire-compat confusion
 
-### Network partition / delayed delivery
+- **Impact**: acceptance divergence, node instability.
+- **Current controls**:
+  - envelope versioning (`CENV` + protocol version)
+  - identify protocol gating (`catalyst/1`)
+  - nonce and signature domain checks on tx path
+- **Verification path**: malformed/replay suites in `#272`.
 
-- **Threat**: consensus stalls or forks during partitions; rejoin causes state divergence.
-- **Mitigations (partial, current)**:
-  - “reliable join” work: backfill + continuity checks
-  - bounded message TTL/hops and dedup
-- **Gaps**:
-  - explicit partition testing harness and recovery procedures (`#241`)
+### 4) Eclipse / peer-set capture
 
-### Storage durability / corruption / rollback hazards
+- **Impact**: liveness stall, delayed convergence, manipulated data view.
+- **Current controls (partial)**:
+  - bootstrap + DNS seed support
+  - min-peer maintenance with backoff/jitter
+- **Residual risk**:
+  - stronger peer diversity and scoring still needed
+- **Verification path**: eclipse scenarios in `#272`; external review in `#273`.
 
-- **Threat**: disk fills or DB corruption causes node failure or silent divergence.
-- **Mitigations**:
-  - history pruning (opt-in) + maintenance tools (`db-stats`, `db-maintenance`)
-  - snapshot backup/restore runbooks (`docs/node-operator-guide.md`)
-  - storage version marker (`storage:version`)
+### 5) Sybil pressure on economic eligibility
 
-### RPC abuse
+- **Impact**: unfair reward capture and fee-credit abuse.
+- **Current controls**:
+  - waiting-pool eligibility gates (identity warmup + churn penalty)
+- **Residual risk**:
+  - this is baseline protection, not full economic Sybil immunity
+- **Verification path**: adversarial eligibility abuse cases in `#272`.
 
-- **Threat**: high-rate RPC calls or expensive queries degrade node liveness.
-- **Mitigations (partial)**:
-  - P2P-side bounding exists; RPC-side needs explicit rate limiting and request shaping (future work).
+### 6) Network partition and heal
 
-## What “done” looks like (mainnet bar)
+- **Impact**: temporary liveness loss, reconciliation stress on rejoin.
+- **Current controls**:
+  - backfill/reliable-join continuity checks
+  - bounded gossip behavior
+- **Verification path**: partition/heal drills with evidence in `#272`.
 
-- Threats tracked to mitigations and tests.
-- At least one **adversarial CI suite** exists and is run per PR.
-- WAN soak/chaos testing is run before releases (`#241`).
+### 7) Storage corruption / rollback hazards
+
+- **Impact**: node failure, potential operator recovery mistakes.
+- **Current controls**:
+  - snapshot restore paths
+  - pruning boundaries and maintenance tools
+  - storage version markers
+- **Verification path**: reset/recovery drills under `#275`, plus security review in `#273`.
+
+### 8) RPC abuse and expensive query pressure
+
+- **Impact**: degraded node responsiveness and potential liveness side-effects.
+- **Current controls**:
+  - baseline request limiting exists
+- **Residual risk**:
+  - endpoint-level shaping and stricter cost controls need continuous hardening
+- **Verification path**: abuse workloads in `#272`.
+
+## Residual risks accepted for v1 (explicit)
+
+- Global internet-scale DDoS resistance is out of scope for protocol code alone.
+- Economic Sybil resistance is improved but not considered fully solved.
+- Public RPC/indexer trust remains best-effort; clients should use multiple sources and proofs where available.
+
+## Mainnet security gate (definition of done)
+
+To satisfy `#262` before launch:
+
+1. Threat model and assumptions are published and reviewed (`#271`).
+2. Adversarial test plan is executed with reproducible evidence (`#272`).
+3. External review scope and remediation workflow are defined (`#273`).
+4. Residual risks are explicitly accepted or mitigated with owners and timelines.
 

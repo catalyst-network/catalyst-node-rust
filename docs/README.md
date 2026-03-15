@@ -57,6 +57,10 @@ These docs are written against the current `catalyst-node-rust` implementation (
   - Snapshot-based node restore workflow
   - Verifying chain identity + head
 
+- **Security threat model**: [`security-threat-model.md`](./security-threat-model.md)
+  - Mainnet attacker assumptions and trust boundaries
+  - Threat matrix mapped to controls and test/review gates
+
 ## Important implementation notes (current state)
 
 - **Consensus traffic is P2P on `30333/tcp`**, not RPC. RPC is only for client interaction.
