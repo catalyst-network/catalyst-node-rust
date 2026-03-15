@@ -65,6 +65,10 @@ These docs are written against the current `catalyst-node-rust` implementation (
   - In-scope components for third-party security review
   - Severity policy and remediation evidence checklist
 
+- **Security adversarial evidence**: [`security-adversarial-evidence.md`](./security-adversarial-evidence.md)
+  - Reproducible command log for CI-suitable adversarial checks
+  - Status tracking for remaining WAN/chaos evidence
+
 ## Important implementation notes (current state)
 
 - **Consensus traffic is P2P on `30333/tcp`**, not RPC. RPC is only for client interaction.

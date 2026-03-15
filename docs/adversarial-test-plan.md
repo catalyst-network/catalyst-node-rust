@@ -1,21 +1,29 @@
-# Adversarial test plan (working)
+# Adversarial test plan (mainnet security gate)
 
-This document enumerates adversarial scenarios and how to test them. Some scenarios are suitable for CI; others require WAN/chaos harnesses.
+This document enumerates adversarial scenarios and evidence requirements for the mainnet security gate.
 
-## CI-suitable (fast, deterministic)
+Tracking:
 
-- **Envelope wire rejection**:
+- Epic: `#262`
+- Execution evidence: `#272`
+- External review scope: `#273`
+
+Execution artifacts are recorded in `docs/security-adversarial-evidence.md`.
+
+## CI-suitable scenarios (fast, deterministic)
+
+- **Envelope wire rejection**
   - unknown `PROTOCOL_VERSION` should be rejected cleanly
-- **Rate budget behavior**:
+- **Rate budget behavior**
   - per-peer/per-conn budgets enforce msg/sec and bytes/sec caps
-- **Backoff/jitter bounding**:
+- **Backoff/jitter bounding**
   - dial backoff clamps to configured maximum
   - jitter stays within configured maximum
-- **Hop/loop bounds**:
+- **Hop/loop bounds**
   - rebroadcast stops after `max_hops`
   - messages don’t loop forever once local id is visited
 
-## Integration/WAN harness (slow, non-deterministic)
+## Integration/WAN scenarios (slow, non-deterministic)
 
 - **Eclipse attempt**:
   - isolate a victim by providing only attacker bootstrap peers
@@ -28,6 +36,22 @@ This document enumerates adversarial scenarios and how to test them. Some scenar
 - **DoS flood**:
   - send mixed size payloads at high QPS
   - verify bounded CPU/memory and steady cycle production
+
+## Evidence policy
+
+For each scenario:
+
+1. record exact command(s) used
+2. capture pass/fail outcome
+3. attach logs/artifacts (where practical)
+4. map residual gaps to follow-up tickets
+
+Do not close `#272` until both CI-suitable and WAN scenario evidence is linked.
+
+## Current status
+
+- CI-suitable suite: **in progress** (initial evidence captured).
+- WAN scenarios: **pending full execution harness and report**.
 
 ## Metrics to record (for #241/#206)
 
