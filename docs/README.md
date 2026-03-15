@@ -61,6 +61,10 @@ These docs are written against the current `catalyst-node-rust` implementation (
   - Mainnet attacker assumptions and trust boundaries
   - Threat matrix mapped to controls and test/review gates
 
+- **Security external review scope**: [`security-external-review-scope.md`](./security-external-review-scope.md)
+  - In-scope components for third-party security review
+  - Severity policy and remediation evidence checklist
+
 ## Important implementation notes (current state)
 
 - **Consensus traffic is P2P on `30333/tcp`**, not RPC. RPC is only for client interaction.
