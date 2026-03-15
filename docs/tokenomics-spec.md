@@ -67,6 +67,8 @@ Current issuance observability surface:
 
 ## Remaining work tracked in GitHub
 
-- `#184` tracks remaining hardening for tokenomics v1 implementation.
-- `#208` tracks protocol parameter governance/validation boundaries.
-- `#201` tracks threat-model/adversarial requirements (including sybil controls).
+- `#261` tracks tokenomics v1 hardening for mainnet.
+- `#268` tracks fee-routing semantics + operator-facing parameter surfaces.
+- `#269` tracks deterministic reward-split + fee-credit edge-case tests.
+- `#270` tracks anti-sybil eligibility controls for waiting-pool rewards/fee credits.
+- `#262` / `#271` / `#272` track security gates that tokenomics depends on before launch.

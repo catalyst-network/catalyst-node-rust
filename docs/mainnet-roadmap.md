@@ -3,6 +3,11 @@
 This doc translates “what’s left before mainnet” into trackable epics/issues in this repo.
 It’s intentionally pragmatic: **public testnet stability + developer usability first**, then economics + launch ceremony.
 
+Canonical tracking:
+
+- **Umbrella**: `#260` (mainnet launch readiness program tracker)
+- **Milestone**: `Mainnet Launch Readiness`
+
 ## Current status (as of this doc)
 
 - Public testnet is running; wallet + explorer are live.
@@ -10,69 +15,63 @@ It’s intentionally pragmatic: **public testnet stability + developer usability
 
 ## Workstreams (mapped to your list)
 
-### 1) Faucet sustainability (top-up + web UI + anti-abuse)
+### 1) Tokenomics + economics hardening
 
-- **Hosted faucet service**: `#220`
-- **Top-up + custody strategy**: `#233`
-- **Public faucet web app + abuse controls**: `#234`
-- Wallet integration notes: `docs/wallet-faucet-integration-catalyst-testnet.md`
+- **Epic**: `#261`
+- **Fee routing + parameter surfaces**: `#268`
+- **Deterministic tokenomics tests**: `#269`
+- **Anti-sybil eligibility controls**: `#270`
 
-### 2) “Install and run a node” should be easy (distribution)
+### 2) Security gate
 
-- **Node installers/packages (Windows/macOS/Ubuntu)**: `#235`
-- **Reproducible builds + upgrade policy**: `#207`
-- Operator runbooks: `#206`, `#205` and `docs/node-operator-guide.md`
+- **Epic**: `#262`
+- **Threat model**: `#271`
+- **Adversarial tests**: `#272`
+- **External review scope/remediation**: `#273`
 
-### 3) Indexing / subgraph path for developers
+### 3) Reliability/performance gate
 
-- **Indexer epic**: `#189`
-- **Self-hosted subgraph compatibility plan**: `#236`
-- **RPC completeness epic** (needed for indexing): `#187`
-- Explorer compatibility notes: `docs/explorer-handoff.md`
+- **Epic**: `#263`
+- **WAN soak/load/chaos thresholds**: `#274`
+- **Repeated reset/recovery reliability report**: `#275`
 
-### 4) Smart contract reliability (real dapps)
+### 4) Release engineering + upgrade safety
 
-- **EVM ABI/logs/receipts improvements**: `#209`
-- **Dapp compatibility test suite (Uniswap/Jeskei)**: `#237`
+- **Epic**: `#264`
+- **Reproducible builds + provenance/SBOM**: `#276`
+- **Upgrade matrix + rollback validation**: `#277`
 
-### 5) Web2 developer ergonomics (beyond raw RPC)
+### 5) Operations + launch ceremony
 
-- **Web2-friendly APIs (service bus/webhooks/REST)**: `#238`
-- Service bus crate: `crates/catalyst-service-bus/`
+- **Epic**: `#265`
+- **Key management runbook**: `#278`
+- **Genesis/launch ceremony runbook**: `#279`
+- **Monitoring/alerting + incident response**: `#280`
 
-### 6) Economics + mainnet launch
+### 6) RPC/indexer/wallet compatibility
 
-- **Economics spec**: `#185`
-- **Economics implementation**: `#184`
+- **Epic**: `#266`
+- **RPC coverage + consistency tests**: `#281`
+- **Indexer/subgraph integration reference**: `#282`
 
-### 7) Token naming / identity freeze (product + client safety)
+### 7) EVM production compatibility
 
-- **Token name/symbol decision + chain identity freeze**: `#239`
-- Identity notes: `docs/network-identity.md`
-
-### 8) Developer tooling + docs + training
-
-- **DevRel package (SDKs/examples/docs)**: `#240`
-
-### 9) Testing (beyond unit tests)
-
-- **Fuzz/property tests**: `#202`
-- **Threat model + adversarial plan**: `#201`
-- **WAN soak/load/chaos harness**: `#241`
-- Release gate milestone: GitHub milestone “Milestone G — Testing + release gate”
+- **Epic**: `#267`
+- **ABI/log/receipt fidelity**: `#283`
+- **Dapp smoke suite + compatibility matrix**: `#284`
 
 ## Additions I recommend (not explicitly in the list, but mainnet-critical)
 
-- **Security review/audit scope** (even a lightweight external review): start from `#201` and define a minimum audit plan.
-- **Monitoring/alerting** for validators/RPC/indexers (SLOs): peer count, cycle liveness (“no LSU produced”), disk growth, RPC rate limits.
-- **Genesis / launch runbook**: key ceremony, parameter freeze, rollback plan (partially covered by `#206`, but should be explicit for mainnet).
+- **Security review/audit scope** is tracked in `#273`.
+- **Monitoring/alerting** is tracked in `#280`.
+- **Genesis / launch runbook** is tracked in `#279`.
 
 ## Suggested ordering (high leverage)
 
-1. Finish **reliable join / backfill / safety limits** (Mainnet Milestone A).
-2. Faucet service + web UI (make testnet usable at scale).
-3. RPC + indexing + devrel basics (make builders productive).
-4. EVM compatibility suite + missing RPC pieces (enable real contracts).
-5. Soak/load/chaos testing + release policy (prove stability).
-6. Economics finalization + mainnet launch ceremony.
+1. Tokenomics hardening (`#261`) + security gate kickoff (`#262`).
+2. Reliability/performance gate execution (`#263`).
+3. Release engineering + ops runbooks (`#264`, `#265`).
+4. RPC/indexing compatibility completion (`#266`).
+5. EVM compatibility gate (`#267`).
+6. Final launch ceremony sign-off (`#279`) and umbrella close (`#260`).
 
