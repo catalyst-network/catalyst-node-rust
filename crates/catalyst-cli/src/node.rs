@@ -223,12 +223,98 @@ const TOKENOMICS_FEE_CREDITS_DAILY_SPEND_CAP_ATOMS: u64 = 300;
 const TOKENOMICS_CYCLE_SECONDS: u64 = 20;
 
 fn split_cycle_fees(total_fees: u64) -> (u64, u64, u64) {
+    debug_assert_eq!(
+        TOKENOMICS_FEE_BURN_BPS
+            .saturating_add(TOKENOMICS_FEE_TO_REWARD_POOL_BPS)
+            .saturating_add(TOKENOMICS_FEE_TO_TREASURY_BPS),
+        10_000
+    );
     // Deterministic floor-division split; any remainder is assigned to burn.
     let to_rewards = total_fees.saturating_mul(TOKENOMICS_FEE_TO_REWARD_POOL_BPS) / 10_000;
     let to_treasury = total_fees.saturating_mul(TOKENOMICS_FEE_TO_TREASURY_BPS) / 10_000;
     let used = to_rewards.saturating_add(to_treasury).min(total_fees);
     let burned = total_fees.saturating_sub(used);
     (burned, to_rewards, to_treasury)
+}
+
+#[cfg(test)]
+mod tokenomics_tests {
+    use super::*;
+    use catalyst_storage::StorageConfig as StorageConfigLib;
+    use catalyst_consensus::types::{LedgerStateUpdate, PartialLedgerStateUpdate};
+    use tempfile::TempDir;
+
+    #[test]
+    fn split_cycle_fees_is_deterministic_with_remainder_to_burn() {
+        assert_eq!(split_cycle_fees(1), (1, 0, 0));
+        assert_eq!(split_cycle_fees(10), (7, 3, 0));
+        assert_eq!(split_cycle_fees(11), (8, 3, 0));
+    }
+
+    #[tokio::test]
+    async fn fee_credit_spend_enforces_daily_cap_and_resets_next_day() {
+        let td = TempDir::new().unwrap();
+        let mut cfg = StorageConfigLib::default();
+        cfg.data_dir = td.path().to_path_buf();
+        let store = StorageManager::new(cfg).await.unwrap();
+
+        let worker = [9u8; 32];
+        set_fee_credit_balance_u64(&store, &worker, 1_000).await.unwrap();
+
+        let same_day_cycle = 5;
+        let spent_1 = apply_fee_credit_spend_for_cycle(&store, &worker, 500, same_day_cycle).await;
+        assert_eq!(spent_1, TOKENOMICS_FEE_CREDITS_DAILY_SPEND_CAP_ATOMS);
+
+        let spent_2 = apply_fee_credit_spend_for_cycle(&store, &worker, 50, same_day_cycle).await;
+        assert_eq!(spent_2, 0);
+
+        let next_day_cycle = same_day_cycle.saturating_add(cycles_per_day());
+        let spent_3 = apply_fee_credit_spend_for_cycle(&store, &worker, 100, next_day_cycle).await;
+        assert_eq!(spent_3, 100);
+
+        let bal = get_fee_credit_balance_u64(&store, &worker).await;
+        assert_eq!(bal, 600);
+    }
+
+    #[tokio::test]
+    async fn fee_credit_accrual_respects_warmup_boundary() {
+        let td = TempDir::new().unwrap();
+        let mut cfg = StorageConfigLib::default();
+        cfg.data_dir = td.path().to_path_buf();
+        let store = StorageManager::new(cfg).await.unwrap();
+
+        let worker = [7u8; 32];
+        store
+            .set_state(&worker_key_for_pubkey(&worker), vec![1u8])
+            .await
+            .unwrap();
+        ensure_worker_first_seen_cycle(&store, &worker, 1).await;
+
+        let warmup_cycles = TOKENOMICS_FEE_CREDITS_WARMUP_DAYS.saturating_mul(cycles_per_day());
+        let before = 1u64.saturating_add(warmup_cycles).saturating_sub(1);
+        let at = 1u64.saturating_add(warmup_cycles);
+
+        let mk_lsu = |cycle: u64| LedgerStateUpdate {
+            partial_update: PartialLedgerStateUpdate {
+                transaction_entries: Vec::new(),
+                transaction_signatures_hash: [0u8; 32],
+                total_fees: 0,
+                timestamp: 0,
+            },
+            compensation_entries: Vec::new(),
+            cycle_number: cycle,
+            producer_list: Vec::new(),
+            vote_list: Vec::new(),
+        };
+
+        distribute_waiting_pool_rewards_and_fee_credits(&store, &mk_lsu(before)).await;
+        let bal_before = get_fee_credit_balance_u64(&store, &worker).await;
+        assert_eq!(bal_before, 0);
+
+        distribute_waiting_pool_rewards_and_fee_credits(&store, &mk_lsu(at)).await;
+        let bal_at = get_fee_credit_balance_u64(&store, &worker).await;
+        assert_eq!(bal_at, TOKENOMICS_FEE_CREDITS_ACCRUAL_ATOMS_PER_DAY);
+    }
 }
 
 async fn resolve_dns_seeds_to_bootstrap_multiaddrs(seeds: &[String], default_port: u16) -> Vec<Multiaddr> {

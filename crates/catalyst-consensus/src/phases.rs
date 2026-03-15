@@ -799,6 +799,62 @@ mod voting_tests {
                 || msg.contains("doesn")
         ); // tolerate error string changes
     }
+
+    #[tokio::test]
+    async fn voting_compensation_remainder_is_distributed_deterministically() {
+        let mut producer = Producer::new("a".to_string(), [1u8; 32], 14);
+        producer.expected_producers = 3;
+        producer.first_hash = Some([5u8; 32]);
+        producer.partial_update = Some(mk_partial());
+
+        let mut phase = VotingPhase::new(producer);
+        let lh = [0u8; 32];
+        phase.add_candidate(candidate("a", 14, 5, lh));
+        phase.add_candidate(candidate("b", 14, 5, lh));
+        phase.add_candidate(candidate("c", 14, 5, lh));
+
+        let cfg = RewardConfig {
+            block_reward: 10,
+            fee_to_reward_pool_bps: 0,
+            producer_set_reward_bps: 7000,
+            waiting_pool_reward_bps: 3000,
+        };
+
+        let _vote = phase.execute(2, &cfg).await.unwrap();
+        let lsu = phase.producer.ledger_update.as_ref().unwrap();
+        let amounts: Vec<u64> = lsu.compensation_entries.iter().map(|e| e.amount).collect();
+        assert_eq!(amounts, vec![3, 2, 2]); // 7 split across a,b,c with remainder to sorted-first
+    }
+
+    #[tokio::test]
+    async fn voting_fee_to_reward_pool_flooring_is_deterministic() {
+        let mut producer = Producer::new("a".to_string(), [1u8; 32], 15);
+        producer.expected_producers = 2;
+        producer.first_hash = Some([6u8; 32]);
+        producer.partial_update = Some(PartialLedgerStateUpdate {
+            transaction_entries: Vec::new(),
+            transaction_signatures_hash: [0u8; 32],
+            total_fees: 10, // 30% => 3 routed to reward pool
+            timestamp: 0,
+        });
+
+        let mut phase = VotingPhase::new(producer);
+        let lh = [0u8; 32];
+        phase.add_candidate(candidate("a", 15, 6, lh));
+        phase.add_candidate(candidate("b", 15, 6, lh));
+
+        let cfg = RewardConfig {
+            block_reward: 1,
+            fee_to_reward_pool_bps: 3000,
+            producer_set_reward_bps: 7000,
+            waiting_pool_reward_bps: 3000,
+        };
+
+        let _vote = phase.execute(2, &cfg).await.unwrap();
+        let lsu = phase.producer.ledger_update.as_ref().unwrap();
+        let total_paid: u64 = lsu.compensation_entries.iter().map(|e| e.amount).sum();
+        assert_eq!(total_paid, 2); // total pool=4, producer share floor(4*0.7)=2
+    }
 }
 
 /// Synchronization Phase Implementation
