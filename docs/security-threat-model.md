@@ -6,7 +6,7 @@ It is the canonical input for:
 - `#262` epic: security threat model and adversarial test gate
 - `#271`: publish mainnet threat model and attack assumptions
 - `#272`: adversarial test execution evidence
-- `#273`: external review scope and remediation checklist
+- `#273`: security review scope and remediation checklist
 
 ## Security goals
 
@@ -84,7 +84,7 @@ It is the canonical input for:
   - min-peer maintenance with backoff/jitter
 - **Residual risk**:
   - stronger peer diversity and scoring still needed
-- **Verification path**: eclipse scenarios in `#272`; external review in `#273`.
+- **Verification path**: eclipse scenarios in `#272`; security review/triage process in `#273`.
 
 ### 5) Sybil pressure on economic eligibility
 
@@ -121,6 +121,15 @@ It is the canonical input for:
   - endpoint-level shaping and stricter cost controls need continuous hardening
 - **Verification path**: abuse workloads in `#272`.
 
+### 9) Vulnerability disclosure process failure
+
+- **Impact**: valid findings are delayed, mishandled, or disclosed unsafely.
+- **Current controls**:
+  - in-repo issue tracking and remediation evidence discipline
+- **Residual risk**:
+  - disclosure channel/SLA policy must be explicitly documented for launch
+- **Verification path**: disclosure/triage workflow definition under `#273`.
+
 ## Residual risks accepted for v1 (explicit)
 
 - Global internet-scale DDoS resistance is out of scope for protocol code alone.
@@ -133,6 +142,6 @@ To satisfy `#262` before launch:
 
 1. Threat model and assumptions are published and reviewed (`#271`).
 2. Adversarial test plan is executed with reproducible evidence (`#272`).
-3. External review scope and remediation workflow are defined (`#273`).
+3. Security review scope and remediation workflow are defined (`#273`), including community disclosure/triage policy.
 4. Residual risks are explicitly accepted or mitigated with owners and timelines.
 

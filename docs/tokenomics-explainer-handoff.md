@@ -101,6 +101,10 @@ Yes. Eligible waiting workers receive a share of cycle rewards and can accrue fe
 
 No. Fee credits are non-transferable and scoped to the same sender identity.
 
+### Could Catalyst run out of tokens quickly?
+
+No. At the v1 mint rate (`1 KAT` every `20s`), the theoretical numeric supply ceiling is extremely far out (about `11,699 years`, based on `u64` atom representation). In practice, this is a long-run runway rather than a near-term limit.
+
 ## Verification snippet for operators
 
 Use this JSON-RPC call to display live tokenomics parameters:

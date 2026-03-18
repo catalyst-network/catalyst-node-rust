@@ -34,6 +34,17 @@ Rationale:
 - avoids governance complexity of dynamic inflation in early network phases
 - aligns with fair-launch objective
 
+## Supply runway (numeric limits)
+
+With `1 KAT` minted per successful `20s` cycle and `1 KAT = 1_000_000_000 atoms`:
+
+- theoretical max representable total supply is bounded by `u64` atoms:
+  - `18_446_744_073_709_551_615 atoms`
+  - `18_446_744_073.709551615 KAT`
+- at `1 KAT` per cycle, reaching that numeric ceiling would take about `11,699 years` of continuous successful cycles
+
+This means v1 does not have a practical near-term risk of "running out" of representable supply.
+
 ## Reward model
 
 Per successful cycle:

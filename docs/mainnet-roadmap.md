@@ -27,7 +27,7 @@ Canonical tracking:
 - **Epic**: `#262`
 - **Threat model**: `#271`
 - **Adversarial tests**: `#272`
-- **External review scope/remediation**: `#273`
+- **Security review scope/remediation + disclosure policy**: `#273`
 
 ### 3) Reliability/performance gate
 
@@ -62,7 +62,8 @@ Canonical tracking:
 
 ## Additions I recommend (not explicitly in the list, but mainnet-critical)
 
-- **Security review/audit scope** is tracked in `#273`.
+- **No-budget security model**: launch can proceed without paid audit if reproducible adversarial and reliability evidence gates are complete.
+- **Security review/disclosure scope** is tracked in `#273` (community reporting + triage workflow).
 - **Monitoring/alerting** is tracked in `#280`.
 - **Genesis / launch runbook** is tracked in `#279`.
 

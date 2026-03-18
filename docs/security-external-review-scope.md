@@ -1,6 +1,6 @@
-# External security review scope and remediation checklist (mainnet)
+# Security review scope and remediation checklist (mainnet)
 
-This document defines the minimum external security review package required for mainnet launch readiness.
+This document defines the minimum security review package for mainnet launch readiness under a no-budget launch model.
 
 Tracking:
 
@@ -9,9 +9,18 @@ Tracking:
 
 ## Objective
 
-Define a clear, auditable external review scope and a deterministic remediation workflow so findings can be triaged, fixed, verified, and signed off before launch.
+Define a clear, auditable review scope and a deterministic remediation workflow so findings can be triaged, fixed, verified, and signed off before launch.
 
-## In-scope components for external review
+## Launch model (explicit)
+
+- Catalyst v1 launch does **not** require a paid third-party audit or paid penetration testing.
+- Launch readiness instead depends on:
+  - reproducible adversarial evidence (`#272`)
+  - reliability/chaos evidence (`#274`, `#275`)
+  - documented residual-risk acceptance and operational controls
+- Post-launch, community-led review is explicitly encouraged and tracked through responsible disclosure workflow.
+
+## In-scope components for security review
 
 Reviewers should focus on code paths that can cause consensus safety failures, liveness failures, or critical asset compromise.
 
@@ -96,7 +105,7 @@ Out-of-scope items can be tracked separately, but must not block launch-gate sig
 
 ## Required review deliverables
 
-The external reviewer package must include:
+The review package should include (from internal testing and/or community reports):
 
 1. Scope and methodology summary.
 2. Finding list with severity and exploit preconditions.
@@ -114,16 +123,28 @@ For each finding:
 4. Add/extend deterministic regression tests.
 5. Run relevant package tests and checks.
 6. Document behavior changes in `docs/` when externally visible.
-7. Request reviewer retest or internal adversarial confirmation.
+7. Request retest by reporter/reviewer where possible, or run internal adversarial confirmation.
 8. Mark as resolved only with evidence attached.
 
 ## Evidence requirements before closing `#273`
 
-- reviewer scope document attached/linked
+- scope document attached/linked
 - findings table with statuses (open/fixed/accepted)
 - all Critical findings resolved
 - High findings resolved or explicitly accepted with mitigation notes
 - remediation commits and test evidence linked per finding
+
+## Community disclosure and triage baseline
+
+Before launch, define and publish:
+
+- a security contact channel (for example: dedicated email or issue template)
+- a report intake template (impact, reproduction, affected version)
+- severity mapping (Critical/High/Medium/Low) and response expectations
+- a triage SLA target for first response and status updates
+- disclosure guidance (private reporting preferred before coordinated public disclosure)
+
+After launch, continue publishing remediation evidence in-repo and maintain a public acknowledgement path for valid reports.
 
 ## Handoff to `#272`
 
