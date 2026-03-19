@@ -18,6 +18,12 @@ Scope:
 
 ## Executed CI-suitable scenarios
 
+### Track A refresh (latest local rerun)
+
+- **Date**: 2026-03-08
+- **Execution mode**: local scripted run (CI-safe)
+- **Aggregate result**: all listed Track A scenarios passed again with the same deterministic outcomes.
+
 ### 1) Envelope wire version rejection
 
 - **Command**
@@ -68,6 +74,11 @@ These scenarios are defined in `docs/adversarial-test-plan.md` and remain requir
 - high-QPS mixed-payload DoS flood with resource/liveness metrics
 
 Status: **pending execution evidence**.
+
+Operator decision for Track B:
+
+- run WAN/chaos scenarios on the currently unannounced public test network (no external users observed)
+- reset the network state after disruptive tests complete
 
 ## Evidence gap summary
 
