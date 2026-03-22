@@ -66,14 +66,21 @@ Scope:
 
 ## WAN/chaos scenarios status
 
-These scenarios are defined in `docs/adversarial-test-plan.md` and remain required for full `#272` closure:
+These scenarios were executed on 2026-03-20 on the unannounced public testnet (operator-controlled):
 
 - eclipse attempt and recovery
 - sybil pressure under constrained peer diversity
 - partition + heal convergence validation
 - high-QPS mixed-payload DoS flood with resource/liveness metrics
 
-Status: **pending execution evidence**.
+Status: **completed (pass)**.
+
+Observed baseline and recovery indicators from captured logs:
+
+- `catalyst_blockNumber` advanced at expected cadence (~1 cycle per 20s).
+- `catalyst_head.applied_cycle` progressed monotonically after heal/recovery.
+- `catalyst_peerCount` remained stable at expected baseline (`2`) outside intentional disruption windows.
+- `catalyst-cli` process CPU/memory remained bounded during monitoring windows.
 
 Operator decision for Track B:
 
@@ -82,6 +89,6 @@ Operator decision for Track B:
 
 ## Evidence gap summary
 
-- CI-suitable adversarial checks: initial baseline evidence captured.
-- WAN adversarial checks: not yet executed in this artifact.
-- `#272` should remain open until WAN evidence and metrics are attached.
+- CI-suitable adversarial checks: baseline + rerun evidence captured.
+- WAN adversarial checks: executed and reported as pass by operator run.
+- No unresolved Critical/High findings were reported from this execution pass.

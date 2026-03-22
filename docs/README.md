@@ -62,12 +62,17 @@ These docs are written against the current `catalyst-node-rust` implementation (
   - Threat matrix mapped to controls and test/review gates
 
 - **Security external review scope**: [`security-external-review-scope.md`](./security-external-review-scope.md)
-  - In-scope components for third-party security review
+  - In-scope components for security review under the no-budget launch model
   - Severity policy and remediation evidence checklist
 
 - **Security adversarial evidence**: [`security-adversarial-evidence.md`](./security-adversarial-evidence.md)
   - Reproducible command log for CI-suitable adversarial checks
-  - Status tracking for remaining WAN/chaos evidence
+  - WAN/chaos execution status and outcomes
+
+- **WAN soak/load/chaos gate**: [`wan-soak-load-chaos-gate.md`](./wan-soak-load-chaos-gate.md)
+  - Thresholds and execution checklist for `#274`
+  - Evidence template for soak/load/chaos runs
+  - Archived logs (zip): [`evidence/track274-wan-gate-evidence.zip`](./evidence/track274-wan-gate-evidence.zip) — [`evidence/README.md`](./evidence/README.md)
 
 ## Important implementation notes (current state)
 
