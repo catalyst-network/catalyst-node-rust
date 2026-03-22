@@ -74,7 +74,7 @@ Use this document to **drive execution** before cutting a public mainnet. It con
 | E2 | Genesis / launch ceremony runbook (ordering, abort criteria, comms). | [`evidence/phase-e-operations-evidence.md`](./evidence/phase-e-operations-evidence.md), [`network-identity.md`](./network-identity.md) | `#279` |
 | E3 | Monitoring, alerting, on-call / incident response defined. | [`tester-guide.md`](./tester-guide.md), [`evidence/phase-e-operations-evidence.md`](./evidence/phase-e-operations-evidence.md) | `#280` |
 
-**Sign-off:** Name / date: _______________
+**Sign-off:** Name / date: TheNewAutonomy 22nd March 2026
 
 **Note:** Phase E combines **repo docs** with **org-specific** custody, on-call, and launch comms — complete the tables in [`evidence/phase-e-operations-evidence.md`](./evidence/phase-e-operations-evidence.md) to close **#278–#280**.
 
@@ -87,7 +87,7 @@ Use this document to **drive execution** before cutting a public mainnet. It con
 | F1 | RPC surfaces needed for wallets/explorers verified; consistency tests green. | [`builder-guide.md`](./builder-guide.md), [`wallet-interop.md`](./wallet-interop.md), [`evidence/phase-f-integrations-evidence.md`](./evidence/phase-f-integrations-evidence.md) | `#266`, `#281` |
 | F2 | Indexer / explorer expectations documented for mainnet. | [`explorer-handoff.md`](./explorer-handoff.md), [`evidence/phase-f-integrations-evidence.md`](./evidence/phase-f-integrations-evidence.md) | `#282` |
 
-**Sign-off:** Name / date: _______________
+**Sign-off:** Name / date: TheNewAutonomy 22nd March 2026
 
 **Note:** Complete [`evidence/phase-f-integrations-evidence.md`](./evidence/phase-f-integrations-evidence.md) (mainnet RPC URL + identity table, F1/F2 checkboxes) to close **#266**, **#281**, **#282**.
 
@@ -97,10 +97,12 @@ Use this document to **drive execution** before cutting a public mainnet. It con
 
 | # | Item | Evidence / doc | GitHub |
 |---|------|----------------|--------|
-| G1 | ABI / logs / receipt fidelity validated for target toolchains. | Smoke results | `#267`, `#283` |
-| G2 | Dapp smoke suite + compatibility matrix pass. | Matrix artifact | `#284` |
+| G1 | ABI / logs / receipt fidelity validated for target toolchains. | [`evm-deploy.md`](./evm-deploy.md), [`builder-guide.md`](./builder-guide.md), [`evidence/phase-g-evm-evidence.md`](./evidence/phase-g-evm-evidence.md) | `#267`, `#283` |
+| G2 | Dapp smoke suite + compatibility matrix pass. | [`evidence/phase-g-evm-evidence.md`](./evidence/phase-g-evm-evidence.md) | `#284` |
 
 **Sign-off:** Name / date: _______________
+
+**Note:** If EVM dapps are **not** a v1 mainnet requirement, complete the **N/A** section in [`evidence/phase-g-evm-evidence.md`](./evidence/phase-g-evm-evidence.md) and defer **#267–#284** with rationale. Otherwise fill G1/G2 and the toolchain matrix.
 
 ---
 

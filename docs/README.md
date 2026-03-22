@@ -10,6 +10,7 @@ These docs are written against the current `catalyst-node-rust` implementation (
 - **Phase D / #264–#277 release + upgrade evidence:** [`evidence/phase-d-release-engineering-evidence.md`](./evidence/phase-d-release-engineering-evidence.md)
 - **Phase E / #278–#280 operations (keys, launch, monitoring):** [`evidence/phase-e-operations-evidence.md`](./evidence/phase-e-operations-evidence.md)
 - **Phase F / #266–#282 wallet + explorer integrations:** [`evidence/phase-f-integrations-evidence.md`](./evidence/phase-f-integrations-evidence.md)
+- **Phase G / #267–#284 EVM production compatibility:** [`evidence/phase-g-evm-evidence.md`](./evidence/phase-g-evm-evidence.md)
 
 ## Guides
 

@@ -45,3 +45,11 @@ Key management, genesis/launch ceremony, monitoring/on-call (**#278**, **#279**,
 RPC / wallet / explorer integration sign-off (**#266**, **#281**, **#282**) for checklist **Phase F**.
 
 - **Location:** [`phase-f-integrations-evidence.md`](./phase-f-integrations-evidence.md)
+
+---
+
+## `phase-g-evm-evidence.md`
+
+EVM deploy/call / receipt / toolchain matrix (**#267**, **#283**, **#284**) for checklist **Phase G** (or N/A).
+
+- **Location:** [`phase-g-evm-evidence.md`](./phase-g-evm-evidence.md)
