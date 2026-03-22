@@ -29,3 +29,11 @@ Reset / recovery / backfill sign-off for GitHub issue **#275** (checklist **C2**
 Release process, provenance (**#264**, **#276**), and upgrade/rollback matrix (**#277**) for checklist **Phase D**.
 
 - **Location:** [`phase-d-release-engineering-evidence.md`](./phase-d-release-engineering-evidence.md)
+
+---
+
+## `phase-e-operations-evidence.md`
+
+Key management, genesis/launch ceremony, monitoring/on-call (**#278**, **#279**, **#280**) for checklist **Phase E**.
+
+- **Location:** [`phase-e-operations-evidence.md`](./phase-e-operations-evidence.md)

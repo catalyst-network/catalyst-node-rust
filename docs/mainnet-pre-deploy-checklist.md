@@ -60,7 +60,7 @@ Use this document to **drive execution** before cutting a public mainnet. It con
 | D1 | Release build process documented; binaries reproducible or provenance captured as required. | [`release-process.md`](./release-process.md), [`evidence/phase-d-release-engineering-evidence.md`](./evidence/phase-d-release-engineering-evidence.md) | `#264`, `#276` |
 | D2 | Upgrade matrix + rollback path tested (coordinated upgrade assumptions documented). | [`evidence/phase-d-release-engineering-evidence.md`](./evidence/phase-d-release-engineering-evidence.md) (matrix + [`node-operator-guide.md`](./node-operator-guide.md)) | `#277` |
 
-**Sign-off:** Name / date: _______________
+**Sign-off:** Name / date: TheNewAutonomy 22nd March 2026
 
 **Note:** Full bit-reproducible builds / SBOM may be optional for v1; this repo documents **tag + CI + `--locked` + SHA256 artifacts** — see the Phase D evidence file. Fill D1/D2 sign-offs and the upgrade matrix there to close the phase.
 
@@ -70,11 +70,13 @@ Use this document to **drive execution** before cutting a public mainnet. It con
 
 | # | Item | Evidence / doc | GitHub |
 |---|------|----------------|--------|
-| E1 | Key management runbook (genesis keys, validator keys, backups, compromise response). | [`node-operator-guide.md`](./node-operator-guide.md) | `#278` |
-| E2 | Genesis / launch ceremony runbook (ordering, abort criteria, comms). | Runbook artifact | `#279` |
-| E3 | Monitoring, alerting, on-call / incident response defined. | Runbook | `#280` |
+| E1 | Key management runbook (genesis keys, validator keys, backups, compromise response). | [`node-operator-guide.md`](./node-operator-guide.md), [`evidence/phase-e-operations-evidence.md`](./evidence/phase-e-operations-evidence.md) | `#278` |
+| E2 | Genesis / launch ceremony runbook (ordering, abort criteria, comms). | [`evidence/phase-e-operations-evidence.md`](./evidence/phase-e-operations-evidence.md), [`network-identity.md`](./network-identity.md) | `#279` |
+| E3 | Monitoring, alerting, on-call / incident response defined. | [`tester-guide.md`](./tester-guide.md), [`evidence/phase-e-operations-evidence.md`](./evidence/phase-e-operations-evidence.md) | `#280` |
 
 **Sign-off:** Name / date: _______________
+
+**Note:** Phase E combines **repo docs** with **org-specific** custody, on-call, and launch comms — complete the tables in [`evidence/phase-e-operations-evidence.md`](./evidence/phase-e-operations-evidence.md) to close **#278–#280**.
 
 ---
 
