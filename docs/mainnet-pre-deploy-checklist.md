@@ -84,10 +84,12 @@ Use this document to **drive execution** before cutting a public mainnet. It con
 
 | # | Item | Evidence / doc | GitHub |
 |---|------|----------------|--------|
-| F1 | RPC surfaces needed for wallets/explorers verified; consistency tests green. | [`builder-guide.md`](./builder-guide.md), [`wallet-interop.md`](./wallet-interop.md) | `#266`, `#281` |
-| F2 | Indexer / explorer expectations documented for mainnet. | [`explorer-handoff.md`](./explorer-handoff.md) | `#282` |
+| F1 | RPC surfaces needed for wallets/explorers verified; consistency tests green. | [`builder-guide.md`](./builder-guide.md), [`wallet-interop.md`](./wallet-interop.md), [`evidence/phase-f-integrations-evidence.md`](./evidence/phase-f-integrations-evidence.md) | `#266`, `#281` |
+| F2 | Indexer / explorer expectations documented for mainnet. | [`explorer-handoff.md`](./explorer-handoff.md), [`evidence/phase-f-integrations-evidence.md`](./evidence/phase-f-integrations-evidence.md) | `#282` |
 
 **Sign-off:** Name / date: _______________
+
+**Note:** Complete [`evidence/phase-f-integrations-evidence.md`](./evidence/phase-f-integrations-evidence.md) (mainnet RPC URL + identity table, F1/F2 checkboxes) to close **#266**, **#281**, **#282**.
 
 ---
 

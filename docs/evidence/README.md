@@ -37,3 +37,11 @@ Release process, provenance (**#264**, **#276**), and upgrade/rollback matrix (*
 Key management, genesis/launch ceremony, monitoring/on-call (**#278**, **#279**, **#280**) for checklist **Phase E**.
 
 - **Location:** [`phase-e-operations-evidence.md`](./phase-e-operations-evidence.md)
+
+---
+
+## `phase-f-integrations-evidence.md`
+
+RPC / wallet / explorer integration sign-off (**#266**, **#281**, **#282**) for checklist **Phase F**.
+
+- **Location:** [`phase-f-integrations-evidence.md`](./phase-f-integrations-evidence.md)

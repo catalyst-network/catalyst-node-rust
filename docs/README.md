@@ -9,6 +9,7 @@ These docs are written against the current `catalyst-node-rust` implementation (
 - **#275 / C2 reset–recovery evidence (retrospective template):** [`evidence/track275-reset-recovery-evidence.md`](./evidence/track275-reset-recovery-evidence.md)
 - **Phase D / #264–#277 release + upgrade evidence:** [`evidence/phase-d-release-engineering-evidence.md`](./evidence/phase-d-release-engineering-evidence.md)
 - **Phase E / #278–#280 operations (keys, launch, monitoring):** [`evidence/phase-e-operations-evidence.md`](./evidence/phase-e-operations-evidence.md)
+- **Phase F / #266–#282 wallet + explorer integrations:** [`evidence/phase-f-integrations-evidence.md`](./evidence/phase-f-integrations-evidence.md)
 
 ## Guides
 
