@@ -11,3 +11,13 @@ WAN soak / load / chaos gate for GitHub issue **#274** (epic **#263**).
   - `evidence/{eu,us,asia}/track274/chaos/` — chaos run (same capture files + `events.log` on ASIA)
 
 **Summary and pass/fail:** see [`../wan-soak-load-chaos-gate.md`](../wan-soak-load-chaos-gate.md).
+
+---
+
+## `track275-reset-recovery-evidence.md`
+
+Reset / recovery / backfill sign-off for GitHub issue **#275** (checklist **C2**).
+
+- **Purpose:** retrospective documentation when resets were performed but not logged per event.
+- **Location:** [`track275-reset-recovery-evidence.md`](./track275-reset-recovery-evidence.md)
+- **Action:** fill in, commit, then close **#275** with the doc link.

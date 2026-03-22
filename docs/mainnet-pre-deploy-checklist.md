@@ -23,7 +23,7 @@ Use this document to **drive execution** before cutting a public mainnet. It con
 | A3 | Anti-sybil / waiting-worker eligibility acceptable for launch risk. | Code + `#270` closure | `#270` |
 | A4 | Testnet or staging validation run completed (issuance RPC, progression). | [`tokenomics-testnet-validation.md`](./tokenomics-testnet-validation.md) | — |
 
-**Sign-off:** Name / date: _______________
+**Sign-off:** Name / date: TheNewAutonomy 22nd March 2026
 
 ---
 
@@ -36,7 +36,7 @@ Use this document to **drive execution** before cutting a public mainnet. It con
 | B3 | Review scope + remediation + disclosure workflow agreed. | [`security-external-review-scope.md`](./security-external-review-scope.md) | `#273` |
 | B4 | **Critical** findings: fixed + re-verified. **High**: fixed or written acceptance + compensating controls. | Same | `#262` |
 
-**Sign-off:** Name / date: _______________
+**Sign-off:** Name / date: TheNewAutonomy 22nd March 2026
 
 ---
 
@@ -45,9 +45,11 @@ Use this document to **drive execution** before cutting a public mainnet. It con
 | # | Item | Evidence / doc | GitHub |
 |---|------|----------------|--------|
 | C1 | WAN soak / load / chaos gate meets thresholds (or failures have follow-up issues). | [`wan-soak-load-chaos-gate.md`](./wan-soak-load-chaos-gate.md) | `#263`, `#274` |
-| C2 | Reset / recovery / backfill reliability acceptable for operators. | Evidence report | `#275` |
+| C2 | Reset / recovery / backfill reliability acceptable for operators. | [`evidence/track275-reset-recovery-evidence.md`](./evidence/track275-reset-recovery-evidence.md) (retrospective OK) | `#275` |
 
 **Sign-off:** Name / date: _______________
+
+**Note:** If you reset testnets many times but did not log each run, complete **C2** by filling in the retrospective sections in `evidence/track275-reset-recovery-evidence.md` and linking it when closing **#275**.
 
 ---
 

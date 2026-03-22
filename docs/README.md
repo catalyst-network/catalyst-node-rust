@@ -6,6 +6,7 @@ These docs are written against the current `catalyst-node-rust` implementation (
 
 - **Pre-deploy checklist (executable gates):** [`mainnet-pre-deploy-checklist.md`](./mainnet-pre-deploy-checklist.md)
 - **Roadmap + GitHub epics (`#260`–`#284`):** [`mainnet-roadmap.md`](./mainnet-roadmap.md)
+- **#275 / C2 reset–recovery evidence (retrospective template):** [`evidence/track275-reset-recovery-evidence.md`](./evidence/track275-reset-recovery-evidence.md)
 
 ## Guides
 
