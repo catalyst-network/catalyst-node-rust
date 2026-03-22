@@ -37,7 +37,7 @@ log = "0.4"
 env_logger = "0.10"
 
 # Metrics (optional)
-prometheus = { version = "0.13", optional = true }
+prometheus = { version = "0.14", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -15,7 +15,8 @@ catalyst-crypto = { path = "../catalyst-crypto" }
 rbpf = "0.3"
 
 # WASM support for native runtime
-wasmtime = "15.0"
+# >=24.0.5 addresses RUSTSEC advisories for unsound/jit-debug issues in older wasmtime lines.
+wasmtime = "24.0.6"
 
 # Basic VM components
 serde = { version = "1.0", features = ["derive"] }

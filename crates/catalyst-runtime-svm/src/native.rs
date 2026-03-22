@@ -1,4 +1,4 @@
-use crate::{SvmConfig, runtime::Runtime};
+use crate::SvmConfig;
 use catalyst_core::{ExecutionResult, ExecutionContext, RuntimeError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

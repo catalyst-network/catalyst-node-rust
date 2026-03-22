@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 # Error handling
 thiserror = "1.0"
 # Keep only prometheus for now (simplest metrics solution)
-prometheus = { version = "0.13", optional = true }
+prometheus = { version = "0.14", optional = true }
 
 # Async support - REQUIRED for your traits
 async-trait = "0.1"

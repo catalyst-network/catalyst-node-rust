@@ -14,7 +14,7 @@ catalyst-network = { path = "../catalyst-network" }
 catalyst-crypto = { path = "../catalyst-crypto" }
 
 # JSON-RPC
-jsonrpsee = { version = "0.21", features = ["server", "macros"] }
+jsonrpsee = { version = "0.26", features = ["server", "macros"] }
 
 # HTTP server
 hyper = "1.0"
