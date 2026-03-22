@@ -166,10 +166,38 @@ testnet_test_basic() {
   echo "node1_pubkey=$node1_pubkey"
 
   echo "sending faucet -> node1 (amount 3)"
-  cargo run -q -p catalyst-cli -- send "$node1_pubkey" 3 --key-file testnet/faucet.key --rpc-url "$rpc"
+  local fund_out tx_id
+  fund_out="$("$BIN" send "$node1_pubkey" 3 --key-file testnet/faucet.key --rpc-url "$rpc" 2>&1)" || true
+  echo "$fund_out"
+  tx_id="$(echo "$fund_out" | awk '/^tx_id:/{print $2}')"
+  if [ -n "$tx_id" ]; then
+    wait_for_tx_applied "$rpc" "$tx_id" 180 || echo "WARN: faucet->node1 tx not applied within timeout" >&2
+  fi
 
   echo "head: $(rpc_call "$rpc" catalyst_head '[]' | python3 -c 'import sys,json; print(json.load(sys.stdin).get("result"))' 2>/dev/null || true)"
-  echo "balance(node1): $(rpc_call "$rpc" catalyst_getBalance "[\"${node1_pubkey}\"]" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("result"))')"
+  echo "balance(node1): $(rpc_balance_atoms "$rpc" "$node1_pubkey")"
+}
+
+# Parse JSON-RPC result for catalyst_getBalance (handles null/error responses).
+rpc_balance_atoms() {
+  local rpc="$1"
+  local addr="$2"
+  rpc_call "$rpc" catalyst_getBalance "[\"${addr}\"]" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    r = d.get("result")
+    if r is None:
+        err = d.get("error")
+        if err:
+            sys.stderr.write("getBalance error: %s\n" % err)
+        print("0")
+    else:
+        print(r)
+except Exception as e:
+    sys.stderr.write("getBalance parse error: %s\n" % e)
+    print("0")
+'
 }
 
 wait_for_balance_at_least() {
@@ -180,14 +208,63 @@ wait_for_balance_at_least() {
   local deadline=$(( $(date +%s) + timeout_secs ))
   while true; do
     local bal
-    bal="$(rpc_call "$rpc" catalyst_getBalance "[\"${addr}\"]" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("result","0"))')"
-    if [ "${bal:-0}" -ge "$min_balance" ]; then
+    bal="$(rpc_balance_atoms "$rpc" "$addr")"
+    if [ -n "${bal:-}" ] && [ "${bal}" -eq "${bal}" ] 2>/dev/null && [ "${bal}" -ge "$min_balance" ]; then
       return 0
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
       return 1
     fi
     sleep 2
+  done
+}
+
+# Wait until tx is applied (or dropped/failed). send() returns before inclusion; balance polls need this.
+wait_for_tx_applied() {
+  local rpc="$1"
+  local tx_hash="$2"
+  local timeout_secs="${3:-180}"
+  local deadline=$(( $(date +%s) + timeout_secs ))
+  [ -n "$tx_hash" ] || return 1
+  while true; do
+    local status success err
+    status="$(rpc_call "$rpc" catalyst_getTransactionReceipt "[\"${tx_hash}\"]" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    r = d.get("result")
+    if r is None:
+        print("none")
+    else:
+        st = r.get("status", "")
+        if st == "applied" and r.get("success") is False:
+            print("failed:" + str(r.get("error", "unknown")))
+        else:
+            print(st)
+except Exception as e:
+    print("parse_err", file=sys.stderr)
+    print("none")
+')"
+    case "$status" in
+      applied)
+        return 0
+        ;;
+      failed:*)
+        die "transaction applied with failure: ${status#failed:}"
+        ;;
+      dropped)
+        die "transaction was dropped (tx_id=${tx_hash})"
+        ;;
+      none|pending|selected|"")
+        ;;
+      *)
+        ;;
+    esac
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "Last receipt status for ${tx_hash}: ${status:-unknown}" >&2
+      return 1
+    fi
+    sleep 1
   done
 }
 
@@ -203,8 +280,13 @@ testnet_test_contract() {
   [ -n "$evm_pk" ] || die "could not derive evm wallet pubkey"
 
   echo "Funding fresh EVM wallet from faucet..."
-  cargo run -q -p catalyst-cli -- send "$evm_pk" 100 --key-file testnet/faucet.key --rpc-url "$rpc"
-  wait_for_balance_at_least "$rpc" "$evm_pk" 1 120 || die "evm wallet funding not observed"
+  local fund_out tx_id
+  fund_out="$("$BIN" send "$evm_pk" 100 --key-file testnet/faucet.key --rpc-url "$rpc" 2>&1)" || true
+  echo "$fund_out"
+  tx_id="$(echo "$fund_out" | awk '/^tx_id:/{print $2}')"
+  [ -n "$tx_id" ] || die "send did not return tx_id (check faucet key and RPC)"
+  wait_for_tx_applied "$rpc" "$tx_id" 180 || die "faucet funding tx did not apply (tx_id=${tx_id})"
+  wait_for_balance_at_least "$rpc" "$evm_pk" 1 90 || die "evm wallet funding not observed after applied tx (check getBalance / execution)"
 
   echo "Deploying deterministic initcode contract (returns 0x2a)..."
   local out

@@ -91,6 +91,8 @@ CC=gcc-13 CXX=g++-13 make testnet-contract-test
 
 If either command fails, treat it as a regression signal and capture logs before rollout.
 
+**`testnet-contract-test` / “evm wallet funding not observed”:** The contract harness funds a fresh wallet via `send`, then checks balance. `send` submits a tx and returns immediately; the script waits for `catalyst_getTransactionReceipt` to show `applied` before asserting balance. If this still fails, check `catalyst_getTransactionReceipt` for the printed `tx_id`, faucet balance, and node logs.
+
 ## 8) Teardown
 
 ```bash
