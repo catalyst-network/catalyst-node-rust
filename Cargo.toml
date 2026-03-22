@@ -38,7 +38,7 @@ cid = "0.10"
 multihash = "0.19"
 
 # Networking with libp2p
-libp2p = { version = "0.53", features = [
+libp2p = { version = "0.56", features = [
     "kad",
     "request-response",
     "gossipsub",

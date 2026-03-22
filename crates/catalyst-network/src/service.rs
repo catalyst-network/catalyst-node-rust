@@ -364,7 +364,7 @@ impl NetworkService {
                                 }
                             }
                             SwarmEvent::Behaviour(BehaviourEvent::Identify(e)) => {
-                                if let identify::Event::Received { peer_id, info } = e {
+                                if let identify::Event::Received { peer_id, info, .. } = e {
                                     let pv = info.protocol_version;
                                     if pv != IDENTIFY_PROTOCOL_VERSION {
                                         log_warn!(

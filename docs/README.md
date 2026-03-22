@@ -65,6 +65,9 @@ These docs are written against the current `catalyst-node-rust` implementation (
   - In-scope components for security review under the no-budget launch model
   - Severity policy and remediation evidence checklist
 
+- **Security dependency updates**: [`security-dependency-updates.md`](./security-dependency-updates.md)
+  - High/critical dependency bumps (libp2p, rustls/aws-lc, quinn, yamux) and known residuals
+
 - **Security adversarial evidence**: [`security-adversarial-evidence.md`](./security-adversarial-evidence.md)
   - Reproducible command log for CI-suitable adversarial checks
   - WAN/chaos execution status and outcomes
