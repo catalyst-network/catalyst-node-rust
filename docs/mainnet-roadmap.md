@@ -1,5 +1,7 @@
 # Mainnet readiness roadmap (working)
 
+**Executable checklist:** [`mainnet-pre-deploy-checklist.md`](./mainnet-pre-deploy-checklist.md)
+
 This doc translates “what’s left before mainnet” into trackable epics/issues in this repo.
 It’s intentionally pragmatic: **public testnet stability + developer usability first**, then economics + launch ceremony.
 

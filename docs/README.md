@@ -2,6 +2,11 @@
 
 These docs are written against the current `catalyst-node-rust` implementation (CLI: `catalyst-cli`).
 
+## Mainnet readiness
+
+- **Pre-deploy checklist (executable gates):** [`mainnet-pre-deploy-checklist.md`](./mainnet-pre-deploy-checklist.md)
+- **Roadmap + GitHub epics (`#260`–`#284`):** [`mainnet-roadmap.md`](./mainnet-roadmap.md)
+
 ## Guides
 
 - **Node operators**: [`node-operator-guide.md`](./node-operator-guide.md)
