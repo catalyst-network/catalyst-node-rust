@@ -1122,7 +1122,7 @@ checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
 name = "catalyst-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "alloy-primitives",
  "anyhow",
@@ -1297,7 +1297,7 @@ dependencies = [
 
 [[package]]
 name = "catalyst-rpc"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",

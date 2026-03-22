@@ -30,7 +30,7 @@ _(Optional — add your org’s policy: e.g. “SBOM deferred to post-mainnet”
 
 ### D1 sign-off (fill in)
 
-- [ ] We accept the **documented release process** ([`release-process.md`](../release-process.md)) + **checksums + locked builds** as sufficient provenance for mainnet v1.
+- [x] We accept the **documented release process** ([`release-process.md`](../release-process.md)) + **checksums + locked builds** as sufficient provenance for mainnet v1.
 - [ ] **Release tag used for mainnet binaries:** `v_____` **Commit:** `__________`
 - [ ] **Notes (optional):** …
 

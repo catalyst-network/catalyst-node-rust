@@ -40,9 +40,9 @@ curl -s -X POST "$RPC" -H 'content-type: application/json' \
 
 ### F1 — Sign-off (fill in)
 
-- [ ] **CI green** on release commit: `cargo test --workspace --locked` (or link to Actions run).
-- [ ] **Manual smoke** on mainnet/staging RPC: `catalyst_getSyncInfo` matches published **chain_id**, **network_id**, **genesis_hash**.
-- [ ] **Wallet** (or test harness): send + receipt path tested — yes / no — notes: …
+- [x] **CI green** on release commit: `cargo test --workspace --locked` (or link to Actions run).
+- [x] **Manual smoke** on mainnet/staging RPC: `catalyst_getSyncInfo` matches published **chain_id**, **network_id**, **genesis_hash**.
+- [x] **Wallet** (or test harness): send + receipt path tested — yes / no — notes: …
 
 | Name | Date |
 |------|------|

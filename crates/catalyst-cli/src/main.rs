@@ -34,7 +34,7 @@ struct ValidatorsFile {
 #[derive(Parser)]
 #[command(name = "catalyst")]
 #[command(about = "Catalyst Network Node - A truly decentralized blockchain")]
-#[command(version = "0.1.0")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
     /// Configuration file path
     #[arg(short, long, default_value = "catalyst.toml")]

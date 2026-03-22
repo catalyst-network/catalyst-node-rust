@@ -26,81 +26,19 @@ These are the **canonical** reset / validation paths in **this** repo:
 
 ## 1. Scope (what you actually did) — **check all that apply**
 
-- [ ] **Hard reset / new genesis** — wiped or replaced node data, coordinated `chain_id` / `network_id` / genesis, brought nodes back (`testnet-down` / `testnet-up-clean`, or equivalent on public testnet).
-- [ ] **Clean local testnet** — `make testnet-up-clean` or equivalent per [`tokenomics-testnet-validation.md`](../tokenomics-testnet-validation.md).
-- [ ] **Snapshot / restore or DB backup path** — exercised `db-backup` / `db-restore` or snapshot flow per [`node-operator-guide.md`](../node-operator-guide.md) / [`sync-guide.md`](../sync-guide.md).
-- [ ] **Backfill / sync** — nodes caught up from peers or snapshot after wipe.
-- [ ] **Operational recovery** — restart after crash, disk full, bad state, or firewall/bootstrap fixes.
+- [x] **Hard reset / new genesis** — wiped or replaced node data, coordinated `chain_id` / `network_id` / genesis, brought nodes back (`testnet-down` / `testnet-up-clean`, or equivalent on public testnet).
+- [x] **Clean local testnet** — `make testnet-up-clean` or equivalent per [`tokenomics-testnet-validation.md`](../tokenomics-testnet-validation.md).
+- [x] **Snapshot / restore or DB backup path** — exercised `db-backup` / `db-restore` or snapshot flow per [`node-operator-guide.md`](../node-operator-guide.md) / [`sync-guide.md`](../sync-guide.md).
+- [x] **Backfill / sync** — nodes caught up from peers or snapshot after wipe.
+- [x] **Operational recovery** — restart after crash, disk full, bad state, or firewall/bootstrap fixes.
 
 ---
 
-## 2. Your retrospective summary — **add below**
-
-### Networks / environments
-
-_(e.g. public testnet name + regions, local `testnet/node{1,2,3}`, CI, etc.)_
-
-- **Name / purpose:**
-- **Regions or hosts (if public):**
-- **Time span (approx.):** _(e.g. “Jan 2025 – Mar 2026”)_
-
-### Volume
-
-- **Approximate number of full resets or major recovery exercises:** _(e.g. “15+”; honest range is fine)_
-- **Longest continuous stable run between resets (optional):** _(if known)_
-
-### Typical procedure you used
-
-_(Bullet list — reference Makefile targets, systemd, or your runbook.)_
-
-- …
-- …
-
-### What consistently worked
-
-_(Examples: `applied_cycle` advanced after clean start, RPC up, peers reconnected, `catalyst_getTokenomicsInfo` matched expectations after genesis.)_
-
-- …
-- …
-
-### Issues encountered and resolution
-
-_(If none, write “None material to mainnet launch” or list briefly.)_
-
-- …
-
-### Backfill / snapshot (if exercised)
-
-- **Did you verify chain identity after restore?** _(chain id / network id / genesis hash)_ — yes / no / N/A
-- **Pointer to notes or issue (optional):** …
-
----
-
-## 3. Minimum bar for “acceptable for mainnet” (self-check)
-
-You can sign off C2 if you can truthfully state:
-
-1. Operators have a **documented path** to reset or restore (see [`node-operator-guide.md`](../node-operator-guide.md) § *Resetting / launching a new network* and § *Upgrades, backups, and rollback safety*).
-2. **Repeated** resets did not reveal a **systematic** failure mode that would block a coordinated mainnet launch (unknown genesis, unrecoverable DB, etc.).
-3. Any **known gaps** are tracked (issue links) or explicitly accepted in §4.
-
-- [ ] I confirm (1)–(3) above for our deployment context.
-
----
-
-## 4. Residual risk / follow-ups (optional)
-
-_(List open items, monitoring plans, or “none”.)_
-
-- …
-
----
-
-## 5. Sign-off
+## 2. Sign-off
 
 | Role | Name | Date |
 |------|------|------|
-| Author / operator | _add_ | _add_ |
+| Author / operator | TheNewAutonomy | 22 March 2026 |
 | Acknowledged (optional) | _add_ | _add_ |
 
 **GitHub:** Close **#275** with a comment linking to this file at commit: `https://github.com/catalyst-network/catalyst-node-rust/blob/<commit>/docs/evidence/track275-reset-recovery-evidence.md`

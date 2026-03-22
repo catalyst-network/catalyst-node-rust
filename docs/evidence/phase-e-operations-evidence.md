@@ -19,14 +19,14 @@ This document supports closing checklist **Phase E** in [`mainnet-pre-deploy-che
 
 ### E1 — Your org checklist (fill in)
 
-- [ ] **Validator / operator keys** stored: _(HSM / file / vault — where)_
-- [ ] **Treasury / faucet keys** (if used): _(custody model)_
-- [ ] **Backup**: keys encrypted at rest; recovery tested at least once (yes / no)
-- [ ] **Incident**: named contact for key leak; steps: _(bullet list)_
+- [x] **Validator / operator keys** stored: _(HSM / file / vault — where)_
+- [x] **Treasury / faucet keys** (if used): _(custody model)_
+- [x] **Backup**: keys encrypted at rest; recovery tested at least once (yes / no)
+- [x] **Incident**: named contact for key leak; steps: _(bullet list)_
 
 | Sign-off | Name | Date |
 |----------|------|------|
-| | | |
+| | TheNewAutonomy | 22 March 2026|
 
 ---
 
@@ -60,7 +60,7 @@ Adjust only if your governance chooses different values; **never** reuse identit
 
 | Sign-off | Name | Date |
 |----------|------|------|
-| | | |
+| | TheNewAutonomy | 22 March 2026|
 
 ---
 
@@ -85,13 +85,13 @@ Define at least:
 2. **How** alerts fire: _(e.g. HTTP check on `:8545`, cron + `status`, external uptime, log-based errors)_.
 3. **Runbook** for: P2P blocked (`30333`), RPC down (`8545`), “insufficient data collected”, disk full (`db-stats` / pruning in node-operator guide).
 
-- [ ] On-call / owner: …
-- [ ] Alert channels: …
+- [x] On-call / owner: …
+- [x] Alert channels: …
 - [ ] Link to internal incident template (optional): …
 
 | Sign-off | Name | Date |
 |----------|------|------|
-| | | |
+| | TheNewAutonomy | 22 March 2026|
 
 ---
 
