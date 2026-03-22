@@ -100,7 +100,7 @@ Use this document to **drive execution** before cutting a public mainnet. It con
 | G1 | ABI / logs / receipt fidelity validated for target toolchains. | [`evm-deploy.md`](./evm-deploy.md), [`builder-guide.md`](./builder-guide.md), [`evidence/phase-g-evm-evidence.md`](./evidence/phase-g-evm-evidence.md) | `#267`, `#283` |
 | G2 | Dapp smoke suite + compatibility matrix pass. | [`evidence/phase-g-evm-evidence.md`](./evidence/phase-g-evm-evidence.md) | `#284` |
 
-**Sign-off:** Name / date: _______________
+**Sign-off:** Name / date: TheNewAutonomy 22nd March 2026
 
 **Note:** If EVM dapps are **not** a v1 mainnet requirement, complete the **N/A** section in [`evidence/phase-g-evm-evidence.md`](./evidence/phase-g-evm-evidence.md) and defer **#267–#284** with rationale. Otherwise fill G1/G2 and the toolchain matrix.
 
@@ -110,10 +110,12 @@ Use this document to **drive execution** before cutting a public mainnet. It con
 
 | # | Item | Evidence / doc | GitHub |
 |---|------|----------------|--------|
-| H1 | Mainnet `chain_id` / `network_id` / genesis ceremony executed once; hashes published. | [`network-identity.md`](./network-identity.md) | `#279` |
-| H2 | Umbrella `#260` closed or explicitly deferred with recorded rationale. | Issue | `#260` |
+| H1 | Mainnet `chain_id` / `network_id` / genesis ceremony executed once; hashes published. | [`network-identity.md`](./network-identity.md), [`evidence/phase-h-final-launch-evidence.md`](./evidence/phase-h-final-launch-evidence.md) | `#279` |
+| H2 | Umbrella `#260` closed or explicitly deferred with recorded rationale. | [`evidence/phase-h-final-launch-evidence.md`](./evidence/phase-h-final-launch-evidence.md), GitHub **#260** | `#260` |
 
 **Sign-off (launch authority):** Name / date: _______________
+
+**Note:** Record **published** `genesis_hash`, RPC URLs, and release tag in [`evidence/phase-h-final-launch-evidence.md`](./evidence/phase-h-final-launch-evidence.md), then close **#260** using the template in §H2 (or defer with rationale).
 
 ---
 

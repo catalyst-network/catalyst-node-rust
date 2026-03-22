@@ -53,3 +53,11 @@ RPC / wallet / explorer integration sign-off (**#266**, **#281**, **#282**) for 
 EVM deploy/call / receipt / toolchain matrix (**#267**, **#283**, **#284**) for checklist **Phase G** (or N/A).
 
 - **Location:** [`phase-g-evm-evidence.md`](./phase-g-evm-evidence.md)
+
+---
+
+## `phase-h-final-launch-evidence.md`
+
+Published mainnet identity, final sign-offs, and **#260** closure/defer (**#279**).
+
+- **Location:** [`phase-h-final-launch-evidence.md`](./phase-h-final-launch-evidence.md)
