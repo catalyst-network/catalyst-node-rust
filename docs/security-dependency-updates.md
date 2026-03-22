@@ -34,6 +34,17 @@ This note tracks **high-severity Dependabot-class** dependency work (crypto, P2P
 
 **Action:** track **`revm` / `arkworks`** releases that move to **`tracing-subscriber` 0.3+**, or upstream changes that drop the dependency. Until then, `cargo audit` may still report **1** vulnerability for this path.
 
+## Dependabot: the two alerts that usually remain open
+
+After upgrades, GitHub often still shows **exactly two** open Rust alerts (verify with *Security → Dependabot* or `gh api repos/OWNER/REPO/dependabot/alerts`):
+
+| Alert (typical) | Severity | Cause | What you can do |
+|-----------------|----------|--------|-----------------|
+| **`yamux`** — malformed Data frame / panic | **High** | **`yamux` 0.12.1** is required by **`libp2p-yamux`** → **`libp2p`**. You already use patched **`yamux` 0.13.10** for the 0.13 stack; **0.12.x is not fixed** (advisory patched only on **≥ 0.13.10**). | **1)** Watch **[rust-libp2p](https://github.com/libp2p/rust-libp2p)** / **`libp2p-yamux`** for a release that **drops** the `^0.12.1` dependency, then bump workspace **`libp2p`**. **2)** Until then, in the Dependabot alert UI use **Dismiss** → *Risk accepted* or *No bandwidth to fix* and paste a short note: *“Transitive via libp2p-yamux; tracked upstream; direct resolution requires rust-libp2p release.”* |
+| **`tracing-subscriber`** — ANSI log poisoning | **Low** | **`ark-relations` 0.5.1** depends on **`tracing-subscriber` ^0.2**; fixed versions are **≥ 0.3.20**. | **1)** Wait for **`revm`** / **`arkworks`** to move the chain to **`tracing-subscriber` 0.3+**. **2)** Dismiss with *Risk accepted* / *Tolerable risk* noting *transitive EVM precompile / ark stack; low severity; no compatible patch without upstream.* |
+
+There is **no reliable in-repo `Cargo.toml` fix** for either item today: **`[patch]`** cannot substitute **`tracing-subscriber` 0.3** where **`ark-relations` requires 0.2** without breaking resolution, and **`yamux` 0.12** cannot be upgraded to 0.13 **inside** the **`^0.12.1`** constraint.
+
 ## Verification
 
 ```bash
