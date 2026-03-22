@@ -21,3 +21,11 @@ Reset / recovery / backfill sign-off for GitHub issue **#275** (checklist **C2**
 - **Purpose:** retrospective documentation when resets were performed but not logged per event.
 - **Location:** [`track275-reset-recovery-evidence.md`](./track275-reset-recovery-evidence.md)
 - **Action:** fill in, commit, then close **#275** with the doc link.
+
+---
+
+## `phase-d-release-engineering-evidence.md`
+
+Release process, provenance (**#264**, **#276**), and upgrade/rollback matrix (**#277**) for checklist **Phase D**.
+
+- **Location:** [`phase-d-release-engineering-evidence.md`](./phase-d-release-engineering-evidence.md)

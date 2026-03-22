@@ -47,7 +47,7 @@ Use this document to **drive execution** before cutting a public mainnet. It con
 | C1 | WAN soak / load / chaos gate meets thresholds (or failures have follow-up issues). | [`wan-soak-load-chaos-gate.md`](./wan-soak-load-chaos-gate.md) | `#263`, `#274` |
 | C2 | Reset / recovery / backfill reliability acceptable for operators. | [`evidence/track275-reset-recovery-evidence.md`](./evidence/track275-reset-recovery-evidence.md) (retrospective OK) | `#275` |
 
-**Sign-off:** Name / date: _______________
+**Sign-off:** Name / date: TheNewAutonomy 22nd March 2026
 
 **Note:** If you reset testnets many times but did not log each run, complete **C2** by filling in the retrospective sections in `evidence/track275-reset-recovery-evidence.md` and linking it when closing **#275**.
 
@@ -57,10 +57,12 @@ Use this document to **drive execution** before cutting a public mainnet. It con
 
 | # | Item | Evidence / doc | GitHub |
 |---|------|----------------|--------|
-| D1 | Release build process documented; binaries reproducible or provenance captured as required. | [`release-process.md`](./release-process.md) | `#264`, `#276` |
-| D2 | Upgrade matrix + rollback path tested (coordinated upgrade assumptions documented). | Operator notes | `#277` |
+| D1 | Release build process documented; binaries reproducible or provenance captured as required. | [`release-process.md`](./release-process.md), [`evidence/phase-d-release-engineering-evidence.md`](./evidence/phase-d-release-engineering-evidence.md) | `#264`, `#276` |
+| D2 | Upgrade matrix + rollback path tested (coordinated upgrade assumptions documented). | [`evidence/phase-d-release-engineering-evidence.md`](./evidence/phase-d-release-engineering-evidence.md) (matrix + [`node-operator-guide.md`](./node-operator-guide.md)) | `#277` |
 
 **Sign-off:** Name / date: _______________
+
+**Note:** Full bit-reproducible builds / SBOM may be optional for v1; this repo documents **tag + CI + `--locked` + SHA256 artifacts** — see the Phase D evidence file. Fill D1/D2 sign-offs and the upgrade matrix there to close the phase.
 
 ---
 
