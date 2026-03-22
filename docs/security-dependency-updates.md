@@ -16,7 +16,7 @@ This note tracks **high-severity Dependabot-class** dependency work (crypto, P2P
 - **`wasmtime`:** **`15` → `24.0.x`** (`catalyst-runtime-svm`; addresses multiple RUSTSEC items on older JIT/runtime lines).
 - **`keccak`:** lockfile **`0.1.5` → `0.1.6`** (RUSTSEC-2026-0012 / yanked 0.1.5).
 - **`catalyst-service-bus`:** removed unused **`reqwest` 0.11** and dev-dependency **`wiremock`** (shrinks the graph; `rustls-pemfile` / `instant` warnings tied to those paths drop when unused).
-- **`jsonwebtoken`:** **`9.x` → `10.3`** (`catalyst-service-bus` auth; addresses Dependabot-class JWT issues on older lines).
+- **`jsonwebtoken`:** **`9.x` → `10.3`** with feature **`aws_lc_rs`** (`catalyst-service-bus` auth; v10 requires an explicit crypto backend — see crate `CryptoProvider` docs).
 
 ## Code changes
 
