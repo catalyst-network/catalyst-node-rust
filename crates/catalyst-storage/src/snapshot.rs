@@ -558,7 +558,8 @@ impl SnapshotManager {
         
         // Load snapshot metadata
         let mut snapshot = self.load_snapshot_metadata(&metadata_file).await?;
-        
+        let orig_name = snapshot.name.clone();
+
         // Use new name if provided
         let final_name = new_name.unwrap_or_else(|| {
             format!("{}_imported_{}", snapshot.name, current_timestamp())
@@ -576,8 +577,8 @@ impl SnapshotManager {
         std::fs::copy(&metadata_file, &snapshot.file_path)
             .map_err(StorageError::from)?;
         
-        // Copy data directory if it exists
-        let data_src = import_dir.join(format!("{}_data", snapshot.name));
+        // Copy data directory if it exists (on-disk folder uses `orig_name`, not renamed `final_name`)
+        let data_src = import_dir.join(format!("{}_data", orig_name));
         let data_dest = self.snapshot_dir.join(format!("{}_data", final_name));
         
         if data_src.exists() {
@@ -678,40 +679,6 @@ impl Snapshot {
     /// Get metadata
     pub fn metadata(&self) -> &SnapshotMetadata {
         &self.metadata
-    }
-    
-    /// Export to directory (convenience method)
-    pub async fn export_to_directory(&self, export_dir: &Path) -> StorageResult<()> {
-        // Create export directory
-        std::fs::create_dir_all(export_dir)
-            .map_err(StorageError::from)?;
-        
-        // Copy metadata file
-        let metadata_dest = export_dir.join(format!("{}.snapshot", self.name));
-        std::fs::copy(&self.file_path, &metadata_dest)
-            .map_err(StorageError::from)?;
-        
-        // Note: In a full implementation, you'd also copy the data directory
-        // This is simplified for the example
-        
-        Ok(())
-    }
-    
-    /// Import from directory (static constructor)
-    pub async fn import_from_directory(name: &str, import_dir: &Path) -> StorageResult<Snapshot> {
-        let metadata_file = import_dir.join(format!("{}.snapshot", name));
-        
-        if !metadata_file.exists() {
-            return Err(StorageError::snapshot(format!("Snapshot metadata file not found: {:?}", metadata_file)));
-        }
-        
-        let content = std::fs::read_to_string(&metadata_file)
-            .map_err(StorageError::from)?;
-        
-        let snapshot: Snapshot = serde_json::from_str(&content)
-            .map_err(|e| StorageError::serialization(format!("Failed to parse snapshot metadata: {}", e)))?;
-        
-        Ok(snapshot)
     }
 }
 

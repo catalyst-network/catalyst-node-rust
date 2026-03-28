@@ -505,12 +505,12 @@ impl StorageManager {
         std::fs::create_dir_all(backup_dir)
             .map_err(StorageError::from)?;
         
-        // Create a snapshot first
+        // Create a snapshot first, then export metadata + `{name}_data` (not just the `.snapshot` file).
         let snapshot_name = format!("backup_{}", current_timestamp());
-        let snapshot = self.create_snapshot(&snapshot_name).await?;
-        
-        // Copy snapshot data to backup directory
-        snapshot.export_to_directory(backup_dir).await?;
+        self.create_snapshot(&snapshot_name).await?;
+        self.snapshot_manager
+            .export_snapshot(&snapshot_name, backup_dir)
+            .await?;
         
         log_info!(LogCategory::Storage, "Database backed up to {:?}", backup_dir);
         Ok(())
@@ -522,12 +522,14 @@ impl StorageManager {
             return Err(StorageError::config(format!("Backup directory {:?} does not exist", backup_dir)));
         }
         
-        // Import snapshot from backup directory
-        let snapshot_name = format!("restore_{}", current_timestamp());
-        let snapshot = Snapshot::import_from_directory(&snapshot_name, backup_dir).await?;
-        
-        // Load the snapshot
-        self.load_snapshot(&snapshot_name).await?;
+        // Register files from `backup_dir` into this node's snapshot dir, then load into the open DB.
+        let imported_name = self
+            .snapshot_manager
+            .import_snapshot(backup_dir, None)
+            .await?;
+        self.snapshot_manager
+            .load_snapshot(&imported_name)
+            .await?;
         
         // Recompute state root
         self.compute_state_root().await?;
