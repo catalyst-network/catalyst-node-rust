@@ -442,6 +442,18 @@ impl StorageManager {
     pub async fn load_snapshot(&self, name: &str) -> StorageResult<()> {
         self.snapshot_manager.load_snapshot(name).await
     }
+
+    /// Delete a named internal snapshot directory (best-effort cleanup after successful reconcile, etc.).
+    pub async fn delete_snapshot(&self, name: &str) -> StorageResult<()> {
+        self.snapshot_manager.delete_snapshot(name).await
+    }
+
+    /// Recompute the sparse Merkle root from `accounts` and refresh the in-memory cache.
+    ///
+    /// Call after bulk engine mutations that bypass `commit()` (e.g. selective column-family wipes).
+    pub async fn refresh_cached_state_root(&self) -> StorageResult<Hash> {
+        self.compute_state_root().await
+    }
     
     /// List available snapshots
     pub async fn list_snapshots(&self) -> StorageResult<Vec<String>> {

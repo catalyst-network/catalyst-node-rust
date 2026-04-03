@@ -2315,6 +2315,231 @@ async fn apply_lsu_to_storage(
     Ok(state_root)
 }
 
+/// BFT-style quorum: distinct agreeing producers must be at least ⌈2n/3⌉ of `producer_list.len()`.
+fn bft_vote_threshold(n: usize) -> usize {
+    if n == 0 {
+        return usize::MAX;
+    }
+    (2 * n + 2) / 3
+}
+
+/// True when `vote_list` is a subset of `producer_list` and distinct voter count meets the BFT threshold.
+fn lsu_has_bft_vote_quorum(lsu: &catalyst_consensus::types::LedgerStateUpdate) -> bool {
+    let n = lsu.producer_list.len();
+    if n == 0 {
+        return false;
+    }
+    let need = bft_vote_threshold(n);
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for v in &lsu.vote_list {
+        if !lsu.producer_list.iter().any(|p| p == v) {
+            return false;
+        }
+        seen.insert(v.as_str());
+    }
+    seen.len() >= need
+}
+
+fn max_replay_cycles_limit() -> u64 {
+    match std::env::var("CATALYST_MAX_REPLAY_CYCLES") {
+        Ok(s) => s.parse().unwrap_or(1_000_000),
+        Err(_) => 1_000_000,
+    }
+}
+
+fn metadata_logical_name_is_preserved(name: &[u8]) -> bool {
+    let Ok(s) = std::str::from_utf8(name) else {
+        return false;
+    };
+    s.starts_with("protocol:")
+        || s.starts_with("consensus:lsu_hash:")
+        || s.starts_with("consensus:lsu_cid:")
+        || s.starts_with("consensus:lsu_state_root:")
+        || s.starts_with("consensus:cycle_by_lsu_hash:")
+        || s.starts_with("consensus:lsu:")
+}
+
+/// Wipe mutable chain state while keeping `protocol:*` metadata and per-cycle LSU history keys
+/// (`consensus:lsu:*`, hashes, CIDs, state roots) for bounded replay.
+async fn purge_mutable_chain_state_preserving_lsu_history(
+    store: &StorageManager,
+) -> anyhow::Result<()> {
+    let engine = store.engine().clone();
+    tokio::task::spawn_blocking(move || {
+        for cf in ["accounts", "transactions", "consensus", "contracts", "dfs_refs"] {
+            let keys: Vec<Vec<u8>> = engine
+                .iterator(cf)
+                .map_err(|e| anyhow::anyhow!("iter {cf}: {e}"))?
+                .filter_map(|r| r.ok().map(|(k, _)| k.to_vec()))
+                .collect();
+            for k in keys {
+                engine
+                    .delete(cf, &k)
+                    .map_err(|e| anyhow::anyhow!("del {cf}: {e}"))?;
+            }
+        }
+        let iter = engine
+            .iterator("metadata")
+            .map_err(|e| anyhow::anyhow!("iter metadata: {e}"))?;
+        let mut del: Vec<Vec<u8>> = Vec::new();
+        for item in iter {
+            let (k, _) = item.map_err(|e| anyhow::anyhow!("metadata iter: {e}"))?;
+            if !k.starts_with(catalyst_utils::state::state_keys::METADATA_PREFIX) {
+                continue;
+            }
+            let logical = &k[catalyst_utils::state::state_keys::METADATA_PREFIX.len()..];
+            if metadata_logical_name_is_preserved(logical) {
+                continue;
+            }
+            del.push(k.to_vec());
+        }
+        for k in del {
+            engine
+                .delete("metadata", &k)
+                .map_err(|e| anyhow::anyhow!("del metadata: {e}"))?;
+        }
+        for cf in engine.cf_names() {
+            let _ = engine.flush_cf(&cf);
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("purge join: {e}"))?
+}
+
+/// On `prev_root` mismatch, if this LSU carries a BFT quorum and we have contiguous stored
+/// history `consensus:lsu:1..cycle-1`, purge mutable state and replay up to this LSU (capped by
+/// `CATALYST_MAX_REPLAY_CYCLES`, `0` disables). Uses a snapshot for rollback if replay/apply fails.
+async fn try_reconcile_fork_from_quorum_lsu(
+    store: &StorageManager,
+    lsu: &catalyst_consensus::types::LedgerStateUpdate,
+    cycle: u64,
+    expected_prev: [u8; 32],
+    expected_post: [u8; 32],
+    expected_lsu_hash: &[u8; 32],
+) -> Result<bool> {
+    if !lsu_has_bft_vote_quorum(lsu) {
+        return Ok(false);
+    }
+    if lsu.cycle_number != cycle {
+        return Ok(false);
+    }
+    let h = catalyst_consensus::types::hash_data(lsu).unwrap_or([0u8; 32]);
+    if &h != expected_lsu_hash {
+        return Ok(false);
+    }
+
+    let max_cycles = max_replay_cycles_limit();
+    if max_cycles == 0 {
+        return Ok(false);
+    }
+    if cycle > max_cycles {
+        warn!(
+            "Quorum fork reconcile skipped: cycle {} exceeds CATALYST_MAX_REPLAY_CYCLES={}",
+            cycle, max_cycles
+        );
+        return Ok(false);
+    }
+
+    if cycle > 1 {
+        for i in 1..cycle {
+            if store
+                .get_metadata(&format!("consensus:lsu:{}", i))
+                .await
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                warn!(
+                    "Quorum fork reconcile skipped: missing stored LSU for cycle {}",
+                    i
+                );
+                return Ok(false);
+            }
+        }
+    }
+
+    let snap = format!(
+        "quorum_reconcile_c{}_{}",
+        cycle,
+        current_timestamp_ms()
+    );
+    store
+        .create_snapshot(&snap)
+        .await
+        .map_err(|e| anyhow::anyhow!("reconcile snapshot create: {e}"))?;
+
+    let reconcile_inner = async {
+        purge_mutable_chain_state_preserving_lsu_history(store).await?;
+        store
+            .refresh_cached_state_root()
+            .await
+            .map_err(|e| anyhow::anyhow!("refresh root: {e}"))?;
+
+        for i in 1..cycle {
+            let key = format!("consensus:lsu:{}", i);
+            let Some(bytes) = store.get_metadata(&key).await.ok().flatten() else {
+                anyhow::bail!("missing lsu during replay {i}");
+            };
+            let lsu_i = catalyst_consensus::types::LedgerStateUpdate::deserialize(&bytes)
+                .map_err(|e| anyhow::anyhow!("deserialize lsu {i}: {e}"))?;
+            if lsu_i.cycle_number != i {
+                anyhow::bail!("stored lsu cycle mismatch at {i}");
+            }
+            if let Some(hb) = store
+                .get_metadata(&format!("consensus:lsu_hash:{}", i))
+                .await
+                .ok()
+                .flatten()
+            {
+                if hb.len() == 32 {
+                    let mut ah = [0u8; 32];
+                    ah.copy_from_slice(&hb[..32]);
+                    let gh = catalyst_consensus::types::hash_data(&lsu_i).unwrap_or([0u8; 32]);
+                    if gh != ah {
+                        anyhow::bail!("lsu hash mismatch at cycle {i}");
+                    }
+                }
+            }
+            apply_lsu_to_storage(store, &lsu_i)
+                .await
+                .map_err(|e| anyhow::anyhow!("apply replay {i}: {e}"))?;
+        }
+
+        let prev_after = local_applied_state_root(store).await;
+        if prev_after != expected_prev {
+            anyhow::bail!(
+                "replay prev root mismatch: got {} expected {}",
+                hex_encode(&prev_after),
+                hex_encode(&expected_prev)
+            );
+        }
+
+        match apply_lsu_with_root_check(store, lsu, expected_post).await {
+            Ok(true) => Ok(()),
+            Ok(false) => anyhow::bail!("final lsu state_root mismatch"),
+            Err(e) => Err(e),
+        }
+    };
+
+    match reconcile_inner.await {
+        Ok(()) => {
+            let _ = store.delete_snapshot(&snap).await;
+            Ok(true)
+        }
+        Err(e) => {
+            warn!("Quorum fork reconcile failed, restoring snapshot: {}", e);
+            if let Err(e2) = store.load_snapshot(&snap).await {
+                return Err(anyhow::anyhow!(
+                    "reconcile failed ({e}) and snapshot restore failed ({e2})"
+                ));
+            }
+            let _ = store.delete_snapshot(&snap).await;
+            Ok(false)
+        }
+    }
+}
+
 async fn apply_lsu_with_root_check(
     store: &StorageManager,
     lsu: &catalyst_consensus::types::LedgerStateUpdate,
@@ -3235,44 +3460,74 @@ impl CatalystNode {
                                                             // safe bypass is the explicit bootstrap case where both
                                                             // local and expected prev roots are zero.
                                                             let local_prev = local_applied_state_root(store.as_ref()).await;
+                                                            let mut already_applied = false;
                                                             if local_prev != ref_msg.prev_state_root {
                                                                 if local_prev == [0u8; 32] && ref_msg.prev_state_root == [0u8; 32] {
                                                                     // bootstrap ok
                                                                 } else {
-                                                                    tracing::warn!(
-                                                                        "Skipping LSU cycle={} cid={} (prev_root mismatch local={} expected={})",
+                                                                    match try_reconcile_fork_from_quorum_lsu(
+                                                                        store.as_ref(),
+                                                                        &lsu,
                                                                         ref_msg.cycle,
-                                                                        ref_msg.cid,
-                                                                        hex_encode(&local_prev),
-                                                                        hex_encode(&ref_msg.prev_state_root)
-                                                                    );
-                                                                    // Request backfill starting from local+1 to observed head.
-                                                                    let mut c = catchup.lock().await;
-                                                                    c.observed_head_cycle = c.observed_head_cycle.max(ref_msg.cycle);
-                                                                    let local_cycle = local_applied_cycle(store.as_ref()).await;
-                                                                    if local_cycle.saturating_add(1) < c.observed_head_cycle
-                                                                        && now_ms.saturating_sub(c.last_req_ms) > 2000
+                                                                        ref_msg.prev_state_root,
+                                                                        ref_msg.state_root,
+                                                                        &ref_msg.lsu_hash,
+                                                                    )
+                                                                    .await
                                                                     {
-                                                                        let start = local_cycle.saturating_add(1);
-                                                                        let remaining = c.observed_head_cycle.saturating_sub(start).saturating_add(1);
-                                                                        let count = remaining.min(256) as u32;
-                                                                        let req = LsuRangeRequest {
-                                                                            requester: producer_id_self.clone(),
-                                                                            start_cycle: start,
-                                                                            count,
-                                                                        };
-                                                                        if let Ok(env) = MessageEnvelope::from_message(&req, "lsu_range_req".to_string(), None) {
-                                                                            let _ = net.broadcast_envelope(&env).await;
-                                                                            c.last_req_ms = now_ms;
+                                                                        Ok(true) => {
+                                                                            info!(
+                                                                                "Reconciled fork via BFT-quorum LSU replay cycle={} cid={}",
+                                                                                ref_msg.cycle, ref_msg.cid
+                                                                            );
+                                                                            already_applied = true;
+                                                                        }
+                                                                        Ok(false) => {
+                                                                            tracing::warn!(
+                                                                                "Skipping LSU cycle={} cid={} (prev_root mismatch local={} expected={})",
+                                                                                ref_msg.cycle,
+                                                                                ref_msg.cid,
+                                                                                hex_encode(&local_prev),
+                                                                                hex_encode(&ref_msg.prev_state_root)
+                                                                            );
+                                                                            // Request backfill starting from local+1 to observed head.
+                                                                            let mut c = catchup.lock().await;
+                                                                            c.observed_head_cycle = c.observed_head_cycle.max(ref_msg.cycle);
+                                                                            let local_cycle = local_applied_cycle(store.as_ref()).await;
+                                                                            if local_cycle.saturating_add(1) < c.observed_head_cycle
+                                                                                && now_ms.saturating_sub(c.last_req_ms) > 2000
+                                                                            {
+                                                                                let start = local_cycle.saturating_add(1);
+                                                                                let remaining = c.observed_head_cycle.saturating_sub(start).saturating_add(1);
+                                                                                let count = remaining.min(256) as u32;
+                                                                                let req = LsuRangeRequest {
+                                                                                    requester: producer_id_self.clone(),
+                                                                                    start_cycle: start,
+                                                                                    count,
+                                                                                };
+                                                                                if let Ok(env) = MessageEnvelope::from_message(&req, "lsu_range_req".to_string(), None) {
+                                                                                    let _ = net.broadcast_envelope(&env).await;
+                                                                                    c.last_req_ms = now_ms;
+                                                                                }
+                                                                            }
+                                                                            continue;
+                                                                        }
+                                                                        Err(e) => {
+                                                                            tracing::warn!(
+                                                                                "Quorum reconcile error cycle={} cid={}: {}",
+                                                                                ref_msg.cycle,
+                                                                                ref_msg.cid,
+                                                                                e
+                                                                            );
+                                                                            continue;
                                                                         }
                                                                     }
-                                                                    continue;
                                                                 }
                                                             }
 
                                                             // Proof-driven path: if we have a proof bundle CID locally, verify it and apply without recomputing root.
-                                                            let mut applied = false;
-                                                            if !ref_msg.proof_cid.is_empty() {
+                                                            let mut applied = already_applied;
+                                                            if !applied && !ref_msg.proof_cid.is_empty() {
                                                                 if let Ok(pb) = dfs.get(&ref_msg.proof_cid).await {
                                                                     if let Ok(bundle) = bincode::deserialize::<StateProofBundle>(&pb) {
                                                                         if bundle.prev_state_root == ref_msg.prev_state_root
@@ -3323,6 +3578,7 @@ impl CatalystNode {
                                                                     }
                                                                 }
                                                             }
+                                                            let _ = applied;
                                                         }
 
                                                         last_lsu.write().await.insert(ref_msg.cycle, lsu);
@@ -3629,53 +3885,85 @@ impl CatalystNode {
                                             // safe bypass is the explicit bootstrap case where both
                                             // local and expected prev roots are zero.
                                             let local_prev = local_applied_state_root(store.as_ref()).await;
+                                            let mut ok = false;
                                             if local_prev != info.prev_state_root {
                                                 if local_prev == [0u8; 32] && info.prev_state_root == [0u8; 32] {
                                                     // bootstrap ok
                                                 } else {
-                                                        // History-only backfill: keep persisted per-cycle metadata but
-                                                        // do not attempt to apply onto a different root.
-                                                        info!(
-                                                            "Backfilled LSU bytes (history only) cycle={} cid={}",
-                                                            info.cycle, resp.cid
-                                                        );
-                                                    continue;
+                                                    match try_reconcile_fork_from_quorum_lsu(
+                                                        store.as_ref(),
+                                                        &lsu,
+                                                        info.cycle,
+                                                        info.prev_state_root,
+                                                        info.expected_state_root,
+                                                        &info.lsu_hash,
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(true) => {
+                                                            info!(
+                                                                "Reconciled fork via BFT-quorum LSU replay cycle={} cid={}",
+                                                                info.cycle, resp.cid
+                                                            );
+                                                            ok = true;
+                                                        }
+                                                        Ok(false) => {
+                                                            info!(
+                                                                "Backfilled LSU bytes (history only) cycle={} cid={}",
+                                                                info.cycle, resp.cid
+                                                            );
+                                                            continue;
+                                                        }
+                                                        Err(e) => {
+                                                            warn!(
+                                                                "Quorum reconcile error cycle={} cid={}: {}",
+                                                                info.cycle, resp.cid, e
+                                                            );
+                                                            continue;
+                                                        }
+                                                    }
                                                 }
                                             }
 
                                             // Proof-driven path if proof bundle is present locally.
-                                            let mut ok = false;
-                                            if let Some(dfs) = &dfs {
-                                                if !info.proof_cid.is_empty() {
-                                                    if let Ok(pb) = dfs.get(&info.proof_cid).await {
-                                                    if let Ok(bundle) = bincode::deserialize::<StateProofBundle>(&pb) {
-                                                        if bundle.prev_state_root == info.prev_state_root
-                                                            && bundle.new_state_root == info.expected_state_root
-                                                            && bundle.lsu_hash == info.lsu_hash
-                                                            && verify_state_transition_bundle(&lsu, &bundle)
-                                                        {
-                                                            ok = apply_lsu_to_storage_without_root_check(
-                                                                store.as_ref(),
-                                                                &lsu,
-                                                                bundle.new_state_root,
-                                                            )
-                                                            .await
-                                                            .is_ok();
+                                            if !ok {
+                                                if let Some(dfs) = &dfs {
+                                                    if !info.proof_cid.is_empty() {
+                                                        if let Ok(pb) = dfs.get(&info.proof_cid).await {
+                                                            if let Ok(bundle) =
+                                                                bincode::deserialize::<StateProofBundle>(&pb)
+                                                            {
+                                                                if bundle.prev_state_root == info.prev_state_root
+                                                                    && bundle.new_state_root
+                                                                        == info.expected_state_root
+                                                                    && bundle.lsu_hash == info.lsu_hash
+                                                                    && verify_state_transition_bundle(
+                                                                        &lsu, &bundle,
+                                                                    )
+                                                                {
+                                                                    ok = apply_lsu_to_storage_without_root_check(
+                                                                        store.as_ref(),
+                                                                        &lsu,
+                                                                        bundle.new_state_root,
+                                                                    )
+                                                                    .await
+                                                                    .is_ok();
+                                                                }
+                                                            }
                                                         }
                                                     }
-                                                    }
                                                 }
-                                            }
 
-                                            // Fallback to apply-then-check.
-                                            if !ok {
-                                                ok = apply_lsu_with_root_check(
-                                                    store.as_ref(),
-                                                    &lsu,
-                                                    info.expected_state_root,
-                                                )
-                                                .await
-                                                .unwrap_or(false);
+                                                // Fallback to apply-then-check.
+                                                if !ok {
+                                                    ok = apply_lsu_with_root_check(
+                                                        store.as_ref(),
+                                                        &lsu,
+                                                        info.expected_state_root,
+                                                    )
+                                                    .await
+                                                    .unwrap_or(false);
+                                                }
                                             }
                                             if ok {
                                                 last_lsu.write().await.insert(info.cycle, lsu);
@@ -4258,5 +4546,70 @@ fn hex_encode(bytes: &[u8]) -> String {
         s.push(HEX[(b & 0x0f) as usize] as char);
     }
     s
+}
+
+#[cfg(test)]
+mod bft_quorum_tests {
+    use super::{bft_vote_threshold, lsu_has_bft_vote_quorum};
+    use catalyst_consensus::types::{
+        CompensationEntry, LedgerStateUpdate, PartialLedgerStateUpdate, TransactionEntry,
+    };
+
+    #[test]
+    fn bft_threshold_matches_ceil_two_thirds() {
+        assert_eq!(bft_vote_threshold(1), 1);
+        assert_eq!(bft_vote_threshold(2), 2);
+        assert_eq!(bft_vote_threshold(3), 2);
+        assert_eq!(bft_vote_threshold(4), 3);
+        assert_eq!(bft_vote_threshold(5), 4);
+        assert_eq!(bft_vote_threshold(6), 4);
+        assert_eq!(bft_vote_threshold(7), 5);
+    }
+
+    fn empty_lsu(
+        cycle: u64,
+        producers: Vec<String>,
+        votes: Vec<String>,
+    ) -> LedgerStateUpdate {
+        LedgerStateUpdate {
+            partial_update: PartialLedgerStateUpdate {
+                transaction_entries: vec![TransactionEntry {
+                    public_key: [0u8; 32],
+                    amount: 0,
+                    signature: vec![0u8; 1],
+                }],
+                transaction_signatures_hash: [0u8; 32],
+                total_fees: 0,
+                timestamp: 0,
+            },
+            compensation_entries: vec![CompensationEntry {
+                producer_id: producers.first().cloned().unwrap_or_default(),
+                public_key: [0u8; 32],
+                amount: 0,
+            }],
+            cycle_number: cycle,
+            producer_list: producers,
+            vote_list: votes,
+        }
+    }
+
+    #[test]
+    fn quorum_requires_distinct_valid_votes() {
+        let p = vec!["a".into(), "b".into(), "c".into()];
+        // n=3 ⇒ threshold 2 distinct votes from producer_list.
+        assert!(!lsu_has_bft_vote_quorum(&empty_lsu(1, p.clone(), vec!["a".into()])));
+        assert!(lsu_has_bft_vote_quorum(&empty_lsu(1, p.clone(), vec!["a".into(), "b".into()])));
+        assert!(lsu_has_bft_vote_quorum(&empty_lsu(
+            1,
+            p.clone(),
+            vec!["a".into(), "b".into(), "c".into()]
+        )));
+        assert!(!lsu_has_bft_vote_quorum(&empty_lsu(
+            1,
+            p.clone(),
+            vec!["a".into(), "b".into(), "x".into()]
+        )));
+        assert!(!lsu_has_bft_vote_quorum(&empty_lsu(1, p, vec!["a".into(), "a".into(), "a".into()])));
+    }
 }
 
