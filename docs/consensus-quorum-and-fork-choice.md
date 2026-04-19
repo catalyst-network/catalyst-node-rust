@@ -74,6 +74,7 @@ Changes implementing this document should be:
 
 - `crates/catalyst-cli/src/node.rs` — consensus loop, `prev_root mismatch`, `apply_lsu_to_storage`, wall-clock `cycle`.
 - `docs/node-operator-guide.md` — validator set bootstrap and operations.
+- `docs/adr/0001-lsu-finality-certificate.md` — **proposed** LSU finality certificate (`H_cert`, quorum signatures, distribution via `finality_cid`).
 
 ---
 

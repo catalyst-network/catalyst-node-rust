@@ -157,6 +157,11 @@ pub enum MessageType {
     
     // Error handling
     ErrorResponse,
+
+    /// ADR 0001: one producer's signature over `H_cert` for an LSU.
+    LsuFinalityAttestation,
+    /// ADR 0001: DFS content id for `LsuFinalityCertificateV1` (bincode).
+    LsuFinalityCid,
     
     // Custom/Extension types for future use
     Custom(u16),
@@ -170,7 +175,9 @@ impl MessageType {
             MessageType::ProducerCandidate |
             MessageType::ProducerVote |
             MessageType::ProducerOutput |
-            MessageType::ConsensusSync
+            MessageType::ConsensusSync |
+            MessageType::LsuFinalityAttestation |
+            MessageType::LsuFinalityCid
         )
     }
     
@@ -239,6 +246,8 @@ impl fmt::Display for MessageType {
             MessageType::NetworkInfo => write!(f, "network_info"),
             MessageType::MetricsReport => write!(f, "metrics_report"),
             MessageType::ErrorResponse => write!(f, "error_response"),
+            MessageType::LsuFinalityAttestation => write!(f, "lsu_finality_attestation"),
+            MessageType::LsuFinalityCid => write!(f, "lsu_finality_cid"),
             MessageType::Custom(id) => write!(f, "custom_{}", id),
         }
     }

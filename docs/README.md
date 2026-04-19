@@ -88,6 +88,11 @@ These docs are written against the current `catalyst-node-rust` implementation (
   - Evidence template for soak/load/chaos runs
   - Archived logs (zip): [`evidence/track274-wan-gate-evidence.zip`](./evidence/track274-wan-gate-evidence.zip) — [`evidence/README.md`](./evidence/README.md)
 
+## Architecture Decision Records (ADRs)
+
+- **Index:** [`adr/README.md`](./adr/README.md)
+- **0001 — LSU finality certificate (proposed):** [`adr/0001-lsu-finality-certificate.md`](./adr/0001-lsu-finality-certificate.md) — cryptographic quorum evidence, `H_cert`, wire shapes, verification steps
+
 ## Important implementation notes (current state)
 
 - **Consensus traffic is P2P on `30333/tcp`**, not RPC. RPC is only for client interaction.

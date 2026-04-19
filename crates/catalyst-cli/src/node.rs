@@ -20,8 +20,8 @@ use catalyst_utils::state::StateManager;
 use crate::config::NodeConfig;
 use crate::tx::{Mempool, ProtocolTxBatch, ProtocolTxGossip, TxBatch, TxGossip};
 use crate::sync::{
-    FileRequestMsg, FileResponseMsg, KeyProofChange, LsuCidGossip, LsuGossip, LsuRangeRequest,
-    LsuRangeResponse, StateProofBundle,
+    FileRequestMsg, FileResponseMsg, KeyProofChange, LsuCidGossip, LsuFinalityAttestationMsg,
+    LsuFinalityCidMsg, LsuGossip, LsuRangeRequest, LsuRangeResponse, StateProofBundle,
 };
 use crate::evm::{decode_evm_marker, encode_evm_marker, EvmTxKind, EvmTxPayload};
 use crate::evm_revm::{execute_call_and_persist, execute_deploy_and_persist};
@@ -2347,6 +2347,246 @@ fn max_replay_cycles_limit() -> u64 {
     }
 }
 
+/// When set (`1` / `true` / `yes`), applying an LSU from P2P requires a verified finality certificate.
+fn catalyst_require_lsu_finality() -> bool {
+    matches!(
+        std::env::var("CATALYST_REQUIRE_LSU_FINALITY")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
+#[derive(Clone, Default)]
+struct FinalityAttestationBucket {
+    chain_id: Option<u64>,
+    genesis_hash: Option<[u8; 32]>,
+    committee_hash: Option<[u8; 32]>,
+    vote_list_hash: Option<[u8; 32]>,
+    votes: std::collections::BTreeMap<String, Vec<u8>>,
+}
+
+fn finality_bucket_matches_msg(b: &FinalityAttestationBucket, msg: &crate::sync::LsuFinalityAttestationMsg) -> bool {
+    b.chain_id.is_none()
+        || (b.chain_id == Some(msg.chain_id)
+            && b.genesis_hash == Some(msg.genesis_hash)
+            && b.committee_hash == Some(msg.committee_hash)
+            && b.vote_list_hash == Some(msg.vote_list_hash))
+}
+
+fn finality_bucket_init_from_msg(b: &mut FinalityAttestationBucket, msg: &crate::sync::LsuFinalityAttestationMsg) {
+    b.chain_id = Some(msg.chain_id);
+    b.genesis_hash = Some(msg.genesis_hash);
+    b.committee_hash = Some(msg.committee_hash);
+    b.vote_list_hash = Some(msg.vote_list_hash);
+}
+
+/// Verify finality certificate when required or when CID is present (best-effort log on failure if not required).
+async fn verify_lsu_finality_for_apply(
+    store: &StorageManager,
+    dfs: &crate::dfs_store::LocalContentStore,
+    lsu: &catalyst_consensus::types::LedgerStateUpdate,
+    cycle: u64,
+    finality_cid_hint: &str,
+) -> bool {
+    let cid = if !finality_cid_hint.is_empty() {
+        finality_cid_hint.to_string()
+    } else {
+        match meta_string(store, &format!("consensus:lsu_finality_cid:{}", cycle)).await {
+            Some(s) => s,
+            None => String::new(),
+        }
+    };
+
+    if !catalyst_require_lsu_finality() {
+        if cid.is_empty() {
+            return true;
+        }
+        if let Ok(bytes) = dfs.get(&cid).await {
+            if let Ok(cert) = bincode::deserialize::<catalyst_consensus::LsuFinalityCertificateV1>(&bytes) {
+                if catalyst_consensus::verify_lsu_finality_certificate(&cert, lsu).is_err() {
+                    tracing::warn!(
+                        "LSU finality certificate present but failed verification cycle={} cid={}",
+                        cycle,
+                        cid
+                    );
+                }
+            }
+        }
+        return true;
+    }
+
+    if cid.is_empty() {
+        tracing::warn!(
+            "CATALYST_REQUIRE_LSU_FINALITY set but no finality CID for cycle={}",
+            cycle
+        );
+        return false;
+    }
+    let Ok(bytes) = dfs.get(&cid).await else {
+        tracing::warn!(
+            "CATALYST_REQUIRE_LSU_FINALITY: missing finality bytes cycle={} cid={}",
+            cycle,
+            cid
+        );
+        return false;
+    };
+    let Ok(cert) = bincode::deserialize::<catalyst_consensus::LsuFinalityCertificateV1>(&bytes) else {
+        tracing::warn!(
+            "CATALYST_REQUIRE_LSU_FINALITY: bad finality certificate encoding cycle={}",
+            cycle
+        );
+        return false;
+    };
+    if let Err(e) = catalyst_consensus::verify_lsu_finality_certificate(&cert, lsu) {
+        tracing::warn!(
+            "CATALYST_REQUIRE_LSU_FINALITY: verify failed cycle={} err={}",
+            cycle,
+            e
+        );
+        return false;
+    }
+    true
+}
+
+async fn try_publish_finality_certificate_from_bucket(
+    store: &StorageManager,
+    dfs: &crate::dfs_store::LocalContentStore,
+    net: &Arc<P2pService>,
+    buckets: &Arc<RwLock<std::collections::HashMap<(u64, [u8; 32]), FinalityAttestationBucket>>>,
+    cycle: u64,
+    lsu_hash: [u8; 32],
+    producer_id_for_broadcast: &str,
+) {
+    let meta_key = format!("consensus:lsu_finality_cid:{}", cycle);
+    if meta_string(store, &meta_key).await.is_some() {
+        return;
+    }
+    let Some(lsu_bytes) = store
+        .get_metadata(&format!("consensus:lsu:{}", cycle))
+        .await
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let Ok(lsu) = catalyst_consensus::types::LedgerStateUpdate::deserialize(&lsu_bytes) else {
+        return;
+    };
+    let Ok(h) = catalyst_consensus::types::hash_data(&lsu) else {
+        return;
+    };
+    if h != lsu_hash {
+        return;
+    }
+    let bucket = {
+        let g = buckets.read().await;
+        g.get(&(cycle, lsu_hash)).cloned()
+    };
+    let Some(bucket) = bucket else { return };
+    let (Some(chain_id), Some(genesis_hash), Some(_ch), Some(_vh)) = (
+        bucket.chain_id,
+        bucket.genesis_hash,
+        bucket.committee_hash,
+        bucket.vote_list_hash,
+    ) else {
+        return;
+    };
+
+    let mut vote_entries: Vec<catalyst_consensus::ProducerFinalityVote> = Vec::new();
+    for (pid, sig) in bucket.votes {
+        if sig.len() != 64 {
+            continue;
+        }
+        if !lsu.vote_list.iter().any(|v| v == &pid) || !lsu.producer_list.iter().any(|v| v == &pid) {
+            continue;
+        }
+        vote_entries.push(catalyst_consensus::ProducerFinalityVote {
+            producer_id: pid,
+            signature: sig,
+        });
+    }
+    if vote_entries.len() < bft_vote_threshold(lsu.producer_list.len()) {
+        return;
+    }
+    let Ok(cert) = catalyst_consensus::LsuFinalityCertificateV1::from_lsu_and_votes(
+        &lsu,
+        chain_id,
+        genesis_hash,
+        lsu_hash,
+        vote_entries,
+    ) else {
+        return;
+    };
+    if catalyst_consensus::verify_lsu_finality_certificate(&cert, &lsu).is_err() {
+        return;
+    }
+    let Ok(blob) = bincode::serialize(&cert) else {
+        return;
+    };
+    let Some(cid) = dfs.put(blob).await.ok() else {
+        return;
+    };
+    let _ = store.set_metadata(&meta_key, cid.as_bytes()).await;
+    let msg = crate::sync::LsuFinalityCidMsg {
+        cycle,
+        lsu_hash,
+        finality_cid: cid,
+    };
+    if let Ok(env) = MessageEnvelope::from_message(&msg, producer_id_for_broadcast.to_string(), None) {
+        let _ = net.broadcast_envelope(&env).await;
+    }
+    info!("Published LSU finality certificate cycle={}", cycle);
+}
+
+async fn ingest_finality_attestation(
+    store: &StorageManager,
+    dfs: &crate::dfs_store::LocalContentStore,
+    net: &Arc<P2pService>,
+    buckets: &Arc<RwLock<std::collections::HashMap<(u64, [u8; 32]), FinalityAttestationBucket>>>,
+    msg: &crate::sync::LsuFinalityAttestationMsg,
+    producer_id_for_broadcast: &str,
+) {
+    if msg.signature.len() != 64 {
+        return;
+    }
+    if catalyst_consensus::verify_finality_attestation(
+        msg.chain_id,
+        &msg.genesis_hash,
+        msg.cycle,
+        &msg.lsu_hash,
+        &msg.committee_hash,
+        &msg.vote_list_hash,
+        &msg.producer_id,
+        &msg.signature,
+    )
+    .is_err()
+    {
+        return;
+    }
+    {
+        let mut g = buckets.write().await;
+        let b = g.entry((msg.cycle, msg.lsu_hash)).or_default();
+        if b.chain_id.is_none() {
+            finality_bucket_init_from_msg(b, msg);
+        } else if !finality_bucket_matches_msg(b, msg) {
+            return;
+        }
+        b.votes.insert(msg.producer_id.clone(), msg.signature.clone());
+    }
+    try_publish_finality_certificate_from_bucket(
+        store,
+        dfs,
+        net,
+        buckets,
+        msg.cycle,
+        msg.lsu_hash,
+        producer_id_for_broadcast,
+    )
+    .await;
+}
+
 fn metadata_logical_name_is_preserved(name: &[u8]) -> bool {
     let Ok(s) = std::str::from_utf8(name) else {
         return false;
@@ -2357,6 +2597,7 @@ fn metadata_logical_name_is_preserved(name: &[u8]) -> bool {
         || s.starts_with("consensus:lsu_state_root:")
         || s.starts_with("consensus:cycle_by_lsu_hash:")
         || s.starts_with("consensus:lsu:")
+        || s.starts_with("consensus:lsu_finality_cid:")
 }
 
 /// Wipe mutable chain state while keeping `protocol:*` metadata and per-cycle LSU history keys
@@ -3061,6 +3302,16 @@ impl CatalystNode {
             Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         let max_entries_per_cycle_cfg = self.config.consensus.max_transactions_per_block as usize;
 
+        let finality_buckets: Arc<
+            RwLock<std::collections::HashMap<(u64, [u8; 32]), FinalityAttestationBucket>>,
+        > = Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+        let validator_signing_key = crate::identity::load_or_generate_private_key(
+            &self.config.node.private_key_file,
+            self.config.node.auto_generate_identity,
+        )
+        .ok();
+
         // Outbound: envelopes produced by consensus → broadcast to peers.
         {
             let net = network.clone();
@@ -3108,6 +3359,7 @@ impl CatalystNode {
             let dfs = dfs.clone();
             let storage = storage.clone();
             let producer_id_self = producer_id.clone();
+            let finality_buckets_in = finality_buckets.clone();
             #[derive(Clone)]
             struct PendingLsuFetch {
                 cycle: u64,
@@ -3115,6 +3367,7 @@ impl CatalystNode {
                 prev_state_root: [u8; 32],
                 expected_state_root: [u8; 32],
                 proof_cid: String,
+                finality_cid: String,
                 attempts: u32,
                 next_retry_at_ms: u64,
             }
@@ -3578,7 +3831,20 @@ impl CatalystNode {
                                                                     }
                                                                 }
                                                             }
-                                                            let _ = applied;
+                                                            if !applied {
+                                                                continue;
+                                                            }
+                                                            if !verify_lsu_finality_for_apply(
+                                                                store.as_ref(),
+                                                                dfs,
+                                                                &lsu,
+                                                                ref_msg.cycle,
+                                                                &ref_msg.finality_cid,
+                                                            )
+                                                            .await
+                                                            {
+                                                                continue;
+                                                            }
                                                         }
 
                                                         last_lsu.write().await.insert(ref_msg.cycle, lsu);
@@ -3650,6 +3916,7 @@ impl CatalystNode {
                                                     prev_state_root: ref_msg.prev_state_root,
                                                     expected_state_root: ref_msg.state_root,
                                                     proof_cid: ref_msg.proof_cid.clone(),
+                                                    finality_cid: ref_msg.finality_cid.clone(),
                                                     attempts: 0,
                                                     next_retry_at_ms: 0,
                                                 },
@@ -3718,6 +3985,49 @@ impl CatalystNode {
                                     }
                                 }
                             }
+                        } else if envelope.message_type == MessageType::LsuFinalityAttestation {
+                            if let Ok(msg) = envelope.extract_message::<LsuFinalityAttestationMsg>() {
+                                let Some(store) = &storage else {
+                                    continue;
+                                };
+                                let Some(dfs) = &dfs else {
+                                    continue;
+                                };
+                                ingest_finality_attestation(
+                                    store.as_ref(),
+                                    dfs,
+                                    &net,
+                                    &finality_buckets_in,
+                                    &msg,
+                                    &producer_id_self,
+                                )
+                                .await;
+                                let do_relay = {
+                                    let mut rc = relay_cache.lock().await;
+                                    rc.should_relay(&envelope, now_ms)
+                                };
+                                if do_relay {
+                                    let _ = net.broadcast_envelope(&envelope).await;
+                                }
+                            }
+                        } else if envelope.message_type == MessageType::LsuFinalityCid {
+                            if let Ok(msg) = envelope.extract_message::<LsuFinalityCidMsg>() {
+                                if let Some(store) = &storage {
+                                    let _ = store
+                                        .set_metadata(
+                                            &format!("consensus:lsu_finality_cid:{}", msg.cycle),
+                                            msg.finality_cid.as_bytes(),
+                                        )
+                                        .await;
+                                }
+                                let do_relay = {
+                                    let mut rc = relay_cache.lock().await;
+                                    rc.should_relay(&envelope, now_ms)
+                                };
+                                if do_relay {
+                                    let _ = net.broadcast_envelope(&envelope).await;
+                                }
+                            }
                         } else if envelope.message_type == MessageType::StateRequest {
                             if let Ok(req) = envelope.extract_message::<LsuRangeRequest>() {
                                 if req.requester == producer_id_self {
@@ -3746,6 +4056,12 @@ impl CatalystNode {
                                             .await
                                             .unwrap_or([0u8; 32])
                                     };
+                                    let finality_cid = meta_string(
+                                        store.as_ref(),
+                                        &format!("consensus:lsu_finality_cid:{}", cycle),
+                                    )
+                                    .await
+                                    .unwrap_or_default();
                                     refs.push(LsuCidGossip {
                                         cycle,
                                         lsu_hash,
@@ -3753,6 +4069,7 @@ impl CatalystNode {
                                         prev_state_root,
                                         state_root,
                                         proof_cid: String::new(),
+                                        finality_cid,
                                     });
                                 }
                                 if refs.is_empty() {
@@ -3798,6 +4115,7 @@ impl CatalystNode {
                                             prev_state_root: r.prev_state_root,
                                             expected_state_root: r.state_root,
                                             proof_cid: r.proof_cid.clone(),
+                                            finality_cid: r.finality_cid.clone(),
                                             attempts: 0,
                                             next_retry_at_ms: 0,
                                         },
@@ -3963,6 +4281,27 @@ impl CatalystNode {
                                                     )
                                                     .await
                                                     .unwrap_or(false);
+                                                }
+                                            }
+                                            if ok {
+                                                if let Some(dfs) = &dfs {
+                                                    if !verify_lsu_finality_for_apply(
+                                                        store.as_ref(),
+                                                        dfs,
+                                                        &lsu,
+                                                        info.cycle,
+                                                        &info.finality_cid,
+                                                    )
+                                                    .await
+                                                    {
+                                                        ok = false;
+                                                    }
+                                                } else if catalyst_require_lsu_finality() {
+                                                    warn!(
+                                                        "CATALYST_REQUIRE_LSU_FINALITY set but DFS unavailable (FileResponse path) cycle={}",
+                                                        info.cycle
+                                                    );
+                                                    ok = false;
                                                 }
                                             }
                                             if ok {
@@ -4132,6 +4471,8 @@ impl CatalystNode {
         if self.config.validator {
             let validator_worker_ids_hex = validator_worker_ids_hex.clone();
             let max_entries_per_cycle = self.config.consensus.max_transactions_per_block as usize;
+            let finality_buckets_consensus = finality_buckets.clone();
+            let validator_signing_key_consensus = validator_signing_key.clone();
             self.consensus_task = Some(tokio::spawn(async move {
                 // Seed for deterministic producer selection (paper uses previous LSU merkle root).
                 // We approximate with the hash of the most recent LSU we produced/observed.
@@ -4419,6 +4760,16 @@ impl CatalystNode {
                                             } else {
                                                 [0u8; 32]
                                             };
+                                            let finality_cid_for_gossip = if let Some(store) = &storage {
+                                                meta_string(
+                                                    store.as_ref(),
+                                                    &format!("consensus:lsu_finality_cid:{}", cycle),
+                                                )
+                                                .await
+                                                .unwrap_or_default()
+                                            } else {
+                                                String::new()
+                                            };
                                             let msg = LsuCidGossip {
                                                 cycle,
                                                 lsu_hash,
@@ -4426,6 +4777,7 @@ impl CatalystNode {
                                                 prev_state_root: prev_state_root_for_msg,
                                                 state_root,
                                                 proof_cid: proof_cid_for_msg,
+                                                finality_cid: finality_cid_for_gossip,
                                             };
                                             if let Ok(env) = MessageEnvelope::from_message(&msg, "lsu_cid".to_string(), None) {
                                                 let _ = network.broadcast_envelope(&env).await;
@@ -4452,6 +4804,64 @@ impl CatalystNode {
                                                         &msg.state_root,
                                                     )
                                                     .await;
+                                            }
+
+                                            // ADR 0001: sign and gossip finality attestation; merge quorum certificate.
+                                            if let (Some(store), Some(sk)) =
+                                                (storage.as_ref(), validator_signing_key_consensus.as_ref())
+                                            {
+                                                if update.vote_list.iter().any(|v| v == &producer_id)
+                                                    && catalyst_consensus::committee_hash_ordered_producer_list(
+                                                        &update.producer_list,
+                                                    )
+                                                    .is_some()
+                                                {
+                                                    let chain_id = load_chain_id_u64(store.as_ref()).await;
+                                                    let genesis_hash = load_genesis_hash_32(store.as_ref()).await;
+                                                    if let Ok(lsu_hash) = catalyst_consensus::types::hash_data(&update) {
+                                                        let ch = catalyst_consensus::committee_hash_ordered_producer_list(
+                                                            &update.producer_list,
+                                                        )
+                                                        .unwrap();
+                                                        let vh = catalyst_consensus::hash_producer_list_merkle(&update.vote_list);
+                                                        let h_cert = catalyst_consensus::h_cert_v1(
+                                                            chain_id,
+                                                            &genesis_hash,
+                                                            cycle,
+                                                            &lsu_hash,
+                                                            &ch,
+                                                            &vh,
+                                                        );
+                                                        let mut rng = rand::rngs::OsRng;
+                                                        let scheme = catalyst_crypto::signatures::SignatureScheme::new();
+                                                        if let Ok(sig) = scheme.sign(&mut rng, sk, &h_cert) {
+                                                            let attest = LsuFinalityAttestationMsg {
+                                                                chain_id,
+                                                                genesis_hash,
+                                                                cycle,
+                                                                lsu_hash,
+                                                                committee_hash: ch,
+                                                                vote_list_hash: vh,
+                                                                producer_id: producer_id.clone(),
+                                                                signature: sig.to_bytes().to_vec(),
+                                                            };
+                                                            ingest_finality_attestation(
+                                                                store.as_ref(),
+                                                                dfs,
+                                                                &network,
+                                                                &finality_buckets_consensus,
+                                                                &attest,
+                                                                &producer_id,
+                                                            )
+                                                            .await;
+                                                            if let Ok(env) =
+                                                                MessageEnvelope::from_message(&attest, "fin_att".to_string(), None)
+                                                            {
+                                                                let _ = network.broadcast_envelope(&env).await;
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             }
                                         } else if let Ok(msg) = LsuGossip::new(update.clone()) {
                                             if let Ok(env) = MessageEnvelope::from_message(&msg, "lsu".to_string(), None) {

@@ -1,0 +1,21 @@
+{
+  "network": "testnet",
+  "endpoints": [
+    {
+      "name": "us",
+      "url": "https://testnet-us-rpc-1/"
+    },
+    {
+      "name": "eu",
+      "url": "https://testnet-eu-rpc-1/"
+    },
+    {
+      "name": "asia",
+      "url": "https://testnet-asia-rpc-1/"
+    },
+    {
+      "name": "rpc",
+      "url": "https://testnet-us-rpc/"
+    }
+  ]
+}

@@ -376,7 +376,8 @@ fn producer_leaf_hash(producer_id: &str) -> Hash {
     hash
 }
 
-fn hash_producer_list_merkle(producer_list: &[String]) -> Hash {
+/// Merkle root over sorted unique producer ids (same as campaigning / voting phases).
+pub fn hash_producer_list_merkle(producer_list: &[String]) -> Hash {
     let mut ids = producer_list.to_vec();
     ids.sort();
     ids.dedup();

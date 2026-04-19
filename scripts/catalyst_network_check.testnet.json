@@ -1,0 +1,21 @@
+{
+  "network": "testnet",
+  "endpoints": [
+    {
+      "name": "us",
+      "url": "https://testnet-us-1.catalystnet.org/"
+    },
+    {
+      "name": "eu",
+      "url": "https://testnet-eu-1.catalystnet.org/"
+    },
+    {
+      "name": "asia",
+      "url": "https://testnet-asia-1.catalystnet.org/"
+    },
+    {
+      "name": "rpc",
+      "url": "https://testnet-eu-rpc.catalystnet.org/"
+    }
+  ]
+}

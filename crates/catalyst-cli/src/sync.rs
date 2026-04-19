@@ -20,9 +20,11 @@ pub struct LsuCidGossip {
     ///
     /// NOTE: `impl_catalyst_serialize!` doesn't support `Option<T>`, so we encode "none" as "".
     pub proof_cid: String,
+    /// CID of `LsuFinalityCertificateV1` (bincode). Empty if not yet assembled (coordinated network upgrade).
+    pub finality_cid: String,
 }
 
-impl_catalyst_serialize!(LsuCidGossip, cycle, lsu_hash, cid, prev_state_root, state_root, proof_cid);
+impl_catalyst_serialize!(LsuCidGossip, cycle, lsu_hash, cid, prev_state_root, state_root, proof_cid, finality_cid);
 
 impl NetworkMessage for LsuCidGossip {
     fn serialize(&self) -> CatalystResult<Vec<u8>> {
@@ -238,6 +240,85 @@ impl LsuGossip {
             lsu_hash,
             lsu,
         })
+    }
+}
+
+/// One validator attestation: Ed25519/Ristretto Schnorr signature over `H_cert` (ADR 0001).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LsuFinalityAttestationMsg {
+    pub chain_id: u64,
+    pub genesis_hash: [u8; 32],
+    pub cycle: u64,
+    pub lsu_hash: [u8; 32],
+    pub committee_hash: [u8; 32],
+    pub vote_list_hash: [u8; 32],
+    pub producer_id: String,
+    pub signature: Vec<u8>,
+}
+
+impl_catalyst_serialize!(
+    LsuFinalityAttestationMsg,
+    chain_id,
+    genesis_hash,
+    cycle,
+    lsu_hash,
+    committee_hash,
+    vote_list_hash,
+    producer_id,
+    signature
+);
+
+impl NetworkMessage for LsuFinalityAttestationMsg {
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        CatalystSerialize::serialize(self)
+    }
+
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        CatalystDeserialize::deserialize(data)
+    }
+
+    fn message_type(&self) -> MessageType {
+        MessageType::LsuFinalityAttestation
+    }
+
+    fn priority(&self) -> u8 {
+        MessagePriority::High as u8
+    }
+
+    fn ttl(&self) -> u32 {
+        300
+    }
+}
+
+/// Announces where to fetch the assembled quorum certificate for a cycle.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LsuFinalityCidMsg {
+    pub cycle: u64,
+    pub lsu_hash: [u8; 32],
+    pub finality_cid: String,
+}
+
+impl_catalyst_serialize!(LsuFinalityCidMsg, cycle, lsu_hash, finality_cid);
+
+impl NetworkMessage for LsuFinalityCidMsg {
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        CatalystSerialize::serialize(self)
+    }
+
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        CatalystDeserialize::deserialize(data)
+    }
+
+    fn message_type(&self) -> MessageType {
+        MessageType::LsuFinalityCid
+    }
+
+    fn priority(&self) -> u8 {
+        MessagePriority::High as u8
+    }
+
+    fn ttl(&self) -> u32 {
+        300
     }
 }
 
