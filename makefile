@@ -1,7 +1,7 @@
 # Catalyst Node Makefile
 # Provides convenient commands for building, testing, and running the Catalyst node
 
-.PHONY: help build test run clean setup dev docker fmt clippy docs bench
+.PHONY: help build test run clean setup dev docker fmt clippy docs bench consensus-checklist-tests
 
 # Default target
 help:
@@ -18,6 +18,7 @@ help:
 	@echo "  fmt       - Format code with rustfmt"
 	@echo "  clippy    - Run clippy lints"
 	@echo "  test      - Run all tests"
+	@echo "  consensus-checklist-tests - Consensus gate (cli + consensus + core protocol tests)"
 	@echo "  bench     - Run benchmarks"
 	@echo ""
 	@echo "Documentation:"
@@ -61,6 +62,14 @@ else
 endif
 
 export CARGO_TARGET_DIR
+
+# GCC 15+ ships stricter / leaner transitive C++ includes. Vendored RocksDB in
+# librocksdb-sys uses uint64_t without always including <cstdint>; force it for native builds.
+GCC_MAJOR := $(shell $(CC) -dumpversion 2>/dev/null | cut -f1 -d.)
+GCC_GE_15 := $(shell test "$(GCC_MAJOR)" -ge 15 2>/dev/null && echo yes)
+ifeq ($(GCC_GE_15),yes)
+export CXXFLAGS += -include cstdint
+endif
 
 # Keep a local mirror of the source tree when building from GVFS/SMB.
 .PHONY: sync-gvfs-mirror
@@ -162,6 +171,24 @@ test-integration:
 	@echo "Running integration tests..."
 	@$(MAKE) sync-gvfs-mirror
 	RUST_LOG=debug $(CARGO) test --workspace --test integration_tests --manifest-path "$(CARGO_MANIFEST_PATH)"
+
+# Subset aligned with docs/consensus-implementation-completion-checklist.md Phase 0 gate.
+consensus-checklist-tests:
+	@echo "Running consensus checklist test slice..."
+	@$(MAKE) sync-gvfs-mirror
+	RUST_LOG=debug $(CARGO) test -p catalyst-cli --manifest-path "$(CARGO_MANIFEST_PATH)"
+	RUST_LOG=debug $(CARGO) test -p catalyst-consensus --manifest-path "$(CARGO_MANIFEST_PATH)"
+	RUST_LOG=debug $(CARGO) test -p catalyst-consensus --test convergence_harness --manifest-path "$(CARGO_MANIFEST_PATH)"
+	RUST_LOG=debug $(CARGO) test -p catalyst-core protocol:: --manifest-path "$(CARGO_MANIFEST_PATH)"
+	RUST_LOG=debug $(CARGO) test -p catalyst-network --no-default-features --features test-hooks --test tcp_batch_drop --manifest-path "$(CARGO_MANIFEST_PATH)"
+
+# Full pre-deploy gate (unit slice + optional multi-process E2E via RUN_CONSENSUS_E2E=1).
+.PHONY: pre-deploy-consensus-gate consensus-e2e
+pre-deploy-consensus-gate:
+	@bash scripts/pre-deploy-consensus-gate.sh
+
+consensus-e2e: build
+	@RUN_CONSENSUS_E2E=1 bash scripts/pre-deploy-consensus-gate.sh
 
 bench:
 	@echo "Running benchmarks..."
@@ -348,6 +375,10 @@ testnet-basic-test: build
 .PHONY: testnet-contract-test
 testnet-contract-test: build
 	@bash scripts/netctl.sh testnet test-contract
+
+.PHONY: testnet-consensus-e2e
+testnet-consensus-e2e: build
+	@bash scripts/consensus-three-validator-e2e.sh
 
 # Public/stable devnet helpers (single node that exposes RPC externally).
 # Example:

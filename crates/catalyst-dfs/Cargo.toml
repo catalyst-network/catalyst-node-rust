@@ -11,7 +11,7 @@ categories = ["network-programming", "filesystem", "cryptography"]
 
 [dependencies]
 # Database and storage
-rocksdb = "0.22"
+rocksdb = { workspace = true }
 
 # IPFS and content addressing - with serde support
 cid = { version = "0.10", features = ["serde-codec"] }

@@ -309,7 +309,38 @@ This means validators are not receiving enough peer messages in a cycle. Common 
 - `30333/tcp` blocked (cloud firewall or `ufw`)
 - node not listening on `0.0.0.0:30333`
 - not actually connected to other validators (bootstrap peers missing/wrong)
-- large clock drift (ensure NTP/chrony)
+- large clock drift (ensure NTP/chrony; validators share a wall-clock cycle index). See also [`consensus-wall-clock-and-time.md`](./consensus-wall-clock-and-time.md).
+
+### Pruning vs fork replay (archival vs pruned)
+
+With `[storage].history_prune_enabled = true`, old `consensus:lsu:*` metadata is deleted. **Quorum fork replay** that replays from cycle `1` requires **archival** LSU metadata (or successful **P2P prefetch** within `CATALYST_RECONCILE_PREFETCH_MS`). Keep at least one archival node, or disable pruning, if you need self-healing from ancient forks. See [`consensus-quorum-and-fork-choice.md`](./consensus-quorum-and-fork-choice.md).
+
+### `TX_BATCH_MISS_FATAL` / validators stop producing the same head
+
+Multi-validator nodes agree on **per-cycle transaction batches** via a deterministic batch leader. If a follower cannot obtain the canonical batch before the end of the cycle window, it **skips producing** for that cycle (preferable to forking with an empty construction set).
+
+Mitigations:
+
+- Keep **NTP-synchronized** clocks and open `30333/tcp` between all validators.
+- Optionally raise the wait budget (milliseconds): `CATALYST_TX_BATCH_WAIT_BUDGET_MS` (default scales from `cycle_duration` minus a safety margin, minimum 12s; see `tx_batch_follower_wait_budget_default` in `crates/catalyst-cli/src/consensus_limits.rs`).
+- For **fork replay** gaps on pruned nodes, ensure peers answer `LsuRangeRequest` or raise `CATALYST_RECONCILE_PREFETCH_MS` (see [`protocol-params.md`](./protocol-params.md)).
+- **Only for mixed-version testnets** where some peers do not yet gossip `TxBatchControl::Commit`: `CATALYST_ALLOW_LEGACY_AMBIGUOUS_EMPTY_TX_BATCH=1` restores the old unsafe “timeout → empty batch” behavior (not for production).
+
+### LSU finality on apply (ADR 0001)
+
+**Default:** `[consensus] require_lsu_finality = true` — validators only treat LSUs with a verified **`LsuFinalityCertificateV1`** as canonical for fork choice and apply. Migration testnets may set `require_lsu_finality = false` or `CATALYST_REQUIRE_LSU_FINALITY=0` until every peer gossips finality CIDs reliably.
+
+The process logs a startup warning if you run **`--validator`** with finality disabled. **`CATALYST_REQUIRE_LSU_FINALITY`** overrides TOML when set to a non-empty value. **`CATALYST_ALLOW_CERT_EQUIVOCATION_TIEBREAK`** is for dev/test only (see [`consensus-quorum-and-fork-choice.md`](./consensus-quorum-and-fork-choice.md)).
+
+### Canonical vs observed LSU metadata (indexers)
+
+| Metadata | Meaning |
+|----------|---------|
+| `consensus:lsu:{cycle}`, `consensus:lsu_hash:{cycle}` | **Canonical** fork-choice winner at that cycle |
+| `cycle_by_lsu_hash:{hash}` | **Observed** LSU (any hash seen; may not be canonical) |
+| `consensus:certified_lsu_hash:{cycle}` | First verified certified hash at cycle (equivocation guard) |
+
+Expose **canonical** head to applications; use observed keys only for debugging or explorer “fork” views.
 
 ### RPC is reachable but tx inclusion is slow
 

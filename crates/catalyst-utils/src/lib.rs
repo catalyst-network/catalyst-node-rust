@@ -77,6 +77,24 @@ pub mod utils {
             .as_millis() as u64
     }
 
+    /// Test-only wall offset in milliseconds (`CATALYST_TEST_WALL_OFFSET_MS`).
+    ///
+    /// Positive values shift the node's notion of "now" forward. Intended for harnesses only;
+    /// do not set in production deployments.
+    pub fn test_wall_offset_ms() -> i64 {
+        match std::env::var("CATALYST_TEST_WALL_OFFSET_MS") {
+            Ok(s) => s.trim().parse::<i64>().unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+
+    /// Wall clock for consensus / P2P ingress: `current_timestamp_ms() + offset`.
+    pub fn wall_now_ms() -> u64 {
+        let base = current_timestamp_ms() as i128;
+        let off = test_wall_offset_ms() as i128;
+        (base.saturating_add(off)).max(0) as u64
+    }
+
     /// Convert bytes to hex string
     pub fn bytes_to_hex(bytes: &[u8]) -> String {
         hex::encode(bytes)

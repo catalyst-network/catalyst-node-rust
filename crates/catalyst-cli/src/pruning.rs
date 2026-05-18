@@ -7,7 +7,8 @@ const META_KEEP_CYCLES: &str = "storage:history_keep_cycles";
 const META_PRUNE_INTERVAL_SECS: &str = "storage:history_prune_interval_seconds";
 const META_PRUNE_BATCH_CYCLES: &str = "storage:history_prune_batch_cycles";
 const META_LAST_PRUNE_RUN_MS: &str = "storage:history_prune_last_run_ms";
-const META_PRUNED_UP_TO_CYCLE: &str = "storage:history_pruned_up_to_cycle";
+/// Last cycle index whose LSU/tx history metadata was pruned (inclusive). Used by fork reconcile.
+pub const META_PRUNED_UP_TO_CYCLE: &str = "storage:history_pruned_up_to_cycle";
 
 #[derive(Debug, Clone)]
 struct PruneCfg {
@@ -197,6 +198,8 @@ async fn prune_once(
         meta_delete(store, &consensus_lsu_cid_key(cycle));
         meta_delete(store, &consensus_lsu_state_root_key(cycle));
         deleted_keys = deleted_keys.saturating_add(4);
+        meta_delete(store, &format!("consensus:tx_batch_commit:{cycle}"));
+        deleted_keys = deleted_keys.saturating_add(1);
 
         if let Some(h) = lsu_hash {
             meta_delete(store, &cycle_by_lsu_hash_key(&h));

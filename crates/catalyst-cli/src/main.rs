@@ -9,7 +9,13 @@ use serde::Deserialize;
 mod node;
 mod commands;
 mod config;
+mod consensus_limits;
+mod fork_choice;
 mod tx;
+mod tx_batch_p2p;
+mod checkpoint;
+#[cfg(test)]
+mod clock_skew_tests;
 mod sync;
 mod pruning;
 mod dfs_store;
@@ -389,6 +395,9 @@ async fn main() -> Result<()> {
                 config.consensus.cycle_duration_seconds = 20;
                 config.consensus.freeze_time_seconds = 1;
                 config.consensus.min_producer_count = 2;
+                if config.consensus.validator_worker_ids.len() >= 3 {
+                    config.consensus.min_producer_count = 3;
+                }
                 config.consensus.phase_timeouts.construction_timeout = 4;
                 config.consensus.phase_timeouts.campaigning_timeout = 4;
                 config.consensus.phase_timeouts.voting_timeout = 4;
@@ -558,6 +567,8 @@ async fn start_node(config: NodeConfig, generate_txs: bool, tx_interval_ms: u64)
     info!("Starting Catalyst node with config: {:#?}", config);
 
     let mut node = CatalystNode::new(config, generate_txs, tx_interval_ms).await?;
+
+    crate::node::ensure_consensus_p2p_cli_metrics_registered();
 
     // Start the node
     node.start().await?;

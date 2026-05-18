@@ -15,7 +15,7 @@ path = "src/main.rs"
 catalyst-core = { path = "../catalyst-core" }
 catalyst-config = { path = "../catalyst-config" }
 catalyst-consensus = { path = "../catalyst-consensus" }
-catalyst-network = { path = "../catalyst-network" }
+catalyst-network = { path = "../catalyst-network", features = ["test-hooks"] }
 catalyst-rpc = { path = "../catalyst-rpc" }
 catalyst-storage = { path = "../catalyst-storage" }
 catalyst-crypto = { path = "../catalyst-crypto" }
@@ -43,6 +43,7 @@ rand = "0.8"
 sha2 = "0.10"
 
 # Async runtime
+async-trait = "0.1"
 futures = "0.3"
 jsonrpsee = { version = "0.26", features = ["http-client"] }
 reqwest = { version = "0.13.2", features = ["json", "rustls", "stream"], default-features = false }

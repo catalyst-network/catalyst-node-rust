@@ -179,7 +179,7 @@ If any step fails, the LSU is **not** treated as **final** under this ADR.
 - **`H_cert` / verify / certificate types:** `crates/catalyst-consensus/src/lsu_finality.rs` (exported from `catalyst-consensus` crate).
 - **Wire messages:** `MessageType::LsuFinalityAttestation`, `MessageType::LsuFinalityCid`; payloads `LsuFinalityAttestationMsg`, `LsuFinalityCidMsg` in `crates/catalyst-cli/src/sync.rs`. **`LsuCidGossip`** includes **`finality_cid`** (extra serialized field — **coordinated upgrade** across peers).
 - **Production:** Validators in **`vote_list`** sign **`H_cert`** and gossip **`LsuFinalityAttestationMsg`**; nodes merge attestations and publish **`LsuFinalityCertificateV1`** to DFS when **BFT quorum** of distinct voters is met, then persist **`consensus:lsu_finality_cid:<cycle>`** and gossip **`LsuFinalityCidMsg`**.
-- **Verification on apply:** Environment variable **`CATALYST_REQUIRE_LSU_FINALITY`** (`1` / `true` / `yes`) requires a valid certificate (from gossip hint or metadata + DFS) before applying an LSU via CID / `FileResponse`. If unset, behavior is unchanged except optional **warn** when a present certificate fails verification.
+- **Verification on apply:** Set **`[consensus] require_lsu_finality = true`** in `catalyst.toml`, or set **`CATALYST_REQUIRE_LSU_FINALITY`** to a non-empty value (`1`/`true`/`yes` or `0`/`false`/`no`) to override the file for that process. Requires a valid certificate (from gossip hint or metadata + DFS) before applying an LSU via CID / `FileResponse`. If disabled, behavior is unchanged except optional **warn** when a present certificate fails verification. **Multi-validator testnets should plan to enable this** once every peer gossips finality CIDs reliably (see checklist §3).
 
 ## Open questions
 

@@ -381,6 +381,14 @@ impl NetworkService {
         }
         Ok(())
     }
+
+    /// Inject an envelope as if received from a peer (integration tests / `test-hooks` feature).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn inject_test_envelope(&self, envelope: MessageEnvelope) -> NetworkResult<()> {
+        let from: SocketAddr = "127.0.0.1:0".parse().expect("parse addr");
+        self.emit(NetworkEvent::MessageReceived { envelope, from })
+            .await
+    }
 }
 
 impl Clone for NetworkService {

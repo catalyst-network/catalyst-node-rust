@@ -1,16 +1,18 @@
 # Consensus quorum, finality, and fork choice (requirements)
 
-This document captures **protocol intent** and **implementation gaps** for Catalyst validator networks. **Partial implementation (MVP):** follower apply paths in `crates/catalyst-cli/src/node.rs` now attempt **BFT vote quorum** on `LedgerStateUpdate.vote_list` vs `producer_list` and, when `prev_state_root` mismatches, may **purge mutable state (preserving `protocol:*` and stored per-cycle LSU metadata), replay** from `consensus:lsu:1..C-1`, then **apply** the quorum LSU—bounded by `CATALYST_MAX_REPLAY_CYCLES` (default `1000000`, `0` disables). This is **not** a substitute for checkpoints or state sync at very large heights; certified signature artifacts and full fork-choice remain future work.
+This document captures **protocol intent** and **implementation** for Catalyst validator networks.
+
+**Implementation:** `crates/catalyst-cli/src/fork_choice.rs`, `crates/catalyst-cli/src/node.rs` (apply, reconcile, P2P LSU paths).
 
 ## Problem statement
 
-Operators have observed that validators can **diverge** (same logical cycle/height, different `state_root`) and **do not self-heal**. Follower logic today largely **skips** LSUs when `prev_state_root` does not match local storage (`prev_root mismatch`), without **reorganizing** to a **quorum-finalized** history.
+Operators have observed that validators can **diverge** (same logical cycle/height, different `state_root`) and **do not self-heal**. Follower logic must **reorganize** to **quorum-finalized / certified** history—not skip indefinitely.
 
 For production and for growing validator sets, the network must:
 
-1. **Finalize** ledger updates only when a **defined quorum** of block producers agrees.
-2. **Treat quorum-finalized history as authoritative** for all nodes (including lagging or partitioned replicas).
-3. **Reconcile** (reorg or state reset to a safe checkpoint) when local state **conflicts** with quorum-finalized updates—not **skip indefinitely**.
+1. **Finalize** ledger updates only when a **defined quorum** of block producers agrees (ADR 0001 certificate).
+2. **Treat certified history as authoritative** for all nodes (including lagging or partitioned replicas).
+3. **Reconcile** when local state **conflicts** with certified updates—not **skip indefinitely**.
 
 Snapshot-based manual restore remains a **break-glass** operational tool, not the liveness mechanism.
 
@@ -18,64 +20,96 @@ Snapshot-based manual restore remains a **break-glass** operational tool, not th
 
 We target **Byzantine fault tolerance** semantics: tolerate up to **f** faulty producers among **n**, with **n ≥ 3f + 1**, using a quorum of **⌈2n/3⌉** agreeing votes (equivalent to **2f + 1** in the classical 3f+1 layout).
 
-Examples (quorum = **⌈2n/3⌉**):
-
 | Producers (n) | Quorum (⌈2n/3⌉) | Notes |
 |---------------|------------------|--------|
 | 3 | 2 | Minimal BFT committee; 1 fault |
-| 4 | 3 | |
-| 5 | 4 | Stricter than bare majority (3); matches BFT supermajority |
-| 6 | 4 | |
-| 7 | 5 | |
-
-**Not** the rule: fixed “50% + 1” only, which for n=5 would be 3 and would **not** match the intended BFT threshold.
+| 5 | 4 | Stricter than bare majority (3) |
 
 The **exact** quorum formula, how **inactive** or **jailed** producers affect **n**, and how **epoch boundaries** rotate the set must be specified in protocol code and kept consistent with this table.
 
-## Finality and fork choice (normative intent)
+## Finality and fork choice (normative policy)
 
-- **Finality**: A ledger state update (LSU) at a given cycle/height is **final** only if accompanied by (or derivable from) evidence that **≥ quorum** of the **current producer set** committed to it (signatures, vote certificates, or equivalent—format TBD in implementation).
+### Finality
 
-- **Fork choice**: Each node’s **canonical chain** is the **prefix** of LSUs that is **compatible** with the **highest** (or **most recently finalized**) **quorum-certified** head, not merely the longest locally applied prefix that skips conflicting gossip.
+A ledger state update (LSU) at cycle *C* is **canonical** for production validators only with a **verified** `LsuFinalityCertificateV1` (ADR 0001) for that LSU’s `lsu_hash` (`[consensus] require_lsu_finality = true` by default; overridable via `CATALYST_REQUIRE_LSU_FINALITY`).
 
-- **Follower reconciliation**: If the node receives a **quorum-finalized** LSU whose **`prev_state_root`** does not match local storage:
+Testnets may set `require_lsu_finality = false` to allow **quorum-inferred** fork choice during migration.
 
-  - The node **must not** permanently ignore that update solely because of mismatch.
-  - The node **must** either:
-    - **Roll back** local state to the certified parent and **apply** the finalized LSU (and any subsequent finalized updates), or
-    - **Fetch and apply** a **contiguous certified prefix** from peers / archive that bridges local head to the finalized head, or
-    - In extreme cases, **reset** from a **checkpoint** that is **at or before** the last mutually agreed finalized state, then fast-forward (implementation-defined, but **must** converge to the same finalized history as honest quorum members).
+### Fork choice at a fixed cycle
 
-- **Safety**: Two **conflicting** LSUs at the **same** cycle/height must **not** both be final unless the protocol is broken; quorum logic must make **equivocation** by &lt; quorum producers **non-finalizing**.
+When two different LSU payloads compete at the **same** `cycle_number`, nodes use **`fork_choice.rs`**:
 
-## Relationship to current implementation (gap analysis)
+1. **Evidence tier** (higher wins):
+   - **`Certified`**: verified ADR 0001 certificate for that `lsu_hash`.
+   - **`QuorumInferred`**: `vote_list` meets ⌈2n/3⌉ ⊆ `producer_list` (only when **not** `certified_only`).
+   - **`None`**: does not compete for canonical slot.
+2. **Tie-break** (equal tier, different hash): **lexicographically smaller `lsu_hash`**.
 
-Today (as of the discussions that motivated this doc):
+Weaker competitors are rejected (`consensus_fork_choice_rejected_weaker_total`). Under `certified_only`, non-certified LSUs are rejected (`consensus_fork_choice_rejected_non_certified_total`).
 
-- **Cycle** is partly driven by **wall-clock** (`current_timestamp_ms() / cycle_ms`), which interacts with producer selection and leader batching; this needs **audit** for skew and restart edge cases.
-- **Followers** previously **skipped** applies on `prev_root mismatch`; they now **may** auto-reconcile via quorum + bounded replay as above when history is present locally (still **no** cryptographic finality certificate—quorum is inferred from LSU fields only).
-- **Operational recovery** (snapshot, `db-restore`, copying `data/`) is required to realign forked validators—acceptable as **ops**, not as **the** liveness story.
+### Certified equivocation (two certs, same cycle)
 
-Implementation work should:
+If two **distinct** verified certificates exist at the same cycle:
 
-1. Define **certified finality** artifacts for LSUs (what is signed, by whom, over what payload).
-2. Wire **apply path** to **prefer** or **require** finality evidence before treating a branch as canonical.
-3. Implement **rollback / reorg / checkpoint sync** bounded by safety rules.
-4. Add **tests**: partition, clock skew, minority equivocation, and **post-rejoin convergence** to one `state_root` at each height.
+| Mode | Policy |
+|------|--------|
+| **Production** (`require_lsu_finality` effective) | **Stall apply** + error log + `consensus_certified_equivocation_stall_total` |
+| **Testnet** (`require_lsu_finality` off) | Deterministic **hash tie-break** + `consensus_certified_equivocation_tiebreak_total` |
+| **Dev override** | `CATALYST_ALLOW_CERT_EQUIVOCATION_TIEBREAK=1` forces tie-break even with finality required |
+
+First certified hash at a cycle is stored in metadata `consensus:certified_lsu_hash:{cycle}`.
+
+### Cross-cycle head adoption
+
+Adopt a **higher** certified head **only** after a **contiguous verified prefix** from genesis, local head, or a **signed checkpoint**—not from gossiped cycle number alone. Implementation: `try_reconcile_fork_from_quorum_lsu` replays `consensus:lsu:1..C-1` (with optional `LsuRangeRequest` prefetch); does not apply a distant head without prefix.
+
+### Reorg on stronger certified LSU
+
+If cycle *C* is **already applied** but a **stronger** LSU at *C* arrives (higher fork-choice rank), the node **purges and replays** via the same reconcile path (`try_reorg_stronger_lsu_at_applied_cycle`), not “first applied wins.”
+
+### Pruned validators
+
+Do not treat a stronger certified LSU as **canonical applied head** until the **prefix** is verifiable (local metadata, P2P range fetch, or checkpoint). Observed alternates may be indexed via `cycle_by_lsu_hash:*` without overwriting `consensus:lsu:{C}`.
+
+### RPC / indexer semantics
+
+| Key / view | Role |
+|------------|------|
+| `consensus:lsu:{C}`, `consensus:lsu_hash:{C}` | **Canonical** LSU at cycle *C* (fork-choice winner) |
+| `cycle_by_lsu_hash:{hash}` | **Observed** index (any hash seen; not necessarily canonical) |
+| `consensus:certified_lsu_hash:{C}` | First verified certified hash recorded at *C* (equivocation detection) |
+
+Application-facing APIs should expose **canonical** head by default; debug/explorer surfaces may list **observed** forks with labels.
+
+### Follower reconciliation
+
+On `prev_root` mismatch with a **certified** (or quorum, on testnet) LSU:
+
+- Roll back via bounded replay (`CATALYST_MAX_REPLAY_CYCLES`, snapshot on failure).
+- Optional prefetch (`CATALYST_RECONCILE_PREFETCH_MS`) before aborting when metadata is missing.
+
+### Safety
+
+Two **conflicting** certified LSUs at the same cycle indicate **equivocation or verifier failure**; production **stalls** rather than silently picking a winner.
+
+## Relationship to implementation
+
+- **Certified apply:** `verify_lsu_finality_for_apply`, `require_lsu_finality` default **true** in `NodeConfig`.
+- **Fork choice:** `fork_choice_apply_gate`, `persist_lsu_history`, P2P LSU handlers.
+- **Replay:** `try_reconcile_fork_from_quorum_lsu`, `try_reorg_stronger_lsu_at_applied_cycle`.
 
 ## Testnet deployment gate
 
-Changes implementing this document should be:
-
-- Covered by **automated** multi-node tests where possible.
-- Deployed to **testnet first**; operators verify **no sustained `prev_root mismatch` split** under injected faults and that **reconvergence** occurs without manual snapshot restore for **defined** scenarios.
+- Automated multi-node tests for competing LSUs, certified vs inferred, and reorg.
+- Testnet verifies re-convergence without manual snapshot for defined fault scenarios.
 
 ## References (internal)
 
-- `crates/catalyst-cli/src/node.rs` — consensus loop, `prev_root mismatch`, `apply_lsu_to_storage`, wall-clock `cycle`.
-- `docs/node-operator-guide.md` — validator set bootstrap and operations.
-- `docs/adr/0001-lsu-finality-certificate.md` — **proposed** LSU finality certificate (`H_cert`, quorum signatures, distribution via `finality_cid`).
+- `docs/consensus-implementation-completion-checklist.md`
+- `docs/adr/0001-lsu-finality-certificate.md`
+- `docs/protocol-params.md`
+- `docs/node-operator-guide.md`
 
 ---
 
-*Document status: **requirements / roadmap**. Implementation and commit timing are at project discretion.*
+*Document status: **normative policy** (agreed 2026-05-16). Implementation ongoing for cross-cycle checkpoint sync and full integration test matrix.*

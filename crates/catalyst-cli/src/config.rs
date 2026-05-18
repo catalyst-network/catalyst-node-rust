@@ -297,6 +297,12 @@ pub struct ConsensusConfig {
     /// For local testnet, it can be auto-populated from `testnet/validators.toml`.
     #[serde(default)]
     pub validator_worker_ids: Vec<String>,
+
+    /// If true, applying an LSU received over P2P requires a verifiable `LsuFinalityCertificateV1` (ADR 0001).
+    ///
+    /// May be overridden by `CATALYST_REQUIRE_LSU_FINALITY` when that variable is set to a non-empty value.
+    #[serde(default)]
+    pub require_lsu_finality: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -543,6 +549,7 @@ impl Default for NodeConfig {
                     synchronization_timeout: 15,
                 },
                 validator_worker_ids: Vec::new(),
+                require_lsu_finality: true,
             },
             runtimes: RuntimeConfig {
                 evm: EvmRuntimeConfig {

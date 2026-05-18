@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
@@ -18,7 +18,7 @@ use catalyst_consensus::types::hash_data;
 use catalyst_utils::state::StateManager;
 
 use crate::config::NodeConfig;
-use crate::tx::{Mempool, ProtocolTxBatch, ProtocolTxGossip, TxBatch, TxGossip};
+use crate::tx::{Mempool, ProtocolTxBatch, ProtocolTxGossip, TxBatch, TxBatchControl, TxGossip};
 use crate::sync::{
     FileRequestMsg, FileResponseMsg, KeyProofChange, LsuCidGossip, LsuFinalityAttestationMsg,
     LsuFinalityCidMsg, LsuGossip, LsuRangeRequest, LsuRangeResponse, StateProofBundle,
@@ -49,7 +49,7 @@ fn jitter_ms(max_ms: u64) -> u64 {
     r % (max_ms + 1)
 }
 
-async fn local_applied_state_root(store: &catalyst_storage::StorageManager) -> [u8; 32] {
+pub(crate) async fn local_applied_state_root(store: &catalyst_storage::StorageManager) -> [u8; 32] {
     // Prefer the engine-provided cached root (restored on open), and fall back to the persisted
     // metadata key used by older codepaths.
     if let Some(r) = store.get_state_root() {
@@ -105,21 +105,222 @@ async fn meta_string(store: &catalyst_storage::StorageManager, key: &str) -> Opt
     if s.is_empty() { None } else { Some(s) }
 }
 
+async fn load_stored_certified_hash_at_cycle(
+    store: &StorageManager,
+    cycle: u64,
+) -> Option<[u8; 32]> {
+    let b = store
+        .get_metadata(&crate::fork_choice::certified_hash_metadata_key(cycle))
+        .await
+        .ok()
+        .flatten()?;
+    if b.len() != 32 {
+        return None;
+    }
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&b[..32]);
+    Some(h)
+}
+
+async fn local_applied_lsu_hash(store: &StorageManager) -> Option<[u8; 32]> {
+    let b = store
+        .get_metadata("consensus:last_applied_lsu_hash")
+        .await
+        .ok()
+        .flatten()?;
+    if b.len() != 32 {
+        return None;
+    }
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&b[..32]);
+    Some(h)
+}
+
+/// Gate apply/reconcile: weaker fork, non-cert under certified-only, or certified equivocation stall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForkChoiceApplyGate {
+    Allow,
+    RejectWeaker,
+    RejectNonCertified,
+    StallCertifiedEquivocation,
+}
+
+async fn fork_choice_apply_gate(
+    store: &StorageManager,
+    dfs: Option<&crate::dfs_store::LocalContentStore>,
+    lsu: &catalyst_consensus::types::LedgerStateUpdate,
+    cycle: u64,
+    lsu_hash: [u8; 32],
+    finality_cid_hint: &str,
+    certified_only: bool,
+) -> ForkChoiceApplyGate {
+    let certified = match dfs {
+        Some(dfs) => {
+            lsu_has_verified_finality_cert(store, dfs, lsu, cycle, finality_cid_hint).await
+        }
+        None => false,
+    };
+    let incoming = crate::fork_choice::ForkChoiceCandidate::new(
+        cycle,
+        lsu_hash,
+        lsu,
+        certified,
+        certified_only,
+    );
+
+    if certified_only && incoming.tier != crate::fork_choice::ForkChoiceTier::Certified {
+        return ForkChoiceApplyGate::RejectNonCertified;
+    }
+
+    if certified {
+        let stored_cert = load_stored_certified_hash_at_cycle(store, cycle).await;
+        match crate::fork_choice::register_certified_hash(stored_cert, lsu_hash) {
+            crate::fork_choice::CertifiedHashRegister::Ok => {
+                if stored_cert.is_none() {
+                    let _ = store
+                        .set_metadata(
+                            &crate::fork_choice::certified_hash_metadata_key(cycle),
+                            &lsu_hash,
+                        )
+                        .await;
+                }
+            }
+            crate::fork_choice::CertifiedHashRegister::ConflictingCertified { existing, new } => {
+                match crate::fork_choice::certified_equivocation_policy(certified_only) {
+                    crate::fork_choice::CertifiedEquivocationPolicy::StallAndAlert => {
+                        tracing::error!(
+                            target: "catalyst.consensus.fork_choice",
+                            cycle,
+                            existing_hash = %hex_encode(&existing),
+                            new_hash = %hex_encode(&new),
+                            "Certified equivocation at cycle: two distinct verified certificates (stalling apply)"
+                        );
+                        catalyst_utils::increment_counter!(
+                            "consensus_certified_equivocation_stall_total",
+                            1
+                        );
+                        return ForkChoiceApplyGate::StallCertifiedEquivocation;
+                    }
+                    crate::fork_choice::CertifiedEquivocationPolicy::TieBreak => {
+                        tracing::warn!(
+                            target: "catalyst.consensus.fork_choice",
+                            cycle,
+                            existing_hash = %hex_encode(&existing),
+                            new_hash = %hex_encode(&new),
+                            "Certified equivocation: testnet tie-break policy active"
+                        );
+                        catalyst_utils::increment_counter!(
+                            "consensus_certified_equivocation_tiebreak_total",
+                            1
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if fork_choice_reject_weaker_incoming(store, dfs, &incoming, certified_only).await {
+        return ForkChoiceApplyGate::RejectWeaker;
+    }
+
+    ForkChoiceApplyGate::Allow
+}
+
+/// Reorg when cycle `cycle` is already applied but incoming wins fork choice (certified / tie-break).
+async fn try_reorg_stronger_lsu_at_applied_cycle(
+    store: &StorageManager,
+    lsu: &catalyst_consensus::types::LedgerStateUpdate,
+    cycle: u64,
+    expected_prev: [u8; 32],
+    expected_post: [u8; 32],
+    expected_lsu_hash: &[u8; 32],
+    fetch: Option<(&P2pService, &str)>,
+    dfs: Option<&crate::dfs_store::LocalContentStore>,
+    finality_cid_hint: &str,
+    certified_only: bool,
+) -> Result<bool> {
+    let applied = local_applied_cycle(store).await;
+    if applied != cycle {
+        return Ok(false);
+    }
+    let Some(applied_hash) = local_applied_lsu_hash(store).await else {
+        return Ok(false);
+    };
+    if applied_hash == *expected_lsu_hash {
+        return Ok(false);
+    }
+    let incoming =
+        fork_choice_candidate_for_lsu(store, dfs, lsu, cycle, *expected_lsu_hash, finality_cid_hint, certified_only)
+            .await;
+    let applied_candidate = load_fork_choice_candidate_at_cycle(store, dfs, cycle, certified_only)
+        .await
+        .filter(|c| c.lsu_hash == applied_hash)
+        .unwrap_or(crate::fork_choice::ForkChoiceCandidate {
+            cycle,
+            lsu_hash: applied_hash,
+            tier: crate::fork_choice::ForkChoiceTier::None,
+        });
+    if !crate::fork_choice::incoming_beats_stored(&incoming, &applied_candidate) {
+        return Ok(false);
+    }
+    tracing::warn!(
+        target: "catalyst.consensus.fork_choice",
+        cycle,
+        applied_hash = %hex_encode(&applied_hash),
+        incoming_hash = %hex_encode(expected_lsu_hash),
+        "Reorg: stronger LSU at already-applied cycle"
+    );
+    try_reconcile_fork_from_quorum_lsu(
+        store,
+        lsu,
+        cycle,
+        expected_prev,
+        expected_post,
+        expected_lsu_hash,
+        fetch,
+        dfs,
+        finality_cid_hint,
+        certified_only,
+    )
+    .await
+}
+
 async fn persist_lsu_history(
     store: &catalyst_storage::StorageManager,
+    dfs: Option<&crate::dfs_store::LocalContentStore>,
     cycle: u64,
     lsu_bytes: &[u8],
     lsu_hash: &[u8; 32],
     cid: &str,
     state_root: &[u8; 32],
+    finality_cid_hint: &str,
+    certified_only: bool,
 ) {
     // Per-cycle history used by RPC/indexers. Best-effort.
-    let _ = store
-        .set_metadata(&format!("consensus:lsu:{}", cycle), lsu_bytes)
+    let mut write_canonical_slot = true;
+    if let Ok(lsu) = catalyst_consensus::types::LedgerStateUpdate::deserialize(lsu_bytes) {
+        let incoming = fork_choice_candidate_for_lsu(
+            store,
+            dfs,
+            &lsu,
+            cycle,
+            *lsu_hash,
+            finality_cid_hint,
+            certified_only,
+        )
         .await;
-    let _ = store
-        .set_metadata(&format!("consensus:lsu_hash:{}", cycle), lsu_hash)
-        .await;
+        if fork_choice_reject_weaker_incoming(store, dfs, &incoming, certified_only).await {
+            write_canonical_slot = false;
+        }
+    }
+    if write_canonical_slot {
+        let _ = store
+            .set_metadata(&format!("consensus:lsu:{}", cycle), lsu_bytes)
+            .await;
+        let _ = store
+            .set_metadata(&format!("consensus:lsu_hash:{}", cycle), lsu_hash)
+            .await;
+    }
     let _ = store
         .set_metadata(&cycle_by_lsu_hash_key(lsu_hash), &cycle.to_le_bytes())
         .await;
@@ -1132,7 +1333,7 @@ async fn load_chain_id_u64(store: &StorageManager) -> u64 {
         .unwrap_or(31337)
 }
 
-async fn ensure_chain_identity_and_genesis(
+pub(crate) async fn ensure_chain_identity_and_genesis(
     store: &StorageManager,
     cfg: &crate::config::ProtocolConfig,
 ) -> anyhow::Result<()> {
@@ -1402,6 +1603,85 @@ fn load_workers_from_state(store: &StorageManager) -> Vec<[u8; 32]> {
     out
 }
 
+/// Best-effort registration of counters used by consensus P2P ingress, fork reconcile, and LSU apply paths
+/// (`increment_counter!` is a no-op unless the metric name exists in the global registry).
+pub(crate) fn ensure_consensus_p2p_cli_metrics_registered() {
+    use catalyst_utils::metrics::{
+        get_metrics_registry, init_metrics, Metric, MetricCategory, MetricType,
+    };
+    if get_metrics_registry().is_none() {
+        let _ = init_metrics();
+    }
+    let Some(registry) = get_metrics_registry() else {
+        return;
+    };
+    let Ok(mut guard) = registry.lock() else {
+        return;
+    };
+    const EXTRA: &[(&str, &str)] = &[
+        (
+            "consensus_p2p_tx_batch_cycle_rejected_total",
+            "Protocol or legacy TxBatch dropped at ingress: cycle outside wall slack window",
+        ),
+        (
+            "consensus_p2p_tx_batch_commit_cycle_rejected_total",
+            "TxBatchControl::Commit ignored at ingress: cycle outside wall slack window",
+        ),
+        (
+            "consensus_p2p_tx_batch_commit_disagrees_total",
+            "ProtocolTxBatch dropped: disagrees with pinned TxBatchControl::Commit",
+        ),
+        (
+            "consensus_p2p_lsu_cycle_rejected_total",
+            "LSU-related P2P payload dropped at ingress: cycle too far ahead of wall clock",
+        ),
+        (
+            "consensus_lsu_gossip_apply_rejected_finality_total",
+            "LsuGossip not applied/relayed: finality policy or missing DFS / certificate",
+        ),
+        (
+            "consensus_fork_reconcile_succeeded_total",
+            "BFT-quorum fork reconcile replay completed and applied target LSU",
+        ),
+        (
+            "consensus_fork_reconcile_aborted_total",
+            "Fork reconcile not started or rolled back (prechecks, missing history, inner replay failure)",
+        ),
+        (
+            "consensus_fork_reconcile_error_total",
+            "Fork reconcile snapshot restore failed after replay error",
+        ),
+        (
+            "consensus_lsu_apply_skipped_prev_root_total",
+            "LsuCidGossip apply skipped after prev_root mismatch and reconcile did not complete",
+        ),
+        (
+            "consensus_fork_choice_rejected_weaker_total",
+            "Competing LSU at same cycle rejected: weaker fork-choice rank (tier or lsu_hash tie-break)",
+        ),
+        (
+            "consensus_fork_choice_rejected_non_certified_total",
+            "LSU rejected: certified-only fork choice policy (no verified finality certificate)",
+        ),
+        (
+            "consensus_certified_equivocation_stall_total",
+            "Two distinct verified certificates at same cycle; apply stalled (production policy)",
+        ),
+        (
+            "consensus_certified_equivocation_tiebreak_total",
+            "Two distinct verified certificates at same cycle; testnet tie-break policy",
+        ),
+    ];
+    for (name, desc) in EXTRA {
+        let _ = guard.register_metric(Metric::new(
+            (*name).to_string(),
+            MetricCategory::Consensus,
+            MetricType::Counter,
+            desc.to_string(),
+        ));
+    }
+}
+
 fn parse_producer_id_pubkey(producer_id: &str) -> Option<[u8; 32]> {
     parse_hex_32(producer_id)
 }
@@ -1586,7 +1866,7 @@ fn tx_boundary_signature(tx: &catalyst_core::protocol::Transaction) -> Vec<u8> {
     }
 }
 
-fn tx_to_consensus_entries(tx: &catalyst_core::protocol::Transaction) -> Vec<catalyst_consensus::types::TransactionEntry> {
+pub(crate) fn tx_to_consensus_entries(tx: &catalyst_core::protocol::Transaction) -> Vec<catalyst_consensus::types::TransactionEntry> {
     // Reuse the canonical protocol->consensus conversion to keep fee-debit handling
     // consistent across mempool admission and cycle construction.
     let msg = ProtocolTxGossip {
@@ -1597,7 +1877,7 @@ fn tx_to_consensus_entries(tx: &catalyst_core::protocol::Transaction) -> Vec<cat
     msg.to_consensus_entries()
 }
 
-async fn validate_and_select_protocol_txs_for_construction(
+pub(crate) async fn validate_and_select_protocol_txs_for_construction(
     store: &StorageManager,
     cycle: u64,
     txs: Vec<catalyst_core::protocol::Transaction>,
@@ -1750,7 +2030,7 @@ async fn validate_and_select_protocol_txs_for_construction(
     out
 }
 
-fn mempool_txid(tx: &catalyst_core::protocol::Transaction) -> Option<[u8; 32]> {
+pub(crate) fn mempool_txid(tx: &catalyst_core::protocol::Transaction) -> Option<[u8; 32]> {
     catalyst_core::protocol::tx_id_v2(tx).ok()
 }
 
@@ -1852,7 +2132,7 @@ async fn delete_persisted_mempool_tx(store: &StorageManager, txid: &[u8; 32]) {
     save_mempool_txids(store, ids).await;
 }
 
-async fn persist_cycle_txids(store: &StorageManager, cycle: u64, mut txids: Vec<[u8; 32]>) {
+pub(crate) async fn persist_cycle_txids(store: &StorageManager, cycle: u64, mut txids: Vec<[u8; 32]>) {
     txids.sort();
     txids.dedup();
     if let Ok(bytes) = bincode::serialize(&txids) {
@@ -1867,7 +2147,254 @@ async fn load_cycle_txids(store: &StorageManager, cycle: u64) -> Vec<[u8; 32]> {
     bincode::deserialize::<Vec<[u8; 32]>>(&bytes).unwrap_or_default()
 }
 
-async fn update_tx_meta_status_selected(store: &StorageManager, tx: &catalyst_core::protocol::Transaction, cycle: u64) {
+/// Wall-clock budget for followers to obtain the canonical `ProtocolTxBatch` (WAN-safe default).
+fn catalyst_tx_batch_wait_budget_ms(cycle_ms: u64) -> u64 {
+    crate::consensus_limits::tx_batch_follower_wait_budget_ms(cycle_ms)
+}
+
+/// **Unsafe:** if true, a producer may run Construction with an empty tx list when the batch
+/// could not be recovered and no `TxBatchControl::Commit` was seen (pre-upgrade peers only).
+fn catalyst_allow_legacy_ambiguous_empty_tx_batch() -> bool {
+    matches!(
+        std::env::var("CATALYST_ALLOW_LEGACY_AMBIGUOUS_EMPTY_TX_BATCH")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
+/// Rebuild Construction inputs from persisted per-cycle tx ids + tx bytes (same validation as ingestion).
+async fn recover_entries_from_persisted_cycle_txs(
+    store: &StorageManager,
+    cycle: u64,
+    max_entries: usize,
+) -> Option<Vec<catalyst_consensus::types::TransactionEntry>> {
+    let index_present = store
+        .get_metadata(&cycle_txids_key(cycle))
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    let txids = load_cycle_txids(store, cycle).await;
+    if txids.is_empty() {
+        return index_present.then_some(Vec::new());
+    }
+    let mut txs: Vec<catalyst_core::protocol::Transaction> = Vec::with_capacity(txids.len());
+    for txid in &txids {
+        let raw = match store
+            .get_metadata(&mempool_tx_key(txid))
+            .await
+            .ok()
+            .flatten()
+        {
+            Some(b) => Some(b),
+            None => store.get_metadata(&tx_raw_key(txid)).await.ok().flatten(),
+        }?;
+        let Ok(tx) = bincode::deserialize::<catalyst_core::protocol::Transaction>(&raw) else {
+            return None;
+        };
+        txs.push(tx);
+    }
+    let valid =
+        validate_and_select_protocol_txs_for_construction(store, cycle, txs, max_entries).await;
+    if let Ok(expect) = ProtocolTxBatch::new(cycle, valid.clone()) {
+        if let Some((h, c)) = read_tx_batch_commit(store, cycle).await {
+            if h != expect.batch_hash || c != expect.txs.len() as u32 {
+                tracing::warn!(
+                    target: "catalyst.consensus.tx_batch",
+                    "recover_entries: batch disagrees with commit (hash or tx_count) for cycle {}",
+                    cycle
+                );
+                return None;
+            }
+        }
+    }
+    let mut entries: Vec<catalyst_consensus::types::TransactionEntry> = Vec::new();
+    for tx in &valid {
+        entries.extend(tx_to_consensus_entries(tx));
+    }
+    Some(entries)
+}
+
+pub(crate) async fn read_tx_batch_commit(
+    store: &StorageManager,
+    cycle: u64,
+) -> Option<([u8; 32], u32)> {
+    let key = format!("consensus:tx_batch_commit:{cycle}");
+    let bytes = store.get_metadata(&key).await.ok().flatten()?;
+    crate::consensus_limits::parse_tx_batch_commit_value(&bytes)
+}
+
+pub(crate) async fn persist_tx_batch_commit_metadata(
+    store: &StorageManager,
+    cycle: u64,
+    batch_hash: [u8; 32],
+    tx_count: u32,
+) {
+    let buf = crate::consensus_limits::encode_tx_batch_commit_value(batch_hash, tx_count);
+    let _ = store
+        .set_metadata(&format!("consensus:tx_batch_commit:{cycle}"), &buf)
+        .await;
+}
+
+/// Wait for canonical construction entries: in-memory batch, store recovery, or resync from peers.
+///
+/// Never returns an ambiguous empty list for non-leaders unless legacy env is enabled.
+///
+/// `network`: when `None`, resync broadcasts are skipped (unit tests only; production passes `Some`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn wait_for_tx_construction_entries(
+    cycle: u64,
+    cycle_ms: u64,
+    producer_id: &str,
+    leader: &str,
+    is_leader: bool,
+    max_entries: usize,
+    tx_batches: &tokio::sync::RwLock<std::collections::HashMap<u64, Vec<catalyst_consensus::types::TransactionEntry>>>,
+    commit_ram: &tokio::sync::RwLock<std::collections::HashMap<u64, ([u8; 32], u32)>>,
+    storage: Option<&StorageManager>,
+    network: Option<&dyn crate::tx_batch_p2p::TxBatchNetwork>,
+) -> Option<Vec<catalyst_consensus::types::TransactionEntry>> {
+    let now_ms = crate::consensus_limits::wall_now_ms();
+    let budget = catalyst_tx_batch_wait_budget_ms(cycle_ms);
+    let deadline_ms = crate::consensus_limits::tx_batch_follower_deadline_ms(
+        now_ms,
+        cycle,
+        cycle_ms,
+        budget,
+    );
+    let mut last_resync_ms = 0u64;
+    let mut resync_sent: u32 = 0;
+
+    loop {
+        let t = crate::consensus_limits::wall_now_ms();
+        if t >= deadline_ms {
+            break;
+        }
+        if let Some(e) = tx_batches.read().await.get(&cycle).cloned() {
+            return Some(e);
+        }
+        if let Some(store) = storage {
+            if let Some(e) = recover_entries_from_persisted_cycle_txs(store, cycle, max_entries).await {
+                tx_batches.write().await.insert(cycle, e.clone());
+                return Some(e);
+            }
+        }
+        if !is_leader && t.saturating_sub(last_resync_ms) >= 600 && resync_sent < 48 {
+            last_resync_ms = t;
+            resync_sent = resync_sent.saturating_add(1);
+            let req = TxBatchControl::ResyncRequest {
+                cycle,
+                requester: producer_id.to_string(),
+            };
+            if let (Some(net), Ok(env)) = (
+                network,
+                MessageEnvelope::from_message(&req, "tx_batch_resync".to_string(), None),
+            ) {
+                let _ = net.broadcast_envelope(&env).await;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Final attempts after budget (up to cycle boundary).
+    let hard_stop = crate::consensus_limits::tx_batch_follower_hard_stop_ms(cycle, cycle_ms);
+    while crate::consensus_limits::wall_now_ms() < hard_stop {
+        if let Some(e) = tx_batches.read().await.get(&cycle).cloned() {
+            return Some(e);
+        }
+        if let Some(store) = storage {
+            if let Some(e) = recover_entries_from_persisted_cycle_txs(store, cycle, max_entries).await {
+                tx_batches.write().await.insert(cycle, e.clone());
+                return Some(e);
+            }
+        }
+        let t = crate::consensus_limits::wall_now_ms();
+        if !is_leader && t.saturating_sub(last_resync_ms) >= 400 && resync_sent < 96 {
+            last_resync_ms = t;
+            resync_sent = resync_sent.saturating_add(1);
+            let req = TxBatchControl::ResyncRequest {
+                cycle,
+                requester: producer_id.to_string(),
+            };
+            if let (Some(net), Ok(env)) = (
+                network,
+                MessageEnvelope::from_message(&req, "tx_batch_resync_late".to_string(), None),
+            ) {
+                let _ = net.broadcast_envelope(&env).await;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+
+    if let Some(e) = tx_batches.read().await.get(&cycle).cloned() {
+        return Some(e);
+    }
+    if let Some(store) = storage {
+        if let Some(e) = recover_entries_from_persisted_cycle_txs(store, cycle, max_entries).await {
+            tx_batches.write().await.insert(cycle, e.clone());
+            return Some(e);
+        }
+    }
+
+    let commit = commit_ram.read().await.get(&cycle).copied();
+    let commit_meta = if let Some(store) = storage {
+        read_tx_batch_commit(store, cycle).await.or(commit)
+    } else {
+        commit
+    };
+
+    match crate::consensus_limits::resolve_empty_construction_takeaway(
+        commit_meta,
+        is_leader,
+        catalyst_allow_legacy_ambiguous_empty_tx_batch(),
+    ) {
+        crate::consensus_limits::EmptyConstructionResolution::AgreedEmpty => {
+            tracing::info!(
+                target: "catalyst.consensus.tx_batch",
+                "Using empty construction set (commit tx_count=0) cycle={} leader={} self={}",
+                cycle,
+                leader,
+                producer_id
+            );
+            Some(Vec::new())
+        }
+        crate::consensus_limits::EmptyConstructionResolution::LeaderMissFatal => {
+            tracing::error!(
+                target: "catalyst.consensus.tx_batch",
+                "TX_BATCH_MISS_FATAL leader failed to retain batch cycle={} (check storage)",
+                cycle
+            );
+            None
+        }
+        crate::consensus_limits::EmptyConstructionResolution::FollowerLegacyEmpty => {
+            tracing::warn!(
+                target: "catalyst.consensus.tx_batch",
+                "CATALYST_ALLOW_LEGACY_AMBIGUOUS_EMPTY_TX_BATCH: proceeding with empty construction cycle={} leader={} self={}",
+                cycle,
+                leader,
+                producer_id
+            );
+            Some(Vec::new())
+        }
+        crate::consensus_limits::EmptyConstructionResolution::FollowerRefuseEmpty => {
+            tracing::error!(
+                target: "catalyst.consensus.tx_batch",
+                "TX_BATCH_MISS_FATAL cycle={} leader={} self={}: refuse empty construction (set CATALYST_ALLOW_LEGACY_AMBIGUOUS_EMPTY_TX_BATCH=1 only for pre-commit peers)",
+                cycle,
+                leader,
+                producer_id
+            );
+            None
+        }
+    }
+}
+
+pub(crate) async fn update_tx_meta_status_selected(
+    store: &StorageManager,
+    tx: &catalyst_core::protocol::Transaction,
+    cycle: u64,
+) {
     let Some(txid) = mempool_txid(tx) else { return };
     let key = tx_meta_key(&txid);
     let existing = store.get_metadata(&key).await.ok().flatten();
@@ -2022,7 +2549,7 @@ async fn rebroadcast_persisted_mempool(
     }
 }
 
-async fn apply_lsu_to_storage(
+pub(crate) async fn apply_lsu_to_storage(
     store: &StorageManager,
     lsu: &catalyst_consensus::types::LedgerStateUpdate,
 ) -> Result<[u8; 32]> {
@@ -2312,50 +2839,88 @@ async fn apply_lsu_to_storage(
     // Opportunistic disk-bounding: prune old historical metadata (if enabled).
     crate::pruning::maybe_prune_history(store).await;
 
+    if let Err(e) = crate::checkpoint::maybe_write_checkpoint_after_apply(
+        store,
+        lsu.cycle_number,
+        state_root,
+        lsu_hash,
+    )
+    .await
+    {
+        tracing::warn!(
+            target: "catalyst.consensus.checkpoint",
+            cycle = lsu.cycle_number,
+            "checkpoint write failed: {e}"
+        );
+    }
+
     Ok(state_root)
 }
 
-/// BFT-style quorum: distinct agreeing producers must be at least ⌈2n/3⌉ of `producer_list.len()`.
-fn bft_vote_threshold(n: usize) -> usize {
-    if n == 0 {
-        return usize::MAX;
-    }
-    (2 * n + 2) / 3
+/// Before giving up on fork reconcile, poll for missing `consensus:lsu:*` metadata after
+/// broadcasting `LsuRangeRequest` (best-effort WAN repair). `0` disables.
+fn catalyst_reconcile_prefetch_wait_ms() -> u64 {
+    std::env::var("CATALYST_RECONCILE_PREFETCH_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8000)
 }
 
-/// True when `vote_list` is a subset of `producer_list` and distinct voter count meets the BFT threshold.
-fn lsu_has_bft_vote_quorum(lsu: &catalyst_consensus::types::LedgerStateUpdate) -> bool {
-    let n = lsu.producer_list.len();
-    if n == 0 {
-        return false;
+/// Ask peers for missing LSU metadata in `[1, end_exclusive)` and poll local storage until filled
+/// or `wait_ms` elapses.
+async fn reconcile_prefetch_lsu_metadata_if_missing(
+    store: &StorageManager,
+    network: &P2pService,
+    requester: &str,
+    end_exclusive: u64,
+    wait_ms: u64,
+) {
+    if wait_ms == 0 || end_exclusive <= 1 {
+        return;
     }
-    let need = bft_vote_threshold(n);
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for v in &lsu.vote_list {
-        if !lsu.producer_list.iter().any(|p| p == v) {
-            return false;
+    let deadline = current_timestamp_ms().saturating_add(wait_ms);
+    loop {
+        let mut first_missing: Option<u64> = None;
+        for i in 1..end_exclusive {
+            let has = store
+                .get_metadata(&format!("consensus:lsu:{}", i))
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+            if !has {
+                first_missing = Some(i);
+                break;
+            }
         }
-        seen.insert(v.as_str());
+        if first_missing.is_none() {
+            return;
+        }
+        if current_timestamp_ms() >= deadline {
+            tracing::info!(
+                target: "catalyst.consensus.reconcile",
+                "reconcile_prefetch: deadline reached with missing LSU metadata before cycle {}",
+                end_exclusive
+            );
+            return;
+        }
+        let start = first_missing.unwrap_or(1);
+        let remaining = end_exclusive.saturating_sub(start);
+        let count = remaining.min(256) as u32;
+        let req = LsuRangeRequest {
+            requester: requester.to_string(),
+            start_cycle: start,
+            count,
+        };
+        if let Ok(env) = MessageEnvelope::from_message(&req, "reconcile_prefetch_lsu".to_string(), None) {
+            let _ = network.broadcast_envelope(&env).await;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    seen.len() >= need
 }
 
 fn max_replay_cycles_limit() -> u64 {
-    match std::env::var("CATALYST_MAX_REPLAY_CYCLES") {
-        Ok(s) => s.parse().unwrap_or(1_000_000),
-        Err(_) => 1_000_000,
-    }
-}
-
-/// When set (`1` / `true` / `yes`), applying an LSU from P2P requires a verified finality certificate.
-fn catalyst_require_lsu_finality() -> bool {
-    matches!(
-        std::env::var("CATALYST_REQUIRE_LSU_FINALITY")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes"
-    )
+    crate::consensus_limits::max_replay_cycles_from_env()
 }
 
 #[derive(Clone, Default)]
@@ -2389,6 +2954,7 @@ async fn verify_lsu_finality_for_apply(
     lsu: &catalyst_consensus::types::LedgerStateUpdate,
     cycle: u64,
     finality_cid_hint: &str,
+    require_finality: bool,
 ) -> bool {
     let cid = if !finality_cid_hint.is_empty() {
         finality_cid_hint.to_string()
@@ -2399,7 +2965,7 @@ async fn verify_lsu_finality_for_apply(
         }
     };
 
-    if !catalyst_require_lsu_finality() {
+    if !require_finality {
         if cid.is_empty() {
             return true;
         }
@@ -2407,6 +2973,7 @@ async fn verify_lsu_finality_for_apply(
             if let Ok(cert) = bincode::deserialize::<catalyst_consensus::LsuFinalityCertificateV1>(&bytes) {
                 if catalyst_consensus::verify_lsu_finality_certificate(&cert, lsu).is_err() {
                     tracing::warn!(
+                        target: "catalyst.consensus.apply",
                         "LSU finality certificate present but failed verification cycle={} cid={}",
                         cycle,
                         cid
@@ -2419,14 +2986,16 @@ async fn verify_lsu_finality_for_apply(
 
     if cid.is_empty() {
         tracing::warn!(
-            "CATALYST_REQUIRE_LSU_FINALITY set but no finality CID for cycle={}",
+            target: "catalyst.consensus.apply",
+            "LSU finality required but no finality CID for cycle={}",
             cycle
         );
         return false;
     }
     let Ok(bytes) = dfs.get(&cid).await else {
         tracing::warn!(
-            "CATALYST_REQUIRE_LSU_FINALITY: missing finality bytes cycle={} cid={}",
+            target: "catalyst.consensus.apply",
+            "LSU finality required: missing finality bytes cycle={} cid={}",
             cycle,
             cid
         );
@@ -2434,20 +3003,126 @@ async fn verify_lsu_finality_for_apply(
     };
     let Ok(cert) = bincode::deserialize::<catalyst_consensus::LsuFinalityCertificateV1>(&bytes) else {
         tracing::warn!(
-            "CATALYST_REQUIRE_LSU_FINALITY: bad finality certificate encoding cycle={}",
+            target: "catalyst.consensus.apply",
+            "LSU finality required: bad finality certificate encoding cycle={}",
             cycle
         );
         return false;
     };
     if let Err(e) = catalyst_consensus::verify_lsu_finality_certificate(&cert, lsu) {
         tracing::warn!(
-            "CATALYST_REQUIRE_LSU_FINALITY: verify failed cycle={} err={}",
+            target: "catalyst.consensus.apply",
+            "LSU finality required: verify failed cycle={} err={}",
             cycle,
             e
         );
         return false;
     }
     true
+}
+
+/// True when a verified ADR 0001 certificate exists locally for this LSU at `cycle`.
+async fn lsu_has_verified_finality_cert(
+    store: &StorageManager,
+    dfs: &crate::dfs_store::LocalContentStore,
+    lsu: &catalyst_consensus::types::LedgerStateUpdate,
+    cycle: u64,
+    finality_cid_hint: &str,
+) -> bool {
+    let cid = if !finality_cid_hint.is_empty() {
+        finality_cid_hint.to_string()
+    } else {
+        match meta_string(store, &format!("consensus:lsu_finality_cid:{}", cycle)).await {
+            Some(s) => s,
+            None => return false,
+        }
+    };
+    let Ok(bytes) = dfs.get(&cid).await else {
+        return false;
+    };
+    let Ok(cert) = bincode::deserialize::<catalyst_consensus::LsuFinalityCertificateV1>(&bytes) else {
+        return false;
+    };
+    catalyst_consensus::verify_lsu_finality_certificate(&cert, lsu).is_ok()
+}
+
+async fn fork_choice_candidate_for_lsu(
+    store: &StorageManager,
+    dfs: Option<&crate::dfs_store::LocalContentStore>,
+    lsu: &catalyst_consensus::types::LedgerStateUpdate,
+    cycle: u64,
+    lsu_hash: [u8; 32],
+    finality_cid_hint: &str,
+    certified_only: bool,
+) -> crate::fork_choice::ForkChoiceCandidate {
+    let certified = match dfs {
+        Some(dfs) => {
+            lsu_has_verified_finality_cert(store, dfs, lsu, cycle, finality_cid_hint).await
+        }
+        None => false,
+    };
+    crate::fork_choice::ForkChoiceCandidate::new(cycle, lsu_hash, lsu, certified, certified_only)
+}
+
+async fn load_fork_choice_candidate_at_cycle(
+    store: &StorageManager,
+    dfs: Option<&crate::dfs_store::LocalContentStore>,
+    cycle: u64,
+    certified_only: bool,
+) -> Option<crate::fork_choice::ForkChoiceCandidate> {
+    let hash_bytes = store
+        .get_metadata(&format!("consensus:lsu_hash:{}", cycle))
+        .await
+        .ok()
+        .flatten()?;
+    if hash_bytes.len() != 32 {
+        return None;
+    }
+    let mut lsu_hash = [0u8; 32];
+    lsu_hash.copy_from_slice(&hash_bytes[..32]);
+    let lsu_bytes = store
+        .get_metadata(&format!("consensus:lsu:{}", cycle))
+        .await
+        .ok()
+        .flatten()?;
+    let lsu = catalyst_consensus::types::LedgerStateUpdate::deserialize(&lsu_bytes).ok()?;
+    if lsu.cycle_number != cycle {
+        return None;
+    }
+    Some(
+        fork_choice_candidate_for_lsu(store, dfs, &lsu, cycle, lsu_hash, "", certified_only).await,
+    )
+}
+
+/// If a weaker competing LSU is already canonical at `cycle`, reject apply/reconcile paths.
+async fn fork_choice_reject_weaker_incoming(
+    store: &StorageManager,
+    dfs: Option<&crate::dfs_store::LocalContentStore>,
+    incoming: &crate::fork_choice::ForkChoiceCandidate,
+    certified_only: bool,
+) -> bool {
+    let Some(stored) =
+        load_fork_choice_candidate_at_cycle(store, dfs, incoming.cycle, certified_only).await
+    else {
+        return false;
+    };
+    if stored.lsu_hash == incoming.lsu_hash {
+        return false;
+    }
+    if crate::fork_choice::incoming_weaker_than_stored(incoming, &stored) {
+        tracing::warn!(
+            target: "catalyst.consensus.fork_choice",
+            cycle = incoming.cycle,
+            incoming_hash = %hex_encode(&incoming.lsu_hash),
+            stored_hash = %hex_encode(&stored.lsu_hash),
+            incoming_tier = ?incoming.tier,
+            stored_tier = ?stored.tier,
+            "Rejecting weaker competing LSU at same cycle (certified quorum + hash tie-break)"
+        );
+        catalyst_utils::increment_counter!("consensus_fork_choice_rejected_weaker_total", 1);
+        return true;
+    }
+    false
 }
 
 async fn try_publish_finality_certificate_from_bucket(
@@ -2507,7 +3182,7 @@ async fn try_publish_finality_certificate_from_bucket(
             signature: sig,
         });
     }
-    if vote_entries.len() < bft_vote_threshold(lsu.producer_list.len()) {
+    if vote_entries.len() < crate::fork_choice::bft_vote_threshold(lsu.producer_list.len()) {
         return;
     }
     let Ok(cert) = catalyst_consensus::LsuFinalityCertificateV1::from_lsu_and_votes(
@@ -2598,6 +3273,9 @@ fn metadata_logical_name_is_preserved(name: &[u8]) -> bool {
         || s.starts_with("consensus:cycle_by_lsu_hash:")
         || s.starts_with("consensus:lsu:")
         || s.starts_with("consensus:lsu_finality_cid:")
+        || s.starts_with("consensus:tx_batch_commit:")
+        || s.starts_with("consensus:checkpoint:")
+        || s == crate::checkpoint::META_CHECKPOINT_LATEST_CYCLE
 }
 
 /// Wipe mutable chain state while keeping `protocol:*` metadata and per-cycle LSU history keys
@@ -2649,8 +3327,11 @@ async fn purge_mutable_chain_state_preserving_lsu_history(
 }
 
 /// On `prev_root` mismatch, if this LSU carries a BFT quorum and we have contiguous stored
-/// history `consensus:lsu:1..cycle-1`, purge mutable state and replay up to this LSU (capped by
-/// `CATALYST_MAX_REPLAY_CYCLES`, `0` disables). Uses a snapshot for rollback if replay/apply fails.
+/// history `consensus:lsu:1..cycle-1` (after optional P2P prefetch), purge mutable state and replay
+/// up to this LSU (capped by `CATALYST_MAX_REPLAY_CYCLES`, `0` disables). Uses a snapshot for rollback if replay/apply fails.
+///
+/// When `fetch` is set, missing `consensus:lsu:{i}` for `i < cycle` triggers bounded P2P backfill
+/// (`LsuRangeRequest` + local poll) before reconcile aborts.
 async fn try_reconcile_fork_from_quorum_lsu(
     store: &StorageManager,
     lsu: &catalyst_consensus::types::LedgerStateUpdate,
@@ -2658,32 +3339,102 @@ async fn try_reconcile_fork_from_quorum_lsu(
     expected_prev: [u8; 32],
     expected_post: [u8; 32],
     expected_lsu_hash: &[u8; 32],
+    fetch: Option<(&P2pService, &str)>,
+    dfs: Option<&crate::dfs_store::LocalContentStore>,
+    finality_cid_hint: &str,
+    certified_only: bool,
 ) -> Result<bool> {
-    if !lsu_has_bft_vote_quorum(lsu) {
+    let incoming =
+        fork_choice_candidate_for_lsu(store, dfs, lsu, cycle, *expected_lsu_hash, finality_cid_hint, certified_only)
+            .await;
+    if certified_only && incoming.tier != crate::fork_choice::ForkChoiceTier::Certified {
+        tracing::warn!(
+            target: "catalyst.consensus.reconcile",
+            cycle,
+            "Quorum fork reconcile skipped: certified-only policy requires verified finality certificate"
+        );
+        catalyst_utils::increment_counter!("consensus_fork_reconcile_aborted_total", 1);
+        return Ok(false);
+    }
+    if !crate::fork_choice::lsu_has_bft_vote_quorum(lsu) {
+        catalyst_utils::increment_counter!("consensus_fork_reconcile_aborted_total", 1);
         return Ok(false);
     }
     if lsu.cycle_number != cycle {
+        catalyst_utils::increment_counter!("consensus_fork_reconcile_aborted_total", 1);
         return Ok(false);
     }
     let h = catalyst_consensus::types::hash_data(lsu).unwrap_or([0u8; 32]);
     if &h != expected_lsu_hash {
+        catalyst_utils::increment_counter!("consensus_fork_reconcile_aborted_total", 1);
+        return Ok(false);
+    }
+
+    if fork_choice_reject_weaker_incoming(store, dfs, &incoming, certified_only).await {
+        catalyst_utils::increment_counter!("consensus_fork_reconcile_aborted_total", 1);
         return Ok(false);
     }
 
     let max_cycles = max_replay_cycles_limit();
     if max_cycles == 0 {
+        catalyst_utils::increment_counter!("consensus_fork_reconcile_aborted_total", 1);
         return Ok(false);
     }
     if cycle > max_cycles {
         warn!(
+            target: "catalyst.consensus.reconcile",
             "Quorum fork reconcile skipped: cycle {} exceeds CATALYST_MAX_REPLAY_CYCLES={}",
             cycle, max_cycles
         );
+        catalyst_utils::increment_counter!("consensus_fork_reconcile_aborted_total", 1);
         return Ok(false);
     }
 
+    let pruned_up_to: u64 = store
+        .get_metadata(crate::pruning::META_PRUNED_UP_TO_CYCLE)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|b| {
+            if b.len() == 8 {
+                let mut a = [0u8; 8];
+                a.copy_from_slice(&b);
+                Some(u64::from_le_bytes(a))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
+    let mut replay_start = 1u64;
     if cycle > 1 {
-        for i in 1..cycle {
+        if let Some((net, requester)) = fetch {
+            let prefetch_ms = catalyst_reconcile_prefetch_wait_ms();
+            if prefetch_ms > 0 {
+                reconcile_prefetch_lsu_metadata_if_missing(store, net, requester, cycle, prefetch_ms)
+                    .await;
+            }
+        }
+        if let Some(cp) =
+            crate::checkpoint::reconcile_checkpoint_for_missing_prefix(store, cycle, pruned_up_to).await
+        {
+            info!(
+                target: "catalyst.consensus.checkpoint",
+                checkpoint_cycle = cp.cycle,
+                target_cycle = cycle,
+                "Using checkpoint for reconcile prefix (pruned LSU metadata)"
+            );
+            if let Err(e) = crate::checkpoint::restore_reconcile_from_checkpoint(store, &cp).await {
+                warn!(
+                    target: "catalyst.consensus.checkpoint",
+                    "Checkpoint restore failed: {e}"
+                );
+                catalyst_utils::increment_counter!("consensus_fork_reconcile_aborted_total", 1);
+                return Ok(false);
+            }
+            replay_start = cp.cycle.saturating_add(1);
+        }
+        for i in replay_start..cycle {
             if store
                 .get_metadata(&format!("consensus:lsu:{}", i))
                 .await
@@ -2691,10 +3442,20 @@ async fn try_reconcile_fork_from_quorum_lsu(
                 .flatten()
                 .is_none()
             {
-                warn!(
-                    "Quorum fork reconcile skipped: missing stored LSU for cycle {}",
-                    i
-                );
+                if i <= pruned_up_to {
+                    warn!(
+                        target: "catalyst.consensus.reconcile",
+                        "Quorum fork reconcile skipped: LSU metadata for cycle {} was pruned (pruned_up_to={}); use checkpoint, archival history, or P2P fetch",
+                        i, pruned_up_to
+                    );
+                } else {
+                    warn!(
+                        target: "catalyst.consensus.reconcile",
+                        "Quorum fork reconcile skipped: missing stored LSU for cycle {} (set CATALYST_RECONCILE_PREFETCH_MS>0 with P2P peers for backfill, or restore archival metadata)",
+                        i
+                    );
+                }
+                catalyst_utils::increment_counter!("consensus_fork_reconcile_aborted_total", 1);
                 return Ok(false);
             }
         }
@@ -2717,7 +3478,7 @@ async fn try_reconcile_fork_from_quorum_lsu(
             .await
             .map_err(|e| anyhow::anyhow!("refresh root: {e}"))?;
 
-        for i in 1..cycle {
+        for i in replay_start..cycle {
             let key = format!("consensus:lsu:{}", i);
             let Some(bytes) = store.get_metadata(&key).await.ok().flatten() else {
                 anyhow::bail!("missing lsu during replay {i}");
@@ -2766,16 +3527,23 @@ async fn try_reconcile_fork_from_quorum_lsu(
     match reconcile_inner.await {
         Ok(()) => {
             let _ = store.delete_snapshot(&snap).await;
+            catalyst_utils::increment_counter!("consensus_fork_reconcile_succeeded_total", 1);
             Ok(true)
         }
         Err(e) => {
-            warn!("Quorum fork reconcile failed, restoring snapshot: {}", e);
+            warn!(
+                target: "catalyst.consensus.reconcile",
+                "Quorum fork reconcile failed, restoring snapshot: {}",
+                e
+            );
             if let Err(e2) = store.load_snapshot(&snap).await {
+                catalyst_utils::increment_counter!("consensus_fork_reconcile_error_total", 1);
                 return Err(anyhow::anyhow!(
                     "reconcile failed ({e}) and snapshot restore failed ({e2})"
                 ));
             }
             let _ = store.delete_snapshot(&snap).await;
+            catalyst_utils::increment_counter!("consensus_fork_reconcile_aborted_total", 1);
             Ok(false)
         }
     }
@@ -2888,6 +3656,15 @@ impl CatalystNode {
     /// Start the node.
     pub async fn start(&mut self) -> Result<()> {
         info!("Starting Catalyst node");
+
+        if self.config.validator
+            && !crate::consensus_limits::effective_require_lsu_finality(&self.config)
+        {
+            warn!(
+                target: "catalyst.consensus.policy",
+                "Validator mode: LSU finality verification is disabled (consensus.require_lsu_finality=false or CATALYST_REQUIRE_LSU_FINALITY=0). Production validators should require ADR 0001 certificates (default true)."
+            );
+        }
 
         // Ensure local directories exist (data dir, dfs cache, logs dir, etc.)
         self.config.ensure_data_dir()?;
@@ -3300,6 +4077,9 @@ impl CatalystNode {
         // Cycle-scoped tx batches (selected by a deterministic "leader" each cycle).
         let tx_batches: Arc<tokio::sync::RwLock<std::collections::HashMap<u64, Vec<catalyst_consensus::types::TransactionEntry>>>> =
             Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let tx_batch_commits: Arc<
+            tokio::sync::RwLock<std::collections::HashMap<u64, ([u8; 32], u32)>>,
+        > = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         let max_entries_per_cycle_cfg = self.config.consensus.max_transactions_per_block as usize;
 
         let finality_buckets: Arc<
@@ -3355,10 +4135,13 @@ impl CatalystNode {
             let net = network.clone();
             let mempool = mempool.clone();
             let tx_batches = tx_batches.clone();
+            let tx_batch_commits_in = tx_batch_commits.clone();
             let max_entries_per_cycle_cfg = max_entries_per_cycle_cfg;
             let dfs = dfs.clone();
             let storage = storage.clone();
             let producer_id_self = producer_id.clone();
+            let gossip_cycle_ms: u64 = (self.config.consensus.cycle_duration_seconds as u64)
+                .saturating_mul(1000);
             let finality_buckets_in = finality_buckets.clone();
             #[derive(Clone)]
             struct PendingLsuFetch {
@@ -3509,7 +4292,7 @@ impl CatalystNode {
                     }
                     let Some(miss) = missing else { continue };
 
-                    let now_ms = current_timestamp_ms();
+                    let now_ms = crate::consensus_limits::wall_now_ms();
                     let mut c = catchup_gap.lock().await;
                     let should = now_ms.saturating_sub(c.last_req_ms) > 2000;
                     if !should {
@@ -3530,10 +4313,14 @@ impl CatalystNode {
                     }
                 }
             });
+            let require_lsu_finality_effective =
+                crate::consensus_limits::effective_require_lsu_finality(&self.config);
             let handle = tokio::spawn(async move {
                 while let Some(ev) = events.recv().await {
                     if let catalyst_network::NetworkEvent::MessageReceived { envelope, .. } = ev {
-                        let now_ms = current_timestamp_ms();
+                        let now_ms = crate::consensus_limits::wall_now_ms();
+                        let lsu_wall_lead_cap =
+                            crate::consensus_limits::p2p_lsu_cycle_max_wall_lead();
                         if envelope.is_expired() {
                             continue;
                         }
@@ -3606,40 +4393,176 @@ impl CatalystNode {
                                     }
                                 }
                             }
-                        } else if envelope.message_type == MessageType::TransactionBatch {
-                            // Prefer protocol tx batches (full signed txs), fallback to legacy entry batch.
-                            let mut accepted = false;
-                            if let Ok(batch) = envelope.extract_message::<ProtocolTxBatch>() {
-                                if batch.verify_hash().unwrap_or(false) {
-                                    if let Some(store) = &storage {
-                                        let valid =
-                                            validate_and_select_protocol_txs_for_construction(
-                                                store.as_ref(),
-                                                batch.cycle,
-                                                batch.txs,
+                        } else if envelope.message_type == MessageType::TransactionRequest {
+                            if let Ok(ctrl) = envelope.extract_message::<TxBatchControl>() {
+                                match ctrl {
+                                    TxBatchControl::Commit { cycle, .. } => {
+                                        let slack =
+                                            crate::consensus_limits::p2p_tx_batch_max_cycle_slack();
+                                        if !crate::consensus_limits::p2p_tx_batch_cycle_allows_ingress(
+                                            cycle,
+                                            now_ms,
+                                            gossip_cycle_ms,
+                                            slack,
+                                        ) {
+                                            tracing::debug!(
+                                                target: "catalyst.consensus.tx_batch",
+                                                cycle,
+                                                now_ms,
+                                                gossip_cycle_ms,
+                                                slack,
+                                                "ignoring TxBatchControl::Commit at ingress: cycle outside wall slack window"
+                                            );
+                                            catalyst_utils::increment_counter!(
+                                                "consensus_p2p_tx_batch_commit_cycle_rejected_total",
+                                                1
+                                            );
+                                        } else {
+                                            let p2p_state = crate::tx_batch_p2p::TxBatchP2pState {
+                                                tx_batches: tx_batches.clone(),
+                                                commit_ram: tx_batch_commits_in.clone(),
+                                            };
+                                            let _ = crate::tx_batch_p2p::ingest_p2p_tx_batch_envelope(
+                                                &p2p_state,
+                                                &envelope,
+                                                now_ms,
+                                                gossip_cycle_ms,
+                                                storage.as_deref(),
                                                 max_entries_per_cycle_cfg,
                                             )
                                             .await;
-                                        let mut entries: Vec<catalyst_consensus::types::TransactionEntry> = Vec::new();
-                                        for tx in &valid {
-                                            entries.extend(tx_to_consensus_entries(tx));
+                                            let do_relay = {
+                                                let mut rc = relay_cache.lock().await;
+                                                rc.should_relay(&envelope, now_ms)
+                                            };
+                                            if do_relay {
+                                                let _ = net.broadcast_envelope(&envelope).await;
+                                            }
                                         }
-                                        // Persist cycle txids + mark Selected.
-                                        let txids: Vec<[u8; 32]> = valid.iter().filter_map(|t| mempool_txid(t)).collect();
-                                        persist_cycle_txids(store.as_ref(), batch.cycle, txids).await;
-                                        for tx in &valid {
-                                            update_tx_meta_status_selected(store.as_ref(), tx, batch.cycle).await;
+                                    }
+                                    TxBatchControl::ResyncRequest { cycle, .. } => {
+                                        if let Some(store) = &storage {
+                                            let txids = load_cycle_txids(store.as_ref(), cycle).await;
+                                            if txids.is_empty() {
+                                                continue;
+                                            }
+                                            let mut txs: Vec<catalyst_core::protocol::Transaction> =
+                                                Vec::with_capacity(txids.len());
+                                            let mut ok = true;
+                                            for txid in &txids {
+                                                let raw = match store
+                                                    .get_metadata(&mempool_tx_key(txid))
+                                                    .await
+                                                    .ok()
+                                                    .flatten()
+                                                {
+                                                    Some(b) => Some(b),
+                                                    None => store
+                                                        .get_metadata(&tx_raw_key(txid))
+                                                        .await
+                                                        .ok()
+                                                        .flatten(),
+                                                };
+                                                let Some(raw) = raw else {
+                                                    ok = false;
+                                                    break;
+                                                };
+                                                let Ok(tx) =
+                                                    bincode::deserialize::<catalyst_core::protocol::Transaction>(
+                                                        &raw,
+                                                    )
+                                                else {
+                                                    ok = false;
+                                                    break;
+                                                };
+                                                txs.push(tx);
+                                            }
+                                            if !ok {
+                                                continue;
+                                            }
+                                            let valid = validate_and_select_protocol_txs_for_construction(
+                                                store.as_ref(),
+                                                cycle,
+                                                txs,
+                                                max_entries_per_cycle_cfg,
+                                            )
+                                            .await;
+                                            if let Ok(batch) = ProtocolTxBatch::new(cycle, valid) {
+                                                if let Ok(env2) = MessageEnvelope::from_message(
+                                                    &batch,
+                                                    "tx_batch_resync_reply".to_string(),
+                                                    None,
+                                                ) {
+                                                    let _ = net.broadcast_envelope(&env2).await;
+                                                }
+                                            }
                                         }
-                                        tx_batches.write().await.insert(batch.cycle, entries);
-                                        accepted = true;
                                     }
                                 }
-                            } else if let Ok(batch) = envelope.extract_message::<TxBatch>() {
-                                // Verify hash before accepting.
-                                if let Ok(h) = catalyst_consensus::types::hash_data(&batch.entries) {
-                                    if h == batch.batch_hash {
-                                        tx_batches.write().await.insert(batch.cycle, batch.entries);
-                                        accepted = true;
+                            }
+                        } else if envelope.message_type == MessageType::TransactionBatch {
+                            let p2p_state = crate::tx_batch_p2p::TxBatchP2pState {
+                                tx_batches: tx_batches.clone(),
+                                commit_ram: tx_batch_commits_in.clone(),
+                            };
+                            let accepted = crate::tx_batch_p2p::ingest_p2p_tx_batch_envelope(
+                                &p2p_state,
+                                &envelope,
+                                now_ms,
+                                gossip_cycle_ms,
+                                storage.as_deref(),
+                                max_entries_per_cycle_cfg,
+                            )
+                            .await;
+                            if !accepted {
+                                if let Ok(batch) = envelope.extract_message::<ProtocolTxBatch>() {
+                                    if !crate::consensus_limits::p2p_tx_batch_cycle_allows_ingress(
+                                        batch.cycle,
+                                        now_ms,
+                                        gossip_cycle_ms,
+                                        crate::consensus_limits::p2p_tx_batch_max_cycle_slack(),
+                                    ) {
+                                        catalyst_utils::increment_counter!(
+                                            "consensus_p2p_tx_batch_cycle_rejected_total",
+                                            1
+                                        );
+                                    } else if batch.verify_hash().unwrap_or(false) {
+                                        if let Some(store) = &storage {
+                                            let pinned = {
+                                                let ram = tx_batch_commits_in
+                                                    .read()
+                                                    .await
+                                                    .get(&batch.cycle)
+                                                    .copied();
+                                                let disk =
+                                                    read_tx_batch_commit(store.as_ref(), batch.cycle)
+                                                        .await;
+                                                ram.or(disk)
+                                            };
+                                            if pinned.map(|cm| {
+                                                crate::consensus_limits::protocol_tx_batch_disagrees_with_commit(
+                                                    &batch, cm,
+                                                )
+                                            }) == Some(true)
+                                            {
+                                                catalyst_utils::increment_counter!(
+                                                    "consensus_p2p_tx_batch_commit_disagrees_total",
+                                                    1
+                                                );
+                                            }
+                                        }
+                                    }
+                                } else if let Ok(batch) = envelope.extract_message::<TxBatch>() {
+                                    if !crate::consensus_limits::p2p_tx_batch_cycle_allows_ingress(
+                                        batch.cycle,
+                                        now_ms,
+                                        gossip_cycle_ms,
+                                        crate::consensus_limits::p2p_tx_batch_max_cycle_slack(),
+                                    ) {
+                                        catalyst_utils::increment_counter!(
+                                            "consensus_p2p_tx_batch_cycle_rejected_total",
+                                            1
+                                        );
                                     }
                                 }
                             }
@@ -3655,6 +4578,26 @@ impl CatalystNode {
                         } else if envelope.message_type == MessageType::ConsensusSync {
                             // Prefer CID-based LSU sync; fallback to full LSU gossip.
                             if let Ok(ref_msg) = envelope.extract_message::<LsuCidGossip>() {
+                                if !crate::consensus_limits::p2p_lsu_cycle_within_wall_lead(
+                                    ref_msg.cycle,
+                                    now_ms,
+                                    gossip_cycle_ms,
+                                    lsu_wall_lead_cap,
+                                ) {
+                                    tracing::debug!(
+                                        target: "catalyst.consensus.policy",
+                                        cycle = ref_msg.cycle,
+                                        now_ms,
+                                        gossip_cycle_ms,
+                                        lead_cap = lsu_wall_lead_cap,
+                                        "dropping LsuCidGossip: cycle too far ahead of wall clock"
+                                    );
+                                    catalyst_utils::increment_counter!(
+                                        "consensus_p2p_lsu_cycle_rejected_total",
+                                        1
+                                    );
+                                    continue;
+                                }
                                 // Relay LSU references even if we can't fetch/apply locally.
                                 let do_relay = {
                                     let mut rc = relay_cache.lock().await;
@@ -3699,13 +4642,43 @@ impl CatalystNode {
                                                             // even if we cannot apply (e.g. filling historical gaps).
                                                             persist_lsu_history(
                                                                 store.as_ref(),
+                                                                Some(dfs),
                                                                 ref_msg.cycle,
                                                                 &bytes,
                                                                 &ref_msg.lsu_hash,
                                                                 &ref_msg.cid,
                                                                 &ref_msg.state_root,
+                                                                &ref_msg.finality_cid,
+                                                                require_lsu_finality_effective,
                                                             )
                                                             .await;
+
+                                                            match fork_choice_apply_gate(
+                                                                store.as_ref(),
+                                                                Some(dfs),
+                                                                &lsu,
+                                                                ref_msg.cycle,
+                                                                ref_msg.lsu_hash,
+                                                                &ref_msg.finality_cid,
+                                                                require_lsu_finality_effective,
+                                                            )
+                                                            .await
+                                                            {
+                                                                ForkChoiceApplyGate::Allow => {}
+                                                                ForkChoiceApplyGate::RejectWeaker => {
+                                                                    continue;
+                                                                }
+                                                                ForkChoiceApplyGate::RejectNonCertified => {
+                                                                    catalyst_utils::increment_counter!(
+                                                                        "consensus_fork_choice_rejected_non_certified_total",
+                                                                        1
+                                                                    );
+                                                                    continue;
+                                                                }
+                                                                ForkChoiceApplyGate::StallCertifiedEquivocation => {
+                                                                    continue;
+                                                                }
+                                                            }
 
                                                             // Ensure we're applying onto the expected previous root.
                                                             //
@@ -3714,7 +4687,23 @@ impl CatalystNode {
                                                             // local and expected prev roots are zero.
                                                             let local_prev = local_applied_state_root(store.as_ref()).await;
                                                             let mut already_applied = false;
-                                                            if local_prev != ref_msg.prev_state_root {
+                                                            if try_reorg_stronger_lsu_at_applied_cycle(
+                                                                store.as_ref(),
+                                                                &lsu,
+                                                                ref_msg.cycle,
+                                                                ref_msg.prev_state_root,
+                                                                ref_msg.state_root,
+                                                                &ref_msg.lsu_hash,
+                                                                Some((net.as_ref(), producer_id_self.as_str())),
+                                                                Some(dfs),
+                                                                &ref_msg.finality_cid,
+                                                                require_lsu_finality_effective,
+                                                            )
+                                                            .await
+                                                            .unwrap_or(false)
+                                                            {
+                                                                already_applied = true;
+                                                            } else if local_prev != ref_msg.prev_state_root {
                                                                 if local_prev == [0u8; 32] && ref_msg.prev_state_root == [0u8; 32] {
                                                                     // bootstrap ok
                                                                 } else {
@@ -3725,6 +4714,10 @@ impl CatalystNode {
                                                                         ref_msg.prev_state_root,
                                                                         ref_msg.state_root,
                                                                         &ref_msg.lsu_hash,
+                                                                        Some((net.as_ref(), producer_id_self.as_str())),
+                                                                        Some(dfs),
+                                                                        &ref_msg.finality_cid,
+                                                                        require_lsu_finality_effective,
                                                                     )
                                                                     .await
                                                                     {
@@ -3737,11 +4730,16 @@ impl CatalystNode {
                                                                         }
                                                                         Ok(false) => {
                                                                             tracing::warn!(
+                                                                                target: "catalyst.consensus.prev_root",
                                                                                 "Skipping LSU cycle={} cid={} (prev_root mismatch local={} expected={})",
                                                                                 ref_msg.cycle,
                                                                                 ref_msg.cid,
                                                                                 hex_encode(&local_prev),
                                                                                 hex_encode(&ref_msg.prev_state_root)
+                                                                            );
+                                                                            catalyst_utils::increment_counter!(
+                                                                                "consensus_lsu_apply_skipped_prev_root_total",
+                                                                                1
                                                                             );
                                                                             // Request backfill starting from local+1 to observed head.
                                                                             let mut c = catchup.lock().await;
@@ -3767,6 +4765,7 @@ impl CatalystNode {
                                                                         }
                                                                         Err(e) => {
                                                                             tracing::warn!(
+                                                                                target: "catalyst.consensus.reconcile",
                                                                                 "Quorum reconcile error cycle={} cid={}: {}",
                                                                                 ref_msg.cycle,
                                                                                 ref_msg.cid,
@@ -3840,6 +4839,7 @@ impl CatalystNode {
                                                                 &lsu,
                                                                 ref_msg.cycle,
                                                                 &ref_msg.finality_cid,
+                                                                require_lsu_finality_effective,
                                                             )
                                                             .await
                                                             {
@@ -3936,57 +4936,168 @@ impl CatalystNode {
                             } else if let Ok(lsu_msg) = envelope.extract_message::<LsuGossip>() {
                                 if let Ok(h) = catalyst_consensus::types::hash_data(&lsu_msg.lsu) {
                                     if h == lsu_msg.lsu_hash {
-                                        let lsu = lsu_msg.lsu;
-                                        last_lsu.write().await.insert(lsu_msg.cycle, lsu.clone());
+                                        if !crate::consensus_limits::p2p_lsu_cycle_within_wall_lead(
+                                            lsu_msg.cycle,
+                                            now_ms,
+                                            gossip_cycle_ms,
+                                            lsu_wall_lead_cap,
+                                        ) {
+                                            tracing::debug!(
+                                                target: "catalyst.consensus.policy",
+                                                cycle = lsu_msg.cycle,
+                                                now_ms,
+                                                gossip_cycle_ms,
+                                                lead_cap = lsu_wall_lead_cap,
+                                                "dropping LsuGossip: cycle too far ahead of wall clock"
+                                            );
+                                            catalyst_utils::increment_counter!(
+                                                "consensus_p2p_lsu_cycle_rejected_total",
+                                                1
+                                            );
+                                            continue;
+                                        }
+                                        let lsu = lsu_msg.lsu.clone();
+                                        let mut relay_ok = true;
 
                                         if let Some(store) = &storage {
-                                            let _ = apply_lsu_to_storage(store.as_ref(), &lsu).await;
+                                            let apply_ok = match dfs.as_ref() {
+                                                None if require_lsu_finality_effective => {
+                                                    tracing::warn!(
+                                                        target: "catalyst.consensus.apply",
+                                                        cycle = lsu_msg.cycle,
+                                                        "Rejecting LsuGossip apply: require_lsu_finality enabled but DFS/content store is not configured"
+                                                    );
+                                                    catalyst_utils::increment_counter!(
+                                                        "consensus_lsu_gossip_apply_rejected_finality_total",
+                                                        1
+                                                    );
+                                                    false
+                                                }
+                                                None => true,
+                                                Some(dfs) => {
+                                                    let ok = verify_lsu_finality_for_apply(
+                                                        store.as_ref(),
+                                                        dfs,
+                                                        &lsu,
+                                                        lsu_msg.cycle,
+                                                        "",
+                                                        require_lsu_finality_effective,
+                                                    )
+                                                    .await;
+                                                    if !ok {
+                                                        catalyst_utils::increment_counter!(
+                                                            "consensus_lsu_gossip_apply_rejected_finality_total",
+                                                            1
+                                                        );
+                                                    }
+                                                    ok
+                                                }
+                                            };
 
-                                            if let Ok(bytes) = lsu.serialize() {
-                                                // Per-cycle history
-                                                let _ = store
-                                                    .set_metadata(
-                                                        &format!("consensus:lsu:{}", lsu_msg.cycle),
-                                                        &bytes,
-                                                    )
-                                                    .await;
-                                                let _ = store
-                                                    .set_metadata(
-                                                        &format!("consensus:lsu_hash:{}", lsu_msg.cycle),
-                                                        &lsu_msg.lsu_hash,
-                                                    )
-                                                    .await;
-                                                let _ = store
-                                                    .set_metadata(
-                                                        &cycle_by_lsu_hash_key(&lsu_msg.lsu_hash),
-                                                        &lsu_msg.cycle.to_le_bytes(),
-                                                    )
-                                                    .await;
+                                            if !apply_ok {
+                                                relay_ok = false;
+                                            } else {
+                                                match fork_choice_apply_gate(
+                                                    store.as_ref(),
+                                                    dfs.as_ref(),
+                                                    &lsu,
+                                                    lsu_msg.cycle,
+                                                    lsu_msg.lsu_hash,
+                                                    "",
+                                                    require_lsu_finality_effective,
+                                                )
+                                                .await
+                                                {
+                                                    ForkChoiceApplyGate::Allow => {}
+                                                    ForkChoiceApplyGate::RejectWeaker => {
+                                                        relay_ok = false;
+                                                    }
+                                                    ForkChoiceApplyGate::RejectNonCertified => {
+                                                        catalyst_utils::increment_counter!(
+                                                            "consensus_fork_choice_rejected_non_certified_total",
+                                                            1
+                                                        );
+                                                        relay_ok = false;
+                                                    }
+                                                    ForkChoiceApplyGate::StallCertifiedEquivocation => {
+                                                        relay_ok = false;
+                                                    }
+                                                }
+                                                if relay_ok {
+                                                let _ = apply_lsu_to_storage(store.as_ref(), &lsu).await;
 
-                                                let _ = store
-                                                    .set_metadata("consensus:last_lsu", &bytes)
-                                                    .await;
-                                                let _ = store
-                                                    .set_metadata("consensus:last_lsu_hash", &lsu_msg.lsu_hash)
-                                                    .await;
-                                                let _ = store
-                                                    .set_metadata("consensus:last_lsu_cycle", &lsu_msg.cycle.to_le_bytes())
-                                                    .await;
+                                                if let Ok(bytes) = lsu.serialize() {
+                                                    // Per-cycle history
+                                                    let _ = store
+                                                        .set_metadata(
+                                                            &format!("consensus:lsu:{}", lsu_msg.cycle),
+                                                            &bytes,
+                                                        )
+                                                        .await;
+                                                    let _ = store
+                                                        .set_metadata(
+                                                            &format!("consensus:lsu_hash:{}", lsu_msg.cycle),
+                                                            &lsu_msg.lsu_hash,
+                                                        )
+                                                        .await;
+                                                    let _ = store
+                                                        .set_metadata(
+                                                            &cycle_by_lsu_hash_key(&lsu_msg.lsu_hash),
+                                                            &lsu_msg.cycle.to_le_bytes(),
+                                                        )
+                                                        .await;
+
+                                                    let _ = store
+                                                        .set_metadata("consensus:last_lsu", &bytes)
+                                                        .await;
+                                                    let _ = store
+                                                        .set_metadata("consensus:last_lsu_hash", &lsu_msg.lsu_hash)
+                                                        .await;
+                                                    let _ = store
+                                                        .set_metadata(
+                                                            "consensus:last_lsu_cycle",
+                                                            &lsu_msg.cycle.to_le_bytes(),
+                                                        )
+                                                        .await;
+                                                }
+                                                last_lsu.write().await.insert(lsu_msg.cycle, lsu);
+                                                }
                                             }
+                                        } else {
+                                            last_lsu.write().await.insert(lsu_msg.cycle, lsu);
                                         }
-                                        // Relay only after hash check.
-                                        let do_relay = {
-                                            let mut rc = relay_cache.lock().await;
-                                            rc.should_relay(&envelope, now_ms)
-                                        };
-                                        if do_relay {
-                                            let _ = net.broadcast_envelope(&envelope).await;
+                                        if relay_ok {
+                                            // Relay only after hash check and policy allow.
+                                            let do_relay = {
+                                                let mut rc = relay_cache.lock().await;
+                                                rc.should_relay(&envelope, now_ms)
+                                            };
+                                            if do_relay {
+                                                let _ = net.broadcast_envelope(&envelope).await;
+                                            }
                                         }
                                     }
                                 }
                             }
                         } else if envelope.message_type == MessageType::LsuFinalityAttestation {
                             if let Ok(msg) = envelope.extract_message::<LsuFinalityAttestationMsg>() {
+                                if !crate::consensus_limits::p2p_lsu_cycle_within_wall_lead(
+                                    msg.cycle,
+                                    now_ms,
+                                    gossip_cycle_ms,
+                                    lsu_wall_lead_cap,
+                                ) {
+                                    tracing::debug!(
+                                        target: "catalyst.consensus.policy",
+                                        cycle = msg.cycle,
+                                        "dropping LsuFinalityAttestationMsg: cycle too far ahead of wall clock"
+                                    );
+                                    catalyst_utils::increment_counter!(
+                                        "consensus_p2p_lsu_cycle_rejected_total",
+                                        1
+                                    );
+                                    continue;
+                                }
                                 let Some(store) = &storage else {
                                     continue;
                                 };
@@ -4012,6 +5123,23 @@ impl CatalystNode {
                             }
                         } else if envelope.message_type == MessageType::LsuFinalityCid {
                             if let Ok(msg) = envelope.extract_message::<LsuFinalityCidMsg>() {
+                                if !crate::consensus_limits::p2p_lsu_cycle_within_wall_lead(
+                                    msg.cycle,
+                                    now_ms,
+                                    gossip_cycle_ms,
+                                    lsu_wall_lead_cap,
+                                ) {
+                                    tracing::debug!(
+                                        target: "catalyst.consensus.policy",
+                                        cycle = msg.cycle,
+                                        "dropping LsuFinalityCidMsg: cycle too far ahead of wall clock"
+                                    );
+                                    catalyst_utils::increment_counter!(
+                                        "consensus_p2p_lsu_cycle_rejected_total",
+                                        1
+                                    );
+                                    continue;
+                                }
                                 if let Some(store) = &storage {
                                     let _ = store
                                         .set_metadata(
@@ -4030,6 +5158,23 @@ impl CatalystNode {
                             }
                         } else if envelope.message_type == MessageType::StateRequest {
                             if let Ok(req) = envelope.extract_message::<LsuRangeRequest>() {
+                                if !crate::consensus_limits::p2p_lsu_cycle_within_wall_lead(
+                                    req.start_cycle,
+                                    now_ms,
+                                    gossip_cycle_ms,
+                                    lsu_wall_lead_cap,
+                                ) {
+                                    tracing::debug!(
+                                        target: "catalyst.consensus.policy",
+                                        start_cycle = req.start_cycle,
+                                        "ignoring LsuRangeRequest: start_cycle too far ahead of wall clock"
+                                    );
+                                    catalyst_utils::increment_counter!(
+                                        "consensus_p2p_lsu_cycle_rejected_total",
+                                        1
+                                    );
+                                    continue;
+                                }
                                 if req.requester == producer_id_self {
                                     continue;
                                 }
@@ -4088,13 +5233,43 @@ impl CatalystNode {
                                 if resp.requester != producer_id_self {
                                     continue;
                                 }
-                                // Update observed head based on response.
-                                if let Some(max_cycle) = resp.refs.iter().map(|r| r.cycle).max() {
+                                // Update observed head based on response (ignore absurd far-future refs).
+                                if let Some(max_cycle) = resp
+                                    .refs
+                                    .iter()
+                                    .filter_map(|r| {
+                                        crate::consensus_limits::p2p_lsu_cycle_within_wall_lead(
+                                            r.cycle,
+                                            now_ms,
+                                            gossip_cycle_ms,
+                                            lsu_wall_lead_cap,
+                                        )
+                                        .then_some(r.cycle)
+                                    })
+                                    .max()
+                                {
                                     let mut c = catchup.lock().await;
                                     c.observed_head_cycle = c.observed_head_cycle.max(max_cycle);
                                 }
                                 // For each reference, if we don't have bytes locally, request via FileRequest.
                                 for r in resp.refs {
+                                    if !crate::consensus_limits::p2p_lsu_cycle_within_wall_lead(
+                                        r.cycle,
+                                        now_ms,
+                                        gossip_cycle_ms,
+                                        lsu_wall_lead_cap,
+                                    ) {
+                                        tracing::debug!(
+                                            target: "catalyst.consensus.policy",
+                                            cycle = r.cycle,
+                                            "skipping LsuRangeResponse ref: cycle too far ahead of wall clock"
+                                        );
+                                        catalyst_utils::increment_counter!(
+                                            "consensus_p2p_lsu_cycle_rejected_total",
+                                            1
+                                        );
+                                        continue;
+                                    }
                                     if let Some(store) = &storage {
                                         // If we already have the LSU bytes in DB, skip requesting.
                                         if store
@@ -4173,6 +5348,25 @@ impl CatalystNode {
                                     continue;
                                 };
 
+                                if !crate::consensus_limits::p2p_lsu_cycle_within_wall_lead(
+                                    info.cycle,
+                                    now_ms,
+                                    gossip_cycle_ms,
+                                    lsu_wall_lead_cap,
+                                ) {
+                                    tracing::debug!(
+                                        target: "catalyst.consensus.policy",
+                                        cycle = info.cycle,
+                                        cid = %resp.cid,
+                                        "dropping FileResponse LSU fetch: cycle too far ahead of wall clock"
+                                    );
+                                    catalyst_utils::increment_counter!(
+                                        "consensus_p2p_lsu_cycle_rejected_total",
+                                        1
+                                    );
+                                    continue;
+                                }
+
                                 if let Some(dfs) = &dfs {
                                     let _ = dfs.put(resp.bytes.clone()).await;
                                 }
@@ -4189,13 +5383,41 @@ impl CatalystNode {
                                                 // regardless of whether we can apply it to current state.
                                                 persist_lsu_history(
                                                     store.as_ref(),
+                                                    dfs.as_ref(),
                                                     info.cycle,
                                                     &resp.bytes,
                                                     &info.lsu_hash,
                                                     &resp.cid,
                                                     &info.expected_state_root,
+                                                    &info.finality_cid,
+                                                    require_lsu_finality_effective,
                                                 )
                                                 .await;
+
+                                            match fork_choice_apply_gate(
+                                                store.as_ref(),
+                                                dfs.as_ref(),
+                                                &lsu,
+                                                info.cycle,
+                                                info.lsu_hash,
+                                                &info.finality_cid,
+                                                require_lsu_finality_effective,
+                                            )
+                                            .await
+                                            {
+                                                ForkChoiceApplyGate::Allow => {}
+                                                ForkChoiceApplyGate::RejectWeaker => continue,
+                                                ForkChoiceApplyGate::RejectNonCertified => {
+                                                    catalyst_utils::increment_counter!(
+                                                        "consensus_fork_choice_rejected_non_certified_total",
+                                                        1
+                                                    );
+                                                    continue;
+                                                }
+                                                ForkChoiceApplyGate::StallCertifiedEquivocation => {
+                                                    continue;
+                                                }
+                                            }
 
                                             // Ensure we're applying onto the expected previous root.
                                             //
@@ -4204,7 +5426,23 @@ impl CatalystNode {
                                             // local and expected prev roots are zero.
                                             let local_prev = local_applied_state_root(store.as_ref()).await;
                                             let mut ok = false;
-                                            if local_prev != info.prev_state_root {
+                                            if try_reorg_stronger_lsu_at_applied_cycle(
+                                                store.as_ref(),
+                                                &lsu,
+                                                info.cycle,
+                                                info.prev_state_root,
+                                                info.expected_state_root,
+                                                &info.lsu_hash,
+                                                Some((net.as_ref(), producer_id_self.as_str())),
+                                                dfs.as_ref(),
+                                                &info.finality_cid,
+                                                require_lsu_finality_effective,
+                                            )
+                                            .await
+                                            .unwrap_or(false)
+                                            {
+                                                ok = true;
+                                            } else if local_prev != info.prev_state_root {
                                                 if local_prev == [0u8; 32] && info.prev_state_root == [0u8; 32] {
                                                     // bootstrap ok
                                                 } else {
@@ -4215,6 +5453,10 @@ impl CatalystNode {
                                                         info.prev_state_root,
                                                         info.expected_state_root,
                                                         &info.lsu_hash,
+                                                        Some((net.as_ref(), producer_id_self.as_str())),
+                                                        dfs.as_ref(),
+                                                        &info.finality_cid,
+                                                        require_lsu_finality_effective,
                                                     )
                                                     .await
                                                     {
@@ -4234,6 +5476,7 @@ impl CatalystNode {
                                                         }
                                                         Err(e) => {
                                                             warn!(
+                                                                target: "catalyst.consensus.reconcile",
                                                                 "Quorum reconcile error cycle={} cid={}: {}",
                                                                 info.cycle, resp.cid, e
                                                             );
@@ -4291,12 +5534,13 @@ impl CatalystNode {
                                                         &lsu,
                                                         info.cycle,
                                                         &info.finality_cid,
+                                                        require_lsu_finality_effective,
                                                     )
                                                     .await
                                                     {
                                                         ok = false;
                                                     }
-                                                } else if catalyst_require_lsu_finality() {
+                                                } else if require_lsu_finality_effective {
                                                     warn!(
                                                         "CATALYST_REQUIRE_LSU_FINALITY set but DFS unavailable (FileResponse path) cycle={}",
                                                         info.cycle
@@ -4473,6 +5717,8 @@ impl CatalystNode {
             let max_entries_per_cycle = self.config.consensus.max_transactions_per_block as usize;
             let finality_buckets_consensus = finality_buckets.clone();
             let validator_signing_key_consensus = validator_signing_key.clone();
+            let tx_batches_consensus = tx_batches.clone();
+            let tx_batch_commits_consensus = tx_batch_commits.clone();
             self.consensus_task = Some(tokio::spawn(async move {
                 // Seed for deterministic producer selection (paper uses previous LSU merkle root).
                 // We approximate with the hash of the most recent LSU we produced/observed.
@@ -4500,7 +5746,7 @@ impl CatalystNode {
                 tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
 
                 // Epoch-aligned cycle schedule so nodes start cycles together.
-                let now_ms = current_timestamp_ms();
+                let now_ms = crate::consensus_limits::wall_now_ms();
                 let rem = now_ms % cycle_ms;
                 let wait_ms = if rem == 0 { 0 } else { cycle_ms - rem };
                 if wait_ms > 0 {
@@ -4523,8 +5769,8 @@ impl CatalystNode {
                         break;
                     }
 
-                    // A stable cycle number based on wall-clock epoch time.
-                    let cycle = current_timestamp_ms() / cycle_ms;
+                    // A stable cycle number based on wall-clock epoch time (honors `CATALYST_TEST_WALL_OFFSET_MS`).
+                    let cycle = crate::consensus_limits::wall_now_ms() / cycle_ms;
 
                     // Deterministic producer selection (protocol function) based on:
                     // - worker pool: configured validator set (worker ids)
@@ -4558,6 +5804,8 @@ impl CatalystNode {
                     }
 
                     let producer_count = worker_pool.len().max(1);
+                    // Simple majority for logging / operator intuition; BFT vote quorum on LSUs
+                    // is enforced separately via `lsu_has_bft_vote_quorum` (⌈2n/3⌉ distinct voters).
                     let required_majority = (producer_count / 2) + 1;
                     info!(
                         "Cycle {} expected_producers={} required_majority={}",
@@ -4576,8 +5824,10 @@ impl CatalystNode {
 
                     info!("Cycle {} selected_producers={:?}", cycle, selected);
 
-                    // Temporary: deterministically pick a "batch leader" so all producers use
-                    // the same tx entries list for Construction.
+                    // Deterministic batch leader: all producers must execute Construction on the
+                    // same protocol tx list. Followers wait (WAN budget), resync over P2P, and may
+                    // recover from persisted per-cycle tx ids — they never silently use an empty
+                    // list unless `TxBatchControl::Commit` advertises tx_count=0.
                     let leader = selected.first().cloned().unwrap_or_else(|| producer_id.clone());
                     let transactions = if producer_id == leader {
                         let candidate_txs = {
@@ -4597,7 +5847,7 @@ impl CatalystNode {
                             Vec::new()
                         };
 
-                        // Persist per-cycle txids + mark Selected (so receipts can show progress).
+                        // Persist per-cycle txids + mark Selected (so followers can recover if gossip drops).
                         if let Some(store) = &storage {
                             let txids: Vec<[u8; 32]> = txs.iter().filter_map(|t| mempool_txid(t)).collect();
                             persist_cycle_txids(store.as_ref(), cycle, txids).await;
@@ -4612,13 +5862,36 @@ impl CatalystNode {
                         }
 
                         info!("Cycle {} tx batch leader={} entries={}", cycle, leader, entries.len());
-                        if let Ok(batch) = ProtocolTxBatch::new(cycle, txs) {
+                        if let Ok(batch) = ProtocolTxBatch::new(cycle, txs.clone()) {
+                            let count = batch.txs.len() as u32;
+                            tx_batch_commits_consensus
+                                .write()
+                                .await
+                                .insert(cycle, (batch.batch_hash, count));
+                            if let Some(store) = &storage {
+                                persist_tx_batch_commit_metadata(
+                                    store.as_ref(),
+                                    cycle,
+                                    batch.batch_hash,
+                                    count,
+                                )
+                                .await;
+                            }
+                            let commit = TxBatchControl::Commit {
+                                cycle,
+                                batch_hash: batch.batch_hash,
+                                tx_count: count,
+                            };
+                            if let Ok(ce) =
+                                MessageEnvelope::from_message(&commit, "tx_batch_commit".to_string(), None)
+                            {
+                                let _ = network.broadcast_envelope(&ce).await;
+                            }
                             if let Ok(env) =
                                 MessageEnvelope::from_message(&batch, "txbatch".to_string(), None)
                             {
-                                // Gossipsub is best-effort; rebroadcast a few times to make
-                                // early-cycle delivery reliable (prevents split first_hash).
-                                for _ in 0..5 {
+                                // Gossipsub is best-effort; rebroadcast to improve WAN delivery.
+                                for _ in 0..8 {
                                     let _ = network.broadcast_envelope(&env).await;
                                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                                 }
@@ -4626,19 +5899,36 @@ impl CatalystNode {
                         }
                         entries
                     } else {
-                        // Wait briefly for the batch to arrive.
-                        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
-                        loop {
-                            if std::time::Instant::now() >= deadline {
-                                info!("Cycle {} tx batch follower={} timeout waiting for leader={}", cycle, producer_id, leader);
-                                break Vec::new();
-                            }
-                            if let Some(entries) = tx_batches.write().await.remove(&cycle) {
-                                info!("Cycle {} tx batch follower={} got entries={}", cycle, producer_id, entries.len());
-                                break entries;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        }
+                        let entries_opt = wait_for_tx_construction_entries(
+                            cycle,
+                            cycle_ms,
+                            &producer_id,
+                            &leader,
+                            false,
+                            max_entries_per_cycle,
+                            tx_batches_consensus.as_ref(),
+                            tx_batch_commits_consensus.as_ref(),
+                            storage.as_ref().map(|s| s.as_ref()),
+                            Some(network.as_ref() as &dyn crate::tx_batch_p2p::TxBatchNetwork),
+                        )
+                        .await;
+                        let Some(entries) = entries_opt else {
+                            tracing::error!(
+                                target: "catalyst.consensus.tx_batch",
+                                "Skipping consensus cycle={}: canonical tx batch unavailable (see TX_BATCH_MISS_FATAL)",
+                                cycle
+                            );
+                            continue;
+                        };
+                        info!(
+                            "Cycle {} tx batch follower={} leader={} entries={}",
+                            cycle,
+                            producer_id,
+                            leader,
+                            entries.len()
+                        );
+                        let _ = tx_batches_consensus.write().await.remove(&cycle);
+                        entries
                     };
 
                     match consensus.start_cycle(cycle, selected, transactions).await {
@@ -4960,7 +6250,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod bft_quorum_tests {
-    use super::{bft_vote_threshold, lsu_has_bft_vote_quorum};
+    use crate::fork_choice::{bft_vote_threshold, lsu_has_bft_vote_quorum};
     use catalyst_consensus::types::{
         CompensationEntry, LedgerStateUpdate, PartialLedgerStateUpdate, TransactionEntry,
     };
@@ -5020,6 +6310,926 @@ mod bft_quorum_tests {
             vec!["a".into(), "b".into(), "x".into()]
         )));
         assert!(!lsu_has_bft_vote_quorum(&empty_lsu(1, p, vec!["a".into(), "a".into(), "a".into()])));
+    }
+}
+
+/// Checklist §7.2: follower **stall** (no silent empty construction) when `Commit` promises txs
+/// but the canonical `ProtocolTxBatch` never arrives — plus agreed-empty and leader-miss tails.
+#[cfg(test)]
+mod tx_batch_follower_wait_tests {
+    use super::wait_for_tx_construction_entries;
+    use catalyst_consensus::types::TransactionEntry;
+    use std::collections::HashMap;
+    use tokio::sync::RwLock;
+
+    /// Tiny `cycle_ms` with `cycle == 0` makes wall-clock epoch ms dominate cycle boundaries so
+    /// wait loops exit immediately (production uses large `cycle` aligned with `now / cycle_ms`).
+    const TEST_CYCLE_MS: u64 = 100;
+
+    #[tokio::test]
+    async fn follower_pinned_nonzero_commit_without_batch_returns_none() {
+        let tx_batches = RwLock::new(HashMap::new());
+        let commit_ram = RwLock::new(HashMap::from([(0u64, ([9u8; 32], 2u32))]));
+        let out = wait_for_tx_construction_entries(
+            0,
+            TEST_CYCLE_MS,
+            "follower_a",
+            "leader_b",
+            false,
+            4096,
+            &tx_batches,
+            &commit_ram,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(out, None, "must not apply ambiguous empty construction");
+    }
+
+    #[tokio::test]
+    async fn follower_commit_tx_count_zero_returns_empty_vec() {
+        let tx_batches = RwLock::new(HashMap::new());
+        let commit_ram = RwLock::new(HashMap::from([(0u64, ([0u8; 32], 0u32))]));
+        let out = wait_for_tx_construction_entries(
+            0,
+            TEST_CYCLE_MS,
+            "follower_a",
+            "leader_b",
+            false,
+            4096,
+            &tx_batches,
+            &commit_ram,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(out, Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn leader_miss_returns_none_when_commit_nonzero_but_batch_missing() {
+        let tx_batches = RwLock::new(HashMap::new());
+        let commit_ram = RwLock::new(HashMap::from([(0u64, ([8u8; 32], 4u32))]));
+        let out = wait_for_tx_construction_entries(
+            0,
+            TEST_CYCLE_MS,
+            "leader_b",
+            "leader_b",
+            true,
+            4096,
+            &tx_batches,
+            &commit_ram,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(out, None);
+    }
+
+    #[tokio::test]
+    async fn ram_batch_short_circuits_wait() {
+        let e = TransactionEntry {
+            public_key: [2u8; 32],
+            amount: 1,
+            signature: vec![1u8; 64],
+        };
+        let tx_batches = RwLock::new(HashMap::from([(0u64, vec![e.clone()])]));
+        let commit_ram = RwLock::new(HashMap::new());
+        let out = wait_for_tx_construction_entries(
+            0,
+            TEST_CYCLE_MS,
+            "follower_a",
+            "leader_b",
+            false,
+            4096,
+            &tx_batches,
+            &commit_ram,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(out, Some(vec![e]));
+    }
+
+    /// §7.2: when the canonical batch appears **before** the soft budget elapses, the follower
+    /// obtains the same entries as if the batch had been present immediately (no stall).
+    #[tokio::test]
+    async fn follower_batch_arrives_mid_wait_returns_entries() {
+        use catalyst_utils::utils::current_timestamp_ms;
+
+        let cycle_ms = 100u64;
+        let now_ms = current_timestamp_ms();
+        let w = now_ms / cycle_ms;
+        let cycle = w.saturating_add(50);
+
+        let e = TransactionEntry {
+            public_key: [3u8; 32],
+            amount: 1,
+            signature: vec![2u8; 64],
+        };
+
+        let tx_batches = std::sync::Arc::new(RwLock::new(HashMap::new()));
+        let commit_ram = RwLock::new(HashMap::from([(cycle, ([9u8; 32], 2u32))]));
+        let bc = std::sync::Arc::clone(&tx_batches);
+        let ec = e.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            bc.write().await.insert(cycle, vec![ec]);
+        });
+
+        let out = wait_for_tx_construction_entries(
+            cycle,
+            cycle_ms,
+            "follower_a",
+            "leader_b",
+            false,
+            4096,
+            tx_batches.as_ref(),
+            &commit_ram,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(out, Some(vec![e]));
+    }
+
+    /// Checklist §7.2 (in-process): two followers with the same pinned commit + batch agree;
+    /// a third follower with commit but no batch stalls (`None`) instead of empty construction.
+    #[tokio::test]
+    async fn three_followers_one_missing_batch_stalls_while_peers_match() {
+        use catalyst_consensus::convergence_test_support::make_transactions;
+
+        let cycle = 0u64;
+        let commit = ([7u8; 32], 5u32);
+        let entries = make_transactions(1);
+        let tx_batches_ab = RwLock::new(HashMap::from([(cycle, entries.clone())]));
+        let tx_batches_c = RwLock::new(HashMap::new());
+        let commit_ram = RwLock::new(HashMap::from([(cycle, commit)]));
+
+        let out_a = wait_for_tx_construction_entries(
+            cycle,
+            TEST_CYCLE_MS,
+            "follower_a",
+            "leader",
+            false,
+            4096,
+            &tx_batches_ab,
+            &commit_ram,
+            None,
+            None,
+        )
+        .await;
+        let out_b = wait_for_tx_construction_entries(
+            cycle,
+            TEST_CYCLE_MS,
+            "follower_b",
+            "leader",
+            false,
+            4096,
+            &tx_batches_ab,
+            &commit_ram,
+            None,
+            None,
+        )
+        .await;
+        let out_c = wait_for_tx_construction_entries(
+            cycle,
+            TEST_CYCLE_MS,
+            "follower_c",
+            "leader",
+            false,
+            4096,
+            &tx_batches_c,
+            &commit_ram,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(out_a, Some(entries.clone()));
+        assert_eq!(out_b, Some(entries));
+        assert_eq!(out_c, None);
+    }
+}
+
+/// Checklist §7.1: identical **applied** `state_root` across isolated `StorageManager` instances when
+/// each applies the same converged LSU from the in-process multi-validator harness.
+#[cfg(test)]
+mod storage_state_root_convergence_tests {
+    use super::{apply_lsu_to_storage, ensure_chain_identity_and_genesis, local_applied_state_root};
+    use crate::config::NodeConfig;
+    use catalyst_consensus::convergence_test_support::{produce_single_cycle_converged_lsu, SimNetConfig};
+    use catalyst_storage::{StorageConfig, StorageManager};
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn three_validators_identical_applied_state_roots_per_cycle() {
+        let n = 3usize;
+        let net = SimNetConfig::default();
+        let protocol = NodeConfig::default().protocol;
+
+        let mut _keep_temp = Vec::new();
+        let mut stores: Vec<StorageManager> = Vec::new();
+        for _ in 0..n {
+            let td = TempDir::new().unwrap();
+            let mut sc = StorageConfig::default();
+            sc.data_dir = td.path().to_path_buf();
+            let store = StorageManager::new(sc).await.expect("storage open");
+            ensure_chain_identity_and_genesis(&store, &protocol)
+                .await
+                .expect("genesis");
+            _keep_temp.push(td);
+            stores.push(store);
+        }
+
+        for cycle in 1u64..=8u64 {
+            let lsu = produce_single_cycle_converged_lsu(n, cycle, net).await;
+            let mut roots: Vec<[u8; 32]> = Vec::new();
+            for store in &stores {
+                let r = apply_lsu_to_storage(store, &lsu)
+                    .await
+                    .unwrap_or_else(|e| panic!("apply cycle {cycle}: {e}"));
+                roots.push(r);
+            }
+            let r0 = roots[0];
+            assert!(
+                roots.iter().all(|r| *r == r0),
+                "cycle {cycle}: stores diverged in committed state_root: {:?}",
+                roots
+            );
+        }
+
+        for store in &stores {
+            let r_meta = local_applied_state_root(store).await;
+            let r_cache = store.get_state_root().expect("state root after commit");
+            assert_eq!(r_meta, r_cache, "metadata vs engine cached root");
+        }
+    }
+
+    /// One validator deliberately skips a cycle apply (batch stall); others advance; straggler
+    /// does not commit a divergent root, then catches up when applying the same converged LSU.
+    #[tokio::test]
+    async fn straggler_stall_then_catch_up_same_state_root() {
+        let n = 3usize;
+        let net = SimNetConfig::default();
+        let protocol = NodeConfig::default().protocol;
+
+        let mut _keep_temp = Vec::new();
+        let mut stores: Vec<StorageManager> = Vec::new();
+        for _ in 0..n {
+            let td = TempDir::new().unwrap();
+            let mut sc = StorageConfig::default();
+            sc.data_dir = td.path().to_path_buf();
+            let store = StorageManager::new(sc).await.expect("storage open");
+            ensure_chain_identity_and_genesis(&store, &protocol)
+                .await
+                .expect("genesis");
+            _keep_temp.push(td);
+            stores.push(store);
+        }
+
+        let lsu1 = produce_single_cycle_converged_lsu(n, 1, net).await;
+        for store in &stores {
+            apply_lsu_to_storage(store, &lsu1)
+                .await
+                .expect("cycle 1 apply");
+        }
+
+        let lsu2 = produce_single_cycle_converged_lsu(n, 2, net).await;
+        for store in stores.iter().take(2) {
+            apply_lsu_to_storage(store, &lsu2)
+                .await
+                .expect("cycle 2 apply on non-straggler");
+        }
+
+        let root_straggler = local_applied_state_root(&stores[2]).await;
+        let root_peer = local_applied_state_root(&stores[0]).await;
+        assert_ne!(
+            root_straggler, root_peer,
+            "straggler should remain on cycle 1 root while peers advanced"
+        );
+
+        apply_lsu_to_storage(&stores[2], &lsu2)
+            .await
+            .expect("straggler catch-up apply");
+        let r0 = local_applied_state_root(&stores[0]).await;
+        let r2 = local_applied_state_root(&stores[2]).await;
+        assert_eq!(r0, r2, "after catch-up, straggler matches peer head");
+    }
+}
+
+/// Checklist §4.1 / §7: fork-choice integration (storage + DFS + apply/reorg gates).
+#[cfg(test)]
+mod fork_choice_integration_tests {
+    use super::{
+        apply_lsu_to_storage, ensure_chain_identity_and_genesis,
+        fork_choice_apply_gate, hex_encode, load_stored_certified_hash_at_cycle,
+        local_applied_lsu_hash, local_applied_state_root, persist_lsu_history,
+        try_reconcile_fork_from_quorum_lsu, try_reorg_stronger_lsu_at_applied_cycle,
+        ForkChoiceApplyGate,
+    };
+    use crate::config::NodeConfig;
+    use crate::dfs_store::LocalContentStore;
+    use catalyst_consensus::types::{
+        hash_data, CompensationEntry, LedgerStateUpdate, PartialLedgerStateUpdate,
+        TransactionEntry,
+    };
+    use catalyst_consensus::{
+        h_cert_v1, committee_hash_ordered_producer_list, verify_lsu_finality_certificate,
+        LsuFinalityCertificateV1, ProducerFinalityVote, FINALITY_CERT_STYLE_INDIVIDUAL,
+    };
+    use catalyst_crypto::{PrivateKey, SignatureScheme};
+    use catalyst_storage::{StorageConfig, StorageManager};
+    use catalyst_utils::{CatalystSerialize, StateManager};
+    use rand::rngs::OsRng;
+    use tempfile::TempDir;
+
+    struct TestCommittee {
+        ids: Vec<String>,
+        keys: Vec<PrivateKey>,
+    }
+
+    impl TestCommittee {
+        fn three() -> Self {
+            let mut rng = OsRng;
+            let keys: Vec<_> = (0..3).map(|_| PrivateKey::generate(&mut rng)).collect();
+            let ids: Vec<_> = keys
+                .iter()
+                .map(|k| hex::encode(k.public_key().to_bytes()))
+                .collect();
+            Self { ids, keys }
+        }
+    }
+
+    struct TestEnv {
+        _store_dir: TempDir,
+        _dfs_dir: TempDir,
+        store: StorageManager,
+        dfs: LocalContentStore,
+        chain_id: u64,
+        genesis_hash: [u8; 32],
+    }
+
+    async fn test_env() -> TestEnv {
+        let store_dir = TempDir::new().unwrap();
+        let dfs_dir = TempDir::new().unwrap();
+        let mut sc = StorageConfig::default();
+        sc.data_dir = store_dir.path().to_path_buf();
+        let store = StorageManager::new(sc).await.expect("storage");
+        let protocol = NodeConfig::default().protocol;
+        ensure_chain_identity_and_genesis(&store, &protocol)
+            .await
+            .expect("genesis");
+        let chain_id = protocol.chain_id;
+        let genesis_hash = store
+            .get_metadata("protocol:genesis_hash")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| {
+                if b.len() == 32 {
+                    let mut g = [0u8; 32];
+                    g.copy_from_slice(&b[..32]);
+                    Some(g)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or([0u8; 32]);
+        let dfs = LocalContentStore::new(dfs_dir.path().to_path_buf());
+        TestEnv {
+            _store_dir: store_dir,
+            _dfs_dir: dfs_dir,
+            store,
+            dfs,
+            chain_id,
+            genesis_hash,
+        }
+    }
+
+    fn lsu_with_tx_seed(committee: &TestCommittee, cycle: u64, tx_seed: u8) -> LedgerStateUpdate {
+        LedgerStateUpdate {
+            partial_update: PartialLedgerStateUpdate {
+                transaction_entries: vec![TransactionEntry {
+                    public_key: committee.keys[0].public_key().to_bytes(),
+                    amount: tx_seed as i64,
+                    signature: vec![tx_seed; 64],
+                }],
+                transaction_signatures_hash: [tx_seed; 32],
+                total_fees: 0,
+                timestamp: 1,
+            },
+            compensation_entries: vec![CompensationEntry {
+                producer_id: committee.ids[0].clone(),
+                public_key: committee.keys[0].public_key().to_bytes(),
+                amount: 0,
+            }],
+            cycle_number: cycle,
+            producer_list: committee.ids.clone(),
+            vote_list: vec![committee.ids[0].clone(), committee.ids[1].clone()],
+        }
+    }
+
+    async fn install_finality_cert(
+        env: &TestEnv,
+        lsu: &LedgerStateUpdate,
+        committee: &TestCommittee,
+    ) -> String {
+        let lsu_hash = hash_data(lsu).expect("lsu hash");
+        let committee_hash =
+            committee_hash_ordered_producer_list(&lsu.producer_list).expect("committee hash");
+        let vote_list_hash = catalyst_consensus::hash_producer_list_merkle(&lsu.vote_list);
+        let h = h_cert_v1(
+            env.chain_id,
+            &env.genesis_hash,
+            lsu.cycle_number,
+            &lsu_hash,
+            &committee_hash,
+            &vote_list_hash,
+        );
+        let mut rng = OsRng;
+        let scheme = SignatureScheme::new();
+        let sig_a = scheme
+            .sign(&mut rng, &committee.keys[0], &h)
+            .expect("sign a")
+            .to_bytes();
+        let sig_b = scheme
+            .sign(&mut rng, &committee.keys[1], &h)
+            .expect("sign b")
+            .to_bytes();
+        let cert = LsuFinalityCertificateV1 {
+            version: 1,
+            style: FINALITY_CERT_STYLE_INDIVIDUAL,
+            chain_id: env.chain_id,
+            genesis_hash: env.genesis_hash,
+            cycle: lsu.cycle_number,
+            lsu_hash,
+            committee_hash,
+            vote_list_hash,
+            votes: vec![
+                ProducerFinalityVote {
+                    producer_id: committee.ids[0].clone(),
+                    signature: sig_a.to_vec(),
+                },
+                ProducerFinalityVote {
+                    producer_id: committee.ids[1].clone(),
+                    signature: sig_b.to_vec(),
+                },
+            ],
+        };
+        verify_lsu_finality_certificate(&cert, lsu).expect("cert verifies");
+        let blob = bincode::serialize(&cert).expect("encode cert");
+        let cid = env.dfs.put(blob).await.expect("dfs put");
+        let _ = env
+            .store
+            .set_metadata(
+                &format!("consensus:lsu_finality_cid:{}", lsu.cycle_number),
+                cid.as_bytes(),
+            )
+            .await;
+        cid
+    }
+
+    async fn canonical_hash_at_cycle(store: &StorageManager, cycle: u64) -> Option<[u8; 32]> {
+        let b = store
+            .get_metadata(&format!("consensus:lsu_hash:{cycle}"))
+            .await
+            .ok()
+            .flatten()?;
+        if b.len() != 32 {
+            return None;
+        }
+        let mut h = [0u8; 32];
+        h.copy_from_slice(&b[..32]);
+        Some(h)
+    }
+
+    fn pick_two_tx_seeds(committee: &TestCommittee, cycle: u64) -> (u8, u8) {
+        let mut seeds: Vec<(u8, [u8; 32])> = (0u8..=255)
+            .map(|s| {
+                let lsu = lsu_with_tx_seed(committee, cycle, s);
+                (s, hash_data(&lsu).expect("hash"))
+            })
+            .collect();
+        seeds.sort_by_key(|(_, h)| *h);
+        (seeds[0].0, seeds[seeds.len() - 1].0)
+    }
+
+    #[tokio::test]
+    async fn persist_smaller_hash_wins_same_tier() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let (seed_lo, seed_hi) = pick_two_tx_seeds(&committee, 1);
+        let lsu_hi = lsu_with_tx_seed(&committee, 1, seed_hi);
+        let lsu_lo = lsu_with_tx_seed(&committee, 1, seed_lo);
+        let hash_hi = hash_data(&lsu_hi).expect("hash hi");
+        let hash_lo = hash_data(&lsu_lo).expect("hash lo");
+        assert!(hash_lo < hash_hi, "test setup: pick distinct hashes");
+
+        let bytes_hi = lsu_hi.serialize().expect("ser");
+        let bytes_lo = lsu_lo.serialize().expect("ser");
+
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            1,
+            &bytes_hi,
+            &hash_hi,
+            "",
+            &[0u8; 32],
+            "",
+            false,
+        )
+        .await;
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            1,
+            &bytes_lo,
+            &hash_lo,
+            "",
+            &[0u8; 32],
+            "",
+            false,
+        )
+        .await;
+
+        assert_eq!(canonical_hash_at_cycle(&env.store, 1).await, Some(hash_lo));
+    }
+
+    #[tokio::test]
+    async fn certified_persist_supersedes_quorum_inferred() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let (seed_lo, seed_hi) = pick_two_tx_seeds(&committee, 1);
+        let lsu_inferred = lsu_with_tx_seed(&committee, 1, seed_hi);
+        let lsu_cert = lsu_with_tx_seed(&committee, 1, seed_lo);
+        let hash_inferred = hash_data(&lsu_inferred).expect("hash");
+        let hash_cert = hash_data(&lsu_cert).expect("hash");
+        let cid = install_finality_cert(&env, &lsu_cert, &committee).await;
+
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            1,
+            &lsu_inferred.serialize().expect("ser"),
+            &hash_inferred,
+            "",
+            &[0u8; 32],
+            "",
+            false,
+        )
+        .await;
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            1,
+            &lsu_cert.serialize().expect("ser"),
+            &hash_cert,
+            "cid",
+            &[0u8; 32],
+            &cid,
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            canonical_hash_at_cycle(&env.store, 1).await,
+            Some(hash_cert)
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_gate_rejects_non_certified_when_certified_only() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let lsu = lsu_with_tx_seed(&committee, 1, 7);
+        let hash = hash_data(&lsu).expect("hash");
+
+        let gate = fork_choice_apply_gate(
+            &env.store,
+            Some(&env.dfs),
+            &lsu,
+            1,
+            hash,
+            "",
+            true,
+        )
+        .await;
+        assert_eq!(gate, ForkChoiceApplyGate::RejectNonCertified);
+    }
+
+    #[tokio::test]
+    async fn apply_gate_stalls_on_double_certified_production_policy() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let (seed_a, seed_b) = pick_two_tx_seeds(&committee, 1);
+        assert_ne!(seed_a, seed_b);
+        let lsu_a = lsu_with_tx_seed(&committee, 1, seed_a);
+        let lsu_b = lsu_with_tx_seed(&committee, 1, seed_b);
+        let hash_a = hash_data(&lsu_a).expect("hash a");
+        let hash_b = hash_data(&lsu_b).expect("hash b");
+        let cid_a = install_finality_cert(&env, &lsu_a, &committee).await;
+        let cid_b = install_finality_cert(&env, &lsu_b, &committee).await;
+
+        let g1 = fork_choice_apply_gate(
+            &env.store,
+            Some(&env.dfs),
+            &lsu_a,
+            1,
+            hash_a,
+            &cid_a,
+            true,
+        )
+        .await;
+        assert_eq!(g1, ForkChoiceApplyGate::Allow);
+        assert_eq!(
+            load_stored_certified_hash_at_cycle(&env.store, 1).await,
+            Some(hash_a)
+        );
+
+        let g2 = fork_choice_apply_gate(
+            &env.store,
+            Some(&env.dfs),
+            &lsu_b,
+            1,
+            hash_b,
+            &cid_b,
+            true,
+        )
+        .await;
+        assert_eq!(g2, ForkChoiceApplyGate::StallCertifiedEquivocation);
+    }
+
+    #[tokio::test]
+    async fn apply_gate_testnet_allows_second_cert_with_tiebreak_policy() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let (seed_lo, seed_hi) = pick_two_tx_seeds(&committee, 1);
+        let lsu_lo = lsu_with_tx_seed(&committee, 1, seed_lo);
+        let lsu_hi = lsu_with_tx_seed(&committee, 1, seed_hi);
+        let hash_lo = hash_data(&lsu_lo).expect("hash lo");
+        let hash_hi = hash_data(&lsu_hi).expect("hash hi");
+        let cid_lo = install_finality_cert(&env, &lsu_lo, &committee).await;
+        let cid_hi = install_finality_cert(&env, &lsu_hi, &committee).await;
+
+        assert_eq!(
+            fork_choice_apply_gate(
+                &env.store,
+                Some(&env.dfs),
+                &lsu_hi,
+                1,
+                hash_hi,
+                &cid_hi,
+                false,
+            )
+            .await,
+            ForkChoiceApplyGate::Allow
+        );
+        // Testnet policy: tie-break, not stall — second cert may proceed (then weaker check).
+        let g2 = fork_choice_apply_gate(
+            &env.store,
+            Some(&env.dfs),
+            &lsu_lo,
+            1,
+            hash_lo,
+            &cid_lo,
+            false,
+        )
+        .await;
+        assert_eq!(g2, ForkChoiceApplyGate::Allow);
+    }
+
+    #[tokio::test]
+    async fn reorg_replaces_applied_head_with_stronger_certified_lsu() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let (seed_lo, seed_hi) = pick_two_tx_seeds(&committee, 1);
+        let lsu_c1 = lsu_with_tx_seed(&committee, 1, seed_hi);
+        let lsu_inferred_c2 = lsu_with_tx_seed(&committee, 2, seed_hi);
+        let mut lsu_cert_c2 = lsu_with_tx_seed(&committee, 2, seed_lo);
+        lsu_cert_c2.cycle_number = 2;
+        let hash_inferred_c2 = hash_data(&lsu_inferred_c2).expect("hash inferred c2");
+        let hash_cert_c2 = hash_data(&lsu_cert_c2).expect("hash cert c2");
+        let cid = install_finality_cert(&env, &lsu_cert_c2, &committee).await;
+
+        let root_c1 = apply_lsu_to_storage(&env.store, &lsu_c1)
+            .await
+            .expect("apply cycle 1");
+
+        let snap = "fork_choice_reorg_expect";
+        env.store
+            .create_snapshot(snap)
+            .await
+            .expect("snapshot create");
+        let expected_post = apply_lsu_to_storage(&env.store, &lsu_cert_c2)
+            .await
+            .expect("expected certified apply");
+        env.store
+            .load_snapshot(snap)
+            .await
+            .expect("snapshot restore");
+        let _ = env.store.delete_snapshot(snap).await;
+
+        let root_inferred_c2 = apply_lsu_to_storage(&env.store, &lsu_inferred_c2)
+            .await
+            .expect("apply inferred cycle 2");
+        assert_eq!(
+            local_applied_lsu_hash(&env.store).await,
+            Some(hash_inferred_c2)
+        );
+
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            1,
+            &lsu_c1.serialize().expect("ser"),
+            &hash_data(&lsu_c1).expect("h1"),
+            "",
+            &root_c1,
+            "",
+            false,
+        )
+        .await;
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            2,
+            &lsu_inferred_c2.serialize().expect("ser"),
+            &hash_inferred_c2,
+            "",
+            &root_inferred_c2,
+            "",
+            false,
+        )
+        .await;
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            2,
+            &lsu_cert_c2.serialize().expect("ser"),
+            &hash_cert_c2,
+            "cid",
+            &[0u8; 32],
+            &cid,
+            true,
+        )
+        .await;
+
+        let reorged = try_reorg_stronger_lsu_at_applied_cycle(
+            &env.store,
+            &lsu_cert_c2,
+            2,
+            root_c1,
+            expected_post,
+            &hash_cert_c2,
+            None,
+            Some(&env.dfs),
+            &cid,
+            true,
+        )
+        .await
+        .expect("reorg");
+
+        assert!(
+            reorged,
+            "try_reorg should reconcile to stronger certified LSU at cycle 2"
+        );
+        assert_eq!(
+            local_applied_lsu_hash(&env.store).await,
+            Some(hash_cert_c2)
+        );
+        assert_eq!(local_applied_state_root(&env.store).await, expected_post);
+        assert_ne!(expected_post, root_inferred_c2);
+    }
+
+    #[tokio::test]
+    async fn reconcile_stronger_certified_over_inferred_prev_root_mismatch() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let (seed_lo, seed_hi) = pick_two_tx_seeds(&committee, 1);
+        let lsu_c1 = lsu_with_tx_seed(&committee, 1, seed_hi);
+        let lsu_inferred_c2 = lsu_with_tx_seed(&committee, 2, seed_hi);
+        let mut lsu_cert_c2 = lsu_with_tx_seed(&committee, 2, seed_lo);
+        lsu_cert_c2.cycle_number = 2;
+        let hash_inferred_c2 = hash_data(&lsu_inferred_c2).expect("hash inferred c2");
+        let hash_cert_c2 = hash_data(&lsu_cert_c2).expect("hash cert c2");
+        let cid = install_finality_cert(&env, &lsu_cert_c2, &committee).await;
+
+        let root_c1 = apply_lsu_to_storage(&env.store, &lsu_c1)
+            .await
+            .expect("apply cycle 1");
+
+        let snap = "fork_choice_reconcile_expect";
+        env.store
+            .create_snapshot(snap)
+            .await
+            .expect("snapshot create");
+        let expected_post = apply_lsu_to_storage(&env.store, &lsu_cert_c2)
+            .await
+            .expect("expected certified apply");
+        env.store
+            .load_snapshot(snap)
+            .await
+            .expect("snapshot restore");
+        let _ = env.store.delete_snapshot(snap).await;
+
+        let _ = apply_lsu_to_storage(&env.store, &lsu_inferred_c2)
+            .await
+            .expect("apply inferred cycle 2");
+
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            1,
+            &lsu_c1.serialize().expect("ser"),
+            &hash_data(&lsu_c1).expect("h1"),
+            "",
+            &root_c1,
+            "",
+            false,
+        )
+        .await;
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            2,
+            &lsu_inferred_c2.serialize().expect("ser"),
+            &hash_inferred_c2,
+            "",
+            &[0u8; 32],
+            "",
+            false,
+        )
+        .await;
+
+        let reconciled = try_reconcile_fork_from_quorum_lsu(
+            &env.store,
+            &lsu_cert_c2,
+            2,
+            root_c1,
+            expected_post,
+            &hash_cert_c2,
+            None,
+            Some(&env.dfs),
+            &cid,
+            true,
+        )
+        .await
+        .expect("reconcile");
+        assert!(
+            reconciled,
+            "reconcile should replay cycle 1 and apply certified LSU at cycle 2"
+        );
+        assert_eq!(
+            local_applied_lsu_hash(&env.store).await,
+            Some(hash_cert_c2)
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_gate_allows_certified_quorum_lsu() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let lsu = lsu_with_tx_seed(&committee, 1, 42);
+        let hash = hash_data(&lsu).expect("hash");
+        let cid = install_finality_cert(&env, &lsu, &committee).await;
+
+        let gate = fork_choice_apply_gate(
+            &env.store,
+            Some(&env.dfs),
+            &lsu,
+            1,
+            hash,
+            &cid,
+            true,
+        )
+        .await;
+        assert_eq!(gate, ForkChoiceApplyGate::Allow);
+    }
+}
+
+#[cfg(test)]
+mod worker_registry_load_tests {
+    use super::{load_workers_from_state, worker_key_for_pubkey};
+    use catalyst_storage::{StorageConfig, StorageManager};
+    use catalyst_utils::StateManager;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn load_workers_empty_then_registered_pubkey() {
+        let td = TempDir::new().unwrap();
+        let mut sc = StorageConfig::default();
+        sc.data_dir = td.path().to_path_buf();
+        let store = StorageManager::new(sc).await.expect("storage open");
+        assert!(load_workers_from_state(&store).is_empty());
+
+        let pk = [11u8; 32];
+        store
+            .set_state(&worker_key_for_pubkey(&pk), vec![1u8])
+            .await
+            .expect("set workers marker");
+        assert_eq!(load_workers_from_state(&store), vec![pk]);
     }
 }
 

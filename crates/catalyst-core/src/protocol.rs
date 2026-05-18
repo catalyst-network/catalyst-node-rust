@@ -689,6 +689,25 @@ mod tests {
     }
 
     #[test]
+    fn producer_selection_order_depends_on_prev_cycle_seed() {
+        let workers: Vec<WorkerId> = (0u8..6)
+            .map(|i| {
+                let mut id = [0u8; 32];
+                id[0] = i;
+                id
+            })
+            .collect();
+        let seed_a = [1u8; 32];
+        let seed_b = [2u8; 32];
+        let order_a = select_producers_for_next_cycle(&workers, &seed_a, workers.len());
+        let order_b = select_producers_for_next_cycle(&workers, &seed_b, workers.len());
+        assert_ne!(
+            order_a, order_b,
+            "XOR mask from PRNG seed should reorder worker scores for nontrivial pools"
+        );
+    }
+
+    #[test]
     fn wallet_tx_v2_wire_roundtrip_and_txid_is_deterministic() {
         let from = [1u8; 32];
         let to = [2u8; 32];

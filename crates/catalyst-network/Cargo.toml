@@ -42,9 +42,17 @@ prometheus = { version = "0.14", optional = true }
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.0"
+catalyst-utils = { path = "../catalyst-utils" }
+
+[[test]]
+name = "tcp_batch_drop"
+required-features = ["test-hooks"]
+# Exercises simple TCP relay (`--no-default-features`); libp2p gossipsub mesh timing is not deterministic here.
 
 [features]
 default = ["metrics", "libp2p-full"]
 metrics = ["prometheus"]
 # Compile the full libp2p stack (gossipsub + mdns + identify + ping).
 libp2p-full = []
+# Exposes `NetworkService::inject_test_envelope` for TCP/gossip integration tests.
+test-hooks = []

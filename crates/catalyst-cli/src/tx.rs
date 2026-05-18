@@ -375,6 +375,77 @@ impl ProtocolTxBatch {
     }
 }
 
+/// Control messages for canonical per-cycle `ProtocolTxBatch` delivery.
+///
+/// Uses [`MessageType::TransactionRequest`] so we avoid reshuffling the `MessageType` enum's
+/// bincode ordinal layout on the wire.
+///
+/// **Payload contract:** the gossip body for `TransactionRequest` **must** be bincode of this
+/// enum when talking to current `catalyst-cli`. Older builds that put unrelated payloads on the
+/// same `MessageType` can fail deserialization or mis-decode; coordinate upgrades accordingly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TxBatchControl {
+    /// Batch leader announces digest + transaction count before (or alongside) full batches.
+    Commit {
+        cycle: u64,
+        batch_hash: Hash,
+        tx_count: u32,
+    },
+    /// Ask peers to re-flood [`ProtocolTxBatch`] for `cycle` (WAN loss recovery).
+    ResyncRequest { cycle: u64, requester: String },
+}
+
+impl NetworkMessage for TxBatchControl {
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        bincode::serialize(self)
+            .map_err(|e| catalyst_utils::error::CatalystError::Serialization(e.to_string()))
+    }
+
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        bincode::deserialize(data)
+            .map_err(|e| catalyst_utils::error::CatalystError::Serialization(e.to_string()))
+    }
+
+    fn message_type(&self) -> MessageType {
+        MessageType::TransactionRequest
+    }
+
+    fn priority(&self) -> u8 {
+        MessagePriority::Critical as u8
+    }
+
+    fn ttl(&self) -> u32 {
+        120
+    }
+}
+
+#[cfg(test)]
+mod tx_batch_control_tests {
+    use super::*;
+    use catalyst_utils::NetworkMessage;
+
+    #[test]
+    fn tx_batch_control_roundtrip() {
+        let c1 = TxBatchControl::Commit {
+            cycle: 42,
+            batch_hash: [7u8; 32],
+            tx_count: 3,
+        };
+        let bytes = NetworkMessage::serialize(&c1).unwrap();
+        let d1 = <TxBatchControl as NetworkMessage>::deserialize(&bytes).unwrap();
+        assert_eq!(c1, d1);
+
+        let c2 = TxBatchControl::ResyncRequest {
+            cycle: 9,
+            requester: "abc".into(),
+        };
+        let bytes2 = NetworkMessage::serialize(&c2).unwrap();
+        let d2 = <TxBatchControl as NetworkMessage>::deserialize(&bytes2).unwrap();
+        assert_eq!(c2, d2);
+        assert_eq!(c2.message_type(), MessageType::TransactionRequest);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MempoolItem {
     entries: Vec<TransactionEntry>,

@@ -12,6 +12,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, mpsc};
 use tokio::time::{timeout, sleep};
 
+/// Checklist §2.2: four-phase inbound bodies must match the engine’s active `current_cycle` to be
+/// counted. Wrong-cycle messages of the **expected** phase type are **not** buffered here (they are
+/// dropped); other message types are pushed to `pending_envelopes` for later phases.
+#[inline]
+fn phase_body_matches_current_cycle(message_cycle: CycleNumber, current_cycle: CycleNumber) -> bool {
+    message_cycle == current_cycle
+}
+
 /// Main consensus engine implementing the 4-phase collaborative consensus
 pub struct CollaborativeConsensus {
     config: ConsensusConfig,
@@ -172,11 +180,8 @@ impl CollaborativeConsensus {
             self.current_cycle
         );
 
-        // Phase 2: Campaigning
-        //
-        // NOTE: Networking collection is still WIP, but to make the node runnable (single
-        // producer) we always feed our own message forward. When networking is wired in,
-        // this should be replaced with the collected set from the network, plus our own.
+        // Phase 2: Campaigning — merge peer `ProducerCandidate` messages collected during the
+        // phase window with our own candidate (see `collect_producer_candidates`).
         let candidate = self.run_campaigning_phase(manager, quantities).await?;
         let mut candidates = self
             .collect_producer_candidates(Duration::from_millis(self.config.campaigning_phase_ms))
@@ -256,7 +261,7 @@ impl CollaborativeConsensus {
         // Broadcast our candidate
         self.broadcast_message(&candidate).await?;
         
-        // TODO: Collect candidates from other producers via network and merge.
+        // Broadcast our candidate; peers are merged from `collect_producer_candidates` above.
         
         Ok(candidate)
     }
@@ -282,7 +287,7 @@ impl CollaborativeConsensus {
         // Broadcast our vote
         self.broadcast_message(&vote).await?;
         
-        // TODO: Collect votes from other producers via network and merge.
+        // Broadcast our vote; peers are merged from `collect_producer_votes` above.
         
         Ok(vote)
     }
@@ -321,7 +326,7 @@ impl CollaborativeConsensus {
         let total_cycle_time = Duration::from_millis(self.config.cycle_duration_ms);
         let _outputs = self.collect_producer_outputs(total_cycle_time).await?;
         
-        // TODO: Determine final ledger state update from collected outputs
+        // TODO: Derive observed LSU from collected `ProducerOutput` set (observer path).
         // For now, return None indicating we observed but didn't generate an update
         Ok(None)
     }
@@ -357,7 +362,7 @@ impl CollaborativeConsensus {
         // First, consume any previously buffered messages of this type.
         for env in self.drain_pending_by_type(MessageType::ProducerQuantity).await {
             if let Ok(q) = env.extract_message::<ProducerQuantity>() {
-                if q.cycle_number == self.current_cycle {
+                if phase_body_matches_current_cycle(q.cycle_number, self.current_cycle) {
                     out.insert(q.producer_id.clone(), q);
                 }
             }
@@ -375,7 +380,7 @@ impl CollaborativeConsensus {
                 Ok(Some(env)) => {
                     if env.message_type == MessageType::ProducerQuantity {
                         if let Ok(q) = env.extract_message::<ProducerQuantity>() {
-                            if q.cycle_number == self.current_cycle {
+                            if phase_body_matches_current_cycle(q.cycle_number, self.current_cycle) {
                                 out.insert(q.producer_id.clone(), q);
                             }
                         }
@@ -407,7 +412,7 @@ impl CollaborativeConsensus {
 
         for env in self.drain_pending_by_type(MessageType::ProducerCandidate).await {
             if let Ok(c) = env.extract_message::<ProducerCandidate>() {
-                if c.cycle_number == self.current_cycle {
+                if phase_body_matches_current_cycle(c.cycle_number, self.current_cycle) {
                     out.insert(c.producer_id.clone(), c);
                 }
             }
@@ -425,7 +430,7 @@ impl CollaborativeConsensus {
                 Ok(Some(env)) => {
                     if env.message_type == MessageType::ProducerCandidate {
                         if let Ok(c) = env.extract_message::<ProducerCandidate>() {
-                            if c.cycle_number == self.current_cycle {
+                            if phase_body_matches_current_cycle(c.cycle_number, self.current_cycle) {
                                 out.insert(c.producer_id.clone(), c);
                             }
                         }
@@ -456,7 +461,7 @@ impl CollaborativeConsensus {
 
         for env in self.drain_pending_by_type(MessageType::ProducerVote).await {
             if let Ok(v) = env.extract_message::<ProducerVote>() {
-                if v.cycle_number == self.current_cycle {
+                if phase_body_matches_current_cycle(v.cycle_number, self.current_cycle) {
                     out.insert(v.producer_id.clone(), v);
                 }
             }
@@ -474,7 +479,7 @@ impl CollaborativeConsensus {
                 Ok(Some(env)) => {
                     if env.message_type == MessageType::ProducerVote {
                         if let Ok(v) = env.extract_message::<ProducerVote>() {
-                            if v.cycle_number == self.current_cycle {
+                            if phase_body_matches_current_cycle(v.cycle_number, self.current_cycle) {
                                 out.insert(v.producer_id.clone(), v);
                             }
                         }
@@ -505,7 +510,7 @@ impl CollaborativeConsensus {
 
         for env in self.drain_pending_by_type(MessageType::ProducerOutput).await {
             if let Ok(o) = env.extract_message::<ProducerOutput>() {
-                if o.cycle_number == self.current_cycle {
+                if phase_body_matches_current_cycle(o.cycle_number, self.current_cycle) {
                     out.insert(o.producer_id.clone(), o);
                 }
             }
@@ -523,7 +528,7 @@ impl CollaborativeConsensus {
                 Ok(Some(env)) => {
                     if env.message_type == MessageType::ProducerOutput {
                         if let Ok(o) = env.extract_message::<ProducerOutput>() {
-                            if o.cycle_number == self.current_cycle {
+                            if phase_body_matches_current_cycle(o.cycle_number, self.current_cycle) {
                                 out.insert(o.producer_id.clone(), o);
                             }
                         }
@@ -847,5 +852,11 @@ mod tests {
         
         // Single-producer cycle should succeed without network wiring.
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn phase_body_cycle_gate_rejects_wrong_cycle() {
+        assert!(super::phase_body_matches_current_cycle(7, 7));
+        assert!(!super::phase_body_matches_current_cycle(6, 7));
     }
 }

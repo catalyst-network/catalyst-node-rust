@@ -5,6 +5,10 @@
 
 pub mod config;
 pub mod error;
+pub mod gossip_sim;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod tcp_test_mesh;
+pub mod protocol_identify;
 pub mod simple;
 
 // Full libp2p implementation (gated). We keep the public API aligned with the
@@ -16,6 +20,7 @@ pub mod service;
 // Common re-exports for downstream crates.
 pub use config::NetworkConfig;
 pub use error::{NetworkError, NetworkResult};
+pub use protocol_identify::{catalyst_identify_protocol_major_ok, CATALYST_IDENTIFY_PROTOCOL_VERSION};
 
 // Default: simple TCP service.
 #[cfg(not(feature = "libp2p-full"))]

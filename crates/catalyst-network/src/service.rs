@@ -8,6 +8,9 @@
 use crate::{
     config::NetworkConfig,
     error::{NetworkError, NetworkResult},
+    protocol_identify::{
+        catalyst_identify_protocol_major_ok, CATALYST_IDENTIFY_PROTOCOL_VERSION,
+    },
 };
 
 use catalyst_utils::logging::*;
@@ -34,8 +37,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, Mutex, RwLock};
-
-const IDENTIFY_PROTOCOL_VERSION: &str = "catalyst/1";
 
 #[derive(Debug, Clone)]
 struct DialBackoff {
@@ -194,7 +195,7 @@ impl NetworkService {
 
         // Identify + Ping
         let identify = identify::Behaviour::new(identify::Config::new(
-            IDENTIFY_PROTOCOL_VERSION.to_string(),
+            CATALYST_IDENTIFY_PROTOCOL_VERSION.to_string(),
             id_keys.public(),
         ));
         let ping = ping::Behaviour::new(ping::Config::new());
@@ -366,13 +367,13 @@ impl NetworkService {
                             SwarmEvent::Behaviour(BehaviourEvent::Identify(e)) => {
                                 if let identify::Event::Received { peer_id, info, .. } = e {
                                     let pv = info.protocol_version;
-                                    if pv != IDENTIFY_PROTOCOL_VERSION {
+                                    if !catalyst_identify_protocol_major_ok(&pv) {
                                         log_warn!(
                                             LogCategory::Network,
-                                            "Disconnecting peer {}: incompatible protocol_version={} (local={})",
+                                            "Disconnecting peer {}: incompatible protocol_version={} (supported catalyst major 1; local identify={})",
                                             peer_id,
                                             pv,
-                                            IDENTIFY_PROTOCOL_VERSION
+                                            CATALYST_IDENTIFY_PROTOCOL_VERSION
                                         );
                                         incompatible.insert(peer_id);
                                         swarm.disconnect_peer_id(peer_id);
@@ -470,6 +471,20 @@ impl NetworkService {
         self.cmd_tx
             .send(Cmd::Dial(addr.clone()))
             .map_err(|_| NetworkError::TransportError("dial channel closed".to_string()))
+    }
+
+    /// Inject an envelope as if received from a peer (integration tests / `test-hooks` feature).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn inject_test_envelope(&self, envelope: MessageEnvelope) -> NetworkResult<()> {
+        let from = PeerId::random();
+        emit(
+            &self.event_tx,
+            NetworkEvent::MessageReceived {
+                envelope,
+                from,
+            },
+        )
+        .await
     }
 }
 

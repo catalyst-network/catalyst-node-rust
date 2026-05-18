@@ -93,6 +93,13 @@ These docs are written against the current `catalyst-node-rust` implementation (
 - **Index:** [`adr/README.md`](./adr/README.md)
 - **0001 — LSU finality certificate (proposed):** [`adr/0001-lsu-finality-certificate.md`](./adr/0001-lsu-finality-certificate.md) — cryptographic quorum evidence, `H_cert`, wire shapes, verification steps
 
+## Consensus protocol (implementation)
+
+- **Completion checklist (engineering gate):** [`consensus-implementation-completion-checklist.md`](./consensus-implementation-completion-checklist.md) — canonical tx availability, phases, finality, fork-choice/replay, tests, exit criteria
+- **Wall clock & time sync (validators):** [`consensus-wall-clock-and-time.md`](./consensus-wall-clock-and-time.md) — `cycle` derivation, NTP, skew, pruning interaction
+- **Quorum, finality, fork choice (requirements):** [`consensus-quorum-and-fork-choice.md`](./consensus-quorum-and-fork-choice.md)
+- **Paper vs codebase notes:** [`consensus-paper-update-notes.md`](./consensus-paper-update-notes.md)
+
 ## Important implementation notes (current state)
 
 - **Consensus traffic is P2P on `30333/tcp`**, not RPC. RPC is only for client interaction.

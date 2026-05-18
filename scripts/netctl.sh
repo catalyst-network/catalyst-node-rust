@@ -16,6 +16,7 @@ Usage:
   scripts/netctl.sh testnet wait-rpc [URL] [TIMEOUT_SECS]
   scripts/netctl.sh testnet test-basic
   scripts/netctl.sh testnet test-contract
+  scripts/netctl.sh testnet test-consensus-heads
 
   scripts/netctl.sh devnet up --host <PUBLIC_IP_OR_DNS> [--p2p-port 30333] [--rpc-port 8545]
   scripts/netctl.sh devnet down
@@ -73,29 +74,38 @@ testnet_up() {
     fi
   done
 
-  # validator set (node1 + node2)
+  # validator set (all three local validators — checklist §7.1)
   PK1="$("$BIN" --log-level error pubkey --key-file testnet/node1/node.key | tail -n 1)"
   PK2="$("$BIN" --log-level error pubkey --key-file testnet/node2/node.key | tail -n 1)"
-  printf 'validator_worker_ids = ["%s", "%s"]\n' "$PK1" "$PK2" > testnet/validators.toml
+  PK3="$("$BIN" --log-level error pubkey --key-file testnet/node3/node.key | tail -n 1)"
+  printf 'validator_worker_ids = ["%s", "%s", "%s"]\n' "$PK1" "$PK2" "$PK3" > testnet/validators.toml
+
+  local finality_env=()
+  if [ -n "${CATALYST_REQUIRE_LSU_FINALITY:-}" ]; then
+    finality_env=( "CATALYST_REQUIRE_LSU_FINALITY=${CATALYST_REQUIRE_LSU_FINALITY}" )
+  else
+    # Local harness: DFS/finality gossip may lag; disable until fleet-ready.
+    finality_env=( "CATALYST_REQUIRE_LSU_FINALITY=0" )
+  fi
 
   echo "Starting node1 (bootstrap + validator + rpc) ..."
-  RUST_LOG=info stdbuf -oL -eL "$BIN" --config testnet/node1/config.toml start \
+  env RUST_LOG="${RUST_LOG:-info}" "${finality_env[@]}" stdbuf -oL -eL "$BIN" --config testnet/node1/config.toml start \
     --validator --storage --rpc --rpc-port 8545 \
     > testnet/node1/logs/stdout.log 2>&1 &
   echo $! > testnet/node1/node.pid
 
   sleep 2
-  echo "Starting node2 (validator + storage) ..."
-  RUST_LOG=info stdbuf -oL -eL "$BIN" --config testnet/node2/config.toml start \
-    --validator --storage --rpc-port 8546 \
+  echo "Starting node2 (validator + storage + rpc) ..."
+  env RUST_LOG="${RUST_LOG:-info}" "${finality_env[@]}" stdbuf -oL -eL "$BIN" --config testnet/node2/config.toml start \
+    --validator --storage --rpc --rpc-port 8546 \
     --bootstrap-peers "/ip4/127.0.0.1/tcp/30333" \
     > testnet/node2/logs/stdout.log 2>&1 &
   echo $! > testnet/node2/node.pid
 
   sleep 2
-  echo "Starting node3 (storage) ..."
-  RUST_LOG=info stdbuf -oL -eL "$BIN" --config testnet/node3/config.toml start \
-    --storage --rpc-port 8547 \
+  echo "Starting node3 (validator + storage + rpc) ..."
+  env RUST_LOG="${RUST_LOG:-info}" "${finality_env[@]}" stdbuf -oL -eL "$BIN" --config testnet/node3/config.toml start \
+    --validator --storage --rpc --rpc-port 8547 \
     --bootstrap-peers "/ip4/127.0.0.1/tcp/30333" \
     > testnet/node3/logs/stdout.log 2>&1 &
   echo $! > testnet/node3/node.pid
@@ -266,6 +276,75 @@ except Exception as e:
     fi
     sleep 1
   done
+}
+
+rpc_head_json() {
+  local url="$1"
+  rpc_call "$url" catalyst_head '[]'
+}
+
+rpc_head_field() {
+  local url="$1"
+  local field="$2"
+  rpc_head_json "$url" | python3 -c "import sys,json; r=json.load(sys.stdin).get('result') or {}; print(r.get('${field}',''))"
+}
+
+# Checklist §7.1: three multi-process validators must share applied_state_root at the same cycle.
+testnet_test_consensus_heads() {
+  local min_cycle="${1:-3}"
+  local timeout="${2:-180}"
+  local rpc1="http://127.0.0.1:8545"
+  local rpc2="http://127.0.0.1:8546"
+  local rpc3="http://127.0.0.1:8547"
+
+  testnet_wait_rpc "$rpc1" 90
+  testnet_wait_rpc "$rpc2" 90
+  testnet_wait_rpc "$rpc3" 90
+
+  local deadline=$(( $(date +%s) + timeout ))
+  echo "Waiting for applied_cycle >= ${min_cycle} on all validators (timeout ${timeout}s) ..."
+  while true; do
+    local c1 c2 c3
+    c1="$(rpc_head_field "$rpc1" applied_cycle)"
+    c2="$(rpc_head_field "$rpc2" applied_cycle)"
+    c3="$(rpc_head_field "$rpc3" applied_cycle)"
+    if [ -n "$c1" ] && [ -n "$c2" ] && [ -n "$c3" ] \
+      && [ "$c1" -ge "$min_cycle" ] 2>/dev/null \
+      && [ "$c2" -ge "$min_cycle" ] 2>/dev/null \
+      && [ "$c3" -ge "$min_cycle" ] 2>/dev/null; then
+      break
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "node1 head: $(rpc_head_json "$rpc1")"
+      echo "node2 head: $(rpc_head_json "$rpc2")"
+      echo "node3 head: $(rpc_head_json "$rpc3")"
+      die "validators did not reach cycle ${min_cycle} within timeout"
+    fi
+    sleep 3
+  done
+
+  local r1 r2 r3 h1 h2 h3
+  r1="$(rpc_head_field "$rpc1" applied_state_root)"
+  r2="$(rpc_head_field "$rpc2" applied_state_root)"
+  r3="$(rpc_head_field "$rpc3" applied_state_root)"
+  h1="$(rpc_head_field "$rpc1" applied_lsu_hash)"
+  h2="$(rpc_head_field "$rpc2" applied_lsu_hash)"
+  h3="$(rpc_head_field "$rpc3" applied_lsu_hash)"
+  c1="$(rpc_head_field "$rpc1" applied_cycle)"
+  c2="$(rpc_head_field "$rpc2" applied_cycle)"
+  c3="$(rpc_head_field "$rpc3" applied_cycle)"
+
+  echo "node1 cycle=$c1 state_root=$r1"
+  echo "node2 cycle=$c2 state_root=$r2"
+  echo "node3 cycle=$c3 state_root=$r3"
+
+  if [ "$r1" != "$r2" ] || [ "$r1" != "$r3" ]; then
+    die "divergent applied_state_root across validators"
+  fi
+  if [ "$h1" != "$h2" ] || [ "$h1" != "$h3" ]; then
+    die "divergent applied_lsu_hash across validators (state_root matched)"
+  fi
+  echo "PASS: identical applied_state_root and applied_lsu_hash at cycle >= ${min_cycle}"
 }
 
 testnet_test_contract() {
@@ -481,6 +560,7 @@ main() {
     testnet:wait-rpc) testnet_wait_rpc "${1:-http://127.0.0.1:8545}" "${2:-90}" ;;
     testnet:test-basic) testnet_test_basic ;;
     testnet:test-contract) testnet_test_contract ;;
+    testnet:test-consensus-heads) testnet_test_consensus_heads "$@" ;;
     devnet:up) devnet_up "$@" ;;
     devnet:down) devnet_down ;;
     devnet:status) devnet_status ;;

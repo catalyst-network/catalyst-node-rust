@@ -13,6 +13,8 @@ pub mod consensus;
 /// LSU finality certificate (ADR 0001).
 pub mod lsu_finality;
 
+pub mod convergence_test_support;
+
 pub use consensus::CollaborativeConsensus;
 pub use phases::hash_producer_list_merkle;
 pub use lsu_finality::{

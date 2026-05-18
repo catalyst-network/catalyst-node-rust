@@ -20,7 +20,7 @@ resolver = "2"
 # Centralized dependency management
 [workspace.dependencies]
 # Database - Use consistent version across workspace
-rocksdb = "0.22"
+rocksdb = "0.24"
 
 # Async runtime
 tokio = { version = "1.0", features = ["full"] }

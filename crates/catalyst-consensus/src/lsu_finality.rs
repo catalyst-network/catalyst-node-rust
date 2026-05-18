@@ -365,4 +365,145 @@ mod tests {
         };
         verify_lsu_finality_certificate(&cert, &lsu).unwrap();
     }
+
+    #[test]
+    fn certificate_verify_rejects_wrong_lsu_hash() {
+        let pk_a = PrivateKey::generate(&mut OsRng);
+        let pk_b = PrivateKey::generate(&mut OsRng);
+        let id_a = hex::encode(pk_a.public_key().to_bytes());
+        let id_b = hex::encode(pk_b.public_key().to_bytes());
+
+        let lsu = LedgerStateUpdate {
+            partial_update: PartialLedgerStateUpdate {
+                transaction_entries: vec![TransactionEntry {
+                    public_key: pk_a.public_key().to_bytes(),
+                    amount: 0,
+                    signature: vec![],
+                }],
+                transaction_signatures_hash: [1u8; 32],
+                total_fees: 0,
+                timestamp: 1,
+            },
+            compensation_entries: vec![CompensationEntry {
+                producer_id: id_a.clone(),
+                public_key: pk_a.public_key().to_bytes(),
+                amount: 0,
+            }],
+            cycle_number: 42,
+            producer_list: vec![id_a.clone(), id_b.clone(), "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string()],
+            vote_list: vec![id_a.clone(), id_b.clone()],
+        };
+
+        let lsu_hash = hash_data(&lsu).unwrap();
+        let chain_id = 7u64;
+        let genesis_hash = [3u8; 32];
+        let committee_hash = committee_hash_ordered_producer_list(&lsu.producer_list).unwrap();
+        let vote_list_hash = hash_producer_list_merkle(&lsu.vote_list);
+        let h = h_cert_v1(
+            chain_id,
+            &genesis_hash,
+            lsu.cycle_number,
+            &lsu_hash,
+            &committee_hash,
+            &vote_list_hash,
+        );
+
+        let mut rng = OsRng;
+        let scheme = SignatureScheme::new();
+        let sig_a = scheme.sign(&mut rng, &pk_a, &h).unwrap().to_bytes();
+        let sig_b = scheme.sign(&mut rng, &pk_b, &h).unwrap().to_bytes();
+
+        let mut cert = LsuFinalityCertificateV1 {
+            version: 1,
+            style: FINALITY_CERT_STYLE_INDIVIDUAL,
+            chain_id,
+            genesis_hash,
+            cycle: lsu.cycle_number,
+            lsu_hash,
+            committee_hash,
+            vote_list_hash,
+            votes: vec![
+                ProducerFinalityVote {
+                    producer_id: id_a,
+                    signature: sig_a.to_vec(),
+                },
+                ProducerFinalityVote {
+                    producer_id: id_b,
+                    signature: sig_b.to_vec(),
+                },
+            ],
+        };
+        // Tamper with digest bound to the certificate.
+        cert.lsu_hash = [0xfe; 32];
+        assert!(matches!(
+            verify_lsu_finality_certificate(&cert, &lsu),
+            Err(LsuFinalityVerifyError::LsuHashMismatch)
+        ));
+    }
+
+    #[test]
+    fn certificate_verify_rejects_insufficient_votes() {
+        let pk_a = PrivateKey::generate(&mut OsRng);
+        let pk_b = PrivateKey::generate(&mut OsRng);
+        let id_a = hex::encode(pk_a.public_key().to_bytes());
+        let id_b = hex::encode(pk_b.public_key().to_bytes());
+
+        let lsu = LedgerStateUpdate {
+            partial_update: PartialLedgerStateUpdate {
+                transaction_entries: vec![TransactionEntry {
+                    public_key: pk_a.public_key().to_bytes(),
+                    amount: 0,
+                    signature: vec![],
+                }],
+                transaction_signatures_hash: [1u8; 32],
+                total_fees: 0,
+                timestamp: 1,
+            },
+            compensation_entries: vec![CompensationEntry {
+                producer_id: id_a.clone(),
+                public_key: pk_a.public_key().to_bytes(),
+                amount: 0,
+            }],
+            cycle_number: 5,
+            producer_list: vec![id_a.clone(), id_b.clone(), "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string()],
+            vote_list: vec![id_a.clone()], // only one voter; need 2 of 3
+        };
+
+        let lsu_hash = hash_data(&lsu).unwrap();
+        let chain_id = 1u64;
+        let genesis_hash = [9u8; 32];
+        let committee_hash = committee_hash_ordered_producer_list(&lsu.producer_list).unwrap();
+        let vote_list_hash = hash_producer_list_merkle(&lsu.vote_list);
+        let h = h_cert_v1(
+            chain_id,
+            &genesis_hash,
+            lsu.cycle_number,
+            &lsu_hash,
+            &committee_hash,
+            &vote_list_hash,
+        );
+
+        let mut rng = OsRng;
+        let scheme = SignatureScheme::new();
+        let sig_a = scheme.sign(&mut rng, &pk_a, &h).unwrap().to_bytes();
+
+        let cert = LsuFinalityCertificateV1 {
+            version: 1,
+            style: FINALITY_CERT_STYLE_INDIVIDUAL,
+            chain_id,
+            genesis_hash,
+            cycle: lsu.cycle_number,
+            lsu_hash,
+            committee_hash,
+            vote_list_hash,
+            votes: vec![ProducerFinalityVote {
+                producer_id: id_a,
+                signature: sig_a.to_vec(),
+            }],
+        };
+        assert!(matches!(
+            verify_lsu_finality_certificate(&cert, &lsu),
+            Err(LsuFinalityVerifyError::InsufficientQuorum)
+        ));
+    }
 }
