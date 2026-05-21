@@ -5331,6 +5331,26 @@ impl CatalystNode {
                                         )
                                         .await;
                                 }
+                                // Finality bytes live in the local DFS cache (not IPFS API). Fetch via P2P if missing.
+                                if !msg.finality_cid.is_empty() {
+                                    let need_fetch = match &dfs {
+                                        Some(d) => !d.has(&msg.finality_cid).await,
+                                        None => true,
+                                    };
+                                    if need_fetch {
+                                        let req = FileRequestMsg {
+                                            requester: producer_id_self.clone(),
+                                            cid: msg.finality_cid.clone(),
+                                        };
+                                        if let Ok(env) = MessageEnvelope::from_message(
+                                            &req,
+                                            "file_req_finality_cid".to_string(),
+                                            None,
+                                        ) {
+                                            let _ = net.broadcast_envelope(&env).await;
+                                        }
+                                    }
+                                }
                                 let do_relay = {
                                     let mut rc = relay_cache.lock().await;
                                     rc.should_relay(&envelope, now_ms)
@@ -5537,6 +5557,10 @@ impl CatalystNode {
                                 if resp.requester != producer_id_self {
                                     continue;
                                 }
+                                // Always persist bytes (finality certs, LSU blobs, etc.) in local DFS cache.
+                                if let Some(dfs) = &dfs {
+                                    let _ = dfs.put(resp.bytes.clone()).await;
+                                }
                                 let Some(info) = pending_lsu_fetch_inbound.write().await.remove(&resp.cid) else {
                                     continue;
                                 };
@@ -5558,10 +5582,6 @@ impl CatalystNode {
                                         1
                                     );
                                     continue;
-                                }
-
-                                if let Some(dfs) = &dfs {
-                                    let _ = dfs.put(resp.bytes.clone()).await;
                                 }
 
                                 if let Ok(lsu) =
