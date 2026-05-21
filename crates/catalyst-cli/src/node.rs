@@ -2866,22 +2866,24 @@ fn catalyst_reconcile_prefetch_wait_ms() -> u64 {
         .unwrap_or(8000)
 }
 
-/// Ask peers for missing LSU metadata in `[1, end_exclusive)` and poll local storage until filled
+/// Ask peers for missing LSU metadata in `[scan_start, end_exclusive)` and poll local storage until filled
 /// or `wait_ms` elapses.
 async fn reconcile_prefetch_lsu_metadata_if_missing(
     store: &StorageManager,
     network: &P2pService,
     requester: &str,
+    scan_start: u64,
     end_exclusive: u64,
     wait_ms: u64,
 ) {
-    if wait_ms == 0 || end_exclusive <= 1 {
+    let scan_start = scan_start.max(1);
+    if wait_ms == 0 || end_exclusive <= scan_start {
         return;
     }
     let deadline = current_timestamp_ms().saturating_add(wait_ms);
     loop {
         let mut first_missing: Option<u64> = None;
-        for i in 1..end_exclusive {
+        for i in scan_start..end_exclusive {
             let has = store
                 .get_metadata(&format!("consensus:lsu:{}", i))
                 .await
@@ -3019,6 +3021,116 @@ async fn verify_lsu_finality_for_apply(
         return false;
     }
     true
+}
+
+/// Apply stored `consensus:lsu:{cycle}` when `cycle == local_applied + 1` (sequential follower catch-up).
+async fn try_apply_stored_lsu_at_cycle(
+    store: &StorageManager,
+    dfs: Option<&crate::dfs_store::LocalContentStore>,
+    cycle: u64,
+    require_lsu_finality: bool,
+) -> bool {
+    let head = local_applied_cycle(store).await;
+    if cycle != head.saturating_add(1) {
+        return false;
+    }
+    let Some(bytes) = store
+        .get_metadata(&format!("consensus:lsu:{}", cycle))
+        .await
+        .ok()
+        .flatten()
+    else {
+        return false;
+    };
+    let Ok(lsu) = catalyst_consensus::types::LedgerStateUpdate::deserialize(&bytes) else {
+        return false;
+    };
+    if lsu.cycle_number != cycle {
+        return false;
+    }
+    let lsu_hash = catalyst_consensus::types::hash_data(&lsu).unwrap_or([0u8; 32]);
+    if let Some(hb) = store
+        .get_metadata(&format!("consensus:lsu_hash:{}", cycle))
+        .await
+        .ok()
+        .flatten()
+    {
+        if hb.len() == 32 {
+            let mut ah = [0u8; 32];
+            ah.copy_from_slice(&hb[..32]);
+            if lsu_hash != ah {
+                return false;
+            }
+        }
+    }
+    let finality_cid = meta_string(store, &format!("consensus:lsu_finality_cid:{}", cycle))
+        .await
+        .unwrap_or_default();
+    if !matches!(
+        fork_choice_apply_gate(
+            store,
+            dfs,
+            &lsu,
+            cycle,
+            lsu_hash,
+            &finality_cid,
+            require_lsu_finality,
+        )
+        .await,
+        ForkChoiceApplyGate::Allow
+    ) {
+        return false;
+    }
+    let local_prev = local_applied_state_root(store).await;
+    let expected_prev = if cycle == 0 {
+        [0u8; 32]
+    } else {
+        meta_32(
+            store,
+            &format!("consensus:lsu_state_root:{}", cycle.saturating_sub(1)),
+        )
+        .await
+        .unwrap_or(local_prev)
+    };
+    if local_prev != expected_prev && !(local_prev == [0u8; 32] && expected_prev == [0u8; 32]) {
+        return false;
+    }
+    if require_lsu_finality {
+        let Some(dfs) = dfs else {
+            return false;
+        };
+        if !verify_lsu_finality_for_apply(store, dfs, &lsu, cycle, &finality_cid, true).await {
+            return false;
+        }
+    } else if let Some(dfs) = dfs {
+        let _ = verify_lsu_finality_for_apply(store, dfs, &lsu, cycle, &finality_cid, false).await;
+    }
+    let Some(expected_post) = meta_32(store, &format!("consensus:lsu_state_root:{}", cycle)).await
+    else {
+        return false;
+    };
+    apply_lsu_with_root_check(store, &lsu, expected_post)
+        .await
+        .ok()
+        .unwrap_or(false)
+}
+
+/// Apply consecutive stored LSUs starting at `local_applied + 1` (bounded batch).
+async fn try_advance_applied_head_from_storage(
+    store: &StorageManager,
+    dfs: Option<&crate::dfs_store::LocalContentStore>,
+    require_lsu_finality: bool,
+    max_steps: u32,
+) -> u32 {
+    let mut applied = 0u32;
+    for _ in 0..max_steps {
+        let next = local_applied_cycle(store).await.saturating_add(1);
+        if !try_apply_stored_lsu_at_cycle(store, dfs, next, require_lsu_finality).await {
+            break;
+        }
+        applied = applied.saturating_add(1);
+    }
+    applied
 }
 
 /// True when a verified ADR 0001 certificate exists locally for this LSU at `cycle`.
@@ -3413,8 +3525,16 @@ async fn try_reconcile_fork_from_quorum_lsu(
         if let Some((net, requester)) = fetch {
             let prefetch_ms = catalyst_reconcile_prefetch_wait_ms();
             if prefetch_ms > 0 {
-                reconcile_prefetch_lsu_metadata_if_missing(store, net, requester, cycle, prefetch_ms)
-                    .await;
+                let prefetch_from = local_cycle.saturating_add(1).max(1);
+                reconcile_prefetch_lsu_metadata_if_missing(
+                    store,
+                    net,
+                    requester,
+                    prefetch_from,
+                    cycle,
+                    prefetch_ms,
+                )
+                .await;
             }
         }
         if let Some(cp) =
@@ -4251,6 +4371,67 @@ impl CatalystNode {
             }
             let catchup: Arc<tokio::sync::Mutex<CatchupState>> =
                 Arc::new(tokio::sync::Mutex::new(CatchupState::default()));
+            // Background: sequential follower apply (head+1) from stored LSU metadata + range backfill.
+            let storage_advance = storage.clone();
+            let dfs_advance = dfs.clone();
+            let net_advance = net.clone();
+            let producer_id_advance = producer_id_self.clone();
+            let catchup_advance = catchup.clone();
+            let mut shutdown_rx_advance = shutdown_rx.clone();
+            let require_fin_advance =
+                crate::consensus_limits::effective_require_lsu_finality(&self.config);
+            let advance_handle = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {},
+                        _ = shutdown_rx_advance.changed() => {},
+                    }
+                    if *shutdown_rx_advance.borrow() {
+                        break;
+                    }
+                    let Some(store) = &storage_advance else {
+                        continue;
+                    };
+                    let applied = try_advance_applied_head_from_storage(
+                        store.as_ref(),
+                        dfs_advance.as_ref(),
+                        require_fin_advance,
+                        32,
+                    )
+                    .await;
+                    if applied > 0 {
+                        info!(
+                            "Follower advanced applied head by {} cycle(s) to {}",
+                            applied,
+                            local_applied_cycle(store.as_ref()).await
+                        );
+                    }
+                    let head = local_applied_cycle(store.as_ref()).await;
+                    let observed = catchup_advance.lock().await.observed_head_cycle;
+                    if observed > head.saturating_add(1) {
+                        let now_ms = crate::consensus_limits::wall_now_ms();
+                        let mut c = catchup_advance.lock().await;
+                        if now_ms.saturating_sub(c.last_req_ms) > 2000 {
+                            let start = head.saturating_add(1);
+                            let remaining = observed.saturating_sub(start).saturating_add(1);
+                            let count = remaining.min(256) as u32;
+                            let req = LsuRangeRequest {
+                                requester: producer_id_advance.clone(),
+                                start_cycle: start,
+                                count,
+                            };
+                            if let Ok(env) =
+                                MessageEnvelope::from_message(&req, "lsu_range_req_follower".to_string(), None)
+                            {
+                                let _ = net_advance.broadcast_envelope(&env).await;
+                                c.last_req_ms = now_ms;
+                            }
+                        }
+                    }
+                }
+            });
             // Background: repair "holes" in per-cycle LSU history for RPC/indexers.
             // This can happen if a node applied forward but missed persisting some cycles.
             let net_gap = net.clone();
@@ -5273,7 +5454,7 @@ impl CatalystNode {
                                         continue;
                                     }
                                     if let Some(store) = &storage {
-                                        // If we already have the LSU bytes in DB, skip requesting.
+                                        // If LSU bytes exist locally, still try sequential apply at head+1.
                                         if store
                                             .get_metadata(&format!("consensus:lsu:{}", r.cycle))
                                             .await
@@ -5281,6 +5462,16 @@ impl CatalystNode {
                                             .flatten()
                                             .is_some()
                                         {
+                                            let head = local_applied_cycle(store.as_ref()).await;
+                                            if r.cycle == head.saturating_add(1) {
+                                                let _ = try_apply_stored_lsu_at_cycle(
+                                                    store.as_ref(),
+                                                    dfs.as_ref(),
+                                                    r.cycle,
+                                                    require_lsu_finality_effective,
+                                                )
+                                                .await;
+                                            }
                                             continue;
                                         }
                                     }
@@ -5578,6 +5769,7 @@ impl CatalystNode {
                 }
             });
             self.network_tasks.push(handle);
+            self.network_tasks.push(advance_handle);
             self.network_tasks.push(gap_handle);
         }
 
