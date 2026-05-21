@@ -55,6 +55,19 @@ make devnet-status
 make devnet-down
 ```
 
+## Fleet health, snapshots, and auto-heal (testnet ops)
+
+See **[`docs/automated-ops.md`](../docs/automated-ops.md)** for the full runbook.
+
+| Script | Purpose |
+|--------|---------|
+| `catalyst_network_check.py` | Compare `catalyst_head` across nodes; detect forks |
+| `catalyst_auto_snapshot.sh` | Canonical validator: snapshot → R2 `latest.tar` → publish |
+| `catalyst_heal_local.sh` | Outlier host: `sync-from-archive` + restart |
+| `catalyst_rpc_sync.sh` | RPC: restore when lagging validators by N cycles |
+
+CLI: `catalyst-cli sync-from-archive --archive-url ... --data-dir ...`
+
 ## `txgen_faucet.sh`
 
 Generates a small, random number of faucet-funded transfers per block so

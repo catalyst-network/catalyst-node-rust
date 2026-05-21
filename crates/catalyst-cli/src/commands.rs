@@ -517,34 +517,19 @@ pub async fn snapshot_publish(
     Ok(())
 }
 
-pub async fn sync_from_snapshot(
-    rpc_url: &str,
-    data_dir: &Path,
-    work_dir: Option<&Path>,
-) -> Result<()> {
-    let client = HttpClientBuilder::default().build(rpc_url)?;
-    let snap: Option<catalyst_rpc::RpcSnapshotInfo> = client
-        .request("catalyst_getSnapshotInfo", jsonrpsee::rpc_params![])
-        .await?;
-    let Some(s) = snap else {
-        anyhow::bail!("no snapshot published by RPC node");
-    };
-
-    let base = work_dir
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::env::temp_dir().join("catalyst-sync"));
-    std::fs::create_dir_all(&base)?;
-    let archive_path = base.join("snapshot.tar");
-    let extract_dir = base.join("snapshot");
-    if extract_dir.exists() {
-        std::fs::remove_dir_all(&extract_dir)?;
-    }
-    std::fs::create_dir_all(&extract_dir)?;
-
-    // Download archive (stream to disk).
-    let resp = reqwest::get(&s.archive_url).await?;
-    anyhow::ensure!(resp.status().is_success(), "download failed: {}", resp.status());
-    let mut file = tokio::fs::File::create(&archive_path).await?;
+async fn download_snapshot_archive(
+    archive_url: &str,
+    archive_path: &Path,
+    expected_bytes: Option<u64>,
+    expected_sha256: Option<&str>,
+) -> Result<u64> {
+    let resp = reqwest::get(archive_url).await?;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "download failed: {}",
+        resp.status()
+    );
+    let mut file = tokio::fs::File::create(archive_path).await?;
     let mut stream = resp.bytes_stream();
     use futures::StreamExt;
     use sha2::Digest;
@@ -558,8 +543,7 @@ pub async fn sync_from_snapshot(
     }
     file.flush().await?;
 
-    // Verify byte size if provided.
-    if let Some(expect_bytes) = s.archive_bytes {
+    if let Some(expect_bytes) = expected_bytes {
         anyhow::ensure!(
             written == expect_bytes,
             "archive size mismatch: expected_bytes={} got_bytes={}",
@@ -567,9 +551,7 @@ pub async fn sync_from_snapshot(
             written
         );
     }
-
-    // Verify sha256 if provided.
-    if let Some(expect) = &s.archive_sha256 {
+    if let Some(expect) = expected_sha256 {
         let got = format!("0x{}", hex::encode(h.finalize()));
         anyhow::ensure!(
             got.to_lowercase() == expect.to_lowercase(),
@@ -578,20 +560,100 @@ pub async fn sync_from_snapshot(
             got
         );
     }
+    Ok(written)
+}
 
-    // Extract tar to directory.
+fn find_snapshot_restore_dir(extract_dir: &Path) -> Result<std::path::PathBuf> {
+    fn walk(dir: &Path) -> Option<std::path::PathBuf> {
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = walk(&path) {
+                    return Some(found);
+                }
+            } else if path.file_name().and_then(|n| n.to_str()) == Some("catalyst_snapshot.json") {
+                return path.parent().map(std::path::Path::to_path_buf);
+            }
+        }
+        None
+    }
+    walk(extract_dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not locate catalyst_snapshot.json under {}",
+            extract_dir.display()
+        )
+    })
+}
+
+/// Download a snapshot tar from a URL and restore into `data_dir` (no RPC required).
+pub async fn sync_from_archive(
+    archive_url: &str,
+    data_dir: &Path,
+    work_dir: Option<&Path>,
+    expected_sha256: Option<&str>,
+    expected_bytes: Option<u64>,
+) -> Result<()> {
+    let base = work_dir
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::temp_dir().join("catalyst-sync"));
+    std::fs::create_dir_all(&base)?;
+    let archive_path = base.join("snapshot.tar");
+    let extract_dir = base.join("extract");
+    if extract_dir.exists() {
+        std::fs::remove_dir_all(&extract_dir)?;
+    }
+    std::fs::create_dir_all(&extract_dir)?;
+
+    let written = download_snapshot_archive(
+        archive_url,
+        &archive_path,
+        expected_bytes,
+        expected_sha256,
+    )
+    .await?;
+    println!("download_ok: true");
+    println!("archive_bytes: {}", written);
+
     let f = std::fs::File::open(&archive_path)?;
     let mut ar = tar::Archive::new(f);
     ar.unpack(&extract_dir)?;
 
-    // Restore into data_dir.
-    db_restore(data_dir, &extract_dir).await?;
+    let snapshot_dir = find_snapshot_restore_dir(&extract_dir)?;
+    let meta_path = snapshot_dir.join("catalyst_snapshot.json");
+    let meta: SnapshotMetaV1 = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
+
+    db_restore(data_dir, &snapshot_dir).await?;
 
     println!("restored: true");
-    println!("expected_chain_id: {}", s.chain_id);
-    println!("expected_genesis_hash: {}", s.genesis_hash);
-    println!("snapshot_cycle: {}", s.applied_cycle);
+    println!("expected_chain_id: {}", meta.chain_id);
+    println!("expected_genesis_hash: {}", meta.genesis_hash);
+    println!("snapshot_cycle: {}", meta.applied_cycle);
+    println!("snapshot_state_root: {}", meta.applied_state_root);
     Ok(())
+}
+
+pub async fn sync_from_snapshot(
+    rpc_url: &str,
+    data_dir: &Path,
+    work_dir: Option<&Path>,
+) -> Result<()> {
+    let client = HttpClientBuilder::default().build(rpc_url)?;
+    let snap: Option<catalyst_rpc::RpcSnapshotInfo> = client
+        .request("catalyst_getSnapshotInfo", jsonrpsee::rpc_params![])
+        .await?;
+    let Some(s) = snap else {
+        anyhow::bail!("no snapshot published by RPC node");
+    };
+
+    sync_from_archive(
+        &s.archive_url,
+        data_dir,
+        work_dir,
+        s.archive_sha256.as_deref(),
+        s.archive_bytes,
+    )
+    .await
 }
 
 pub async fn snapshot_make_latest(

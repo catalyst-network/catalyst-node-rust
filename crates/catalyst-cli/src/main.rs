@@ -203,6 +203,24 @@ enum Commands {
         #[arg(long)]
         work_dir: Option<PathBuf>,
     },
+    /// Download a snapshot tar from a URL and restore locally (no RPC metadata required)
+    SyncFromArchive {
+        /// HTTP(S) URL of the snapshot tar (e.g. R2 latest.tar)
+        #[arg(long)]
+        archive_url: String,
+        /// Data directory to restore into
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Download/extract work directory
+        #[arg(long)]
+        work_dir: Option<PathBuf>,
+        /// Optional expected sha256 (0x...)
+        #[arg(long)]
+        archive_sha256: Option<String>,
+        /// Optional expected byte size
+        #[arg(long)]
+        expected_bytes: Option<u64>,
+    },
     /// Create+archive a new snapshot and publish it to RPC (with retention cleanup)
     SnapshotMakeLatest {
         /// Data directory (same as config.storage.data_dir) of the RPC node
@@ -493,6 +511,22 @@ async fn main() -> Result<()> {
         }
         Commands::SyncFromSnapshot { rpc_url, data_dir, work_dir } => {
             commands::sync_from_snapshot(&rpc_url, &data_dir, work_dir.as_deref()).await?;
+        }
+        Commands::SyncFromArchive {
+            archive_url,
+            data_dir,
+            work_dir,
+            archive_sha256,
+            expected_bytes,
+        } => {
+            commands::sync_from_archive(
+                &archive_url,
+                &data_dir,
+                work_dir.as_deref(),
+                archive_sha256.as_deref(),
+                expected_bytes,
+            )
+            .await?;
         }
         Commands::SnapshotMakeLatest { data_dir, out_base_dir, archive_url_base, retain, ttl_seconds } => {
             commands::snapshot_make_latest(&data_dir, &out_base_dir, &archive_url_base, retain, ttl_seconds).await?;

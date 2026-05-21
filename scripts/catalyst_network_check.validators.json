@@ -1,0 +1,17 @@
+{
+  "network": "catalyst-testnet-validators",
+  "endpoints": [
+    {
+      "name": "eu",
+      "url": "http://127.0.0.1:8545"
+    },
+    {
+      "name": "us",
+      "url": "http://127.0.0.1:8545"
+    },
+    {
+      "name": "asia",
+      "url": "http://127.0.0.1:8545"
+    }
+  ]
+}

@@ -124,6 +124,50 @@ def rows_aligned(rows: list[dict[str, Any]], max_cycle_diff: int) -> tuple[bool,
     return True, "aligned (same root per cycle; lower cycles may be lagging)"
 
 
+def pick_canonical_and_outliers(
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Majority vote at the highest applied_cycle among successful responses.
+    Returns canonical endpoint name/url/root and outlier names (forked at tip or lagging far behind).
+    """
+    ok_rows = [r for r in rows if not r.get("error")]
+    if not ok_rows:
+        return {"canonical": None, "outliers": [], "lagging": [], "max_cycle": None}
+    max_cycle = max(int(r["applied_cycle"]) for r in ok_rows if r.get("applied_cycle") is not None)
+    at_tip = [r for r in ok_rows if int(r.get("applied_cycle", -1)) == max_cycle]
+    roots: dict[str, list[str]] = {}
+    for r in at_tip:
+        sr = str(r.get("applied_state_root") or "")
+        if sr:
+            roots.setdefault(sr, []).append(r["name"])
+    if not roots:
+        return {"canonical": None, "outliers": [], "lagging": [], "max_cycle": max_cycle}
+    majority_root = max(roots.items(), key=lambda kv: len(kv[1]))[0]
+    canonical_names = roots[majority_root]
+    canonical_row = next(r for r in at_tip if r["name"] == canonical_names[0])
+    outliers: list[str] = []
+    for r in at_tip:
+        if r.get("applied_state_root") != majority_root:
+            outliers.append(r["name"])
+    lagging = [
+        r["name"]
+        for r in ok_rows
+        if int(r.get("applied_cycle", 0)) < max_cycle
+    ]
+    return {
+        "canonical": {
+            "name": canonical_row["name"],
+            "url": canonical_row["url"],
+            "applied_cycle": max_cycle,
+            "applied_state_root": majority_root,
+        },
+        "outliers": outliers,
+        "lagging": lagging,
+        "max_cycle": max_cycle,
+    }
+
+
 def describe_failure_nodes(
     rows: list[dict[str, Any]],
     aligned: bool,
@@ -273,6 +317,26 @@ def main() -> int:
         metavar="FILE",
         help="On failure: overwrite with UTC time + which nodes diverged. On success: delete file.",
     )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON (aligned, summary, rows, canonical, outliers)",
+    )
+    p.add_argument(
+        "--heal-plan",
+        action="store_true",
+        help="Print suggested heal commands for outliers/lagging nodes (uses --archive-url-template)",
+    )
+    p.add_argument(
+        "--archive-url-template",
+        default="https://pub-9e7e1b5e3a264b2cb43c5fc723e05dd3.r2.dev/catalysttestnet/latest.tar",
+        help="Snapshot tar URL used in heal-plan (default: testnet R2 latest.tar)",
+    )
+    p.add_argument(
+        "--cli-path",
+        default="./target/release/catalyst-cli",
+        help="Path to catalyst-cli in heal-plan output",
+    )
     args = p.parse_args()
 
     try:
@@ -338,6 +402,44 @@ def main() -> int:
         print(f"OK: {msg}")
     else:
         print(f"NOT OK: {msg}")
+
+    plan = pick_canonical_and_outliers(rows)
+    if args.heal_plan:
+        print()
+        print("Heal plan (run on each outlier/lagging host):")
+        canon = plan.get("canonical")
+        if canon:
+            print(
+                f"  Canonical: {canon['name']} cycle={canon['applied_cycle']} "
+                f"root={canon['applied_state_root'][:18]}..."
+            )
+        targets = sorted(set(plan.get("outliers", []) + plan.get("lagging", [])))
+        for name in targets:
+            print(f"  --- {name} ---")
+            print(
+                f"  sudo systemctl stop catalyst\n"
+                f"  sudo rm -rf /var/lib/catalyst/<region>/data /tmp/catalyst-restore/extract\n"
+                f"  sudo mkdir -p /var/lib/catalyst/<region>/data\n"
+                f"  {args.cli_path} sync-from-archive \\\n"
+                f"    --archive-url {args.archive_url_template} \\\n"
+                f"    --data-dir /var/lib/catalyst/<region>/data \\\n"
+                f"    --work-dir /tmp/catalyst-restore\n"
+                f"  sudo systemctl start catalyst\n"
+                f"  # Or: scripts/catalyst_heal_local.sh --data-dir ... --archive-url ..."
+            )
+
+    if args.json:
+        import json as json_mod
+
+        payload = {
+            "aligned": aligned,
+            "summary": msg,
+            "rows": rows,
+            "canonical": plan.get("canonical"),
+            "outliers": plan.get("outliers"),
+            "lagging": plan.get("lagging"),
+        }
+        print(json_mod.dumps(payload, indent=2))
 
     if args.log:
         try:
