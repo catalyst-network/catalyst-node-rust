@@ -3380,11 +3380,13 @@ async fn try_reconcile_fork_from_quorum_lsu(
         catalyst_utils::increment_counter!("consensus_fork_reconcile_aborted_total", 1);
         return Ok(false);
     }
-    if cycle > max_cycles {
+    let local_cycle = local_applied_cycle(store).await;
+    let replay_depth = cycle.saturating_sub(local_cycle);
+    if replay_depth > max_cycles {
         warn!(
             target: "catalyst.consensus.reconcile",
-            "Quorum fork reconcile skipped: cycle {} exceeds CATALYST_MAX_REPLAY_CYCLES={}",
-            cycle, max_cycles
+            "Quorum fork reconcile skipped: replay depth {} (cycle {} local {}) exceeds CATALYST_MAX_REPLAY_CYCLES={}",
+            replay_depth, cycle, local_cycle, max_cycles
         );
         catalyst_utils::increment_counter!("consensus_fork_reconcile_aborted_total", 1);
         return Ok(false);
