@@ -577,20 +577,38 @@ impl VotingPhase {
             }.into());
         }
 
-        // Spec-shaped list selection:
-        // The network message currently does not carry the full witness list, only a witness hash.
-        // Until we introduce witness list transport, treat the set of candidate submitters for the
-        // chosen `majority_hash` as `Ln(prod)` for this scaffold.
+        // CRITICAL (consensus determinism / fork-safety):
         //
-        // Deterministically include self if missing.
-        if !voting_producers.contains(&self.producer.id) {
-            voting_producers.push(self.producer.id.clone());
+        // The applied LSU must be a pure function of (cycle, canonical tx batch,
+        // seed-selected producer set). Deriving `producer_list`/`vote_list`/compensation
+        // from the locally-observed candidate set (`voting_producers`) makes the LSU hash
+        // and the applied state root depend on which messages this node happened to receive
+        // within the phase window. Under WAN latency asymmetry, geographically-separated
+        // nodes observe different subsets and therefore compute different reward splits and
+        // waiting-pool distributions for the same logical cycle — forking the chain even on
+        // empty blocks.
+        //
+        // The locally-observed `voting_producers` set is still used above purely as a
+        // liveness/quorum signal (did at least `required_majority` producers agree on the
+        // same tx batch?). It MUST NOT define LSU content. Instead we use the canonical
+        // seed-selected committee, which is identical on every honest node.
+        let mut canonical_producers = self.producer.selected_producers.clone();
+        canonical_producers.sort();
+        canonical_producers.dedup();
+        if canonical_producers.is_empty() {
+            // Degenerate/legacy configuration where the selected set was not provided.
+            // Fall back to the observed set (still deterministically ordered) so single-node
+            // and test setups keep working.
+            if !voting_producers.contains(&self.producer.id) {
+                voting_producers.push(self.producer.id.clone());
+            }
+            voting_producers.sort();
+            voting_producers.dedup();
+            canonical_producers = voting_producers;
         }
-        voting_producers.sort();
-        voting_producers.dedup();
-        let final_producer_list = voting_producers.clone();
-        
-        // Create compensation entries
+        let final_producer_list = canonical_producers;
+
+        // Create compensation entries over the canonical producer set (deterministic).
         let compensation_entries = self.create_compensation_entries(&final_producer_list, reward_config)?;
 
         // Build complete ledger state update
@@ -600,16 +618,15 @@ impl VotingPhase {
             })?
             .clone();
 
-        // Deterministic ordering is critical: this structure is hashed and becomes the vote value.
-        let final_producer_list = final_producer_list;
-        let voting_producers = voting_producers;
-
+        // The vote list mirrors the canonical committee so the LSU hash and the finality
+        // witness hashes are identical across nodes. The real "who finalized" evidence is the
+        // quorum of signed finality attestations (see lsu_finality), not this scaffold field.
         let ledger_update = LedgerStateUpdate {
             partial_update,
             compensation_entries,
             cycle_number: self.producer.cycle_number,
-            producer_list: final_producer_list,
-            vote_list: voting_producers.clone(),
+            producer_list: final_producer_list.clone(),
+            vote_list: final_producer_list.clone(),
         };
 
         // Hash the complete ledger state update
@@ -619,8 +636,8 @@ impl VotingPhase {
         self.producer.ledger_update = Some(ledger_update);
 
         // Create vote list witness/hash (spec-shaped) and store vote list.
-        let vote_list_hash = hash_producer_list_merkle(&voting_producers);
-        self.producer.vote_list = Some(voting_producers.clone());
+        let vote_list_hash = hash_producer_list_merkle(&final_producer_list);
+        self.producer.vote_list = Some(final_producer_list.clone());
 
         let vote = ProducerVote {
             ledger_state_hash,
@@ -774,6 +791,58 @@ mod voting_tests {
         assert_eq!(vote_a.vote_list_hash, vote_b.vote_list_hash);
         assert_eq!(phase_a.producer.vote_list, phase_b.producer.vote_list);
         assert_eq!(phase_a.producer.ledger_update.as_ref().unwrap().producer_list, vec!["p1".to_string(), "p2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn lsu_is_deterministic_across_disjoint_observed_candidate_sets() {
+        // Regression: the applied LSU must be a pure function of (cycle, tx batch,
+        // canonical seed-selected producer set) — NOT of which candidate messages a node
+        // observed over the network. Three nodes share the same canonical committee but each
+        // collects a different subset of candidates; they must still produce an identical
+        // ledger_state_hash and producer_list (otherwise WAN latency forks the chain).
+        let canonical = vec!["p1".to_string(), "p2".to_string(), "p3".to_string()];
+
+        let mk_node = |id: &str| {
+            let mut p = Producer::new(id.to_string(), [1u8; 32], 21);
+            p.expected_producers = 3;
+            p.first_hash = Some([7u8; 32]);
+            p.partial_update = Some(mk_partial());
+            p.selected_producers = canonical.clone();
+            p
+        };
+        let lh = [0u8; 32];
+
+        // Node p1 hears only {p1, p2}.
+        let mut n1 = VotingPhase::new(mk_node("p1"));
+        n1.add_candidate(candidate("p1", 21, 7, lh));
+        n1.add_candidate(candidate("p2", 21, 7, lh));
+        let v1 = n1.execute(2, &RewardConfig::default()).await.unwrap();
+
+        // Node p2 hears only {p2, p3}.
+        let mut n2 = VotingPhase::new(mk_node("p2"));
+        n2.add_candidate(candidate("p2", 21, 7, lh));
+        n2.add_candidate(candidate("p3", 21, 7, lh));
+        let v2 = n2.execute(2, &RewardConfig::default()).await.unwrap();
+
+        // Node p3 hears all three.
+        let mut n3 = VotingPhase::new(mk_node("p3"));
+        n3.add_candidate(candidate("p1", 21, 7, lh));
+        n3.add_candidate(candidate("p2", 21, 7, lh));
+        n3.add_candidate(candidate("p3", 21, 7, lh));
+        let v3 = n3.execute(2, &RewardConfig::default()).await.unwrap();
+
+        // Identical LSU hash + vote-list witness across all three nodes.
+        assert_eq!(v1.ledger_state_hash, v2.ledger_state_hash);
+        assert_eq!(v2.ledger_state_hash, v3.ledger_state_hash);
+        assert_eq!(v1.vote_list_hash, v2.vote_list_hash);
+        assert_eq!(v2.vote_list_hash, v3.vote_list_hash);
+
+        // producer_list/vote_list are the canonical committee, not the observed subset.
+        for phase in [&n1, &n2, &n3] {
+            let lsu = phase.producer.ledger_update.as_ref().unwrap();
+            assert_eq!(lsu.producer_list, canonical);
+            assert_eq!(lsu.vote_list, canonical);
+        }
     }
 
     #[tokio::test]

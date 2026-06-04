@@ -20,6 +20,14 @@ pub struct Producer {
     pub first_hash: Option<Hash>,
     pub producer_list: Option<Vec<ProducerId>>,
     pub vote_list: Option<Vec<ProducerId>>,
+    /// Canonical seed-selected producer set for this cycle (sorted, deduped).
+    ///
+    /// This is the deterministic committee for the cycle. It MUST drive the LSU's
+    /// `producer_list`/`vote_list`/`compensation_entries`, independent of which
+    /// candidate/vote messages this node happened to observe over the network.
+    /// Building LSU content from locally-observed sets makes the applied state root
+    /// view-dependent and forks geographically-separated nodes.
+    pub selected_producers: Vec<ProducerId>,
 }
 
 impl Producer {
@@ -34,13 +42,22 @@ impl Producer {
             first_hash: None,
             producer_list: None,
             vote_list: None,
+            selected_producers: Vec::new(),
         }
     }
 
-    /// Reset producer state for new cycle
-    pub fn reset_for_cycle(&mut self, cycle_number: CycleNumber, expected_producers: usize) {
+    /// Reset producer state for new cycle.
+    ///
+    /// `selected_producers` is the canonical seed-selected committee for the cycle; the
+    /// expected producer count is derived from it so liveness thresholds and LSU content
+    /// share a single deterministic source of truth.
+    pub fn reset_for_cycle(&mut self, cycle_number: CycleNumber, selected_producers: Vec<ProducerId>) {
+        let mut canonical = selected_producers;
+        canonical.sort();
+        canonical.dedup();
         self.cycle_number = cycle_number;
-        self.expected_producers = expected_producers.max(1);
+        self.expected_producers = canonical.len().max(1);
+        self.selected_producers = canonical;
         self.partial_update = None;
         self.ledger_update = None;
         self.first_hash = None;
@@ -165,10 +182,10 @@ impl ProducerManager {
         self.producer.read().await.clone()
     }
 
-    /// Reset for new cycle
-    pub async fn reset_for_cycle(&self, cycle_number: CycleNumber, expected_producers: usize) {
+    /// Reset for new cycle with the canonical seed-selected producer set.
+    pub async fn reset_for_cycle(&self, cycle_number: CycleNumber, selected_producers: Vec<ProducerId>) {
         let mut producer = self.producer.write().await;
-        producer.reset_for_cycle(cycle_number, expected_producers);
+        producer.reset_for_cycle(cycle_number, selected_producers);
         
         log_info!(LogCategory::Consensus, "Producer {} reset for cycle {}", producer.id, cycle_number);
     }
@@ -239,11 +256,12 @@ mod tests {
         producer.producer_list = Some(vec!["p1".to_string()]);
         
         // Reset for new cycle
-        producer.reset_for_cycle(2, 1);
+        producer.reset_for_cycle(2, vec!["p1".to_string()]);
         
         assert_eq!(producer.cycle_number, 2);
         assert!(producer.first_hash.is_none());
         assert!(producer.producer_list.is_none());
+        assert_eq!(producer.selected_producers, vec!["p1".to_string()]);
     }
 
     #[tokio::test]

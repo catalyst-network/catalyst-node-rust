@@ -102,7 +102,7 @@ impl CollaborativeConsensus {
                 let producer = manager.get_producer().await;
                 if selected_producers.contains(&producer.id) {
                     log_info!(LogCategory::Consensus, "Participating as producer in cycle {}", cycle_number);
-                    manager.reset_for_cycle(cycle_number, selected_producers.len()).await;
+                    manager.reset_for_cycle(cycle_number, selected_producers.clone()).await;
                     Some(manager)
                 } else {
                     log_info!(LogCategory::Consensus, "Not selected as producer for cycle {}, observing only", cycle_number);
