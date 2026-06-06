@@ -204,6 +204,33 @@ python3 scripts/catalyst_network_check.py -c scripts/catalyst_network_check.test
 ssh root@45.32.177.248 'bash -s' < scripts/catalyst_heal_local.sh --data-dir ...  # adapt
 ```
 
+## 7. Determinism & automatic self-heal
+
+The applied state root is a pure function of `(cycle, canonical tx batch, seed-selected producer set)`. Two classes of non-determinism that previously seeded silent single-node forks have been removed in code:
+
+- **LSU content from the canonical committee.** `producer_list` / `vote_list` / `compensation_entries` are derived from the seed-selected producer set, not from each node's locally-observed votes. Locally-observed votes are used only as a liveness/quorum signal.
+- **LSU-driven fee-credit settlement.** Fee-credit spend reimbursement is reconstructed from the applied LSU's transaction entries instead of the leader-only `cycle_txids` index. Previously only the batch leader settled fee credits, so any cycle that spent credits offset that node's state root by one cycle and forked it off-chain.
+
+### Reconcile / backfill (already enabled)
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `CATALYST_RECONCILE_PREFETCH_MS` | `8000` | Time budget to backfill missing `consensus:lsu:*` from peers over P2P before a fork-reconcile attempt. `0` disables. |
+| `CATALYST_CHECKPOINT_EVERY_CYCLES` | `32` | Cadence of local state checkpoints used to anchor a reconcile replay (avoids genesis replay). |
+| `CATALYST_MAX_REPLAY_CYCLES` | (see config) | Caps reconcile replay depth. |
+
+Prefetch is **on by default** — set non-zero only if it was explicitly disabled. For backfill to succeed, peers must be reachable (`bootstrap_peers` / libp2p connectivity) so the node can answer `LsuRangeRequest`s. Fork-reconcile now resolves a checkpoint prefix **first**, then aims the P2P backfill at the actual replay window (`checkpoint+1..target`) rather than always anchoring to the local head.
+
+### Self-heal bounds (and when to restore from snapshot)
+
+Automatic reconcile recovers a node that is **behind** or briefly divergent **within the checkpoint/replay horizon** and whose checkpoint lies on the canonical chain. It cannot safely recover a node that:
+
+- has diverged beyond `CATALYST_MAX_REPLAY_CYCLES`, or
+- is missing genesis-era LSU history with no on-chain checkpoint (logs: `Quorum fork reconcile skipped: missing stored LSU for cycle 1`), or
+- repeatedly logs `Insufficient data collected: got 1, required 2` (its cycle/branch no longer aligns with the quorum — it has been cut out).
+
+For those, re-seed from the canonical majority via `sync-from-archive` (sections 3–4). Verify with `catalyst_network_check.py` that `applied_state_root` matches the majority **at the same cycle** before resuming snapshot publication.
+
 ## Related docs
 
 - [`sync-guide.md`](./sync-guide.md) — snapshot format and RPC metadata

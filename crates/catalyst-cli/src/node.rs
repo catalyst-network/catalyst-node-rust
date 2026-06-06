@@ -480,6 +480,95 @@ mod tokenomics_tests {
     }
 
     #[tokio::test]
+    async fn fee_credit_settlement_is_driven_by_lsu_not_local_txids() {
+        // Regression (fork-safety): settlement must be reconstructable purely from the applied
+        // LSU. A "follower" store that never persisted `cycle_txids` or raw tx bytes must still
+        // decrement the fee-credit balance and reimburse the sender identically to the leader.
+        let td = TempDir::new().unwrap();
+        let mut cfg = StorageConfigLib::default();
+        cfg.data_dir = td.path().to_path_buf();
+        let store = StorageManager::new(cfg).await.unwrap();
+
+        let sender = [5u8; 32];
+        let recipient = [6u8; 32];
+        set_fee_credit_balance_u64(&store, &sender, 1_000).await.unwrap();
+        set_balance_i64(&store, &sender, 10_000).await.unwrap();
+
+        // Transfer of 100 with a 50 fee, encoded the same way `fee_debit_entries` does:
+        // transfers net to zero and the fee is a dedicated negative entry on the sender.
+        let sig = vec![0xABu8; 64];
+        let lsu = LedgerStateUpdate {
+            partial_update: PartialLedgerStateUpdate {
+                transaction_entries: vec![
+                    catalyst_consensus::types::TransactionEntry {
+                        public_key: sender,
+                        amount: -100,
+                        signature: sig.clone(),
+                    },
+                    catalyst_consensus::types::TransactionEntry {
+                        public_key: recipient,
+                        amount: 100,
+                        signature: sig.clone(),
+                    },
+                    catalyst_consensus::types::TransactionEntry {
+                        public_key: sender,
+                        amount: -50,
+                        signature: sig.clone(),
+                    },
+                ],
+                transaction_signatures_hash: [0u8; 32],
+                total_fees: 50,
+                timestamp: 0,
+            },
+            compensation_entries: Vec::new(),
+            cycle_number: 5,
+            producer_list: Vec::new(),
+            vote_list: Vec::new(),
+        };
+
+        settle_fee_credit_spend_for_applied_cycle(&store, &lsu).await;
+
+        // Fee (50) is under the daily cap, fully covered by credits: credit balance is
+        // decremented by 50 and the sender is reimbursed by 50 — with no local txid index.
+        assert_eq!(get_fee_credit_balance_u64(&store, &sender).await, 950);
+        assert_eq!(get_balance_i64(&store, &sender).await, 10_050);
+    }
+
+    #[tokio::test]
+    async fn fee_credit_settlement_skips_positive_net_groups() {
+        // Faucet/mint-style entries with a non-negative net carry no fee and must not spend
+        // any fee credit during settlement.
+        let td = TempDir::new().unwrap();
+        let mut cfg = StorageConfigLib::default();
+        cfg.data_dir = td.path().to_path_buf();
+        let store = StorageManager::new(cfg).await.unwrap();
+
+        let recipient = [7u8; 32];
+        set_fee_credit_balance_u64(&store, &recipient, 1_000).await.unwrap();
+
+        let sig = vec![0xCDu8; 64];
+        let lsu = LedgerStateUpdate {
+            partial_update: PartialLedgerStateUpdate {
+                transaction_entries: vec![catalyst_consensus::types::TransactionEntry {
+                    public_key: recipient,
+                    amount: 500,
+                    signature: sig,
+                }],
+                transaction_signatures_hash: [0u8; 32],
+                total_fees: 0,
+                timestamp: 0,
+            },
+            compensation_entries: Vec::new(),
+            cycle_number: 5,
+            producer_list: Vec::new(),
+            vote_list: Vec::new(),
+        };
+
+        settle_fee_credit_spend_for_applied_cycle(&store, &lsu).await;
+        assert_eq!(get_fee_credit_balance_u64(&store, &recipient).await, 1_000);
+    }
+
+    #[tokio::test]
     async fn fee_credit_accrual_respects_warmup_boundary() {
         let td = TempDir::new().unwrap();
         let mut cfg = StorageConfigLib::default();
@@ -1155,7 +1244,7 @@ async fn apply_lsu_to_storage_without_root_check(
     }
 
     // Fee-credit spend reimbursement and waiting-pool rewards/credits are deterministic from cycle LSU.
-    settle_fee_credit_spend_for_applied_cycle(store, lsu.cycle_number).await;
+    settle_fee_credit_spend_for_applied_cycle(store, lsu).await;
     distribute_waiting_pool_rewards_and_fee_credits(store, lsu).await;
 
     // Persist head metadata (trusted).
@@ -1806,19 +1895,78 @@ async fn distribute_waiting_pool_rewards_and_fee_credits(
     }
 }
 
-async fn settle_fee_credit_spend_for_applied_cycle(store: &StorageManager, cycle: u64) {
-    let txids = load_cycle_txids(store, cycle).await;
-    for txid in txids {
-        let Some(raw) = store.get_metadata(&tx_raw_key(&txid)).await.ok().flatten() else {
+/// Settle fee-credit spending for the applied cycle.
+///
+/// CRITICAL (consensus determinism / fork-safety): this MUST be a pure function of the
+/// applied LSU. The previous implementation read `load_cycle_txids` + the raw transaction
+/// `fees` from node-local metadata, which only the cycle's batch leader persists. Followers
+/// found no txids and skipped settlement entirely, so on any cycle that spent fee credits the
+/// leader credited/decremented balances that followers did not — permanently offsetting that
+/// node's `accounts` state root by one cycle and forking it off the canonical chain (with no
+/// path to auto-heal). Every node applies the same LSU, so we reconstruct each transaction's
+/// (sender, fee) directly from the LSU's transaction entries instead.
+///
+/// Fee reconstruction: `fee_debit_entries` charges the full declared fee as a dedicated
+/// negative entry under the transaction's signature boundary. Transfer entries net to zero
+/// within a boundary, so the net-negative remainder of a signature group is exactly the fee.
+async fn settle_fee_credit_spend_for_applied_cycle(
+    store: &StorageManager,
+    lsu: &catalyst_consensus::types::LedgerStateUpdate,
+) {
+    if !TOKENOMICS_FEE_CREDITS_ENABLED {
+        return;
+    }
+    let cycle = lsu.cycle_number;
+
+    // Group entries by signature (the tx-boundary marker), iterating in deterministic order.
+    use std::collections::BTreeMap;
+    let mut by_sig: BTreeMap<Vec<u8>, Vec<&catalyst_consensus::types::TransactionEntry>> =
+        BTreeMap::new();
+    for e in &lsu.partial_update.transaction_entries {
+        by_sig.entry(e.signature.clone()).or_default().push(e);
+    }
+
+    for (_sig, entries) in by_sig {
+        // The full fee is the net-negative remainder of the boundary (transfers net to zero).
+        let net: i128 = entries.iter().map(|e| e.amount as i128).sum();
+        if net >= 0 {
+            continue;
+        }
+        let fee = (-net).min(u64::MAX as i128) as u64;
+        if fee == 0 {
+            continue;
+        }
+
+        // Sender selection mirrors nonce attribution: a single negative-amount pubkey, else
+        // the worker-registration / EVM marker pubkey.
+        let mut sender: Option<[u8; 32]> = None;
+        for e in &entries {
+            if e.amount < 0 {
+                match sender {
+                    None => sender = Some(e.public_key),
+                    Some(pk) if pk == e.public_key => {}
+                    Some(_) => {
+                        sender = None;
+                        break;
+                    }
+                }
+            }
+        }
+        if sender.is_none() {
+            if let Some(e0) = entries.iter().find(|e| is_worker_reg_marker(&e.signature)) {
+                sender = Some(e0.public_key);
+            }
+        }
+        if sender.is_none() {
+            if let Some(e0) = entries.iter().find(|e| is_evm_marker(&e.signature)) {
+                sender = Some(e0.public_key);
+            }
+        }
+        let Some(sender) = sender else {
             continue;
         };
-        let Ok(tx) = bincode::deserialize::<catalyst_core::protocol::Transaction>(&raw) else {
-            continue;
-        };
-        let Some(sender) = tx_sender_pubkey(&tx) else {
-            continue;
-        };
-        let spend = apply_fee_credit_spend_for_cycle(store, &sender, tx.core.fees, cycle).await;
+
+        let spend = apply_fee_credit_spend_for_cycle(store, &sender, fee, cycle).await;
         if spend > 0 {
             let cur = get_balance_i64(store, &sender).await;
             let _ = set_balance_i64(store, &sender, cur.saturating_add(spend as i64)).await;
@@ -2755,7 +2903,7 @@ pub(crate) async fn apply_lsu_to_storage(
     }
 
     // Fee-credit spend reimbursement and waiting-pool rewards/credits are deterministic from cycle LSU.
-    settle_fee_credit_spend_for_applied_cycle(store, lsu.cycle_number).await;
+    settle_fee_credit_spend_for_applied_cycle(store, lsu).await;
     distribute_waiting_pool_rewards_and_fee_credits(store, lsu).await;
 
     // Flush + compute a state root that commits the applied balances.
@@ -3522,21 +3670,10 @@ async fn try_reconcile_fork_from_quorum_lsu(
 
     let mut replay_start = 1u64;
     if cycle > 1 {
-        if let Some((net, requester)) = fetch {
-            let prefetch_ms = catalyst_reconcile_prefetch_wait_ms();
-            if prefetch_ms > 0 {
-                let prefetch_from = local_cycle.saturating_add(1).max(1);
-                reconcile_prefetch_lsu_metadata_if_missing(
-                    store,
-                    net,
-                    requester,
-                    prefetch_from,
-                    cycle,
-                    prefetch_ms,
-                )
-                .await;
-            }
-        }
+        // Resolve a checkpoint prefix FIRST so the P2P backfill below targets the actual
+        // replay window (checkpoint+1..cycle) rather than always anchoring to the local head.
+        // Without this, a node missing genesis-era LSU history can never satisfy the replay
+        // loop and aborts with "missing stored LSU for cycle 1".
         if let Some(cp) =
             crate::checkpoint::reconcile_checkpoint_for_missing_prefix(store, cycle, pruned_up_to).await
         {
@@ -3555,6 +3692,27 @@ async fn try_reconcile_fork_from_quorum_lsu(
                 return Ok(false);
             }
             replay_start = cp.cycle.saturating_add(1);
+        }
+        if let Some((net, requester)) = fetch {
+            let prefetch_ms = catalyst_reconcile_prefetch_wait_ms();
+            if prefetch_ms > 0 {
+                // When a checkpoint anchored the prefix, backfill from there; otherwise preserve
+                // the legacy window (local head onward) — genesis backfill over P2P is infeasible.
+                let prefetch_from = if replay_start > 1 {
+                    replay_start
+                } else {
+                    local_cycle.saturating_add(1).max(1)
+                };
+                reconcile_prefetch_lsu_metadata_if_missing(
+                    store,
+                    net,
+                    requester,
+                    prefetch_from,
+                    cycle,
+                    prefetch_ms,
+                )
+                .await;
+            }
         }
         for i in replay_start..cycle {
             if store
