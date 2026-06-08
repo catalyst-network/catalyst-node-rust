@@ -211,6 +211,12 @@ The applied state root is a pure function of `(cycle, canonical tx batch, seed-s
 - **LSU content from the canonical committee.** `producer_list` / `vote_list` / `compensation_entries` are derived from the seed-selected producer set, not from each node's locally-observed votes. Locally-observed votes are used only as a liveness/quorum signal.
 - **LSU-driven fee-credit settlement.** Fee-credit spend reimbursement is reconstructed from the applied LSU's transaction entries instead of the leader-only `cycle_txids` index. Previously only the batch leader settled fee credits, so any cycle that spent credits offset that node's state root by one cycle and forked it off-chain.
 
+### Depth-gate: behind nodes stop producing (prevents the recurring freeze)
+
+The recurring multi-day freeze was a **wall-clock cycle vs. applied-state** divergence, not a state-content bug. Cycle numbers are `wall_now_ms / cycle_ms`, but the chain links by `prev_root`. A node that fell behind on *applying* kept minting LSUs stamped with the **current** wall-clock cycle, chaining them onto its **stale** root — forking itself off canon. Because the apply head is keyed by cycle number, its `last_applied_cycle` then ran ahead of its real chain position and it rejected every canonical LSU forever (`prev_root mismatch` / `missing stored LSU for cycle 1` looping for a day).
+
+Fix: the consensus loop now **defers producing/voting** while the observed network head is ahead of the local applied head (`should_defer_production_when_behind`), and catches up first. It is skip-safe — a caught-up node still produces across legitimately skipped cycle numbers. Watch `consensus_cycle_deferred_behind_total` and the `Deferring consensus cycle …` log line. Details: [`consensus-wall-clock-and-time.md`](./consensus-wall-clock-and-time.md).
+
 ### Reconcile / backfill (already enabled)
 
 | Env | Default | Purpose |
@@ -219,17 +225,21 @@ The applied state root is a pure function of `(cycle, canonical tx batch, seed-s
 | `CATALYST_CHECKPOINT_EVERY_CYCLES` | `32` | Cadence of local state checkpoints used to anchor a reconcile replay (avoids genesis replay). |
 | `CATALYST_MAX_REPLAY_CYCLES` | (see config) | Caps reconcile replay depth. |
 
-Prefetch is **on by default** — set non-zero only if it was explicitly disabled. For backfill to succeed, peers must be reachable (`bootstrap_peers` / libp2p connectivity) so the node can answer `LsuRangeRequest`s. Fork-reconcile now resolves a checkpoint prefix **first**, then aims the P2P backfill at the actual replay window (`checkpoint+1..target`) rather than always anchoring to the local head.
+Prefetch is **on by default** — set non-zero only if it was explicitly disabled. For backfill to succeed, peers must be reachable (`bootstrap_peers` / libp2p connectivity) so the node can answer `LsuRangeRequest`s.
+
+A node that is merely **behind** (its applied root is a recent canonical root) catches up via sequential `head+1` apply + `LsuRangeRequest` backfill — this is the common, reliable recovery and is unaffected by the limitations below.
 
 ### Self-heal bounds (and when to restore from snapshot)
 
-Automatic reconcile recovers a node that is **behind** or briefly divergent **within the checkpoint/replay horizon** and whose checkpoint lies on the canonical chain. It cannot safely recover a node that:
+Sequential catch-up recovers a node that is **behind on a canonical root**. It cannot recover a node that has already **diverged** onto a non-canonical / cycle-offset chain. Such a node logs, indefinitely:
 
-- has diverged beyond `CATALYST_MAX_REPLAY_CYCLES`, or
-- is missing genesis-era LSU history with no on-chain checkpoint (logs: `Quorum fork reconcile skipped: missing stored LSU for cycle 1`), or
-- repeatedly logs `Insufficient data collected: got 1, required 2` (its cycle/branch no longer aligns with the quorum — it has been cut out).
+- `Quorum fork reconcile skipped: missing stored LSU for cycle 1`, and/or
+- `Skipping LSU … prev_root mismatch local=… expected=…` with a **fixed** local root, and/or
+- `Insufficient data collected: got 1, required 2` (its branch no longer aligns with quorum).
 
-For those, re-seed from the canonical majority via `sync-from-archive` (sections 3–4). Verify with `catalyst_network_check.py` that `applied_state_root` matches the majority **at the same cycle** before resuming snapshot publication.
+> Known limitation: checkpoint-anchored fork-reconcile does **not** currently self-heal a diverged non-pruning node. `restore_reconcile_from_checkpoint` does a full-DB `load_snapshot` (which also reverts LSU history) and runs *before* the reconcile purge, so forward replay cannot anchor on a checkpoint. Redesigning this is tracked as follow-up; the depth-gate above prevents the divergence from forming in the first place.
+
+For an already-diverged node, **re-seed from the canonical majority** via `sync-from-archive` (sections 3–4). Verify with `catalyst_network_check.py` that `applied_state_root` matches the majority **at the same cycle** before resuming snapshot publication. Operators can automate this as a stuck-detector: if a node's `catalyst_blockNumber` is flat while peers advance and it logs `prev_root mismatch` for more than a few minutes, restore the latest snapshot from a healthy node.
 
 ## Related docs
 

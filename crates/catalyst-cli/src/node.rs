@@ -72,6 +72,19 @@ pub(crate) async fn local_applied_state_root(store: &catalyst_storage::StorageMa
         .unwrap_or([0u8; 32])
 }
 
+/// Whether a validator should defer producing/participating in the current wall-clock cycle because
+/// its applied head is behind the highest network head it has observed over gossip.
+///
+/// Cycle numbers are wall-clock-derived and the chain links by `prev_root`; a behind node that
+/// produces the current cycle would chain a fresh LSU onto its stale applied root and fork itself
+/// off the canonical chain (the root cause of the recurring testnet freeze). This is skip-safe: when
+/// we are caught up (`observed_head <= applied`) we never defer, even if intervening wall-clock cycle
+/// numbers were legitimately skipped (a slot with no producer quorum). `applied == 0` is the
+/// bootstrap / fresh-network case, where we must produce to get the chain started.
+fn should_defer_production_when_behind(applied: u64, observed_head: u64) -> bool {
+    applied != 0 && observed_head > applied
+}
+
 async fn local_applied_cycle(store: &catalyst_storage::StorageManager) -> u64 {
     let Some(b) = store
         .get_metadata("consensus:last_applied_cycle")
@@ -1104,6 +1117,10 @@ async fn apply_lsu_to_storage_without_root_check(
     lsu: &catalyst_consensus::types::LedgerStateUpdate,
     new_root: [u8; 32],
 ) -> Result<()> {
+    // NOTE: this trusted path intentionally has no cycle-number idempotence guard. It is used both
+    // for forward application (proof-verified, chains onto the current root) and for same-cycle
+    // reorg/reconcile that replaces the applied head's LSU with a stronger certified one; the callers
+    // are responsible for verifying chaining / fork-choice before invoking it.
     #[derive(Clone, Debug, Default)]
     struct ApplyOutcome {
         success: bool,
@@ -4409,10 +4426,15 @@ impl CatalystNode {
             self.network_tasks.push(handle);
         }
 
+        // Highest network head observed over gossip, shared from the inbound/catch-up tasks to the
+        // consensus production loop so a node that is behind defers producing (see depth-gate below).
+        let observed_head_shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         // Inbound: envelopes received from peers → update validator map / handle tx gossip / handle LSU gossip / forward consensus messages.
         {
             let mut events = network.subscribe_events().await;
             let net = network.clone();
+            let observed_head_pub = observed_head_shared.clone();
             let mempool = mempool.clone();
             let tx_batches = tx_batches.clone();
             let tx_batch_commits_in = tx_batch_commits.clone();
@@ -4535,6 +4557,7 @@ impl CatalystNode {
             let net_advance = net.clone();
             let producer_id_advance = producer_id_self.clone();
             let catchup_advance = catchup.clone();
+            let observed_head_advance = observed_head_pub.clone();
             let mut shutdown_rx_advance = shutdown_rx.clone();
             let require_fin_advance =
                 crate::consensus_limits::effective_require_lsu_finality(&self.config);
@@ -4568,6 +4591,7 @@ impl CatalystNode {
                     }
                     let head = local_applied_cycle(store.as_ref()).await;
                     let observed = catchup_advance.lock().await.observed_head_cycle;
+                    observed_head_advance.fetch_max(observed, std::sync::atomic::Ordering::Relaxed);
                     if observed > head.saturating_add(1) {
                         let now_ms = crate::consensus_limits::wall_now_ms();
                         let mut c = catchup_advance.lock().await;
@@ -6091,6 +6115,7 @@ impl CatalystNode {
             let validator_signing_key_consensus = validator_signing_key.clone();
             let tx_batches_consensus = tx_batches.clone();
             let tx_batch_commits_consensus = tx_batch_commits.clone();
+            let observed_head_consensus = observed_head_shared.clone();
             self.consensus_task = Some(tokio::spawn(async move {
                 // Seed for deterministic producer selection (paper uses previous LSU merkle root).
                 // We approximate with the hash of the most recent LSU we produced/observed.
@@ -6143,6 +6168,33 @@ impl CatalystNode {
 
                     // A stable cycle number based on wall-clock epoch time (honors `CATALYST_TEST_WALL_OFFSET_MS`).
                     let cycle = crate::consensus_limits::wall_now_ms() / cycle_ms;
+
+                    // Depth-gate (safety, root-cause fix): never mint a fresh wall-clock cycle while our
+                    // applied head is behind the network head we have already observed over gossip.
+                    //
+                    // Cycle numbers are wall-clock-derived and the chain links by `prev_root`. If a node
+                    // that has fallen behind produces the *current* wall-clock cycle, it chains a fresh LSU
+                    // onto its stale applied root and forks itself off the canonical chain (the recurring
+                    // freeze). We therefore defer production whenever the observed network head is ahead of
+                    // our applied head, and let the concurrent catch-up/backfill path advance us first.
+                    //
+                    // This is skip-safe: cycle numbers may legitimately have gaps (a wall-clock slot with no
+                    // quorum produces nothing), so we compare against the *observed* head rather than doing
+                    // wall-clock arithmetic. When we are caught up (`observed_head <= applied`) we produce
+                    // normally, even across skipped cycles.
+                    if let Some(store) = &storage {
+                        let applied = local_applied_cycle(store.as_ref()).await;
+                        let observed_head =
+                            observed_head_consensus.load(std::sync::atomic::Ordering::Relaxed);
+                        if should_defer_production_when_behind(applied, observed_head) {
+                            info!(
+                                "Deferring consensus cycle {}: applied head {} is behind observed network head {}; catching up before producing",
+                                cycle, applied, observed_head
+                            );
+                            catalyst_utils::increment_counter!("consensus_cycle_deferred_behind_total", 1);
+                            continue;
+                        }
+                    }
 
                     // Deterministic producer selection (protocol function) based on:
                     // - worker pool: configured validator set (worker ids)
@@ -6636,6 +6688,20 @@ mod bft_quorum_tests {
         assert_eq!(bft_vote_threshold(5), 4);
         assert_eq!(bft_vote_threshold(6), 4);
         assert_eq!(bft_vote_threshold(7), 5);
+    }
+
+    #[test]
+    fn depth_gate_defers_only_when_behind_observed_head() {
+        use super::should_defer_production_when_behind;
+        // Bootstrap (no applied head yet): never defer, we must start the chain.
+        assert!(!should_defer_production_when_behind(0, 0));
+        assert!(!should_defer_production_when_behind(0, 89_043_100));
+        // Caught up (observed <= applied): produce, even across skipped cycle numbers.
+        assert!(!should_defer_production_when_behind(89_043_100, 89_043_100));
+        assert!(!should_defer_production_when_behind(89_043_100, 89_043_090));
+        // Behind the observed network head: defer and catch up before minting onto stale state.
+        assert!(should_defer_production_when_behind(89_043_100, 89_043_101));
+        assert!(should_defer_production_when_behind(89_043_100, 89_045_827));
     }
 
     fn empty_lsu(

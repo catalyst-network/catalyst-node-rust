@@ -149,8 +149,12 @@ pub async fn find_latest_checkpoint_at_or_below(
 ) -> Option<CheckpointRecord> {
     let latest = get_metadata_u64(store, META_CHECKPOINT_LATEST_CYCLE).await?;
     if latest == 0 || latest > max_cycle {
-        // Scan downward from max_cycle in case latest pointer is stale (best-effort).
-        for c in (1..=max_cycle).rev() {
+        // Scan downward from max_cycle in case the latest pointer is stale (best-effort).
+        // Cycle numbers are wall-clock-derived (~10^9), so the scan MUST be bounded to a small
+        // recent window; an unbounded `1..=max_cycle` walk would be billions of async reads.
+        const MAX_SCAN: u64 = 4096;
+        let lo = max_cycle.saturating_sub(MAX_SCAN).max(1);
+        for c in (lo..=max_cycle).rev() {
             if let Some(rec) = load_checkpoint_at_cycle(store, c).await {
                 return Some(rec);
             }
@@ -218,6 +222,12 @@ async fn lsu_metadata_present(store: &StorageManager, cycle: u64) -> bool {
 }
 
 /// If cycles `1..target_cycle` have gaps only because of pruning, return a checkpoint to start replay.
+///
+/// NOTE: making fork-reconcile self-heal for *non-pruning* nodes (the recurring testnet freeze) needs
+/// a redesign of the checkpoint restore path — `restore_reconcile_from_checkpoint` does a full-DB
+/// `load_snapshot` that also reverts LSU history and runs before `reconcile_inner`'s purge, so forward
+/// replay cannot currently anchor on a checkpoint. That redesign is tracked separately; the recurring
+/// freeze itself is prevented upstream by the consensus depth-gate (see `node.rs`).
 pub async fn reconcile_checkpoint_for_missing_prefix(
     store: &StorageManager,
     target_cycle: u64,
@@ -243,7 +253,7 @@ pub async fn reconcile_checkpoint_for_missing_prefix(
     if cp.cycle == 0 {
         return None;
     }
-  // All missing cycles must lie within the pruned gap at or before the checkpoint.
+    // All missing cycles must lie within the pruned gap at or before the checkpoint.
     for i in 1..target_cycle {
         if !lsu_metadata_present(store, i).await && i > cp.cycle {
             return None;
@@ -335,5 +345,30 @@ mod tests {
                 "replay should continue from cycle {i}"
             );
         }
+    }
+
+    /// The fallback downward scan in `find_latest_checkpoint_at_or_below` must stay bounded: cycle
+    /// numbers are wall-clock-derived (~10^9), so an unbounded `1..=max_cycle` walk would be billions
+    /// of async reads. With a stale/absent latest pointer and no recent checkpoint, it returns quickly.
+    #[tokio::test]
+    async fn find_latest_checkpoint_scan_is_bounded() {
+        let td = TempDir::new().unwrap();
+        let mut cfg = StorageConfig::default();
+        cfg.data_dir = td.path().to_path_buf();
+        let store = StorageManager::new(cfg).await.unwrap();
+
+        // Latest checkpoint is far ABOVE the query bound, forcing the downward-scan fallback. The scan
+        // must stay bounded (it would otherwise walk ~10^9 wall-clock cycles, one async read each).
+        write_checkpoint(&store, 89_050_000, [1u8; 32], [2u8; 32])
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let out = find_latest_checkpoint_at_or_below(&store, 89_043_072).await;
+        assert!(out.is_none(), "no checkpoint within the bounded window below max_cycle");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "bounded scan must not walk ~10^9 cycles"
+        );
     }
 }
