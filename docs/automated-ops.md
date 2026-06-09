@@ -210,6 +210,11 @@ The applied state root is a pure function of `(cycle, canonical tx batch, seed-s
 
 - **LSU content from the canonical committee.** `producer_list` / `vote_list` / `compensation_entries` are derived from the seed-selected producer set, not from each node's locally-observed votes. Locally-observed votes are used only as a liveness/quorum signal.
 - **LSU-driven fee-credit settlement.** Fee-credit spend reimbursement is reconstructed from the applied LSU's transaction entries instead of the leader-only `cycle_txids` index. Previously only the batch leader settled fee credits, so any cycle that spent credits offset that node's state root by one cycle and forked it off-chain.
+- **Reward-eligibility inputs are committed by the state root.** Worker `first_seen` / `last_registration` and fee-credit `daily_spend` — which drive waiting-pool reward eligibility and fee-credit settlement (both of which mutate root-covered balances) — are stored in the root-covered `accounts` column family, not the metadata CF. Previously they lived outside the state root, so two nodes could share an `applied_state_root` yet disagree on eligibility; at the cycle a worker crossed the warmup boundary they paid different rewards and the `accounts` root forked (the few-hours freeze). Because they are now part of the state, all nodes agree and fork-heal/replay reconstructs them.
+
+### Leader rotation (liveness: one stuck node can't halt the fleet)
+
+The per-cycle batch leader **rotates** through the sorted producer set (`rotating_batch_leader`, `selected[cycle % n]`) instead of being the fixed lexicographically-smallest producer. With a fixed leader, a single wedged/diverged/slow producer blocks *every* cycle (followers log `TX_BATCH_MISS_FATAL` forever) and the whole network freezes. With rotation a faulty node owns only ~1/n cycles; the remaining cycles have a healthy leader and the quorum keeps advancing. All nodes derive the identical `selected` set, so the elected leader is consistent fleet-wide.
 
 ### Depth-gate: behind nodes stop producing (prevents the recurring freeze)
 
@@ -229,15 +234,19 @@ Prefetch is **on by default** — set non-zero only if it was explicitly disable
 
 A node that is merely **behind** (its applied root is a recent canonical root) catches up via sequential `head+1` apply + `LsuRangeRequest` backfill — this is the common, reliable recovery and is unaffected by the limitations below.
 
+### Shallow-fork self-heal fast-path
+
+When a node rolled back a divergent tip (or is exactly one cycle behind) and the **certified** next LSU chains directly onto its current applied head (`prev_root == applied root`, `cycle == head+1`), fork-reconcile now **forward-applies that LSU directly** (root-checked, auto-reverting on mismatch) instead of attempting the purge+replay-from-genesis path. That replay path anchors at cycle 1 and dead-ends with `missing stored LSU for cycle 1` on wall-clock chains (first real cycle is ~10⁹) — which is exactly how a rolled-back node previously stayed permanently one cycle behind while holding the canonical LSU it needed. Watch `consensus_fork_reconcile_fastpath_total`.
+
 ### Self-heal bounds (and when to restore from snapshot)
 
-Sequential catch-up recovers a node that is **behind on a canonical root**. It cannot recover a node that has already **diverged** onto a non-canonical / cycle-offset chain. Such a node logs, indefinitely:
+Sequential catch-up and the shallow-fork fast-path recover a node that is **behind on, or a single tip off, a canonical root**. They cannot recover a node that has diverged **deeply** (many cycles) onto a non-canonical chain. Such a node logs, indefinitely:
 
 - `Quorum fork reconcile skipped: missing stored LSU for cycle 1`, and/or
 - `Skipping LSU … prev_root mismatch local=… expected=…` with a **fixed** local root, and/or
 - `Insufficient data collected: got 1, required 2` (its branch no longer aligns with quorum).
 
-> Known limitation: checkpoint-anchored fork-reconcile does **not** currently self-heal a diverged non-pruning node. `restore_reconcile_from_checkpoint` does a full-DB `load_snapshot` (which also reverts LSU history) and runs *before* the reconcile purge, so forward replay cannot anchor on a checkpoint. Redesigning this is tracked as follow-up; the depth-gate above prevents the divergence from forming in the first place.
+> Known limitation: checkpoint-anchored fork-reconcile does **not** currently self-heal a *deeply* diverged non-pruning node (one whose common ancestor with canon is many cycles back). `restore_reconcile_from_checkpoint` does a full-DB `load_snapshot` (which also reverts LSU history) and runs *before* the reconcile purge, so forward replay cannot anchor on a checkpoint. The determinism fixes above prevent the divergence from forming, and the fast-path heals the shallow case; deep-divergence redesign remains follow-up.
 
 For an already-diverged node, **re-seed from the canonical majority** via `sync-from-archive` (sections 3–4). Verify with `catalyst_network_check.py` that `applied_state_root` matches the majority **at the same cycle** before resuming snapshot publication. Operators can automate this as a stuck-detector: if a node's `catalyst_blockNumber` is flat while peers advance and it logs `prev_root mismatch` for more than a few minutes, restore the latest snapshot from a healthy node.
 

@@ -85,6 +85,21 @@ fn should_defer_production_when_behind(applied: u64, observed_head: u64) -> bool
     applied != 0 && observed_head > applied
 }
 
+/// Deterministic per-cycle batch leader, rotating through the canonical (sorted, deduped) producer
+/// set. Liveness: a single stuck/faulty producer must not permanently halt the network. With a fixed
+/// `selected.first()` leader, if that node wedges (e.g. it diverged and is catching up, or is down)
+/// every cycle blocks on a tx batch that never arrives and the whole network freezes. Rotating the
+/// leader by `cycle` means a faulty node only owns ~1/n cycles; the remaining cycles have a healthy
+/// leader and the quorum keeps advancing. All nodes derive the identical `selected` set, so the
+/// elected leader is consistent fleet-wide without extra coordination.
+fn rotating_batch_leader(selected: &[String], cycle: u64) -> Option<String> {
+    if selected.is_empty() {
+        return None;
+    }
+    let idx = (cycle % selected.len() as u64) as usize;
+    selected.get(idx).cloned()
+}
+
 async fn local_applied_cycle(store: &catalyst_storage::StorageManager) -> u64 {
     let Some(b) = store
         .get_metadata("consensus:last_applied_cycle")
@@ -492,6 +507,101 @@ mod tokenomics_tests {
         assert_eq!(bal, 600);
     }
 
+    #[test]
+    fn rotating_batch_leader_rotates_per_cycle_and_is_stable() {
+        // Liveness regression: with a fixed `selected.first()` leader, a single wedged producer
+        // halted every cycle. The leader must rotate deterministically through the sorted set so a
+        // faulty node owns only ~1/n cycles.
+        let producers = vec!["aaa".to_string(), "bbb".to_string(), "ccc".to_string()];
+        assert_eq!(rotating_batch_leader(&producers, 0).as_deref(), Some("aaa"));
+        assert_eq!(rotating_batch_leader(&producers, 1).as_deref(), Some("bbb"));
+        assert_eq!(rotating_batch_leader(&producers, 2).as_deref(), Some("ccc"));
+        assert_eq!(rotating_batch_leader(&producers, 3).as_deref(), Some("aaa"));
+        // Deterministic across nodes for the same (set, cycle).
+        assert_eq!(
+            rotating_batch_leader(&producers, 89_048_300),
+            rotating_batch_leader(&producers, 89_048_300)
+        );
+        // No single node is leader for every cycle.
+        let leaders: std::collections::BTreeSet<_> =
+            (0u64..9).filter_map(|c| rotating_batch_leader(&producers, c)).collect();
+        assert_eq!(leaders.len(), 3, "all producers must take turns leading");
+        assert_eq!(rotating_batch_leader(&[], 5), None);
+    }
+
+    #[tokio::test]
+    async fn waiting_eligibility_inputs_are_committed_by_state_root() {
+        // Consensus-determinism regression (network freeze root cause): worker `first_seen` /
+        // `last_registration` and fee-credit `daily_spend` steer waiting-pool reward eligibility and
+        // fee-credit settlement, both of which mutate root-covered balances. If these inputs live
+        // outside the state root (old behavior: metadata CF), two nodes can share a state root yet
+        // disagree on eligibility, paying different rewards and forking the `accounts` root at the
+        // cycle a worker crosses the warmup boundary. They MUST be committed by the state root.
+        let td = TempDir::new().unwrap();
+        let mut cfg = StorageConfigLib::default();
+        cfg.data_dir = td.path().to_path_buf();
+        let store = StorageManager::new(cfg).await.unwrap();
+
+        let pk = [7u8; 32];
+        let r0 = store.commit().await.unwrap();
+
+        ensure_worker_first_seen_cycle(&store, &pk, 100).await;
+        let r1 = store.commit().await.unwrap();
+        assert_ne!(r0, r1, "first_seen must be committed by the state root");
+
+        set_worker_last_registration_cycle(&store, &pk, 100).await;
+        let r2 = store.commit().await.unwrap();
+        assert_ne!(r1, r2, "last_registration must be committed by the state root");
+
+        set_fee_credit_daily_spend(
+            &store,
+            &pk,
+            &FeeCreditDailySpend { day_bucket: 1, spent_atoms: 5 },
+        )
+        .await;
+        let r3 = store.commit().await.unwrap();
+        assert_ne!(r2, r3, "daily_spend must be committed by the state root");
+
+        // Values round-trip from root-covered state.
+        assert_eq!(get_worker_first_seen_cycle(&store, &pk).await, Some(100));
+        assert_eq!(get_worker_last_registration_cycle(&store, &pk).await, Some(100));
+        assert_eq!(get_fee_credit_daily_spend(&store, &pk).await.spent_atoms, 5);
+    }
+
+    #[tokio::test]
+    async fn applying_identical_lsu_yields_identical_root_across_independent_stores() {
+        // Determinism: applying the same LSU on two independent stores from the same prior state
+        // MUST yield the same root. Exercises the reward/eligibility path that previously read
+        // non-root-covered metadata.
+        async fn fresh_store() -> StorageManager {
+            let td = Box::leak(Box::new(TempDir::new().unwrap()));
+            let mut cfg = StorageConfigLib::default();
+            cfg.data_dir = td.path().to_path_buf();
+            StorageManager::new(cfg).await.unwrap()
+        }
+        let lsu = LedgerStateUpdate {
+            partial_update: PartialLedgerStateUpdate {
+                transaction_entries: vec![],
+                transaction_signatures_hash: [0u8; 32],
+                total_fees: 0,
+                timestamp: 0,
+            },
+            compensation_entries: vec![catalyst_consensus::types::CompensationEntry {
+                producer_id: String::new(),
+                public_key: [3u8; 32],
+                amount: 1_000,
+            }],
+            cycle_number: 42,
+            producer_list: vec![],
+            vote_list: vec![],
+        };
+        let a = fresh_store().await;
+        let b = fresh_store().await;
+        let ra = apply_lsu_to_storage(&a, &lsu).await.unwrap();
+        let rb = apply_lsu_to_storage(&b, &lsu).await.unwrap();
+        assert_eq!(ra, rb, "same LSU + same prior state must produce the same root");
+    }
+
     #[tokio::test]
     async fn fee_credit_settlement_is_driven_by_lsu_not_local_txids() {
         // Regression (fork-safety): settlement must be reconstructable purely from the applied
@@ -787,16 +897,32 @@ fn fee_credit_balance_key_for_pubkey(pubkey: &[u8; 32]) -> Vec<u8> {
     k
 }
 
-fn fee_credit_first_seen_cycle_key_for_pubkey(pubkey: &[u8; 32]) -> String {
-    format!("workers:first_seen_cycle:{}", hex_encode(pubkey))
+// CONSENSUS DETERMINISM: worker `first_seen` / `last_registration` and fee-credit `daily_spend`
+// drive waiting-pool reward eligibility and fee-credit settlement, both of which mutate
+// root-covered balances. They MUST therefore live in the `accounts` column family (committed by
+// the SMT state root) so every node with the same root agrees on them and they are reconciled by
+// fork-heal/replay. Storing them in the (non-root-covered, non-reconciled) metadata CF let two
+// nodes share a state root yet disagree on eligibility, producing different reward payouts and a
+// divergent `accounts` root at the cycle a worker crossed the warmup boundary (network freeze).
+//
+// These prefixes are byte keys (not `workers:`) so `load_workers_from_state` never mistakes them
+// for worker-registration markers.
+fn fee_credit_first_seen_cycle_key_for_pubkey(pubkey: &[u8; 32]) -> Vec<u8> {
+    let mut k = b"wfs:".to_vec();
+    k.extend_from_slice(pubkey);
+    k
 }
 
-fn worker_last_registration_cycle_key_for_pubkey(pubkey: &[u8; 32]) -> String {
-    format!("workers:last_registration_cycle:{}", hex_encode(pubkey))
+fn worker_last_registration_cycle_key_for_pubkey(pubkey: &[u8; 32]) -> Vec<u8> {
+    let mut k = b"wlr:".to_vec();
+    k.extend_from_slice(pubkey);
+    k
 }
 
-fn fee_credit_daily_spend_key_for_pubkey(pubkey: &[u8; 32]) -> String {
-    format!("feecred:daily_spend:{}", hex_encode(pubkey))
+fn fee_credit_daily_spend_key_for_pubkey(pubkey: &[u8; 32]) -> Vec<u8> {
+    let mut k = b"fcd:".to_vec();
+    k.extend_from_slice(pubkey);
+    k
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -833,7 +959,7 @@ async fn set_fee_credit_balance_u64(store: &StorageManager, pubkey: &[u8; 32], v
 
 async fn get_fee_credit_daily_spend(store: &StorageManager, pubkey: &[u8; 32]) -> FeeCreditDailySpend {
     let Some(bytes) = store
-        .get_metadata(&fee_credit_daily_spend_key_for_pubkey(pubkey))
+        .get_state(&fee_credit_daily_spend_key_for_pubkey(pubkey))
         .await
         .ok()
         .flatten()
@@ -850,7 +976,7 @@ async fn set_fee_credit_daily_spend(
 ) {
     if let Ok(bytes) = bincode::serialize(daily) {
         let _ = store
-            .set_metadata(&fee_credit_daily_spend_key_for_pubkey(pubkey), &bytes)
+            .set_state(&fee_credit_daily_spend_key_for_pubkey(pubkey), bytes)
             .await;
     }
 }
@@ -1794,20 +1920,20 @@ fn parse_producer_id_pubkey(producer_id: &str) -> Option<[u8; 32]> {
 
 async fn ensure_worker_first_seen_cycle(store: &StorageManager, pubkey: &[u8; 32], cycle: u64) {
     let key = fee_credit_first_seen_cycle_key_for_pubkey(pubkey);
-    if store.get_metadata(&key).await.ok().flatten().is_none() {
-        let _ = store.set_metadata(&key, &cycle.to_le_bytes()).await;
+    if store.get_state(&key).await.ok().flatten().is_none() {
+        let _ = store.set_state(&key, cycle.to_le_bytes().to_vec()).await;
     }
 }
 
 async fn set_worker_last_registration_cycle(store: &StorageManager, pubkey: &[u8; 32], cycle: u64) {
     let _ = store
-        .set_metadata(&worker_last_registration_cycle_key_for_pubkey(pubkey), &cycle.to_le_bytes())
+        .set_state(&worker_last_registration_cycle_key_for_pubkey(pubkey), cycle.to_le_bytes().to_vec())
         .await;
 }
 
 async fn get_worker_last_registration_cycle(store: &StorageManager, pubkey: &[u8; 32]) -> Option<u64> {
     let bytes = store
-        .get_metadata(&worker_last_registration_cycle_key_for_pubkey(pubkey))
+        .get_state(&worker_last_registration_cycle_key_for_pubkey(pubkey))
         .await
         .ok()
         .flatten()?;
@@ -1816,7 +1942,7 @@ async fn get_worker_last_registration_cycle(store: &StorageManager, pubkey: &[u8
 
 async fn get_worker_first_seen_cycle(store: &StorageManager, pubkey: &[u8; 32]) -> Option<u64> {
     let bytes = store
-        .get_metadata(&fee_credit_first_seen_cycle_key_for_pubkey(pubkey))
+        .get_state(&fee_credit_first_seen_cycle_key_for_pubkey(pubkey))
         .await
         .ok()
         .flatten()?;
@@ -3650,6 +3776,46 @@ async fn try_reconcile_fork_from_quorum_lsu(
     if fork_choice_reject_weaker_incoming(store, dfs, &incoming, certified_only).await {
         catalyst_utils::increment_counter!("consensus_fork_reconcile_aborted_total", 1);
         return Ok(false);
+    }
+
+    // L2 self-heal FAST-PATH (forward apply): if this certified/quorum LSU chains directly onto our
+    // CURRENT applied head (its prev_root equals our applied root and it is exactly head+1), we do
+    // not need the purge+replay-from-genesis machinery below. That machinery anchors at cycle 1 and
+    // dead-ends with "missing stored LSU for cycle 1" on wall-clock chains (whose first cycle is
+    // ~10^9), which is exactly how a node that rolled back a divergent tip got permanently wedged
+    // one cycle behind while it already held the canonical next LSU. Forward-applying here is as safe
+    // as a normal follower apply (root-checked, auto-reverting on mismatch) and resolves the common
+    // shallow/tip-fork recovery without touching historical state.
+    {
+        let local_cycle = local_applied_cycle(store).await;
+        let local_root = local_applied_state_root(store).await;
+        if cycle == local_cycle.saturating_add(1) && expected_prev == local_root {
+            match apply_lsu_with_root_check(store, lsu, expected_post).await {
+                Ok(true) => {
+                    catalyst_utils::increment_counter!(
+                        "consensus_fork_reconcile_fastpath_total",
+                        1
+                    );
+                    info!(
+                        target: "catalyst.consensus.reconcile",
+                        cycle,
+                        "Fork self-heal fast-path: applied certified next LSU onto current head"
+                    );
+                    return Ok(true);
+                }
+                Ok(false) => {
+                    // Resulting root did not match the certified post-root (already reverted).
+                    // Fall through to the full replay path as a backstop.
+                }
+                Err(e) => {
+                    warn!(
+                        target: "catalyst.consensus.reconcile",
+                        cycle,
+                        "Fork self-heal fast-path apply errored ({e}); falling back to replay"
+                    );
+                }
+            }
+        }
     }
 
     let max_cycles = max_replay_cycles_limit();
@@ -6248,11 +6414,13 @@ impl CatalystNode {
 
                     info!("Cycle {} selected_producers={:?}", cycle, selected);
 
-                    // Deterministic batch leader: all producers must execute Construction on the
-                    // same protocol tx list. Followers wait (WAN budget), resync over P2P, and may
-                    // recover from persisted per-cycle tx ids — they never silently use an empty
-                    // list unless `TxBatchControl::Commit` advertises tx_count=0.
-                    let leader = selected.first().cloned().unwrap_or_else(|| producer_id.clone());
+                    // Deterministic, per-cycle-ROTATING batch leader: all producers must execute
+                    // Construction on the same protocol tx list. Followers wait (WAN budget), resync
+                    // over P2P, and may recover from persisted per-cycle tx ids — they never silently
+                    // use an empty list unless `TxBatchControl::Commit` advertises tx_count=0.
+                    // Rotation (vs fixed first) is the liveness fix: one stuck producer no longer
+                    // halts every cycle (see `rotating_batch_leader`).
+                    let leader = rotating_batch_leader(&selected, cycle).unwrap_or_else(|| producer_id.clone());
                     let transactions = if producer_id == leader {
                         let candidate_txs = {
                             let mut mp = mempool.write().await;
