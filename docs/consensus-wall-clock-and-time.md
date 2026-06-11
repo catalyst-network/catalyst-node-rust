@@ -29,7 +29,19 @@ defer if  applied != 0  &&  observed_head_cycle > applied_cycle
 
 This is **skip-safe**: when caught up (`observed_head ≤ applied`) the node produces normally, even across legitimately skipped cycle numbers; it only steps aside while it is genuinely behind, letting the concurrent catch-up / backfill path advance the applied head first. See `should_defer_production_when_behind` and the `Deferring consensus cycle …` log line in `node.rs`. Metric: `consensus_cycle_deferred_behind_total`.
 
-> Self-heal note: a node that is *already* wedged on a divergent/offset chain (e.g. from before this fix) is not auto-healed by the depth-gate — recover it operationally by restoring a snapshot from a healthy peer (see `docs/automated-ops.md`). Making fork-reconcile anchor on a checkpoint for non-pruning nodes requires a redesign of the checkpoint restore path (it currently does a full-DB `load_snapshot` before the reconcile purge) and is tracked as follow-up.
+### Bounded defer + ≥1-behind catch-up (liveness, root cause of the Jun-2026 deadlock)
+
+The depth-gate alone is a **deadlock hazard** and caused a permanent freeze on the 3-validator testnet:
+
+1. The gate defers production whenever the node is **≥1** cycle behind, but the follower **catch-up range-fetch** previously only fired at **≥2** behind (`observed > head + 1`). A node exactly **one** cycle behind was therefore gated from producing/voting **and** never requested the one LSU it lacked — a dead zone.
+2. At N=3 with one validator already down, the wedged node holds a vote the quorum needs, so a single missed tip-LSU froze the whole network with `Insufficient data collected: got 1, required 2` on the live node and an endless `Deferring consensus cycle …` on the stuck node.
+
+Two changes make this self-healing and guarantee liveness at any validator count:
+
+- **Catch-up at ≥1 behind:** the range-fetch now triggers on `observed > head` (not `observed > head + 1`), so a one-cycle-behind node immediately requests + applies the missing certified LSU (its `prev_root` matches, so the fast-path applies it) and rejoins the quorum.
+- **Bounded depth-gate:** a node defers at most `CATALYST_MAX_DEFER_CYCLES` (default **6**) *consecutive* cycles **while its applied head stays stuck**. Any catch-up progress resets the counter, so healthy catch-up never trips it. If the budget is exhausted with no progress, the gate is released and the node resumes producing/voting (`consensus_cycle_defer_budget_exhausted_total`). Releasing is safe: an LSU built on a minority root never reaches quorum (harmless, uncertified), while in the deadlock case resuming restores the quorum that lets the chain advance. See `evaluate_depth_gate` in `node.rs`.
+
+> Self-heal note: a node that is *already* wedged on a deeply divergent/offset chain (many cycles, e.g. from before this fix) is still best recovered operationally by restoring a snapshot from a healthy peer or running a coordinated reset (see `docs/automated-ops.md`). The bounded gate + ≥1-behind catch-up specifically eliminate the **shallow** (one-to-a-few-cycle) tip deadlock that caused the recurring freezes. A full checkpoint-anchored deep-fork auto-heal still requires the checkpoint-restore redesign tracked as follow-up.
 
 ## NTP / chrony (required for multi-region)
 
