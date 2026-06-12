@@ -85,69 +85,6 @@ fn should_defer_production_when_behind(applied: u64, observed_head: u64) -> bool
     applied != 0 && observed_head > applied
 }
 
-/// Maximum number of consecutive production cycles we will defer while our applied head stays
-/// stuck behind the observed network head, before releasing the depth-gate to preserve liveness.
-///
-/// The depth-gate prevents a behind node from minting a fresh wall-clock cycle onto stale state
-/// (a self-fork). But deferring *unconditionally* is itself a liveness hazard: if catch-up cannot
-/// make progress — the peer is down, the observed head was a phantom that never certified, or (at
-/// small validator counts with one node down) *we* hold a vote the quorum requires — the node
-/// would defer forever and the whole network deadlocks. Bounding the defer streak guarantees that
-/// a node always resumes participating in consensus. Releasing is safe: an LSU built on a minority
-/// root never reaches quorum (harmless, uncertified), while in the deadlock case resuming restores
-/// the quorum that lets the chain advance. The counter only accrues while the applied head is
-/// *stuck*; any catch-up progress resets it, so healthy catch-up never trips the backstop.
-fn max_defer_cycles_when_behind() -> u32 {
-    std::env::var("CATALYST_MAX_DEFER_CYCLES")
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(6)
-        .max(1)
-}
-
-/// Outcome of the bounded depth-gate evaluation for one production cycle.
-#[derive(Debug, PartialEq, Eq)]
-enum DepthGateDecision {
-    /// Caught up (or bootstrapping): produce normally.
-    Produce,
-    /// Behind and still within the defer budget: skip this cycle and let catch-up run.
-    Defer { streak: u32, max: u32 },
-    /// Behind, but the defer budget is exhausted with no catch-up progress: resume producing to
-    /// preserve liveness (breaks a depth-gate deadlock).
-    ReleaseForLiveness { streak: u32 },
-}
-
-/// Pure bounded depth-gate decision. `anchor`/`streak` are the caller's running state across
-/// cycles: `anchor` is the applied head at which the current defer streak began, `streak` is the
-/// number of consecutive deferrals at that stuck head. Any catch-up progress (applied head moving)
-/// resets the streak, so only a genuinely stuck head accrues toward the budget.
-fn evaluate_depth_gate(
-    applied: u64,
-    observed_head: u64,
-    anchor: &mut u64,
-    streak: &mut u32,
-    max_defer_cycles: u32,
-) -> DepthGateDecision {
-    if !should_defer_production_when_behind(applied, observed_head) {
-        *anchor = u64::MAX;
-        *streak = 0;
-        return DepthGateDecision::Produce;
-    }
-    if applied != *anchor {
-        *anchor = applied;
-        *streak = 0;
-    }
-    *streak = streak.saturating_add(1);
-    if *streak <= max_defer_cycles {
-        DepthGateDecision::Defer {
-            streak: *streak,
-            max: max_defer_cycles,
-        }
-    } else {
-        DepthGateDecision::ReleaseForLiveness { streak: *streak }
-    }
-}
-
 /// Deterministic per-cycle batch leader, rotating through the canonical (sorted, deduped) producer
 /// set. Liveness: a single stuck/faulty producer must not permanently halt the network. With a fixed
 /// `selected.first()` leader, if that node wedges (e.g. it diverged and is catching up, or is down)
@@ -6389,12 +6326,6 @@ impl CatalystNode {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_millis(cycle_ms));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-                // Bounded depth-gate state: track how many consecutive cycles we have deferred while our
-                // applied head has stayed stuck, so we never defer forever (see `max_defer_cycles_when_behind`).
-                let max_defer_cycles = max_defer_cycles_when_behind();
-                let mut defer_anchor_applied: u64 = u64::MAX;
-                let mut defer_streak: u32 = 0;
-
                 loop {
                     tokio::select! {
                         _ = ticker.tick() => {},
@@ -6424,36 +6355,26 @@ impl CatalystNode {
                     // quorum produces nothing), so we compare against the *observed* head rather than doing
                     // wall-clock arithmetic. When we are caught up (`observed_head <= applied`) we produce
                     // normally, even across skipped cycles.
+                    // Depth-gate: never mint a fresh wall-clock cycle while our applied head is behind the
+                    // network head observed over gossip. Producing on a stale applied root forks us off
+                    // canon. We DEFER (never force-produce): a behind node stays canonical and converges
+                    // via the concurrent forward catch-up (`try_advance_applied_head_from_storage`) once the
+                    // >=1-behind range backfill fetches the missing certified LSUs. We deliberately do NOT
+                    // release the gate to "preserve liveness" by producing — that just mints onto stale
+                    // state and silently forks the node (observed regression). Worst case while a peer is
+                    // unreachable is a frozen-but-intact node (operator-recoverable), never a corrupt fork;
+                    // and with any healthy quorum the rest of the fleet keeps advancing meanwhile.
                     if let Some(store) = &storage {
                         let applied = local_applied_cycle(store.as_ref()).await;
                         let observed_head =
                             observed_head_consensus.load(std::sync::atomic::Ordering::Relaxed);
-                        match evaluate_depth_gate(
-                            applied,
-                            observed_head,
-                            &mut defer_anchor_applied,
-                            &mut defer_streak,
-                            max_defer_cycles,
-                        ) {
-                            DepthGateDecision::Produce => {}
-                            DepthGateDecision::Defer { streak, max } => {
-                                info!(
-                                    "Deferring consensus cycle {}: applied head {} is behind observed network head {} ({}/{}); catching up before producing",
-                                    cycle, applied, observed_head, streak, max
-                                );
-                                catalyst_utils::increment_counter!("consensus_cycle_deferred_behind_total", 1);
-                                continue;
-                            }
-                            DepthGateDecision::ReleaseForLiveness { streak } => {
-                                // Catch-up made no progress for the whole defer budget: resume producing
-                                // to break a potential depth-gate deadlock (this node may hold a vote the
-                                // quorum needs). A minority-root LSU we produce simply stays uncertified.
-                                warn!(
-                                    "Depth-gate defer budget exhausted at applied head {} (observed {}, {} stalled cycles): resuming production to preserve liveness",
-                                    applied, observed_head, streak
-                                );
-                                catalyst_utils::increment_counter!("consensus_cycle_defer_budget_exhausted_total", 1);
-                            }
+                        if should_defer_production_when_behind(applied, observed_head) {
+                            info!(
+                                "Deferring consensus cycle {}: applied head {} is behind observed network head {}; catching up before producing",
+                                cycle, applied, observed_head
+                            );
+                            catalyst_utils::increment_counter!("consensus_cycle_deferred_behind_total", 1);
+                            continue;
                         }
                     }
 
@@ -6963,73 +6884,10 @@ mod bft_quorum_tests {
         assert!(!should_defer_production_when_behind(89_043_100, 89_043_100));
         assert!(!should_defer_production_when_behind(89_043_100, 89_043_090));
         // Behind the observed network head: defer and catch up before minting onto stale state.
+        // We never force-produce while behind (producing on stale state forks the node), so a
+        // lagging node defers indefinitely and relies on the >=1-behind forward catch-up to converge.
         assert!(should_defer_production_when_behind(89_043_100, 89_043_101));
         assert!(should_defer_production_when_behind(89_043_100, 89_045_827));
-    }
-
-    #[test]
-    fn bounded_depth_gate_releases_after_budget_when_head_is_stuck() {
-        use super::{evaluate_depth_gate, DepthGateDecision};
-        let max = 6u32;
-        let mut anchor = u64::MAX;
-        let mut streak = 0u32;
-        // Exactly one cycle behind and stuck: defer for `max` cycles, then release for liveness.
-        // This is the exact testnet deadlock: applied=89055075, observed=89055076, head never moves.
-        for i in 1..=max {
-            assert_eq!(
-                evaluate_depth_gate(89_055_075, 89_055_076, &mut anchor, &mut streak, max),
-                DepthGateDecision::Defer { streak: i, max }
-            );
-        }
-        assert_eq!(
-            evaluate_depth_gate(89_055_075, 89_055_076, &mut anchor, &mut streak, max),
-            DepthGateDecision::ReleaseForLiveness { streak: max + 1 }
-        );
-    }
-
-    #[test]
-    fn bounded_depth_gate_resets_streak_on_catchup_progress() {
-        use super::{evaluate_depth_gate, DepthGateDecision};
-        let max = 6u32;
-        let mut anchor = u64::MAX;
-        let mut streak = 0u32;
-        // Defer a few cycles while stuck at 100 (observed 105).
-        for _ in 0..4 {
-            assert!(matches!(
-                evaluate_depth_gate(100, 105, &mut anchor, &mut streak, max),
-                DepthGateDecision::Defer { .. }
-            ));
-        }
-        // Catch-up advances the applied head: the streak resets, so we never trip the budget while
-        // genuinely making progress.
-        assert_eq!(
-            evaluate_depth_gate(101, 105, &mut anchor, &mut streak, max),
-            DepthGateDecision::Defer { streak: 1, max }
-        );
-        // Once caught up, produce normally and clear the streak state.
-        assert_eq!(
-            evaluate_depth_gate(105, 105, &mut anchor, &mut streak, max),
-            DepthGateDecision::Produce
-        );
-        assert_eq!(streak, 0);
-        assert_eq!(anchor, u64::MAX);
-    }
-
-    #[test]
-    fn bounded_depth_gate_produces_when_caught_up_or_bootstrapping() {
-        use super::{evaluate_depth_gate, DepthGateDecision};
-        let mut anchor = u64::MAX;
-        let mut streak = 0u32;
-        // Bootstrap (applied == 0): always produce to start the chain.
-        assert_eq!(
-            evaluate_depth_gate(0, 89_055_076, &mut anchor, &mut streak, 6),
-            DepthGateDecision::Produce
-        );
-        // Caught up: produce.
-        assert_eq!(
-            evaluate_depth_gate(89_055_076, 89_055_076, &mut anchor, &mut streak, 6),
-            DepthGateDecision::Produce
-        );
     }
 
     fn empty_lsu(
