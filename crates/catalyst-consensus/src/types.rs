@@ -205,6 +205,40 @@ impl NetworkMessage for ProducerOutput {
 
 impl_catalyst_serialize!(ProducerOutput, dfs_address, vote_list_hash, cycle_number, producer_id, timestamp);
 
+/// Full LSU broadcast from a producer at the end of the synchronization phase.
+///
+/// Allows non-producer observers to apply the cycle's finalized `LedgerStateUpdate`
+/// within the consensus collection window, without depending on the separate node-level
+/// `LsuGossip` path, which may arrive after the observer's timeout has elapsed.
+/// The observer cross-checks the embedded LSU hash against the quorum-agreed
+/// `dfs_address` prefix from `ProducerOutput` before accepting it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LedgerStateUpdateBroadcast {
+    pub lsu: LedgerStateUpdate,
+    pub cycle_number: CycleNumber,
+    pub producer_id: ProducerId,
+}
+
+impl NetworkMessage for LedgerStateUpdateBroadcast {
+    fn serialize(&self) -> catalyst_utils::CatalystResult<Vec<u8>> {
+        CatalystSerialize::serialize(self)
+    }
+
+    fn deserialize(data: &[u8]) -> catalyst_utils::CatalystResult<Self> {
+        CatalystDeserialize::deserialize(data)
+    }
+
+    fn message_type(&self) -> MessageType {
+        MessageType::ConsensusSync
+    }
+
+    fn priority(&self) -> u8 {
+        MessagePriority::High as u8
+    }
+}
+
+impl_catalyst_serialize!(LedgerStateUpdateBroadcast, lsu, cycle_number, producer_id);
+
 /// Current timestamp in milliseconds
 pub fn current_timestamp_ms() -> u64 {
     SystemTime::now()

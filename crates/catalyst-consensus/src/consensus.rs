@@ -166,10 +166,14 @@ impl CollaborativeConsensus {
         manager: &ProducerManager,
         transactions: Vec<TransactionEntry>,
     ) -> CatalystResult<Option<LedgerStateUpdate>> {
-        // Phase 1: Construction
+        // Phase 1: Construction — track elapsed so collection gets only the remaining budget,
+        // preventing the double-count that caused cycles to overrun cycle_duration_ms.
+        let phase_start = Instant::now();
         let quantity = self.run_construction_phase(manager, transactions).await?;
+        let remaining_ms = self.config.construction_phase_ms
+            .saturating_sub(phase_start.elapsed().as_millis() as u64);
         let mut quantities = self
-            .collect_producer_quantities(Duration::from_millis(self.config.construction_phase_ms))
+            .collect_producer_quantities(Duration::from_millis(remaining_ms))
             .await?;
         quantities.push(quantity.clone());
         dedup_by_producer_id_quantity(&mut quantities);
@@ -182,9 +186,12 @@ impl CollaborativeConsensus {
 
         // Phase 2: Campaigning — merge peer `ProducerCandidate` messages collected during the
         // phase window with our own candidate (see `collect_producer_candidates`).
+        let phase_start = Instant::now();
         let candidate = self.run_campaigning_phase(manager, quantities).await?;
+        let remaining_ms = self.config.campaigning_phase_ms
+            .saturating_sub(phase_start.elapsed().as_millis() as u64);
         let mut candidates = self
-            .collect_producer_candidates(Duration::from_millis(self.config.campaigning_phase_ms))
+            .collect_producer_candidates(Duration::from_millis(remaining_ms))
             .await?;
         candidates.push(candidate.clone());
         dedup_by_producer_id_candidate(&mut candidates);
@@ -196,9 +203,12 @@ impl CollaborativeConsensus {
         );
 
         // Phase 3: Voting
+        let phase_start = Instant::now();
         let vote = self.run_voting_phase(manager, candidates).await?;
+        let remaining_ms = self.config.voting_phase_ms
+            .saturating_sub(phase_start.elapsed().as_millis() as u64);
         let mut votes = self
-            .collect_producer_votes(Duration::from_millis(self.config.voting_phase_ms))
+            .collect_producer_votes(Duration::from_millis(remaining_ms))
             .await?;
         votes.push(vote.clone());
         dedup_by_producer_id_vote(&mut votes);
@@ -209,7 +219,8 @@ impl CollaborativeConsensus {
             self.current_cycle
         );
 
-        // Phase 4: Synchronization
+        // Phase 4: Synchronization — remaining budget after vote collection is handled
+        // inside run_synchronization_phase which has its own timeout.
         let final_result = self.run_synchronization_phase(manager, votes).await?;
         
         // Return the final ledger state update
@@ -312,22 +323,180 @@ impl CollaborativeConsensus {
 
         // Broadcast our output
         self.broadcast_message(&output).await?;
-        
-        // Get the final ledger state update
+
+        // Broadcast the full LSU so non-producer observers can apply it directly
+        // within the consensus collection window, without depending on the separate
+        // node-level LsuGossip path that may arrive after the observer's window closes.
         let producer = manager.get_producer().await;
+        if let Some(lsu) = &producer.ledger_update {
+            let broadcast = LedgerStateUpdateBroadcast {
+                lsu: lsu.clone(),
+                cycle_number: self.current_cycle,
+                producer_id: producer.id.clone(),
+            };
+            self.broadcast_message(&broadcast).await?;
+        }
+
         Ok(producer.ledger_update)
     }
 
-    /// Observe consensus without participating (for non-producer nodes)
+    /// Collect both `ProducerOutput` and `LedgerStateUpdateBroadcast` messages in a single
+    /// receive loop for the observer path.  Returns all outputs keyed by producer and all
+    /// LSU broadcasts received before the deadline.
+    async fn collect_observer_messages(
+        &self,
+        timeout_duration: Duration,
+    ) -> CatalystResult<(HashMap<ProducerId, ProducerOutput>, Vec<LedgerStateUpdateBroadcast>)> {
+        let Some(rx) = &self.network_receiver else {
+            sleep(timeout_duration).await;
+            return Ok((HashMap::new(), Vec::new()));
+        };
+
+        let deadline = Instant::now() + timeout_duration;
+        let mut outputs: HashMap<ProducerId, ProducerOutput> = HashMap::new();
+        let mut broadcasts: Vec<LedgerStateUpdateBroadcast> = Vec::new();
+
+        // Drain any already-buffered messages of either type.
+        for env in self.drain_pending_by_type(MessageType::ProducerOutput).await {
+            if let Ok(o) = env.extract_message::<ProducerOutput>() {
+                if phase_body_matches_current_cycle(o.cycle_number, self.current_cycle) {
+                    outputs.insert(o.producer_id.clone(), o);
+                }
+            }
+        }
+        for env in self.drain_pending_by_type(MessageType::ConsensusSync).await {
+            if let Ok(b) = env.extract_message::<LedgerStateUpdateBroadcast>() {
+                if phase_body_matches_current_cycle(b.cycle_number, self.current_cycle) {
+                    broadcasts.push(b);
+                }
+            }
+        }
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline - now;
+
+            let mut guard = rx.lock().await;
+            match timeout(remaining, guard.recv()).await {
+                Ok(Some(env)) => {
+                    match env.message_type {
+                        MessageType::ProducerOutput => {
+                            if let Ok(o) = env.extract_message::<ProducerOutput>() {
+                                if phase_body_matches_current_cycle(o.cycle_number, self.current_cycle) {
+                                    outputs.insert(o.producer_id.clone(), o);
+                                }
+                            }
+                        }
+                        MessageType::ConsensusSync => {
+                            if let Ok(b) = env.extract_message::<LedgerStateUpdateBroadcast>() {
+                                if phase_body_matches_current_cycle(b.cycle_number, self.current_cycle) {
+                                    broadcasts.push(b);
+                                }
+                            }
+                        }
+                        _ => {
+                            self.pending_envelopes.lock().await.push_back(env);
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        Ok((outputs, broadcasts))
+    }
+
+    /// Observe consensus without participating (non-producer path).
+    ///
+    /// Waits for a quorum of `ProducerOutput` messages agreeing on the same DFS address,
+    /// then finds a matching `LedgerStateUpdateBroadcast` whose LSU hash cross-checks
+    /// against that address prefix.  Returns `Some(lsu)` when both conditions are met so
+    /// the node can apply the cycle's state update directly.  Returns `Ok(None)` when
+    /// quorum is not yet visible or no LSU broadcast was received — in both cases the
+    /// separate node-level `LsuGossip` path will apply the LSU asynchronously.
     async fn observe_consensus(&self) -> CatalystResult<Option<LedgerStateUpdate>> {
         log_info!(LogCategory::Consensus, "Observing consensus cycle {}", self.current_cycle);
-        
-        // Wait for the cycle to complete and collect final outputs
+
+        let required_majority = if self.selected_producers.is_empty() {
+            1
+        } else {
+            (self.selected_producers.len() / 2) + 1
+        };
+
         let total_cycle_time = Duration::from_millis(self.config.cycle_duration_ms);
-        let _outputs = self.collect_producer_outputs(total_cycle_time).await?;
-        
-        // TODO: Derive observed LSU from collected `ProducerOutput` set (observer path).
-        // For now, return None indicating we observed but didn't generate an update
+        let (outputs, broadcasts) = self.collect_observer_messages(total_cycle_time).await?;
+
+        if outputs.len() < required_majority {
+            log_info!(
+                LogCategory::Consensus,
+                "Observer: insufficient outputs for cycle {} ({}/{}), relying on gossip",
+                self.current_cycle,
+                outputs.len(),
+                required_majority
+            );
+            return Ok(None);
+        }
+
+        // Find the dfs_address that a quorum of producers agreed on.
+        let mut addr_counts: BTreeMap<[u8; 21], Vec<&str>> = BTreeMap::new();
+        for output in outputs.values() {
+            addr_counts
+                .entry(output.dfs_address)
+                .or_default()
+                .push(&output.producer_id);
+        }
+
+        let agreed_addr = addr_counts
+            .iter()
+            .find(|(_, v)| v.len() >= required_majority)
+            .map(|(addr, _)| *addr);
+
+        let Some(agreed_addr) = agreed_addr else {
+            log_info!(
+                LogCategory::Consensus,
+                "Observer: no quorum dfs_address for cycle {}, relying on gossip",
+                self.current_cycle
+            );
+            return Ok(None);
+        };
+
+        // The dfs_address scheme 0x01: first 20 bytes of the LSU hash.
+        if agreed_addr[0] != 0x01 {
+            return Ok(None);
+        }
+        let expected_prefix = &agreed_addr[1..21];
+
+        // Find a broadcast LSU whose hash matches the quorum-agreed prefix.
+        for broadcast in &broadcasts {
+            if broadcast.cycle_number != self.current_cycle {
+                continue;
+            }
+            let Ok(lsu_hash) = hash_data(&broadcast.lsu) else {
+                continue;
+            };
+            if lsu_hash[..20] == *expected_prefix {
+                log_info!(
+                    LogCategory::Consensus,
+                    "Observer: verified LSU for cycle {} from producer {}",
+                    self.current_cycle,
+                    broadcast.producer_id
+                );
+                increment_counter!("consensus_observer_lsu_verified_total", 1);
+                return Ok(Some(broadcast.lsu.clone()));
+            }
+        }
+
+        // Quorum confirmed consensus happened but no matching LSU broadcast arrived —
+        // the node-level LsuGossip path will deliver and apply it asynchronously.
+        log_info!(
+            LogCategory::Consensus,
+            "Observer: quorum reached for cycle {} but no LSU broadcast received, relying on gossip",
+            self.current_cycle
+        );
         Ok(None)
     }
 
@@ -858,5 +1027,110 @@ mod tests {
     fn phase_body_cycle_gate_rejects_wrong_cycle() {
         assert!(super::phase_body_matches_current_cycle(7, 7));
         assert!(!super::phase_body_matches_current_cycle(6, 7));
+    }
+
+    /// Observer returns Some(lsu) when a quorum of ProducerOutputs agree on a dfs_address
+    /// and a matching LedgerStateUpdateBroadcast is present on the channel.
+    #[tokio::test]
+    async fn observer_returns_lsu_on_quorum_plus_broadcast() {
+        use crate::types::{
+            hash_data, LedgerStateUpdate, LedgerStateUpdateBroadcast, PartialLedgerStateUpdate,
+            ProducerOutput,
+        };
+        use catalyst_utils::MessageEnvelope;
+        use tokio::sync::mpsc;
+
+        let cycle = 42u64;
+        let selected = vec!["p1".to_string(), "p2".to_string(), "p3".to_string()];
+
+        let lsu = LedgerStateUpdate {
+            partial_update: PartialLedgerStateUpdate {
+                transaction_entries: vec![],
+                transaction_signatures_hash: [0u8; 32],
+                total_fees: 0,
+                timestamp: cycle,
+            },
+            compensation_entries: vec![],
+            cycle_number: cycle,
+            producer_list: selected.clone(),
+            vote_list: selected.clone(),
+        };
+        let lsu_hash = hash_data(&lsu).unwrap();
+
+        // Build the dfs_address the sync phase would have produced.
+        let mut dfs_address = [0u8; 21];
+        dfs_address[0] = 0x01;
+        dfs_address[1..21].copy_from_slice(&lsu_hash[..20]);
+
+        let (tx, rx) = mpsc::unbounded_channel::<MessageEnvelope>();
+
+        // Three producers each send a ProducerOutput pointing at the same dfs_address.
+        for pid in &["p1", "p2", "p3"] {
+            let output = ProducerOutput {
+                dfs_address,
+                vote_list_hash: [0u8; 32],
+                cycle_number: cycle,
+                producer_id: pid.to_string(),
+                timestamp: 0,
+            };
+            let env = MessageEnvelope::from_message(&output, pid.to_string(), None).unwrap();
+            tx.send(env).unwrap();
+        }
+
+        // Producer p1 also sends the full LSU broadcast.
+        let broadcast = LedgerStateUpdateBroadcast {
+            lsu: lsu.clone(),
+            cycle_number: cycle,
+            producer_id: "p1".to_string(),
+        };
+        let env = MessageEnvelope::from_message(&broadcast, "p1".to_string(), None).unwrap();
+        tx.send(env).unwrap();
+
+        let mut cfg = ConsensusConfig::default();
+        cfg.cycle_duration_ms = 200; // keep the test fast
+        let mut consensus = CollaborativeConsensus::new(cfg);
+        consensus.current_cycle = cycle;
+        consensus.selected_producers = selected;
+        consensus.set_network_receiver(rx);
+
+        let result = consensus.observe_consensus().await.unwrap();
+        assert!(result.is_some(), "observer should return Some(lsu) with quorum + broadcast");
+        assert_eq!(result.unwrap().cycle_number, cycle);
+    }
+
+    /// Observer returns None when outputs don't reach the required majority.
+    #[tokio::test]
+    async fn observer_returns_none_below_quorum() {
+        use crate::types::ProducerOutput;
+        use catalyst_utils::MessageEnvelope;
+        use tokio::sync::mpsc;
+
+        let cycle = 43u64;
+        let selected = vec!["p1".to_string(), "p2".to_string(), "p3".to_string()];
+
+        let dfs_address = [0u8; 21]; // wrong/empty address
+
+        let (tx, rx) = mpsc::unbounded_channel::<MessageEnvelope>();
+
+        // Only one output — below the majority of 2.
+        let output = ProducerOutput {
+            dfs_address,
+            vote_list_hash: [0u8; 32],
+            cycle_number: cycle,
+            producer_id: "p1".to_string(),
+            timestamp: 0,
+        };
+        let env = MessageEnvelope::from_message(&output, "p1".to_string(), None).unwrap();
+        tx.send(env).unwrap();
+
+        let mut cfg = ConsensusConfig::default();
+        cfg.cycle_duration_ms = 100;
+        let mut consensus = CollaborativeConsensus::new(cfg);
+        consensus.current_cycle = cycle;
+        consensus.selected_producers = selected;
+        consensus.set_network_receiver(rx);
+
+        let result = consensus.observe_consensus().await.unwrap();
+        assert!(result.is_none(), "observer should return None when below quorum");
     }
 }

@@ -1032,16 +1032,22 @@ impl SynchronizationPhase {
             }.into());
         }
 
-        // Spec-shaped vote list selection:
-        // Like VotingPhase, we do not yet transport/validate the full witness list; only the witness hash.
-        // Until vote-list witness transport is implemented, treat the set of vote submitters for the
-        // final ledger_state_hash as `Ln(vote)` for this scaffold.
-        if !vote_producers.contains(&self.producer.id) {
-            vote_producers.push(self.producer.id.clone());
+        // Use the canonical seed-selected committee as the vote list, mirroring the
+        // fix applied in VotingPhase.  Deriving this from the locally-observed vote
+        // submitters makes the `vote_list_hash` in `ProducerOutput` view-dependent
+        // under WAN latency, causing it to diverge across nodes for the same cycle.
+        let mut final_vote_list = self.producer.selected_producers.clone();
+        if final_vote_list.is_empty() {
+            // Degenerate / test setup without a provided canonical set: fall back to
+            // the observed vote submitters (still deterministically ordered) so
+            // single-node and test environments keep working.
+            if !vote_producers.contains(&self.producer.id) {
+                vote_producers.push(self.producer.id.clone());
+            }
+            vote_producers.sort();
+            vote_producers.dedup();
+            final_vote_list = vote_producers;
         }
-        vote_producers.sort();
-        vote_producers.dedup();
-        let final_vote_list = vote_producers;
         
         // Get our ledger update (must match the majority)
         let ledger_update = self.producer.ledger_update.as_ref()
