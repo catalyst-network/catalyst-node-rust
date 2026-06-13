@@ -1238,6 +1238,20 @@ fn verify_state_transition_bundle(
     true
 }
 
+/// Process-scoped mutex that serialises all LSU-to-storage applies.
+///
+/// Three independent tokio tasks (gossip receiver, advance ticker, consensus runner) can all
+/// call `apply_lsu_to_storage[_without_root_check]` concurrently.  The per-cycle idempotence
+/// check inside those functions is a read-then-write and therefore not atomic: every concurrent
+/// caller reads `last_applied_cycle = N-1` before any of them writes `N`, so all proceed and
+/// apply the same cycle multiple times from different intermediate states, corrupting the chain.
+/// Holding this lock for the full duration of each apply collapses concurrent callers into a
+/// strict sequence; the idempotence check then correctly gates out duplicates.
+fn lsu_apply_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 async fn apply_lsu_to_storage_without_root_check(
     store: &StorageManager,
     lsu: &catalyst_consensus::types::LedgerStateUpdate,
@@ -1247,6 +1261,8 @@ async fn apply_lsu_to_storage_without_root_check(
     // for forward application (proof-verified, chains onto the current root) and for same-cycle
     // reorg/reconcile that replaces the applied head's LSU with a stronger certified one; the callers
     // are responsible for verifying chaining / fork-choice before invoking it.
+    let _apply_guard = lsu_apply_lock().lock().await;
+
     #[derive(Clone, Debug, Default)]
     struct ApplyOutcome {
         success: bool,
@@ -2844,6 +2860,11 @@ pub(crate) async fn apply_lsu_to_storage(
     store: &StorageManager,
     lsu: &catalyst_consensus::types::LedgerStateUpdate,
 ) -> Result<[u8; 32]> {
+    // Serialize against all concurrent apply paths (gossip, advance ticker, consensus task).
+    // Must be acquired BEFORE the idempotence check so that the check sees the updated
+    // last_applied_cycle from whichever apply completed just before us.
+    let _apply_guard = lsu_apply_lock().lock().await;
+
     // Idempotence: only apply if this LSU advances the applied head.
     let already = store
         .get_metadata("consensus:last_applied_cycle")
