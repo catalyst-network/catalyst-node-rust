@@ -14,7 +14,7 @@ use catalyst_utils::{
     utils::current_timestamp_ms,
     impl_catalyst_serialize,
 };
-use catalyst_consensus::types::hash_data;
+use catalyst_consensus::types::{hash_data, LedgerStateUpdateBroadcast};
 use catalyst_utils::state::StateManager;
 
 use crate::config::NodeConfig;
@@ -3887,7 +3887,7 @@ async fn try_reconcile_fork_from_quorum_lsu(
                 target_cycle = cycle,
                 "Using checkpoint for reconcile prefix (pruned LSU metadata)"
             );
-            if let Err(e) = crate::checkpoint::restore_reconcile_from_checkpoint(store, &cp).await {
+            if let Err(e) = crate::checkpoint::restore_reconcile_from_checkpoint(store, &cp, local_cycle).await {
                 warn!(
                     target: "catalyst.consensus.checkpoint",
                     "Checkpoint restore failed: {e}"
@@ -5637,6 +5637,18 @@ impl CatalystNode {
                                         }
                                     }
                                 }
+                            } else if let Ok(_) = envelope.extract_message::<LedgerStateUpdateBroadcast>() {
+                                // LedgerStateUpdateBroadcast from a producer's synchronization phase.
+                                // Relay so multi-hop WAN topologies can deliver it, then forward to
+                                // the consensus engine where the observer path reads it.
+                                let do_relay = {
+                                    let mut rc = relay_cache.lock().await;
+                                    rc.should_relay(&envelope, now_ms)
+                                };
+                                if do_relay {
+                                    let _ = net.broadcast_envelope(&envelope).await;
+                                }
+                                let _ = in_tx.send(envelope.clone());
                             }
                         } else if envelope.message_type == MessageType::LsuFinalityAttestation {
                             if let Ok(msg) = envelope.extract_message::<LsuFinalityAttestationMsg>() {
@@ -5805,6 +5817,29 @@ impl CatalystNode {
                                 };
                                 if let Ok(env) = MessageEnvelope::from_message(&resp, "lsu_range_resp".to_string(), None) {
                                     let _ = net.broadcast_envelope(&env).await;
+                                }
+                                // Also push full LSU bytes alongside the CID reference so the
+                                // requester can apply without a DFS file-fetch round-trip.
+                                // Cap at 8 cycles to avoid flooding; each node requesting
+                                // sequential catch-up will issue its own range request.
+                                for gossip_ref in resp.refs.iter().take(8) {
+                                    let cycle_g = gossip_ref.cycle;
+                                    if let Some(bytes) = store
+                                        .get_metadata(&format!("consensus:lsu:{}", cycle_g))
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                    {
+                                        if let Ok(lsu) = catalyst_consensus::types::LedgerStateUpdate::deserialize(&bytes) {
+                                            if let Ok(gossip) = LsuGossip::new(lsu) {
+                                                if let Ok(env) = MessageEnvelope::from_message(
+                                                    &gossip, "lsu_push".to_string(), None,
+                                                ) {
+                                                    let _ = net.broadcast_envelope(&env).await;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         } else if envelope.message_type == MessageType::StateResponse {

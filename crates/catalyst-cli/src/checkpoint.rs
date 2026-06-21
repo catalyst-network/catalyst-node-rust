@@ -177,10 +177,45 @@ pub async fn load_checkpoint_at_cycle(
 }
 
 /// Load checkpoint snapshot and align applied-head metadata to the checkpoint.
+///
+/// The full-DB `load_snapshot` reverts ALL RocksDB state including LSU history metadata
+/// (`consensus:lsu:{N}`, `consensus:lsu_hash:{N}`, `consensus:lsu_state_root:{N}`) for
+/// every cycle after `record.cycle`.  Those keys are essential for the forward replay that
+/// immediately follows the checkpoint restore, so we save them before the snapshot and
+/// write them back afterwards.
+///
+/// `current_head` is the locally-applied cycle number before the restore; it bounds the
+/// range of metadata we need to preserve.
 pub async fn restore_reconcile_from_checkpoint(
     store: &StorageManager,
     record: &CheckpointRecord,
+    current_head: u64,
 ) -> Result<()> {
+    // Save post-checkpoint LSU history before the snapshot wipes it.
+    let save_start = record.cycle.saturating_add(1);
+    let save_end = current_head.saturating_add(1); // inclusive upper bound + 1
+
+    struct SavedCycleMeta {
+        cycle: u64,
+        lsu_bytes: Option<Vec<u8>>,
+        lsu_hash: Option<Vec<u8>>,
+        lsu_state_root: Option<Vec<u8>>,
+        lsu_cid: Option<Vec<u8>>,
+    }
+
+    let mut saved: Vec<SavedCycleMeta> = Vec::new();
+    if save_start < save_end {
+        for n in save_start..save_end {
+            let lsu_bytes = store.get_metadata(&format!("consensus:lsu:{n}")).await.ok().flatten();
+            let lsu_hash = store.get_metadata(&format!("consensus:lsu_hash:{n}")).await.ok().flatten();
+            let lsu_state_root = store.get_metadata(&format!("consensus:lsu_state_root:{n}")).await.ok().flatten();
+            let lsu_cid = store.get_metadata(&format!("consensus:lsu_cid:{n}")).await.ok().flatten();
+            if lsu_bytes.is_some() || lsu_state_root.is_some() {
+                saved.push(SavedCycleMeta { cycle: n, lsu_bytes, lsu_hash, lsu_state_root, lsu_cid });
+            }
+        }
+    }
+
     store
         .load_snapshot(&record.snapshot_name)
         .await
@@ -203,10 +238,28 @@ pub async fn restore_reconcile_from_checkpoint(
         .await
         .map_err(|e| anyhow::anyhow!("set last_applied_lsu_hash: {e}"))?;
 
+    // Re-write the post-checkpoint LSU history so the forward replay can proceed.
+    for meta in &saved {
+        let n = meta.cycle;
+        if let Some(b) = &meta.lsu_bytes {
+            let _ = store.set_metadata(&format!("consensus:lsu:{n}"), b).await;
+        }
+        if let Some(b) = &meta.lsu_hash {
+            let _ = store.set_metadata(&format!("consensus:lsu_hash:{n}"), b).await;
+        }
+        if let Some(b) = &meta.lsu_state_root {
+            let _ = store.set_metadata(&format!("consensus:lsu_state_root:{n}"), b).await;
+        }
+        if let Some(b) = &meta.lsu_cid {
+            let _ = store.set_metadata(&format!("consensus:lsu_cid:{n}"), b).await;
+        }
+    }
+
     tracing::info!(
         target: "catalyst.consensus.checkpoint",
         cycle = record.cycle,
         state_root = %hex::encode(record.state_root),
+        preserved_cycles = saved.len(),
         "Restored reconcile prefix from checkpoint"
     );
     Ok(())
@@ -221,44 +274,57 @@ async fn lsu_metadata_present(store: &StorageManager, cycle: u64) -> bool {
         .is_some()
 }
 
-/// If cycles `1..target_cycle` have gaps only because of pruning, return a checkpoint to start replay.
+/// If cycles `1..target_cycle` have gaps that a checkpoint can bridge, return that checkpoint.
 ///
-/// NOTE: making fork-reconcile self-heal for *non-pruning* nodes (the recurring testnet freeze) needs
-/// a redesign of the checkpoint restore path — `restore_reconcile_from_checkpoint` does a full-DB
-/// `load_snapshot` that also reverts LSU history and runs before `reconcile_inner`'s purge, so forward
-/// replay cannot currently anchor on a checkpoint. That redesign is tracked separately; the recurring
-/// freeze itself is prevented upstream by the consensus depth-gate (see `node.rs`).
+/// Two scenarios are handled identically:
+///
+/// * **Pruned chains** (`pruned_up_to > 0`): LSU history before `pruned_up_to` was
+///   intentionally removed; only a checkpoint can seed the replay.
+///
+/// * **Wall-clock chains without pruning** (`pruned_up_to == 0`): the chain's first
+///   real cycle may be far into the wall-clock sequence (e.g. cycle ~89 million on a
+///   fresh testnet), so cycles 1..first_real_cycle are simply absent from storage.
+///   A checkpoint written after the first real cycle covers this gap.
+///
+/// In both cases the requirement is: a checkpoint exists, and every cycle between the
+/// checkpoint and `target_cycle` is present locally (needed for forward replay).  Any
+/// missing cycle *after* the checkpoint means the replay would stall — return `None`.
 pub async fn reconcile_checkpoint_for_missing_prefix(
     store: &StorageManager,
     target_cycle: u64,
     pruned_up_to: u64,
 ) -> Option<CheckpointRecord> {
-    if target_cycle <= 1 || pruned_up_to == 0 {
+    if target_cycle <= 1 {
         return None;
     }
-    let mut missing_in_pruned_range = false;
-    for i in 1..target_cycle {
-        if !lsu_metadata_present(store, i).await {
-            if i <= pruned_up_to {
-                missing_in_pruned_range = true;
-            } else {
-                return None;
-            }
-        }
-    }
-    if !missing_in_pruned_range {
-        return None;
-    }
+
+    // Find the most recent checkpoint at or below target_cycle.
     let cp = find_latest_checkpoint_at_or_below(store, target_cycle.saturating_sub(1)).await?;
     if cp.cycle == 0 {
         return None;
     }
-    // All missing cycles must lie within the pruned gap at or before the checkpoint.
+
+    // Cycles at or before the checkpoint are covered by its snapshot — whether they were
+    // explicitly pruned or never existed on a wall-clock chain.
+    let safe_gap_end = cp.cycle.max(pruned_up_to);
+
+    let mut missing_in_prefix = false;
     for i in 1..target_cycle {
-        if !lsu_metadata_present(store, i).await && i > cp.cycle {
-            return None;
+        if !lsu_metadata_present(store, i).await {
+            if i <= safe_gap_end {
+                missing_in_prefix = true;
+            } else {
+                // Gap after checkpoint and outside pruned range — forward replay would stall.
+                return None;
+            }
         }
     }
+
+    // If no cycles are missing the caller already has full history; no checkpoint needed.
+    if !missing_in_prefix {
+        return None;
+    }
+
     Some(cp)
 }
 
@@ -327,7 +393,7 @@ mod tests {
             .expect("checkpoint for pruned prefix");
         assert_eq!(cp.cycle, cp_cycle);
 
-        restore_reconcile_from_checkpoint(&store, &cp)
+        restore_reconcile_from_checkpoint(&store, &cp, target_cycle.saturating_sub(1))
             .await
             .expect("restore");
 
@@ -345,6 +411,40 @@ mod tests {
                 "replay should continue from cycle {i}"
             );
         }
+    }
+
+    /// Wall-clock chains never have cycles 1..first_real_cycle stored.  Even without pruning
+    /// (`pruned_up_to == 0`), a checkpoint written after the first real cycle should be returned
+    /// so that reconcile can anchor its replay there instead of failing at cycle 1.
+    #[tokio::test]
+    async fn checkpoint_found_on_unprunded_wall_clock_chain() {
+        let td = TempDir::new().unwrap();
+        let mut cfg = StorageConfig::default();
+        cfg.data_dir = td.path().to_path_buf();
+        let store = StorageManager::new(cfg).await.unwrap();
+
+        // Simulated wall-clock chain: first real cycle is 89_000_000.  Checkpoint at 89_000_032.
+        // Cycles 1..89_000_000 are ABSENT (wall-clock gap).
+        // Cycles 89_000_000..89_000_064 (=target) ARE present.
+        let cp_cycle = 89_000_032u64;
+        let target = 89_000_064u64;
+
+        write_checkpoint(&store, cp_cycle, [5u8; 32], [6u8; 32])
+            .await
+            .unwrap();
+
+        for c in 89_000_000..target {
+            store
+                .set_metadata(&format!("consensus:lsu:{c}"), b"stub")
+                .await
+                .unwrap();
+        }
+
+        // pruned_up_to == 0 (no pruning), but checkpoint should still be found.
+        let cp = reconcile_checkpoint_for_missing_prefix(&store, target, 0)
+            .await
+            .expect("checkpoint found on unprunded wall-clock chain");
+        assert_eq!(cp.cycle, cp_cycle);
     }
 
     /// The fallback downward scan in `find_latest_checkpoint_at_or_below` must stay bounded: cycle
