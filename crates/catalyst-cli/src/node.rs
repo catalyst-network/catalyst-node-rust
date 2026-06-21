@@ -5000,59 +5000,87 @@ impl CatalystNode {
                                         }
                                     }
                                     TxBatchControl::ResyncRequest { cycle, .. } => {
+                                        // Always re-broadcast the commit if we have it.
+                                        // This is the only recovery path for empty batches
+                                        // (zero transactions): the resync-reply below only
+                                        // sends a ProtocolTxBatch, which is skipped when
+                                        // txids is empty, so without this a follower that
+                                        // missed the one-shot Commit broadcast can never
+                                        // resolve AgreedEmpty and stalls with TX_BATCH_MISS_FATAL.
+                                        let stored_commit = {
+                                            let ram = tx_batch_commits_in.read().await.get(&cycle).copied();
+                                            if let (None, Some(store)) = (ram, &storage) {
+                                                read_tx_batch_commit(store.as_ref(), cycle).await
+                                            } else {
+                                                ram
+                                            }
+                                        };
+                                        if let Some((batch_hash, tx_count)) = stored_commit {
+                                            let reply = TxBatchControl::Commit {
+                                                cycle,
+                                                batch_hash,
+                                                tx_count,
+                                            };
+                                            if let Ok(env2) = MessageEnvelope::from_message(
+                                                &reply,
+                                                "tx_batch_commit_relay".to_string(),
+                                                None,
+                                            ) {
+                                                let _ = net.broadcast_envelope(&env2).await;
+                                            }
+                                        }
+                                        // Also relay the full ProtocolTxBatch when we have txids.
                                         if let Some(store) = &storage {
                                             let txids = load_cycle_txids(store.as_ref(), cycle).await;
-                                            if txids.is_empty() {
-                                                continue;
-                                            }
-                                            let mut txs: Vec<catalyst_core::protocol::Transaction> =
-                                                Vec::with_capacity(txids.len());
-                                            let mut ok = true;
-                                            for txid in &txids {
-                                                let raw = match store
-                                                    .get_metadata(&mempool_tx_key(txid))
-                                                    .await
-                                                    .ok()
-                                                    .flatten()
-                                                {
-                                                    Some(b) => Some(b),
-                                                    None => store
-                                                        .get_metadata(&tx_raw_key(txid))
+                                            if !txids.is_empty() {
+                                                let mut txs: Vec<catalyst_core::protocol::Transaction> =
+                                                    Vec::with_capacity(txids.len());
+                                                let mut ok = true;
+                                                for txid in &txids {
+                                                    let raw = match store
+                                                        .get_metadata(&mempool_tx_key(txid))
                                                         .await
                                                         .ok()
-                                                        .flatten(),
-                                                };
-                                                let Some(raw) = raw else {
-                                                    ok = false;
-                                                    break;
-                                                };
-                                                let Ok(tx) =
-                                                    bincode::deserialize::<catalyst_core::protocol::Transaction>(
-                                                        &raw,
+                                                        .flatten()
+                                                    {
+                                                        Some(b) => Some(b),
+                                                        None => store
+                                                            .get_metadata(&tx_raw_key(txid))
+                                                            .await
+                                                            .ok()
+                                                            .flatten(),
+                                                    };
+                                                    let Some(raw) = raw else {
+                                                        ok = false;
+                                                        break;
+                                                    };
+                                                    let Ok(tx) =
+                                                        bincode::deserialize::<catalyst_core::protocol::Transaction>(
+                                                            &raw,
+                                                        )
+                                                    else {
+                                                        ok = false;
+                                                        break;
+                                                    };
+                                                    txs.push(tx);
+                                                }
+                                                if ok {
+                                                    let valid = validate_and_select_protocol_txs_for_construction(
+                                                        store.as_ref(),
+                                                        cycle,
+                                                        txs,
+                                                        max_entries_per_cycle_cfg,
                                                     )
-                                                else {
-                                                    ok = false;
-                                                    break;
-                                                };
-                                                txs.push(tx);
-                                            }
-                                            if !ok {
-                                                continue;
-                                            }
-                                            let valid = validate_and_select_protocol_txs_for_construction(
-                                                store.as_ref(),
-                                                cycle,
-                                                txs,
-                                                max_entries_per_cycle_cfg,
-                                            )
-                                            .await;
-                                            if let Ok(batch) = ProtocolTxBatch::new(cycle, valid) {
-                                                if let Ok(env2) = MessageEnvelope::from_message(
-                                                    &batch,
-                                                    "tx_batch_resync_reply".to_string(),
-                                                    None,
-                                                ) {
-                                                    let _ = net.broadcast_envelope(&env2).await;
+                                                    .await;
+                                                    if let Ok(batch) = ProtocolTxBatch::new(cycle, valid) {
+                                                        if let Ok(env2) = MessageEnvelope::from_message(
+                                                            &batch,
+                                                            "tx_batch_resync_reply".to_string(),
+                                                            None,
+                                                        ) {
+                                                            let _ = net.broadcast_envelope(&env2).await;
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
