@@ -82,7 +82,10 @@ pub(crate) async fn local_applied_state_root(store: &catalyst_storage::StorageMa
 /// numbers were legitimately skipped (a slot with no producer quorum). `applied == 0` is the
 /// bootstrap / fresh-network case, where we must produce to get the chain started.
 fn should_defer_production_when_behind(applied: u64, observed_head: u64) -> bool {
-    applied != 0 && observed_head > applied
+    // Do not gate on `applied != 0`: a freshly-wiped node (applied=0) that receives gossip
+    // from a live network (observed_head > 0) must also defer — otherwise it produces from
+    // genesis state and forks itself off the canonical chain immediately on restart.
+    observed_head > applied
 }
 
 /// Deterministic per-cycle batch leader, rotating through the canonical (sorted, deduped) producer
@@ -5273,6 +5276,7 @@ impl CatalystNode {
                                                             // safe bypass is the explicit bootstrap case where both
                                                             // local and expected prev roots are zero.
                                                             let local_prev = local_applied_state_root(store.as_ref()).await;
+                                                            let local_applied_now = local_applied_cycle(store.as_ref()).await;
                                                             let mut already_applied = false;
                                                             if try_reorg_stronger_lsu_at_applied_cycle(
                                                                 store.as_ref(),
@@ -5289,6 +5293,15 @@ impl CatalystNode {
                                                             .await
                                                             .unwrap_or(false)
                                                             {
+                                                                already_applied = true;
+                                                            } else if local_applied_now == ref_msg.cycle {
+                                                                // Cycle already at this head and incoming LSU was same-or-weaker
+                                                                // (try_reorg returned false). Never reconcile: reconcile does
+                                                                // restore_checkpoint then purge_mutable_chain_state, which takes
+                                                                // the snapshot at the checkpoint state (pre-cycle), not the
+                                                                // post-cycle state — so a failed reconcile would revert the node
+                                                                // one cycle backward. Since the applied state is already correct,
+                                                                // no reconcile is needed.
                                                                 already_applied = true;
                                                             } else if local_prev != ref_msg.prev_state_root {
                                                                 if local_prev == [0u8; 32] && ref_msg.prev_state_root == [0u8; 32] {
@@ -6077,6 +6090,7 @@ impl CatalystNode {
                                             // safe bypass is the explicit bootstrap case where both
                                             // local and expected prev roots are zero.
                                             let local_prev = local_applied_state_root(store.as_ref()).await;
+                                            let local_applied_now = local_applied_cycle(store.as_ref()).await;
                                             let mut ok = false;
                                             if try_reorg_stronger_lsu_at_applied_cycle(
                                                 store.as_ref(),
@@ -6093,6 +6107,10 @@ impl CatalystNode {
                                             .await
                                             .unwrap_or(false)
                                             {
+                                                ok = true;
+                                            } else if local_applied_now == info.cycle {
+                                                // Cycle already applied; incoming same-or-weaker. Skip reconcile
+                                                // to prevent checkpoint-restore reversion (see LsuCidGossip path).
                                                 ok = true;
                                             } else if local_prev != info.prev_state_root {
                                                 if local_prev == [0u8; 32] && info.prev_state_root == [0u8; 32] {
