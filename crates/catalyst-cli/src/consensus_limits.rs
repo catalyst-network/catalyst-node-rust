@@ -56,6 +56,28 @@ pub fn effective_require_lsu_finality(config: &NodeConfig) -> bool {
     }
 }
 
+/// Whether a trusted/catch-up LSU apply requires a verified `LsuStateRootCertificateV1` (ADR 0002)
+/// matching the claimed `state_root`.
+///
+/// Precedence: if `CATALYST_REQUIRE_STATE_ROOT_FINALITY` is set and non-empty after trim, it wins
+/// (`1`/`true`/`yes` vs `0`/`false`/`no`). Otherwise [`NodeConfig::consensus`] `require_state_root_finality` applies.
+pub fn effective_require_state_root_finality(config: &NodeConfig) -> bool {
+    match std::env::var("CATALYST_REQUIRE_STATE_ROOT_FINALITY") {
+        Ok(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                return config.consensus.require_state_root_finality;
+            }
+            match t.to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" => true,
+                "0" | "false" | "no" => false,
+                _ => config.consensus.require_state_root_finality,
+            }
+        }
+        Err(_) => config.consensus.require_state_root_finality,
+    }
+}
+
 /// Wall time for consensus helpers (`catalyst_utils::utils::wall_now_ms`, honors test offset).
 pub fn wall_now_ms() -> u64 {
     catalyst_utils::utils::wall_now_ms()
@@ -638,6 +660,29 @@ mod tests {
             let _e = EnvGuard::set("CATALYST_REQUIRE_LSU_FINALITY", "false");
             cfg.consensus.require_lsu_finality = true;
             assert!(!effective_require_lsu_finality(&cfg));
+        }
+    }
+
+    #[test]
+    fn effective_require_state_root_finality_precedence() {
+        let mut cfg = NodeConfig::default();
+
+        {
+            let _e = EnvGuard::unset("CATALYST_REQUIRE_STATE_ROOT_FINALITY");
+            cfg.consensus.require_state_root_finality = false;
+            assert!(!effective_require_state_root_finality(&cfg));
+            cfg.consensus.require_state_root_finality = true;
+            assert!(effective_require_state_root_finality(&cfg));
+        }
+        {
+            let _e = EnvGuard::set("CATALYST_REQUIRE_STATE_ROOT_FINALITY", "1");
+            cfg.consensus.require_state_root_finality = false;
+            assert!(effective_require_state_root_finality(&cfg));
+        }
+        {
+            let _e = EnvGuard::set("CATALYST_REQUIRE_STATE_ROOT_FINALITY", "false");
+            cfg.consensus.require_state_root_finality = true;
+            assert!(!effective_require_state_root_finality(&cfg));
         }
     }
 

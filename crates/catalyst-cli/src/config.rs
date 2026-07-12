@@ -303,6 +303,14 @@ pub struct ConsensusConfig {
     /// May be overridden by `CATALYST_REQUIRE_LSU_FINALITY` when that variable is set to a non-empty value.
     #[serde(default)]
     pub require_lsu_finality: bool,
+
+    /// If true, a trusted/catch-up LSU apply also requires a verifiable `LsuStateRootCertificateV1`
+    /// (ADR 0002) matching the claimed `state_root` before it is trusted. Defaults to `false` while
+    /// networks roll out ADR 0002 attestation gossip (mirrors `require_lsu_finality`'s migration path).
+    ///
+    /// May be overridden by `CATALYST_REQUIRE_STATE_ROOT_FINALITY` when set to a non-empty value.
+    #[serde(default)]
+    pub require_state_root_finality: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -550,6 +558,7 @@ impl Default for NodeConfig {
                 },
                 validator_worker_ids: Vec::new(),
                 require_lsu_finality: true,
+                require_state_root_finality: false,
             },
             runtimes: RuntimeConfig {
                 evm: EvmRuntimeConfig {

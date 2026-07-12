@@ -12,6 +12,8 @@ bash "$ROOT/scripts/run-consensus-ci-parity.sh"
 if [ "${RUN_CONSENSUS_E2E:-0}" = "1" ]; then
   echo "==> pre-deploy-consensus-gate: multi-process three-validator E2E"
   bash "$ROOT/scripts/consensus-three-validator-e2e.sh"
+  echo "==> pre-deploy-consensus-gate: multi-process restart-recovery E2E (Phase 10)"
+  bash "$ROOT/scripts/consensus-restart-recovery-e2e.sh"
 else
   echo ""
   echo "Optional full gate (starts local testnet, ~3–5 min):"

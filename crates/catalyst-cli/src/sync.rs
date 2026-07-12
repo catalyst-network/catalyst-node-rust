@@ -22,9 +22,22 @@ pub struct LsuCidGossip {
     pub proof_cid: String,
     /// CID of `LsuFinalityCertificateV1` (bincode). Empty if not yet assembled (coordinated network upgrade).
     pub finality_cid: String,
+    /// CID of `LsuStateRootCertificateV1` (bincode, ADR 0002). Empty if not yet assembled
+    /// (coordinated network upgrade) — same convention as `finality_cid`.
+    pub state_root_cid: String,
 }
 
-impl_catalyst_serialize!(LsuCidGossip, cycle, lsu_hash, cid, prev_state_root, state_root, proof_cid, finality_cid);
+impl_catalyst_serialize!(
+    LsuCidGossip,
+    cycle,
+    lsu_hash,
+    cid,
+    prev_state_root,
+    state_root,
+    proof_cid,
+    finality_cid,
+    state_root_cid
+);
 
 impl NetworkMessage for LsuCidGossip {
     fn serialize(&self) -> CatalystResult<Vec<u8>> {
@@ -311,6 +324,87 @@ impl NetworkMessage for LsuFinalityCidMsg {
 
     fn message_type(&self) -> MessageType {
         MessageType::LsuFinalityCid
+    }
+
+    fn priority(&self) -> u8 {
+        MessagePriority::High as u8
+    }
+
+    fn ttl(&self) -> u32 {
+        300
+    }
+}
+
+/// One validator attestation: Ed25519/Ristretto Schnorr signature over `H_root` (ADR 0002),
+/// binding a producer's independently-computed applied `state_root` to `(cycle, lsu_hash)`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StateRootAttestationMsg {
+    pub chain_id: u64,
+    pub genesis_hash: [u8; 32],
+    pub cycle: u64,
+    pub lsu_hash: [u8; 32],
+    pub committee_hash: [u8; 32],
+    pub state_root: [u8; 32],
+    pub producer_id: String,
+    pub signature: Vec<u8>,
+}
+
+impl_catalyst_serialize!(
+    StateRootAttestationMsg,
+    chain_id,
+    genesis_hash,
+    cycle,
+    lsu_hash,
+    committee_hash,
+    state_root,
+    producer_id,
+    signature
+);
+
+impl NetworkMessage for StateRootAttestationMsg {
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        CatalystSerialize::serialize(self)
+    }
+
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        CatalystDeserialize::deserialize(data)
+    }
+
+    fn message_type(&self) -> MessageType {
+        MessageType::StateRootAttestation
+    }
+
+    fn priority(&self) -> u8 {
+        MessagePriority::High as u8
+    }
+
+    fn ttl(&self) -> u32 {
+        300
+    }
+}
+
+/// Announces where to fetch the assembled quorum state-root certificate for a cycle.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StateRootFinalityCidMsg {
+    pub cycle: u64,
+    pub lsu_hash: [u8; 32],
+    pub state_root: [u8; 32],
+    pub state_root_cid: String,
+}
+
+impl_catalyst_serialize!(StateRootFinalityCidMsg, cycle, lsu_hash, state_root, state_root_cid);
+
+impl NetworkMessage for StateRootFinalityCidMsg {
+    fn serialize(&self) -> CatalystResult<Vec<u8>> {
+        CatalystSerialize::serialize(self)
+    }
+
+    fn deserialize(data: &[u8]) -> CatalystResult<Self> {
+        CatalystDeserialize::deserialize(data)
+    }
+
+    fn message_type(&self) -> MessageType {
+        MessageType::StateRootFinalityCid
     }
 
     fn priority(&self) -> u8 {

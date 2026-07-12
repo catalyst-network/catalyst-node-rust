@@ -21,6 +21,10 @@ pub struct ForkChoiceCandidate {
     pub cycle: u64,
     pub lsu_hash: [u8; 32],
     pub tier: ForkChoiceTier,
+    /// Whether a verified `LsuStateRootCertificateV1` (ADR 0002) backs this candidate's applied
+    /// `state_root`. Only a tie-break signal within `tier` — it never promotes a candidate above
+    /// a higher `tier`, since `tier` is still the LSU-recipe evidence fork choice is defined over.
+    pub state_root_certified: bool,
 }
 
 impl ForkChoiceCandidate {
@@ -30,11 +34,13 @@ impl ForkChoiceCandidate {
         lsu: &LedgerStateUpdate,
         certified: bool,
         certified_only: bool,
+        state_root_certified: bool,
     ) -> Self {
         Self {
             cycle,
             lsu_hash,
             tier: effective_fork_choice_tier(lsu, certified, certified_only),
+            state_root_certified,
         }
     }
 }
@@ -161,10 +167,19 @@ pub fn fork_choice_prefer(a: &ForkChoiceCandidate, b: &ForkChoiceCandidate) -> F
         std::cmp::Ordering::Greater => ForkChoicePrefer::Left,
         std::cmp::Ordering::Less => ForkChoicePrefer::Right,
         std::cmp::Ordering::Equal => {
-            if a.lsu_hash < b.lsu_hash {
-                ForkChoicePrefer::Left
-            } else {
-                ForkChoicePrefer::Right
+            // Same LSU-recipe tier: prefer additional state-root (ADR 0002) backing before
+            // falling back to the hash tie-break, so a candidate whose *result* is also
+            // quorum-certified wins over one that's merely recipe-certified.
+            match (a.state_root_certified, b.state_root_certified) {
+                (true, false) => ForkChoicePrefer::Left,
+                (false, true) => ForkChoicePrefer::Right,
+                _ => {
+                    if a.lsu_hash < b.lsu_hash {
+                        ForkChoicePrefer::Left
+                    } else {
+                        ForkChoicePrefer::Right
+                    }
+                }
             }
         }
     }
@@ -231,6 +246,7 @@ mod tests {
             cycle,
             lsu_hash: [hash_byte; 32],
             tier,
+            state_root_certified: false,
         }
     }
 
@@ -238,9 +254,9 @@ mod tests {
     fn certified_only_downgrades_inferred_quorum() {
         let p = vec!["a".into(), "b".into(), "c".into()];
         let lsu = empty_lsu(1, p, vec!["a".into(), "b".into()]);
-        let c = ForkChoiceCandidate::new(1, [1u8; 32], &lsu, false, true);
+        let c = ForkChoiceCandidate::new(1, [1u8; 32], &lsu, false, true, false);
         assert_eq!(c.tier, ForkChoiceTier::None);
-        let c2 = ForkChoiceCandidate::new(1, [1u8; 32], &lsu, false, false);
+        let c2 = ForkChoiceCandidate::new(1, [1u8; 32], &lsu, false, false, false);
         assert_eq!(c2.tier, ForkChoiceTier::QuorumInferred);
     }
 
@@ -248,6 +264,20 @@ mod tests {
     fn certified_beats_quorum_inferred() {
         let a = cand(5, 0xff, ForkChoiceTier::Certified);
         let b = cand(5, 0x01, ForkChoiceTier::QuorumInferred);
+        assert_eq!(fork_choice_prefer(&a, &b), ForkChoicePrefer::Left);
+    }
+
+    #[test]
+    fn state_root_certified_wins_tie_break_over_hash_within_same_tier() {
+        let mut a = cand(5, 0x01, ForkChoiceTier::Certified);
+        let mut b = cand(5, 0xff, ForkChoiceTier::Certified);
+        // Without state-root backing, smaller hash (`a`) would normally win.
+        assert_eq!(fork_choice_prefer(&a, &b), ForkChoicePrefer::Left);
+        // With only `b` state-root-certified, it wins despite the larger hash.
+        b.state_root_certified = true;
+        assert_eq!(fork_choice_prefer(&a, &b), ForkChoicePrefer::Right);
+        // With both state-root-certified, falls back to the hash tie-break again.
+        a.state_root_certified = true;
         assert_eq!(fork_choice_prefer(&a, &b), ForkChoicePrefer::Left);
     }
 

@@ -7,6 +7,7 @@ ADRs record **why** a protocol or system design choice was made, and **what** im
 | ADR | Title | Status |
 |-----|--------|--------|
 | [0001](./0001-lsu-finality-certificate.md) | LSU finality certificate (cryptographic quorum evidence) | Proposed |
+| [0002](./0002-canonical-state-root-and-proofs.md) | Canonical state root, proofs, and state-root finality certificate | Accepted |
 
 ## Conventions
 

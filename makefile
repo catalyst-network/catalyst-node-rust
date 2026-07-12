@@ -380,6 +380,10 @@ testnet-contract-test: build
 testnet-consensus-e2e: build
 	@bash scripts/consensus-three-validator-e2e.sh
 
+.PHONY: consensus-restart-recovery-e2e
+consensus-restart-recovery-e2e: build
+	@bash scripts/consensus-restart-recovery-e2e.sh
+
 # Public/stable devnet helpers (single node that exposes RPC externally).
 # Example:
 #   make devnet-up HOST=203.0.113.10 P2P_PORT=30333 RPC_PORT=8545

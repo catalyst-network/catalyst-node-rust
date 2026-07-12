@@ -315,6 +315,25 @@ This means validators are not receiving enough peer messages in a cycle. Common 
 
 With `[storage].history_prune_enabled = true`, old `consensus:lsu:*` metadata is deleted. **Quorum fork replay** that replays from cycle `1` requires **archival** LSU metadata (or successful **P2P prefetch** within `CATALYST_RECONCILE_PREFETCH_MS`). Keep at least one archival node, or disable pruning, if you need self-healing from ancient forks. See [`consensus-quorum-and-fork-choice.md`](./consensus-quorum-and-fork-choice.md).
 
+### Reconcile stuck: "no checkpoint or peer bridged" the gap
+
+Every process now writes a checkpoint on its **first** successful apply after startup (in addition
+to the periodic `CATALYST_CHECKPOINT_EVERY_CYCLES` interval, default 32 cycles), so a fresh restart
+or reset should always have an anchor available for near-head reconcile. If you still see
+`Quorum fork reconcile FAILED: missing stored LSU for cycle N and no checkpoint or peer bridged it`
+in logs (tracing target `catalyst.consensus.reconcile`) and the
+`consensus_fork_reconcile_no_checkpoint_total` counter incrementing, the node has correctly
+refused to guess rather than silently apply divergent state — it needs operator help:
+
+- Pull a `db-backup` from a healthy, caught-up peer and `db-restore` it onto this node (see
+  [Upgrades, backups, and rollback safety](#upgrades-backups-and-rollback-safety) above), then
+  restart.
+- Or wait for peers to answer `LsuRangeRequest` (`CATALYST_RECONCILE_PREFETCH_MS`) if the gap is
+  recoverable from gossip.
+- Do **not** manually delete/edit `consensus:*` metadata to force past this — the check exists
+  because the alternative is a silent, permanent state fork (see
+  [`consensus-reliability-review-2026-07.md`](./consensus-reliability-review-2026-07.md)).
+
 ### `TX_BATCH_MISS_FATAL` / validators stop producing the same head
 
 Multi-validator nodes agree on **per-cycle transaction batches** via a deterministic batch leader. If a follower cannot obtain the canonical batch before the end of the cycle window, it **skips producing** for that cycle (preferable to forking with an empty construction set).

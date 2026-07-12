@@ -59,6 +59,7 @@ These are read by `catalyst-cli` at runtime (not TOML). They affect **liveness**
 | `CATALYST_RECONCILE_PREFETCH_MS` | `8000` | Before aborting **quorum fork replay**, broadcast `LsuRangeRequest` and poll for missing `consensus:lsu:{i}` metadata. Set `0` to disable. |
 | `CATALYST_MAX_REPLAY_CYCLES` | `1000000` | Upper bound on replay depth for fork reconcile; `0` disables reconcile replay. |
 | `CATALYST_REQUIRE_LSU_FINALITY` | unset (use TOML) | When set to a **non-empty** value, overrides [`consensus.require_lsu_finality`](#consensus-toml-keys) for this process. `1`/`true`/`yes` enable; `0`/`false`/`no` disable. |
+| `CATALYST_REQUIRE_STATE_ROOT_FINALITY` | unset (use TOML) | When set to a **non-empty** value, overrides [`consensus.require_state_root_finality`](#consensus-toml-keys) for this process. `1`/`true`/`yes` enable; `0`/`false`/`no` disable. |
 | `CATALYST_ALLOW_CERT_EQUIVOCATION_TIEBREAK` | unset | If `1`/`true`/`yes`, allow deterministic `lsu_hash` tie-break when two **verified** certificates conflict at the same cycle (disables production stall). **Dev/test only.** |
 
 `MessageType::TransactionRequest` gossip payloads for tx-batch control are **bincode-encoded** `TxBatchControl` (`Commit` / `ResyncRequest`) in `crates/catalyst-cli/src/tx.rs`; do not multiplex unrelated payloads on that message type across versions.
@@ -70,6 +71,7 @@ For a given cycle, **`TxBatchControl::Commit.tx_count` must equal** the number o
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `require_lsu_finality` | `true` | If `true`, fork choice and apply require a verified **`LsuFinalityCertificateV1`** (ADR 0001); quorum-inferred LSUs do not compete for canonical slots. Set `false` on migration testnets only. Overridable by `CATALYST_REQUIRE_LSU_FINALITY`. |
+| `require_state_root_finality` | `false` | If `true`, the trusted/catch-up apply path additionally requires a verified **`LsuStateRootCertificateV1`** (ADR 0002) whose certified `state_root` matches the peer's claimed root before trusting it. Defaults `false` while networks roll out ADR 0002 attestation gossip; plan to flip to `true` for mainnet once every peer gossips state-root CIDs reliably (same rollout shape ADR 0001 used). Overridable by `CATALYST_REQUIRE_STATE_ROOT_FINALITY`. |
 
 Wall-clock behavior and NTP expectations: [`consensus-wall-clock-and-time.md`](./consensus-wall-clock-and-time.md).
 

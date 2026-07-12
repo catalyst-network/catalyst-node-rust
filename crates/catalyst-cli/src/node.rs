@@ -22,6 +22,7 @@ use crate::tx::{Mempool, ProtocolTxBatch, ProtocolTxGossip, TxBatch, TxBatchCont
 use crate::sync::{
     FileRequestMsg, FileResponseMsg, KeyProofChange, LsuCidGossip, LsuFinalityAttestationMsg,
     LsuFinalityCidMsg, LsuGossip, LsuRangeRequest, LsuRangeResponse, StateProofBundle,
+    StateRootAttestationMsg, StateRootFinalityCidMsg,
 };
 use crate::evm::{decode_evm_marker, encode_evm_marker, EvmTxKind, EvmTxPayload};
 use crate::evm_revm::{execute_call_and_persist, execute_deploy_and_persist};
@@ -212,12 +213,17 @@ async fn fork_choice_apply_gate(
         }
         None => false,
     };
+    let state_root_certified = match dfs {
+        Some(dfs) => lsu_has_verified_state_root_cert(store, dfs, lsu, cycle).await,
+        None => false,
+    };
     let incoming = crate::fork_choice::ForkChoiceCandidate::new(
         cycle,
         lsu_hash,
         lsu,
         certified,
         certified_only,
+        state_root_certified,
     );
 
     if certified_only && incoming.tier != crate::fork_choice::ForkChoiceTier::Certified {
@@ -311,6 +317,7 @@ async fn try_reorg_stronger_lsu_at_applied_cycle(
             cycle,
             lsu_hash: applied_hash,
             tier: crate::fork_choice::ForkChoiceTier::None,
+            state_root_certified: false,
         });
     if !crate::fork_choice::incoming_beats_stored(&incoming, &applied_candidate) {
         return Ok(false);
@@ -2103,6 +2110,10 @@ pub(crate) fn ensure_consensus_p2p_cli_metrics_registered() {
             "Fork reconcile short-circuited: fresh check confirmed the exact LSU was already applied at this cycle (TOCTOU self-echo)",
         ),
         (
+            "consensus_fork_reconcile_no_checkpoint_total",
+            "Fork reconcile aborted specifically because no checkpoint or peer bridged a missing LSU-history gap (operator action needed: db-backup/db-restore from a healthy peer, or wait for the next periodic checkpoint)",
+        ),
+        (
             "consensus_fork_reconcile_circuit_broken_total",
             "Fork reconcile skipped: consecutive-failure circuit breaker open for this (cycle, lsu_hash); needs operator action",
         ),
@@ -3392,14 +3403,33 @@ async fn apply_lsu_to_storage_locked(
     // Opportunistic disk-bounding: prune old historical metadata (if enabled).
     crate::pruning::maybe_prune_history(store).await;
 
-    if let Err(e) = crate::checkpoint::maybe_write_checkpoint_after_apply(
-        store,
-        lsu.cycle_number,
-        state_root,
-        lsu_hash,
-    )
-    .await
+    // On the first successful apply after process start, always write a checkpoint here,
+    // regardless of the periodic `CATALYST_CHECKPOINT_EVERY_CYCLES` interval. Without this, a
+    // freshly (re)started node has no checkpoint at all until the next interval boundary (up to
+    // `every` cycles away), so any near-head reconcile conflict in that window has no anchor to
+    // bridge from and can only fail loud, not self-heal (docs/consensus-reliability-review-2026-07.md §3.2/§5.2).
+    static STARTUP_CHECKPOINT_WRITTEN: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    let checkpoint_result = if STARTUP_CHECKPOINT_WRITTEN
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok()
     {
+        crate::checkpoint::write_checkpoint(store, lsu.cycle_number, state_root, lsu_hash).await
+    } else {
+        crate::checkpoint::maybe_write_checkpoint_after_apply(
+            store,
+            lsu.cycle_number,
+            state_root,
+            lsu_hash,
+        )
+        .await
+    };
+    if let Err(e) = checkpoint_result {
         tracing::warn!(
             target: "catalyst.consensus.checkpoint",
             cycle = lsu.cycle_number,
@@ -3575,6 +3605,99 @@ async fn verify_lsu_finality_for_apply(
     true
 }
 
+/// ADR 0002: gate for the trusted/catch-up apply path (`apply_lsu_to_storage_without_root_check`).
+///
+/// Mirrors `verify_lsu_finality_for_apply`, but additionally checks that `claimed_root` — the peer's
+/// claim the caller is about to trust and cache without a local recompute-and-compare against a
+/// certificate — matches the certificate's own `state_root` field. A certificate that verifies but
+/// certifies a *different* root than what the caller is about to trust must not pass: that would
+/// let a peer claim quorum backing for one root while feeding the apply path another.
+async fn verify_state_root_finality_for_apply(
+    store: &StorageManager,
+    dfs: &crate::dfs_store::LocalContentStore,
+    lsu: &catalyst_consensus::types::LedgerStateUpdate,
+    cycle: u64,
+    claimed_root: [u8; 32],
+    state_root_cid_hint: &str,
+    require_state_root_finality: bool,
+) -> bool {
+    let cid = if !state_root_cid_hint.is_empty() {
+        state_root_cid_hint.to_string()
+    } else {
+        match meta_string(store, &format!("consensus:lsu_state_root_cid:{}", cycle)).await {
+            Some(s) => s,
+            None => String::new(),
+        }
+    };
+
+    if !require_state_root_finality {
+        if cid.is_empty() {
+            return true;
+        }
+        if let Ok(bytes) = dfs.get(&cid).await {
+            if let Ok(cert) = bincode::deserialize::<catalyst_consensus::LsuStateRootCertificateV1>(&bytes) {
+                if catalyst_consensus::verify_lsu_state_root_certificate(&cert, lsu).is_err()
+                    || cert.state_root != claimed_root
+                {
+                    tracing::warn!(
+                        target: "catalyst.consensus.apply",
+                        "State-root certificate present but failed verification or root mismatch cycle={} cid={}",
+                        cycle,
+                        cid
+                    );
+                }
+            }
+        }
+        return true;
+    }
+
+    if cid.is_empty() {
+        tracing::warn!(
+            target: "catalyst.consensus.apply",
+            "State-root finality required but no state-root CID for cycle={}",
+            cycle
+        );
+        return false;
+    }
+    let Ok(bytes) = dfs.get(&cid).await else {
+        tracing::warn!(
+            target: "catalyst.consensus.apply",
+            "State-root finality required: missing certificate bytes cycle={} cid={}",
+            cycle,
+            cid
+        );
+        return false;
+    };
+    let Ok(cert) = bincode::deserialize::<catalyst_consensus::LsuStateRootCertificateV1>(&bytes) else {
+        tracing::warn!(
+            target: "catalyst.consensus.apply",
+            "State-root finality required: bad certificate encoding cycle={}",
+            cycle
+        );
+        return false;
+    };
+    if let Err(e) = catalyst_consensus::verify_lsu_state_root_certificate(&cert, lsu) {
+        tracing::warn!(
+            target: "catalyst.consensus.apply",
+            "State-root finality required: verify failed cycle={} err={}",
+            cycle,
+            e
+        );
+        return false;
+    }
+    if cert.state_root != claimed_root {
+        tracing::warn!(
+            target: "catalyst.consensus.apply",
+            "State-root finality required: certified root does not match claimed root cycle={} certified={} claimed={}",
+            cycle,
+            hex_encode(&cert.state_root),
+            hex_encode(&claimed_root)
+        );
+        return false;
+    }
+    true
+}
+
 /// Apply stored `consensus:lsu:{cycle}` when `cycle == local_applied + 1` (sequential follower catch-up).
 ///
 /// Holds `lsu_apply_lock` across its whole read-decide-apply sequence (not just the final write) so
@@ -3717,6 +3840,28 @@ async fn lsu_has_verified_finality_cert(
     catalyst_consensus::verify_lsu_finality_certificate(&cert, lsu).is_ok()
 }
 
+/// True when a verified ADR 0002 state-root certificate exists locally for this exact LSU at
+/// `cycle` (best-effort fork-choice tie-break signal only — see `ForkChoiceCandidate::state_root_certified`;
+/// correctness of applied state does not depend on this, only on the apply-path gating in
+/// `verify_state_root_finality_for_apply`).
+async fn lsu_has_verified_state_root_cert(
+    store: &StorageManager,
+    dfs: &crate::dfs_store::LocalContentStore,
+    lsu: &catalyst_consensus::types::LedgerStateUpdate,
+    cycle: u64,
+) -> bool {
+    let Some(cid) = meta_string(store, &format!("consensus:lsu_state_root_cid:{}", cycle)).await else {
+        return false;
+    };
+    let Ok(bytes) = dfs.get(&cid).await else {
+        return false;
+    };
+    let Ok(cert) = bincode::deserialize::<catalyst_consensus::LsuStateRootCertificateV1>(&bytes) else {
+        return false;
+    };
+    catalyst_consensus::verify_lsu_state_root_certificate(&cert, lsu).is_ok()
+}
+
 async fn fork_choice_candidate_for_lsu(
     store: &StorageManager,
     dfs: Option<&crate::dfs_store::LocalContentStore>,
@@ -3732,7 +3877,18 @@ async fn fork_choice_candidate_for_lsu(
         }
         None => false,
     };
-    crate::fork_choice::ForkChoiceCandidate::new(cycle, lsu_hash, lsu, certified, certified_only)
+    let state_root_certified = match dfs {
+        Some(dfs) => lsu_has_verified_state_root_cert(store, dfs, lsu, cycle).await,
+        None => false,
+    };
+    crate::fork_choice::ForkChoiceCandidate::new(
+        cycle,
+        lsu_hash,
+        lsu,
+        certified,
+        certified_only,
+        state_root_certified,
+    )
 }
 
 async fn load_fork_choice_candidate_at_cycle(
@@ -3928,6 +4084,174 @@ async fn ingest_finality_attestation(
         buckets,
         msg.cycle,
         msg.lsu_hash,
+        producer_id_for_broadcast,
+    )
+    .await;
+}
+
+/// ADR 0002: accumulates `StateRootAttestationMsg`s that agree on the same `(cycle, lsu_hash,
+/// state_root)`, kept as the HashMap key so a divergent minority's claimed root can never mix
+/// into a majority bucket for the same LSU (see `state_root_buckets` at node construction).
+#[derive(Clone, Default)]
+struct StateRootAttestationBucket {
+    chain_id: Option<u64>,
+    genesis_hash: Option<[u8; 32]>,
+    committee_hash: Option<[u8; 32]>,
+    attestations: std::collections::BTreeMap<String, Vec<u8>>,
+}
+
+fn state_root_bucket_matches_msg(
+    b: &StateRootAttestationBucket,
+    msg: &crate::sync::StateRootAttestationMsg,
+) -> bool {
+    b.chain_id.is_none()
+        || (b.chain_id == Some(msg.chain_id)
+            && b.genesis_hash == Some(msg.genesis_hash)
+            && b.committee_hash == Some(msg.committee_hash))
+}
+
+fn state_root_bucket_init_from_msg(
+    b: &mut StateRootAttestationBucket,
+    msg: &crate::sync::StateRootAttestationMsg,
+) {
+    b.chain_id = Some(msg.chain_id);
+    b.genesis_hash = Some(msg.genesis_hash);
+    b.committee_hash = Some(msg.committee_hash);
+}
+
+async fn try_publish_state_root_certificate_from_bucket(
+    store: &StorageManager,
+    dfs: &crate::dfs_store::LocalContentStore,
+    net: &Arc<P2pService>,
+    buckets: &Arc<RwLock<std::collections::HashMap<(u64, [u8; 32], [u8; 32]), StateRootAttestationBucket>>>,
+    cycle: u64,
+    lsu_hash: [u8; 32],
+    state_root: [u8; 32],
+    producer_id_for_broadcast: &str,
+) {
+    let meta_key = format!("consensus:lsu_state_root_cid:{}", cycle);
+    if meta_string(store, &meta_key).await.is_some() {
+        return;
+    }
+    let Some(lsu_bytes) = store
+        .get_metadata(&format!("consensus:lsu:{}", cycle))
+        .await
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let Ok(lsu) = catalyst_consensus::types::LedgerStateUpdate::deserialize(&lsu_bytes) else {
+        return;
+    };
+    let Ok(h) = catalyst_consensus::types::hash_data(&lsu) else {
+        return;
+    };
+    if h != lsu_hash {
+        return;
+    }
+    let bucket = {
+        let g = buckets.read().await;
+        g.get(&(cycle, lsu_hash, state_root)).cloned()
+    };
+    let Some(bucket) = bucket else { return };
+    let (Some(chain_id), Some(genesis_hash), Some(_ch)) =
+        (bucket.chain_id, bucket.genesis_hash, bucket.committee_hash)
+    else {
+        return;
+    };
+
+    let mut attestation_entries: Vec<catalyst_consensus::StateRootAttestation> = Vec::new();
+    for (pid, sig) in bucket.attestations {
+        if sig.len() != 64 {
+            continue;
+        }
+        if !lsu.producer_list.iter().any(|v| v == &pid) {
+            continue;
+        }
+        attestation_entries.push(catalyst_consensus::StateRootAttestation {
+            producer_id: pid,
+            signature: sig,
+        });
+    }
+    if attestation_entries.len() < crate::fork_choice::bft_vote_threshold(lsu.producer_list.len()) {
+        return;
+    }
+    let Ok(cert) = catalyst_consensus::LsuStateRootCertificateV1::from_lsu_and_attestations(
+        &lsu,
+        chain_id,
+        genesis_hash,
+        lsu_hash,
+        state_root,
+        attestation_entries,
+    ) else {
+        return;
+    };
+    if catalyst_consensus::verify_lsu_state_root_certificate(&cert, &lsu).is_err() {
+        return;
+    }
+    let Ok(blob) = bincode::serialize(&cert) else {
+        return;
+    };
+    let Some(cid) = dfs.put(blob).await.ok() else {
+        return;
+    };
+    let _ = store.set_metadata(&meta_key, cid.as_bytes()).await;
+    let msg = crate::sync::StateRootFinalityCidMsg {
+        cycle,
+        lsu_hash,
+        state_root,
+        state_root_cid: cid,
+    };
+    if let Ok(env) = MessageEnvelope::from_message(&msg, producer_id_for_broadcast.to_string(), None) {
+        let _ = net.broadcast_envelope(&env).await;
+    }
+    info!("Published LSU state-root certificate cycle={} state_root={}", cycle, hex_encode(&state_root));
+}
+
+async fn ingest_state_root_attestation(
+    store: &StorageManager,
+    dfs: &crate::dfs_store::LocalContentStore,
+    net: &Arc<P2pService>,
+    buckets: &Arc<RwLock<std::collections::HashMap<(u64, [u8; 32], [u8; 32]), StateRootAttestationBucket>>>,
+    msg: &crate::sync::StateRootAttestationMsg,
+    producer_id_for_broadcast: &str,
+) {
+    if msg.signature.len() != 64 {
+        return;
+    }
+    if catalyst_consensus::verify_state_root_attestation(
+        msg.chain_id,
+        &msg.genesis_hash,
+        msg.cycle,
+        &msg.lsu_hash,
+        &msg.committee_hash,
+        &msg.state_root,
+        &msg.producer_id,
+        &msg.signature,
+    )
+    .is_err()
+    {
+        return;
+    }
+    {
+        let mut g = buckets.write().await;
+        let b = g.entry((msg.cycle, msg.lsu_hash, msg.state_root)).or_default();
+        if b.chain_id.is_none() {
+            state_root_bucket_init_from_msg(b, msg);
+        } else if !state_root_bucket_matches_msg(b, msg) {
+            return;
+        }
+        b.attestations.insert(msg.producer_id.clone(), msg.signature.clone());
+    }
+    try_publish_state_root_certificate_from_bucket(
+        store,
+        dfs,
+        net,
+        buckets,
+        msg.cycle,
+        msg.lsu_hash,
+        msg.state_root,
         producer_id_for_broadcast,
     )
     .await;
@@ -4259,6 +4583,7 @@ async fn try_reconcile_fork_from_quorum_lsu(
                     );
                 }
                 catalyst_utils::increment_counter!("consensus_fork_reconcile_aborted_total", 1);
+                catalyst_utils::increment_counter!("consensus_fork_reconcile_no_checkpoint_total", 1);
                 return Ok(None);
             }
         }
@@ -4957,6 +5282,12 @@ impl CatalystNode {
             RwLock<std::collections::HashMap<(u64, [u8; 32]), FinalityAttestationBucket>>,
         > = Arc::new(RwLock::new(std::collections::HashMap::new()));
 
+        // ADR 0002: state-root attestation buckets, keyed by (cycle, lsu_hash, state_root) so a
+        // divergent minority's claimed root can never poison a majority bucket for the same LSU.
+        let state_root_buckets: Arc<
+            RwLock<std::collections::HashMap<(u64, [u8; 32], [u8; 32]), StateRootAttestationBucket>>,
+        > = Arc::new(RwLock::new(std::collections::HashMap::new()));
+
         let validator_signing_key = crate::identity::load_or_generate_private_key(
             &self.config.node.private_key_file,
             self.config.node.auto_generate_identity,
@@ -5019,6 +5350,7 @@ impl CatalystNode {
             let gossip_cycle_ms: u64 = (self.config.consensus.cycle_duration_seconds as u64)
                 .saturating_mul(1000);
             let finality_buckets_in = finality_buckets.clone();
+            let state_root_buckets_in = state_root_buckets.clone();
             #[derive(Clone)]
             struct PendingLsuFetch {
                 cycle: u64,
@@ -5027,6 +5359,7 @@ impl CatalystNode {
                 expected_state_root: [u8; 32],
                 proof_cid: String,
                 finality_cid: String,
+                state_root_cid: String,
                 attempts: u32,
                 next_retry_at_ms: u64,
             }
@@ -5331,6 +5664,8 @@ impl CatalystNode {
             });
             let require_lsu_finality_effective =
                 crate::consensus_limits::effective_require_lsu_finality(&self.config);
+            let require_state_root_finality_effective =
+                crate::consensus_limits::effective_require_state_root_finality(&self.config);
             let handle = tokio::spawn(async move {
                 while let Some(ev) = events.recv().await {
                     if let catalyst_network::NetworkEvent::MessageReceived { envelope, .. } = ev {
@@ -5840,6 +6175,16 @@ impl CatalystNode {
                                                                             && bundle.new_state_root == ref_msg.state_root
                                                                             && bundle.lsu_hash == ref_msg.lsu_hash
                                                                             && verify_state_transition_bundle(&lsu, &bundle)
+                                                                            && verify_state_root_finality_for_apply(
+                                                                                store.as_ref(),
+                                                                                dfs,
+                                                                                &lsu,
+                                                                                ref_msg.cycle,
+                                                                                bundle.new_state_root,
+                                                                                &ref_msg.state_root_cid,
+                                                                                require_state_root_finality_effective,
+                                                                            )
+                                                                            .await
                                                                         {
                                                                             if apply_lsu_to_storage_without_root_check(
                                                                                 store.as_ref(),
@@ -5971,6 +6316,7 @@ impl CatalystNode {
                                                     expected_state_root: ref_msg.state_root,
                                                     proof_cid: ref_msg.proof_cid.clone(),
                                                     finality_cid: ref_msg.finality_cid.clone(),
+                                                    state_root_cid: ref_msg.state_root_cid.clone(),
                                                     attempts: 0,
                                                     next_retry_at_ms: 0,
                                                 },
@@ -6242,6 +6588,103 @@ impl CatalystNode {
                                     let _ = net.broadcast_envelope(&envelope).await;
                                 }
                             }
+                        } else if envelope.message_type == MessageType::StateRootAttestation {
+                            if let Ok(msg) = envelope.extract_message::<StateRootAttestationMsg>() {
+                                if !crate::consensus_limits::p2p_lsu_cycle_within_wall_lead(
+                                    msg.cycle,
+                                    now_ms,
+                                    gossip_cycle_ms,
+                                    lsu_wall_lead_cap,
+                                ) {
+                                    tracing::debug!(
+                                        target: "catalyst.consensus.policy",
+                                        cycle = msg.cycle,
+                                        "dropping StateRootAttestationMsg: cycle too far ahead of wall clock"
+                                    );
+                                    catalyst_utils::increment_counter!(
+                                        "consensus_p2p_lsu_cycle_rejected_total",
+                                        1
+                                    );
+                                    continue;
+                                }
+                                let Some(store) = &storage else {
+                                    continue;
+                                };
+                                let Some(dfs) = &dfs else {
+                                    continue;
+                                };
+                                ingest_state_root_attestation(
+                                    store.as_ref(),
+                                    dfs,
+                                    &net,
+                                    &state_root_buckets_in,
+                                    &msg,
+                                    &producer_id_self,
+                                )
+                                .await;
+                                let do_relay = {
+                                    let mut rc = relay_cache.lock().await;
+                                    rc.should_relay(&envelope, now_ms)
+                                };
+                                if do_relay {
+                                    let _ = net.broadcast_envelope(&envelope).await;
+                                }
+                            }
+                        } else if envelope.message_type == MessageType::StateRootFinalityCid {
+                            if let Ok(msg) = envelope.extract_message::<StateRootFinalityCidMsg>() {
+                                if !crate::consensus_limits::p2p_lsu_cycle_within_wall_lead(
+                                    msg.cycle,
+                                    now_ms,
+                                    gossip_cycle_ms,
+                                    lsu_wall_lead_cap,
+                                ) {
+                                    tracing::debug!(
+                                        target: "catalyst.consensus.policy",
+                                        cycle = msg.cycle,
+                                        "dropping StateRootFinalityCidMsg: cycle too far ahead of wall clock"
+                                    );
+                                    catalyst_utils::increment_counter!(
+                                        "consensus_p2p_lsu_cycle_rejected_total",
+                                        1
+                                    );
+                                    continue;
+                                }
+                                if let Some(store) = &storage {
+                                    let _ = store
+                                        .set_metadata(
+                                            &format!("consensus:lsu_state_root_cid:{}", msg.cycle),
+                                            msg.state_root_cid.as_bytes(),
+                                        )
+                                        .await;
+                                }
+                                // State-root cert bytes live in the local DFS cache. Fetch via P2P if missing.
+                                if !msg.state_root_cid.is_empty() {
+                                    let need_fetch = match &dfs {
+                                        Some(d) => !d.has(&msg.state_root_cid).await,
+                                        None => true,
+                                    };
+                                    if need_fetch {
+                                        let req = FileRequestMsg {
+                                            requester: producer_id_self.clone(),
+                                            cid: msg.state_root_cid.clone(),
+                                        };
+                                        if let Ok(env) = MessageEnvelope::from_message(
+                                            &req,
+                                            "file_req_state_root_cid".to_string(),
+                                            None,
+                                        ) {
+                                            let _ = net.broadcast_envelope(&env).await;
+                                        }
+                                    }
+                                }
+                                let do_relay = {
+                                    let mut rc = relay_cache.lock().await;
+                                    rc.should_relay(&envelope, now_ms)
+                                };
+                                if do_relay {
+                                    let _ = net.broadcast_envelope(&envelope).await;
+                                }
+                            }
                         } else if envelope.message_type == MessageType::StateRequest {
                             if let Ok(req) = envelope.extract_message::<LsuRangeRequest>() {
                                 if !crate::consensus_limits::p2p_lsu_cycle_within_wall_lead(
@@ -6293,6 +6736,12 @@ impl CatalystNode {
                                     )
                                     .await
                                     .unwrap_or_default();
+                                    let state_root_cid = meta_string(
+                                        store.as_ref(),
+                                        &format!("consensus:lsu_state_root_cid:{}", cycle),
+                                    )
+                                    .await
+                                    .unwrap_or_default();
                                     refs.push(LsuCidGossip {
                                         cycle,
                                         lsu_hash,
@@ -6301,6 +6750,7 @@ impl CatalystNode {
                                         state_root,
                                         proof_cid: String::new(),
                                         finality_cid,
+                                        state_root_cid,
                                     });
                                 }
                                 if refs.is_empty() {
@@ -6423,6 +6873,7 @@ impl CatalystNode {
                                             expected_state_root: r.state_root,
                                             proof_cid: r.proof_cid.clone(),
                                             finality_cid: r.finality_cid.clone(),
+                                            state_root_cid: r.state_root_cid.clone(),
                                             attempts: 0,
                                             next_retry_at_ms: 0,
                                         },
@@ -6638,6 +7089,16 @@ impl CatalystNode {
                                                                     && verify_state_transition_bundle(
                                                                         &lsu, &bundle,
                                                                     )
+                                                                    && verify_state_root_finality_for_apply(
+                                                                        store.as_ref(),
+                                                                        dfs,
+                                                                        &lsu,
+                                                                        info.cycle,
+                                                                        bundle.new_state_root,
+                                                                        &info.state_root_cid,
+                                                                        require_state_root_finality_effective,
+                                                                    )
+                                                                    .await
                                                                 {
                                                                     ok = apply_lsu_to_storage_without_root_check(
                                                                         store.as_ref(),
@@ -6854,6 +7315,7 @@ impl CatalystNode {
             let validator_worker_ids_hex = validator_worker_ids_hex.clone();
             let max_entries_per_cycle = self.config.consensus.max_transactions_per_block as usize;
             let finality_buckets_consensus = finality_buckets.clone();
+            let state_root_buckets_consensus = state_root_buckets.clone();
             let validator_signing_key_consensus = validator_signing_key.clone();
             let tx_batches_consensus = tx_batches.clone();
             let tx_batch_commits_consensus = tx_batch_commits.clone();
@@ -7237,6 +7699,16 @@ impl CatalystNode {
                                             } else {
                                                 String::new()
                                             };
+                                            let state_root_cid_for_gossip = if let Some(store) = &storage {
+                                                meta_string(
+                                                    store.as_ref(),
+                                                    &format!("consensus:lsu_state_root_cid:{}", cycle),
+                                                )
+                                                .await
+                                                .unwrap_or_default()
+                                            } else {
+                                                String::new()
+                                            };
                                             let msg = LsuCidGossip {
                                                 cycle,
                                                 lsu_hash,
@@ -7245,6 +7717,7 @@ impl CatalystNode {
                                                 state_root,
                                                 proof_cid: proof_cid_for_msg,
                                                 finality_cid: finality_cid_for_gossip,
+                                                state_root_cid: state_root_cid_for_gossip,
                                             };
                                             if let Ok(env) = MessageEnvelope::from_message(&msg, "lsu_cid".to_string(), None) {
                                                 let _ = network.broadcast_envelope(&env).await;
@@ -7324,6 +7797,64 @@ impl CatalystNode {
                                                             if let Ok(env) =
                                                                 MessageEnvelope::from_message(&attest, "fin_att".to_string(), None)
                                                             {
+                                                                let _ = network.broadcast_envelope(&env).await;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            // ADR 0002: sign and gossip this validator's independently-computed
+                                            // state_root attestation; merge quorum certificate. Every producer in
+                                            // producer_list attests (not just the leader), matching ADR 0001's model —
+                                            // this is what turns `state_root` from one peer's claim into a BFT fact.
+                                            if let (Some(store), Some(sk)) =
+                                                (storage.as_ref(), validator_signing_key_consensus.as_ref())
+                                            {
+                                                if update.producer_list.iter().any(|v| v == &producer_id) {
+                                                    let chain_id = load_chain_id_u64(store.as_ref()).await;
+                                                    let genesis_hash = load_genesis_hash_32(store.as_ref()).await;
+                                                    if let (Ok(lsu_hash), Some(ch)) = (
+                                                        catalyst_consensus::types::hash_data(&update),
+                                                        catalyst_consensus::committee_hash_ordered_producer_list(
+                                                            &update.producer_list,
+                                                        ),
+                                                    ) {
+                                                        let h_root = catalyst_consensus::h_root_v1(
+                                                            chain_id,
+                                                            &genesis_hash,
+                                                            cycle,
+                                                            &lsu_hash,
+                                                            &ch,
+                                                            &state_root,
+                                                        );
+                                                        let mut rng = rand::rngs::OsRng;
+                                                        let scheme = catalyst_crypto::signatures::SignatureScheme::new();
+                                                        if let Ok(sig) = scheme.sign(&mut rng, sk, &h_root) {
+                                                            let attest = StateRootAttestationMsg {
+                                                                chain_id,
+                                                                genesis_hash,
+                                                                cycle,
+                                                                lsu_hash,
+                                                                committee_hash: ch,
+                                                                state_root,
+                                                                producer_id: producer_id.clone(),
+                                                                signature: sig.to_bytes().to_vec(),
+                                                            };
+                                                            ingest_state_root_attestation(
+                                                                store.as_ref(),
+                                                                dfs,
+                                                                &network,
+                                                                &state_root_buckets_consensus,
+                                                                &attest,
+                                                                &producer_id,
+                                                            )
+                                                            .await;
+                                                            if let Ok(env) = MessageEnvelope::from_message(
+                                                                &attest,
+                                                                "root_att".to_string(),
+                                                                None,
+                                                            ) {
                                                                 let _ = network.broadcast_envelope(&env).await;
                                                             }
                                                         }
@@ -7844,7 +8375,7 @@ mod fork_choice_integration_tests {
         fork_choice_apply_gate, get_balance_i64, hex_encode, load_stored_certified_hash_at_cycle,
         local_applied_cycle, local_applied_lsu_hash, local_applied_state_root, persist_lsu_history,
         reconcile_failure_state_for_test, set_balance_i64, try_reconcile_fork_from_quorum_lsu,
-        try_reorg_stronger_lsu_at_applied_cycle, ForkChoiceApplyGate,
+        try_reorg_stronger_lsu_at_applied_cycle, verify_state_root_finality_for_apply, ForkChoiceApplyGate,
     };
     use crate::config::NodeConfig;
     use crate::dfs_store::LocalContentStore;
@@ -7853,8 +8384,9 @@ mod fork_choice_integration_tests {
         TransactionEntry,
     };
     use catalyst_consensus::{
-        h_cert_v1, committee_hash_ordered_producer_list, verify_lsu_finality_certificate,
-        LsuFinalityCertificateV1, ProducerFinalityVote, FINALITY_CERT_STYLE_INDIVIDUAL,
+        h_cert_v1, h_root_v1, committee_hash_ordered_producer_list, verify_lsu_finality_certificate,
+        LsuFinalityCertificateV1, LsuStateRootCertificateV1, ProducerFinalityVote, StateRootAttestation,
+        FINALITY_CERT_STYLE_INDIVIDUAL,
     };
     use catalyst_crypto::{PrivateKey, SignatureScheme};
     use catalyst_storage::{StorageConfig, StorageManager};
@@ -8006,6 +8538,49 @@ mod fork_choice_integration_tests {
             )
             .await;
         cid
+    }
+
+    /// Builds and DFS-publishes an ADR 0002 `LsuStateRootCertificateV1` for `state_root`, signed by
+    /// the first two committee members (matches `install_finality_cert`'s quorum-of-2-of-3 shape).
+    /// Does NOT persist the `consensus:lsu_state_root_cid:{cycle}` metadata pointer — callers pass
+    /// the returned CID directly as a hint, mirroring how a fresh gossip message would arrive.
+    async fn install_state_root_cert(
+        env: &TestEnv,
+        lsu: &LedgerStateUpdate,
+        committee: &TestCommittee,
+        state_root: [u8; 32],
+    ) -> String {
+        let lsu_hash = hash_data(lsu).expect("lsu hash");
+        let committee_hash =
+            committee_hash_ordered_producer_list(&lsu.producer_list).expect("committee hash");
+        let h = h_root_v1(
+            env.chain_id,
+            &env.genesis_hash,
+            lsu.cycle_number,
+            &lsu_hash,
+            &committee_hash,
+            &state_root,
+        );
+        let mut rng = OsRng;
+        let scheme = SignatureScheme::new();
+        let sig_a = scheme.sign(&mut rng, &committee.keys[0], &h).expect("sign a").to_bytes();
+        let sig_b = scheme.sign(&mut rng, &committee.keys[1], &h).expect("sign b").to_bytes();
+        let cert = LsuStateRootCertificateV1 {
+            version: 1,
+            chain_id: env.chain_id,
+            genesis_hash: env.genesis_hash,
+            cycle: lsu.cycle_number,
+            lsu_hash,
+            state_root,
+            committee_hash,
+            attestations: vec![
+                StateRootAttestation { producer_id: committee.ids[0].clone(), signature: sig_a.to_vec() },
+                StateRootAttestation { producer_id: committee.ids[1].clone(), signature: sig_b.to_vec() },
+            ],
+        };
+        catalyst_consensus::verify_lsu_state_root_certificate(&cert, lsu).expect("cert verifies");
+        let blob = bincode::serialize(&cert).expect("encode cert");
+        env.dfs.put(blob).await.expect("dfs put")
     }
 
     async fn canonical_hash_at_cycle(store: &StorageManager, cycle: u64) -> Option<[u8; 32]> {
@@ -8991,6 +9566,105 @@ mod fork_choice_integration_tests {
             env.store.get_metadata("consensus:lsu_hash:1").await.ok().flatten().is_none(),
             "rejected claim must not leave a stray consensus:lsu_hash:{{cycle}} record behind"
         );
+    }
+
+    /// ADR 0002 apply-path gate (`verify_state_root_finality_for_apply`): when
+    /// `require_state_root_finality` is off (default during rollout), the trusted apply path must
+    /// proceed even with no certificate present — this is the coordinated-upgrade tolerance every
+    /// prior ADR 0001 field also needed.
+    #[tokio::test]
+    async fn state_root_finality_gate_passes_when_not_required_and_no_cert() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let lsu = lsu_with_tx_seed(&committee, 1, 5);
+        let claimed_root = [7u8; 32];
+
+        let ok = verify_state_root_finality_for_apply(
+            &env.store,
+            &env.dfs,
+            &lsu,
+            lsu.cycle_number,
+            claimed_root,
+            "",
+            false,
+        )
+        .await;
+        assert!(ok, "must not block the trusted apply path while the feature is off");
+    }
+
+    /// When `require_state_root_finality` is on, a missing certificate must block the trusted
+    /// apply path rather than silently trusting the peer's claimed root (closes the gap the
+    /// reliability review flagged: "nothing forces two nodes' pre-apply state to be provably
+    /// identical" — a required cert is exactly that "something").
+    #[tokio::test]
+    async fn state_root_finality_gate_rejects_missing_cert_when_required() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let lsu = lsu_with_tx_seed(&committee, 1, 5);
+        let claimed_root = [7u8; 32];
+
+        let ok = verify_state_root_finality_for_apply(
+            &env.store,
+            &env.dfs,
+            &lsu,
+            lsu.cycle_number,
+            claimed_root,
+            "",
+            true,
+        )
+        .await;
+        assert!(!ok, "required finality with no certificate must reject");
+    }
+
+    /// A valid, BFT-quorum-signed `LsuStateRootCertificateV1` whose certified root matches the
+    /// claimed root must pass the gate when required — the intended happy path.
+    #[tokio::test]
+    async fn state_root_finality_gate_accepts_valid_matching_cert_when_required() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let lsu = lsu_with_tx_seed(&committee, 1, 5);
+        let state_root = [42u8; 32];
+        let cid = install_state_root_cert(&env, &lsu, &committee, state_root).await;
+
+        let ok = verify_state_root_finality_for_apply(
+            &env.store,
+            &env.dfs,
+            &lsu,
+            lsu.cycle_number,
+            state_root,
+            &cid,
+            true,
+        )
+        .await;
+        assert!(ok, "valid certificate matching the claimed root must be accepted");
+    }
+
+    /// A certificate that verifies on its own terms but certifies a *different* root than the one
+    /// the caller is about to trust must still be rejected — otherwise a peer could present a
+    /// genuine quorum certificate for one root while feeding the apply path a different claimed
+    /// root, defeating the point of certifying `state_root` at all.
+    #[tokio::test]
+    async fn state_root_finality_gate_rejects_cert_for_different_root_than_claimed() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let lsu = lsu_with_tx_seed(&committee, 1, 5);
+        let certified_root = [42u8; 32];
+        let cid = install_state_root_cert(&env, &lsu, &committee, certified_root).await;
+
+        let mut claimed_root = certified_root;
+        claimed_root[0] ^= 0xFF;
+
+        let ok = verify_state_root_finality_for_apply(
+            &env.store,
+            &env.dfs,
+            &lsu,
+            lsu.cycle_number,
+            claimed_root,
+            &cid,
+            true,
+        )
+        .await;
+        assert!(!ok, "certificate for a different root than the claimed one must be rejected");
     }
 
     /// Regression test for the "LSU history not persisted" bug: applying a cycle via the L2

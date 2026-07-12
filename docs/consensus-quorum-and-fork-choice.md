@@ -8,6 +8,8 @@ This document captures **protocol intent** and **implementation** for Catalyst v
 
 Operators have observed that validators can **diverge** (same logical cycle/height, different `state_root`) and **do not self-heal**. Follower logic must **reorganize** to **quorum-finalized / certified** history—not skip indefinitely.
 
+This document originally covered only the LSU **recipe** (`lsu_hash`, ADR 0001) — a quorum can be certified as having agreed on the same recipe while still independently computing different `state_root`s from it, exactly the divergence described above; see [`consensus-reliability-review-2026-07.md`](./consensus-reliability-review-2026-07.md) for the production incident that surfaced this. [ADR 0002](./adr/0002-canonical-state-root-and-proofs.md) closes that gap with a second, additive certificate over the applied *result*.
+
 For production and for growing validator sets, the network must:
 
 1. **Finalize** ledger updates only when a **defined quorum** of block producers agrees (ADR 0001 certificate).
@@ -43,7 +45,11 @@ When two different LSU payloads compete at the **same** `cycle_number`, nodes us
    - **`Certified`**: verified ADR 0001 certificate for that `lsu_hash`.
    - **`QuorumInferred`**: `vote_list` meets ⌈2n/3⌉ ⊆ `producer_list` (only when **not** `certified_only`).
    - **`None`**: does not compete for canonical slot.
-2. **Tie-break** (equal tier, different hash): **lexicographically smaller `lsu_hash`**.
+2. **State-root tie-break** (equal tier, different hash): a candidate additionally backed by a verified
+   ADR 0002 `LsuStateRootCertificateV1` (`ForkChoiceCandidate.state_root_certified`) wins over one that
+   is not. This never promotes a candidate above a higher tier — tier remains defined purely over
+   LSU-recipe evidence.
+3. **Hash tie-break** (equal tier, equal state-root-certified status, different hash): **lexicographically smaller `lsu_hash`**.
 
 Weaker competitors are rejected (`consensus_fork_choice_rejected_weaker_total`). Under `certified_only`, non-certified LSUs are rejected (`consensus_fork_choice_rejected_non_certified_total`).
 

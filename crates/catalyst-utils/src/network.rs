@@ -162,7 +162,11 @@ pub enum MessageType {
     LsuFinalityAttestation,
     /// ADR 0001: DFS content id for `LsuFinalityCertificateV1` (bincode).
     LsuFinalityCid,
-    
+    /// ADR 0002: one producer's signature over `H_root` for an LSU's applied state_root.
+    StateRootAttestation,
+    /// ADR 0002: DFS content id for `LsuStateRootCertificateV1` (bincode).
+    StateRootFinalityCid,
+
     // Custom/Extension types for future use
     Custom(u16),
 }
@@ -177,7 +181,9 @@ impl MessageType {
             MessageType::ProducerOutput |
             MessageType::ConsensusSync |
             MessageType::LsuFinalityAttestation |
-            MessageType::LsuFinalityCid
+            MessageType::LsuFinalityCid |
+            MessageType::StateRootAttestation |
+            MessageType::StateRootFinalityCid
         )
     }
     
@@ -248,6 +254,8 @@ impl fmt::Display for MessageType {
             MessageType::ErrorResponse => write!(f, "error_response"),
             MessageType::LsuFinalityAttestation => write!(f, "lsu_finality_attestation"),
             MessageType::LsuFinalityCid => write!(f, "lsu_finality_cid"),
+            MessageType::StateRootAttestation => write!(f, "state_root_attestation"),
+            MessageType::StateRootFinalityCid => write!(f, "state_root_finality_cid"),
             MessageType::Custom(id) => write!(f, "custom_{}", id),
         }
     }

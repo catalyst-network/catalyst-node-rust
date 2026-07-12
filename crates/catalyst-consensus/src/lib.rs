@@ -13,6 +13,9 @@ pub mod consensus;
 /// LSU finality certificate (ADR 0001).
 pub mod lsu_finality;
 
+/// Certified state-root attestation (ADR 0002), companion to `lsu_finality`.
+pub mod state_root_finality;
+
 pub mod convergence_test_support;
 
 pub use consensus::CollaborativeConsensus;
@@ -21,6 +24,11 @@ pub use lsu_finality::{
     bft_vote_threshold, committee_hash_ordered_producer_list, h_cert_v1, parse_producer_hex32,
     verify_finality_attestation, verify_lsu_finality_certificate, LsuFinalityCertificateV1,
     LsuFinalityVerifyError, ProducerFinalityVote, FINALITY_CERT_STYLE_INDIVIDUAL, MAX_FINALITY_VOTES,
+};
+pub use state_root_finality::{
+    h_root_v1, verify_lsu_state_root_certificate, verify_state_root_attestation,
+    LsuStateRootCertificateV1, StateRootAttestation, StateRootVerifyError,
+    MAX_STATE_ROOT_ATTESTATIONS,
 };
 pub use types::{
     ConsensusConfig, CycleNumber, ProducerCandidate, ProducerId, ProducerOutput, ProducerQuantity, ProducerVote,

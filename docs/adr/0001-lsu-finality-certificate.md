@@ -150,6 +150,9 @@ If any step fails, the LSU is **not** treated as **final** under this ADR.
 - Slashing proofs or on-chain enforcement of equivocation (can be layered later using individual signatures from Style A).
 - Light-client-optimized **checkpoint** certificates spanning many cycles (separate ADR).
 - Replacing **`StateProofBundle`**; it remains the **execution** proof path.
+- **Certifying `state_root` itself** — this certificate covers the LSU *recipe* (`lsu_hash`) only; the
+  *result* of applying it is covered by the separate, additive
+  [ADR 0002](./0002-canonical-state-root-and-proofs.md) `LsuStateRootCertificateV1`.
 
 ## Consequences
 
