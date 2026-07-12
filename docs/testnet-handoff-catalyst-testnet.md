@@ -2,12 +2,23 @@
 
 This file is intended to be handed to an external agent/tooling team building a block explorer/indexer.
 
+> **2026-07-12 genesis reset.** `us`/`asia`/`rpc` had been offline since 2026-07-04 and had fallen
+> too far behind the wall-clock cycle to rejoin via normal replay (`try_reconcile_fork_from_quorum_lsu`
+> caps replay depth). The fleet was recovered via a full coordinated reset
+> (`scripts/catalyst_fleet_reset.sh`): all four nodes stopped, data wiped, restarted together from a
+> fresh genesis. `chain_id`/`network_id` are unchanged, but **`genesis_hash` changed** (genesis hash
+> is deterministic over `(mode, chain_id, network_id, faucet_pubkey, faucet_balance)`, and a fresh
+> genesis apply is a new `mode: "fresh"` descriptor even with identical config). All pre-reset chain
+> history and account balances are gone. See `docs/consensus-reliability-review-2026-07.md` for the
+> underlying incident this reset was recovering from. Old genesis hash (now invalid):
+> `0xeea16848e6b1d39d6b7a5e094ad9189d5382a6a4b19fb95342ef9846258fee5a`.
+
 ## Network identity (MUST match)
 
 - **network_id**: `catalyst-testnet`
 - **chain_id (decimal)**: `200820092`
 - **chain_id (hex)**: `0xbf8457c`
-- **genesis_hash**: `0xeea16848e6b1d39d6b7a5e094ad9189d5382a6a4b19fb95342ef9846258fee5a`
+- **genesis_hash**: `0x32bceec02712a1184f788ce4aebf3472e98be2f09ffd5e356148e13a01f7ea9d` (since 2026-07-12; see reset note above)
 
 If these don’t match what the explorer sees from RPC, it is indexing the wrong chain.
 
@@ -42,7 +53,7 @@ curl -s -X POST "$RPC_URL" -H 'content-type: application/json' \
 Expected fields:
 - `chain_id` == `0xbf8457c`
 - `network_id` == `catalyst-testnet`
-- `genesis_hash` == `0xeea16848e6b1d39d6b7a5e094ad9189d5382a6a4b19fb95342ef9846258fee5a`
+- `genesis_hash` == `0x32bceec02712a1184f788ce4aebf3472e98be2f09ffd5e356148e13a01f7ea9d`
 
 ### 2) Confirm the network is live
 

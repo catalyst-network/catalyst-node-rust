@@ -9,12 +9,16 @@ It combines:
 
 ## Live network parameters (as deployed)
 
+> **2026-07-12 genesis reset**: `genesis_hash` changed below (fleet recovery after a >1 week outage
+> on 3 of 4 validators; see `docs/testnet-handoff-catalyst-testnet.md` for details). `chain_id` is
+> unchanged, but **any transaction signed against the old `genesis_hash` is now invalid**.
+
 ### Chain identity (MUST match)
 
 - **network_id**: `catalyst-testnet`
 - **chain_id (decimal)**: `200820092`
 - **chain_id (hex)**: `0xbf8457c`
-- **genesis_hash**: `0xeea16848e6b1d39d6b7a5e094ad9189d5382a6a4b19fb95342ef9846258fee5a`
+- **genesis_hash**: `0x32bceec02712a1184f788ce4aebf3472e98be2f09ffd5e356148e13a01f7ea9d`
 
 Wallets must bind signatures to \(`chain_id`, `genesis_hash`\) using the v1 signing payload.
 
