@@ -1268,14 +1268,25 @@ const RECONCILE_FAILURE_TRACKER_MAX_ENTRIES: usize = 2000;
 const RECONCILE_FAILURE_TRACKER_TARGET_ENTRIES: usize = 1500;
 const RECONCILE_FAILURE_TRACKER_RETENTION_MS: u64 = 10 * 60 * 1000;
 
-/// Tracks consecutive `try_reconcile_fork_from_quorum_lsu` failures per `(cycle, lsu_hash)` to
-/// back the circuit breaker (see `consensus_limits::reconcile_circuit_break_threshold`), so a
-/// genuinely unrecoverable divergence stops retrying identically forever at WARN level with no
-/// operator signal (the busy-loop failure mode observed in production: 55k+ failed reconcile
-/// attempts over 3 days). Bounded like `RelayCache` above: prune stale (non-broken) entries by
-/// timestamp, then cap by count if still oversized.
+/// Tracks consecutive `try_reconcile_fork_from_quorum_lsu` failures per **`local_cycle`** (the
+/// node's own stuck applied-head position at the time of the attempt) to back the circuit breaker
+/// (see `consensus_limits::reconcile_circuit_break_threshold`), so a genuinely unrecoverable
+/// divergence stops retrying identically forever at WARN/ERROR level with no operator signal.
+///
+/// Keyed on `local_cycle`, NOT on the target `(cycle, lsu_hash)` being reconciled *to*: a stuck
+/// node gets re-triggered with a *new, ever-increasing* target cycle/hash on every subsequent
+/// wall-clock tick (each newly-gossiped LSU is a fresh reconcile attempt), so a target-keyed
+/// breaker never accumulates enough repeats on the same key to trip — this was an actual bug in
+/// the first version of this breaker, caught live: a node stuck unable to bridge a genuinely
+/// missing gap cycle kept calling `resolve_replay_start` (and logging
+/// "Quorum fork reconcile FAILED: missing stored LSU...") every ~20s indefinitely, because that
+/// failure path returns before ever reaching the target-keyed check. `local_cycle` is the thing
+/// that's actually invariant while stuck, and naturally stops mattering the moment it advances.
+///
+/// Bounded like `RelayCache` above: prune stale (non-broken) entries by timestamp, then cap by
+/// count if still oversized.
 struct ReconcileFailureTracker {
-    entries: std::collections::HashMap<(u64, [u8; 32]), ReconcileFailureEntry>,
+    entries: std::collections::HashMap<u64, ReconcileFailureEntry>,
 }
 
 impl ReconcileFailureTracker {
@@ -1290,7 +1301,7 @@ impl ReconcileFailureTracker {
         self.entries
             .retain(|_, e| e.broken || e.last_seen_ms >= keep_after);
         if self.entries.len() > RECONCILE_FAILURE_TRACKER_MAX_ENTRIES {
-            let mut v: Vec<((u64, [u8; 32]), u64)> = self
+            let mut v: Vec<(u64, u64)> = self
                 .entries
                 .iter()
                 .map(|(k, e)| (*k, e.last_seen_ms))
@@ -1312,22 +1323,22 @@ fn reconcile_failure_tracker() -> &'static tokio::sync::Mutex<ReconcileFailureTr
     TRACKER.get_or_init(|| tokio::sync::Mutex::new(ReconcileFailureTracker::new()))
 }
 
-/// True if reconcile attempts for this `(cycle, lsu_hash)` should be skipped without doing the
-/// expensive purge/replay — the circuit breaker has tripped.
-async fn reconcile_circuit_is_broken(cycle: u64, lsu_hash: [u8; 32]) -> bool {
+/// True if reconcile attempts while stuck at this `local_cycle` should be skipped entirely — the
+/// circuit breaker has tripped.
+async fn reconcile_circuit_is_broken(local_cycle: u64) -> bool {
     let tracker = reconcile_failure_tracker().lock().await;
     tracker
         .entries
-        .get(&(cycle, lsu_hash))
+        .get(&local_cycle)
         .map(|e| e.broken)
         .unwrap_or(false)
 }
 
-/// Records a reconcile failure for `(cycle, lsu_hash)`, tripping the circuit breaker after
+/// Records a reconcile failure while stuck at `local_cycle`, tripping the circuit breaker after
 /// `reconcile_circuit_break_threshold()` consecutive failures within
 /// `reconcile_circuit_break_window_ms()` of each other. Returns true exactly on the transition
 /// into "broken" (so the caller can emit a one-time escalated log instead of repeating it).
-async fn record_reconcile_failure(cycle: u64, lsu_hash: [u8; 32]) -> bool {
+async fn record_reconcile_failure(local_cycle: u64) -> bool {
     let now_ms = current_timestamp_ms();
     let mut tracker = reconcile_failure_tracker().lock().await;
     tracker.prune(now_ms);
@@ -1335,7 +1346,7 @@ async fn record_reconcile_failure(cycle: u64, lsu_hash: [u8; 32]) -> bool {
     let threshold = crate::consensus_limits::reconcile_circuit_break_threshold();
     let entry = tracker
         .entries
-        .entry((cycle, lsu_hash))
+        .entry(local_cycle)
         .or_insert(ReconcileFailureEntry {
             consecutive_failures: 0,
             last_seen_ms: now_ms,
@@ -1354,18 +1365,18 @@ async fn record_reconcile_failure(cycle: u64, lsu_hash: [u8; 32]) -> bool {
     false
 }
 
-/// Clears any failure history for `(cycle, lsu_hash)` on a successful reconcile.
-async fn clear_reconcile_failure(cycle: u64, lsu_hash: [u8; 32]) {
+/// Clears any failure history for `local_cycle` on a successful reconcile.
+async fn clear_reconcile_failure(local_cycle: u64) {
     let mut tracker = reconcile_failure_tracker().lock().await;
-    tracker.entries.remove(&(cycle, lsu_hash));
+    tracker.entries.remove(&local_cycle);
 }
 
 #[cfg(test)]
-async fn reconcile_failure_state_for_test(cycle: u64, lsu_hash: [u8; 32]) -> Option<(u32, bool)> {
+async fn reconcile_failure_state_for_test(local_cycle: u64) -> Option<(u32, bool)> {
     let tracker = reconcile_failure_tracker().lock().await;
     tracker
         .entries
-        .get(&(cycle, lsu_hash))
+        .get(&local_cycle)
         .map(|e| (e.consecutive_failures, e.broken))
 }
 
@@ -4098,6 +4109,23 @@ async fn try_reconcile_fork_from_quorum_lsu(
         return Ok(false);
     }
     let local_cycle = local_applied_cycle(store).await;
+
+    // Circuit breaker: a genuinely unrecoverable divergence (distinct from the freshness/idempotency
+    // no-op above, which already handles the common spurious case) would otherwise fail identically
+    // on every re-gossip, forever, burning CPU on repeated snapshot/purge/replay (or, for the
+    // "missing stored LSU" gap case below, repeated metadata scans + P2P prefetch broadcasts) --
+    // exactly the busy-loop observed in production (55k+ failed attempts over 3 days with no
+    // operator signal). Checked here, before `resolve_replay_start`, because that function's own
+    // "missing stored LSU, can't bridge" failure path returns before ever reaching a check placed
+    // later (this was caught live: a node stuck on a genuinely-unbridgeable gap kept retrying every
+    // ~20s indefinitely because the later check only guarded the purge/replay transaction, not this
+    // earlier gap-resolution step). Keyed on `local_cycle`, not the target `(cycle, hash)` -- see
+    // `ReconcileFailureTracker`'s doc comment for why.
+    if reconcile_circuit_is_broken(local_cycle).await {
+        catalyst_utils::increment_counter!("consensus_fork_reconcile_circuit_broken_total", 1);
+        return Ok(false);
+    }
+
     let replay_depth = cycle.saturating_sub(local_cycle);
     if replay_depth > max_cycles {
         warn!(
@@ -4220,18 +4248,16 @@ async fn try_reconcile_fork_from_quorum_lsu(
     let Some(mut replay_start) =
         resolve_replay_start(store, cycle, pruned_up_to, fetch, default_start).await?
     else {
+        if record_reconcile_failure(local_cycle).await {
+            error!(
+                target: "catalyst.consensus.reconcile",
+                local_cycle,
+                threshold = crate::consensus_limits::reconcile_circuit_break_threshold(),
+                "Reconcile circuit-broken after repeated consecutive failures resolving a replay gap; needs operator action (restart, resync, or investigate divergence)"
+            );
+        }
         return Ok(false);
     };
-
-    // Circuit breaker: a genuinely unrecoverable divergence (distinct from the freshness/idempotency
-    // no-op above, which already handles the common spurious case) would otherwise fail identically
-    // on every re-gossip of the same LSU, forever, burning CPU on repeated snapshot/purge/replay —
-    // exactly the busy-loop observed in production (55k+ failed attempts over 3 days with no
-    // operator signal). Skip the expensive transaction entirely once tripped for this (cycle, hash).
-    if reconcile_circuit_is_broken(cycle, *expected_lsu_hash).await {
-        catalyst_utils::increment_counter!("consensus_fork_reconcile_circuit_broken_total", 1);
-        return Ok(false);
-    }
 
     let snap = format!(
         "quorum_reconcile_c{}_{}",
@@ -4316,7 +4342,7 @@ async fn try_reconcile_fork_from_quorum_lsu(
         Ok(()) => {
             let _ = store.delete_snapshot(&snap).await;
             catalyst_utils::increment_counter!("consensus_fork_reconcile_succeeded_total", 1);
-            clear_reconcile_failure(cycle, *expected_lsu_hash).await;
+            clear_reconcile_failure(local_cycle).await;
             Ok(true)
         }
         Err(e) => {
@@ -4333,13 +4359,14 @@ async fn try_reconcile_fork_from_quorum_lsu(
             }
             let _ = store.delete_snapshot(&snap).await;
             catalyst_utils::increment_counter!("consensus_fork_reconcile_aborted_total", 1);
-            if record_reconcile_failure(cycle, *expected_lsu_hash).await {
+            if record_reconcile_failure(local_cycle).await {
                 // Transition into "broken": the per-attempt warn above will stop recurring from
                 // here on (the circuit-breaker check short-circuits before reconcile_inner runs
                 // again), so escalate once, loudly, since nothing else will.
                 error!(
                     target: "catalyst.consensus.reconcile",
                     cycle,
+                    local_cycle,
                     lsu_hash = %hex_encode(expected_lsu_hash),
                     threshold = crate::consensus_limits::reconcile_circuit_break_threshold(),
                     "Reconcile circuit-broken after repeated consecutive failures; needs operator action (restart, resync, or investigate divergence)"
@@ -8498,7 +8525,7 @@ mod fork_choice_integration_tests {
             .expect("reconcile must fail cleanly, not hard-error");
             assert!(!reconciled, "deliberately-wrong expected_prev must never succeed");
 
-            let (count, broken) = reconcile_failure_state_for_test(1, hash_c1_alt)
+            let (count, broken) = reconcile_failure_state_for_test(1)
                 .await
                 .expect("failure entry must exist after a failed attempt");
             assert_eq!(count, attempt, "consecutive_failures must track each attempt exactly");
@@ -8534,9 +8561,10 @@ mod fork_choice_integration_tests {
             "circuit-broken attempt must never reach create_snapshot"
         );
 
-        // A different (cycle, hash) key is unaffected by this open circuit: apply cycle 2 for
-        // real, then reconcile a self-echo of it (hits the item-1 idempotency no-op path) and
-        // confirm it succeeds cleanly rather than being caught by cycle 1's tripped breaker.
+        // A different local_cycle key is unaffected by this open circuit: apply cycle 2 for real
+        // (advancing local_cycle to 2), then reconcile a self-echo of it (hits the item-1
+        // idempotency no-op path) and confirm it succeeds cleanly rather than being caught by
+        // local_cycle=1's tripped breaker.
         let lsu_c2 = lsu_with_tx_seed(&committee, 2, 7);
         let hash_c2 = hash_data(&lsu_c2).expect("hash c2");
         let root_c2 = apply_lsu_to_storage(&env.store, &lsu_c2)
@@ -8569,6 +8597,96 @@ mod fork_choice_integration_tests {
         .await
         .expect("reconcile for an unrelated (cycle, hash) key must not be affected by cycle 1's open circuit");
         assert!(reconciled, "self-echo of cycle 2 must hit the idempotent no-op path and succeed");
+    }
+
+    /// Regression test for a bug in the circuit breaker's first implementation, caught live on a
+    /// running testnet during this session: a node stuck unable to bridge a genuinely-missing gap
+    /// cycle gets re-invoked with a *different, ever-increasing* target `cycle` on every
+    /// subsequent wall-clock tick (each newly-gossiped LSU is a fresh call), and
+    /// `resolve_replay_start`'s "missing stored LSU, can't bridge" failure returns *before* a
+    /// breaker keyed on the target `(cycle, hash)` would ever see repeats on the same key — so it
+    /// never tripped, and the node retried every ~20s indefinitely. The fix keys the breaker on
+    /// `local_cycle` (the node's own unchanging stuck position) instead, checked before
+    /// `resolve_replay_start` runs. This test calls with a different target `cycle` every time,
+    /// exactly reproducing the live failure shape, and asserts the breaker still trips.
+    #[tokio::test]
+    async fn reconcile_circuit_breaker_trips_on_unbridgeable_gap_despite_increasing_target_cycle() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+
+        // Use a distinctive, unlikely-to-collide base cycle for local_cycle: the tracker this
+        // test exercises is keyed on a bare u64 in a process-global static, and cargo runs tests
+        // in the same process concurrently -- a small number like 1 collides with
+        // `reconcile_circuit_breaker_trips_after_threshold_and_skips_further_attempts` above,
+        // which also gets stuck at local_cycle=1 (caught live: this test flaked exactly that way
+        // the first time both tests ran together). Applying a single LSU with a large
+        // `cycle_number` directly succeeds without replaying every intermediate cycle, since the
+        // idempotence check is `cycle_number <= already_applied`, not "sequential".
+        const BASE: u64 = 900_001;
+
+        // BASE applied and recorded; BASE+1's LSU is never stored anywhere (no peer, no
+        // checkpoint) -- a permanent, unbridgeable gap, matching "leader-miss skipped this cycle
+        // network-wide" in the live incident.
+        let lsu_base = lsu_with_tx_seed(&committee, BASE, 5);
+        let hash_base = hash_data(&lsu_base).expect("hash base");
+        let root_base = apply_lsu_to_storage(&env.store, &lsu_base)
+            .await
+            .expect("apply base cycle");
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            BASE,
+            &lsu_base.serialize().expect("ser"),
+            &hash_base,
+            "",
+            &root_base,
+            "",
+            false,
+        )
+        .await;
+
+        let threshold = crate::consensus_limits::reconcile_circuit_break_threshold();
+        // Target cycle increases on every attempt, exactly like each new wall-clock tick's gossip
+        // in production -- never the same (cycle, hash) key twice.
+        for attempt in 1..=threshold {
+            let target_cycle = BASE + 1 + attempt as u64;
+            let lsu_target = lsu_with_tx_seed(&committee, target_cycle, 100 + attempt as u8);
+            let hash_target = hash_data(&lsu_target).expect("hash target");
+            let reconciled = try_reconcile_fork_from_quorum_lsu(
+                &env.store,
+                &lsu_target,
+                target_cycle,
+                [0u8; 32],
+                [0u8; 32],
+                &hash_target,
+                None, // no P2P fetch available -- the gap can never be bridged
+                Some(&env.dfs),
+                "",
+                false,
+            )
+            .await
+            .expect("reconcile must fail cleanly on an unbridgeable gap, not hard-error");
+            assert!(!reconciled, "BASE+1 is permanently missing; must never succeed");
+            assert_eq!(
+                local_applied_cycle(&env.store).await,
+                BASE,
+                "stuck node's local_cycle must never move"
+            );
+
+            let (count, broken) = reconcile_failure_state_for_test(BASE)
+                .await
+                .expect("failure entry must exist, keyed on local_cycle=BASE, after a failed attempt");
+            assert_eq!(
+                count, attempt,
+                "consecutive_failures must accumulate across attempts despite each having a distinct target cycle/hash"
+            );
+            assert_eq!(broken, attempt >= threshold);
+        }
+
+        assert!(
+            reconcile_failure_state_for_test(BASE).await.unwrap().1,
+            "breaker must be tripped after `threshold` attempts, even though no target (cycle, hash) ever repeated"
+        );
     }
 
     /// Regression test for the "purge before checkpoint restore" / "purge from an arbitrary
