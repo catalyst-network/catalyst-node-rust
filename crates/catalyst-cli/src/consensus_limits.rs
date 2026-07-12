@@ -171,6 +171,39 @@ pub fn stale_observed_head_reset_ms() -> u64 {
         .unwrap_or(DEFAULT)
 }
 
+/// Consecutive `try_reconcile_fork_from_quorum_lsu` failures for the same `(cycle, lsu_hash)`
+/// before further attempts are skipped without doing the expensive purge/replay
+/// (`CATALYST_RECONCILE_CIRCUIT_BREAK_THRESHOLD`, default `5`, max `1000`).
+///
+/// Guards against the busy-loop failure mode observed in production: a genuinely unrecoverable
+/// divergence (e.g. local history itself is wrong) makes reconcile fail identically on every
+/// re-gossip of the same LSU, forever, at WARN level, with no backoff and no operator signal —
+/// burning CPU on repeated snapshot/purge/replay cycles that can never succeed. Once tripped for a
+/// given `(cycle, lsu_hash)`, the breaker stays open for the process lifetime: the underlying cause
+/// needs an operator (restart, resync, or a code fix), not a timer.
+pub fn reconcile_circuit_break_threshold() -> u32 {
+    const MAX: u32 = 1000;
+    const DEFAULT: u32 = 5;
+    std::env::var("CATALYST_RECONCILE_CIRCUIT_BREAK_THRESHOLD")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&v| v > 0 && v <= MAX)
+        .unwrap_or(DEFAULT)
+}
+
+/// Window (ms) within which reconcile failures for the same `(cycle, lsu_hash)` must recur to
+/// count as "consecutive" toward the circuit breaker; a gap longer than this resets the counter
+/// (`CATALYST_RECONCILE_CIRCUIT_BREAK_WINDOW_MS`, default `30_000`, max `3_600_000`).
+pub fn reconcile_circuit_break_window_ms() -> u64 {
+    const MAX: u64 = 3_600_000;
+    const DEFAULT: u64 = 30_000;
+    std::env::var("CATALYST_RECONCILE_CIRCUIT_BREAK_WINDOW_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0 && v <= MAX)
+        .unwrap_or(DEFAULT)
+}
+
 /// On-disk / metadata encoding for `consensus:tx_batch_commit:{cycle}` (36 bytes).
 pub fn parse_tx_batch_commit_value(bytes: &[u8]) -> Option<([u8; 32], u32)> {
     if bytes.len() != 36 {
@@ -474,6 +507,46 @@ mod tests {
         {
             let _e = EnvGuard::unset("CATALYST_STALE_OBSERVED_HEAD_RESET_MS");
             assert_eq!(stale_observed_head_reset_ms(), 60_000);
+        }
+    }
+
+    #[test]
+    fn reconcile_circuit_break_threshold_env_and_fallbacks() {
+        {
+            let _e = EnvGuard::set("CATALYST_RECONCILE_CIRCUIT_BREAK_THRESHOLD", "3");
+            assert_eq!(reconcile_circuit_break_threshold(), 3);
+        }
+        {
+            let _e = EnvGuard::set("CATALYST_RECONCILE_CIRCUIT_BREAK_THRESHOLD", "0");
+            assert_eq!(reconcile_circuit_break_threshold(), 5);
+        }
+        {
+            let _e = EnvGuard::set("CATALYST_RECONCILE_CIRCUIT_BREAK_THRESHOLD", "9999999999");
+            assert_eq!(reconcile_circuit_break_threshold(), 5);
+        }
+        {
+            let _e = EnvGuard::unset("CATALYST_RECONCILE_CIRCUIT_BREAK_THRESHOLD");
+            assert_eq!(reconcile_circuit_break_threshold(), 5);
+        }
+    }
+
+    #[test]
+    fn reconcile_circuit_break_window_ms_env_and_fallbacks() {
+        {
+            let _e = EnvGuard::set("CATALYST_RECONCILE_CIRCUIT_BREAK_WINDOW_MS", "5000");
+            assert_eq!(reconcile_circuit_break_window_ms(), 5000);
+        }
+        {
+            let _e = EnvGuard::set("CATALYST_RECONCILE_CIRCUIT_BREAK_WINDOW_MS", "0");
+            assert_eq!(reconcile_circuit_break_window_ms(), 30_000);
+        }
+        {
+            let _e = EnvGuard::set("CATALYST_RECONCILE_CIRCUIT_BREAK_WINDOW_MS", "9999999999");
+            assert_eq!(reconcile_circuit_break_window_ms(), 30_000);
+        }
+        {
+            let _e = EnvGuard::unset("CATALYST_RECONCILE_CIRCUIT_BREAK_WINDOW_MS");
+            assert_eq!(reconcile_circuit_break_window_ms(), 30_000);
         }
     }
 

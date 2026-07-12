@@ -1255,6 +1255,120 @@ fn lsu_apply_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ReconcileFailureEntry {
+    consecutive_failures: u32,
+    last_seen_ms: u64,
+    /// Once tripped, stays tripped for the process lifetime: the underlying cause needs an
+    /// operator (restart, resync, or a code fix), not a timer.
+    broken: bool,
+}
+
+const RECONCILE_FAILURE_TRACKER_MAX_ENTRIES: usize = 2000;
+const RECONCILE_FAILURE_TRACKER_TARGET_ENTRIES: usize = 1500;
+const RECONCILE_FAILURE_TRACKER_RETENTION_MS: u64 = 10 * 60 * 1000;
+
+/// Tracks consecutive `try_reconcile_fork_from_quorum_lsu` failures per `(cycle, lsu_hash)` to
+/// back the circuit breaker (see `consensus_limits::reconcile_circuit_break_threshold`), so a
+/// genuinely unrecoverable divergence stops retrying identically forever at WARN level with no
+/// operator signal (the busy-loop failure mode observed in production: 55k+ failed reconcile
+/// attempts over 3 days). Bounded like `RelayCache` above: prune stale (non-broken) entries by
+/// timestamp, then cap by count if still oversized.
+struct ReconcileFailureTracker {
+    entries: std::collections::HashMap<(u64, [u8; 32]), ReconcileFailureEntry>,
+}
+
+impl ReconcileFailureTracker {
+    fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+        }
+    }
+
+    fn prune(&mut self, now_ms: u64) {
+        let keep_after = now_ms.saturating_sub(RECONCILE_FAILURE_TRACKER_RETENTION_MS);
+        self.entries
+            .retain(|_, e| e.broken || e.last_seen_ms >= keep_after);
+        if self.entries.len() > RECONCILE_FAILURE_TRACKER_MAX_ENTRIES {
+            let mut v: Vec<((u64, [u8; 32]), u64)> = self
+                .entries
+                .iter()
+                .map(|(k, e)| (*k, e.last_seen_ms))
+                .collect();
+            v.sort_by_key(|(_, ts)| *ts);
+            let drop_n = v
+                .len()
+                .saturating_sub(RECONCILE_FAILURE_TRACKER_TARGET_ENTRIES);
+            for (k, _) in v.into_iter().take(drop_n) {
+                self.entries.remove(&k);
+            }
+        }
+    }
+}
+
+fn reconcile_failure_tracker() -> &'static tokio::sync::Mutex<ReconcileFailureTracker> {
+    static TRACKER: std::sync::OnceLock<tokio::sync::Mutex<ReconcileFailureTracker>> =
+        std::sync::OnceLock::new();
+    TRACKER.get_or_init(|| tokio::sync::Mutex::new(ReconcileFailureTracker::new()))
+}
+
+/// True if reconcile attempts for this `(cycle, lsu_hash)` should be skipped without doing the
+/// expensive purge/replay — the circuit breaker has tripped.
+async fn reconcile_circuit_is_broken(cycle: u64, lsu_hash: [u8; 32]) -> bool {
+    let tracker = reconcile_failure_tracker().lock().await;
+    tracker
+        .entries
+        .get(&(cycle, lsu_hash))
+        .map(|e| e.broken)
+        .unwrap_or(false)
+}
+
+/// Records a reconcile failure for `(cycle, lsu_hash)`, tripping the circuit breaker after
+/// `reconcile_circuit_break_threshold()` consecutive failures within
+/// `reconcile_circuit_break_window_ms()` of each other. Returns true exactly on the transition
+/// into "broken" (so the caller can emit a one-time escalated log instead of repeating it).
+async fn record_reconcile_failure(cycle: u64, lsu_hash: [u8; 32]) -> bool {
+    let now_ms = current_timestamp_ms();
+    let mut tracker = reconcile_failure_tracker().lock().await;
+    tracker.prune(now_ms);
+    let window_ms = crate::consensus_limits::reconcile_circuit_break_window_ms();
+    let threshold = crate::consensus_limits::reconcile_circuit_break_threshold();
+    let entry = tracker
+        .entries
+        .entry((cycle, lsu_hash))
+        .or_insert(ReconcileFailureEntry {
+            consecutive_failures: 0,
+            last_seen_ms: now_ms,
+            broken: false,
+        });
+    if now_ms.saturating_sub(entry.last_seen_ms) > window_ms {
+        // Gap too long since the last failure: treat this as a fresh sequence.
+        entry.consecutive_failures = 0;
+    }
+    entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+    entry.last_seen_ms = now_ms;
+    if !entry.broken && entry.consecutive_failures >= threshold {
+        entry.broken = true;
+        return true;
+    }
+    false
+}
+
+/// Clears any failure history for `(cycle, lsu_hash)` on a successful reconcile.
+async fn clear_reconcile_failure(cycle: u64, lsu_hash: [u8; 32]) {
+    let mut tracker = reconcile_failure_tracker().lock().await;
+    tracker.entries.remove(&(cycle, lsu_hash));
+}
+
+#[cfg(test)]
+async fn reconcile_failure_state_for_test(cycle: u64, lsu_hash: [u8; 32]) -> Option<(u32, bool)> {
+    let tracker = reconcile_failure_tracker().lock().await;
+    tracker
+        .entries
+        .get(&(cycle, lsu_hash))
+        .map(|e| (e.consecutive_failures, e.broken))
+}
+
 /// Despite the name (kept for call-site continuity — both callers already treat a falsy result
 /// as "fall back to the verifying path"), this now DOES verify: `new_root` is a peer's *claim*
 /// (from a `StateProofBundle` whose Merkle proofs only cover the touched keys, not this node's
@@ -1951,6 +2065,14 @@ pub(crate) fn ensure_consensus_p2p_cli_metrics_registered() {
         (
             "consensus_fork_reconcile_error_total",
             "Fork reconcile snapshot restore failed after replay error",
+        ),
+        (
+            "consensus_fork_reconcile_noop_already_applied_total",
+            "Fork reconcile short-circuited: fresh check confirmed the exact LSU was already applied at this cycle (TOCTOU self-echo)",
+        ),
+        (
+            "consensus_fork_reconcile_circuit_broken_total",
+            "Fork reconcile skipped: consecutive-failure circuit breaker open for this (cycle, lsu_hash); needs operator action",
         ),
         (
             "consensus_lsu_apply_skipped_prev_root_total",
@@ -2913,6 +3035,11 @@ async fn rebroadcast_persisted_mempool(
     }
 }
 
+/// Acquires `lsu_apply_lock` then delegates to [`apply_lsu_to_storage_locked`]. Use this from any
+/// caller that does not already hold the lock (production self-apply, standalone follower applies,
+/// tests). Callers that already hold it (the reconcile transaction) must call
+/// `apply_lsu_to_storage_locked` directly — `tokio::sync::Mutex` is not reentrant, so calling this
+/// wrapper while already holding the lock deadlocks.
 pub(crate) async fn apply_lsu_to_storage(
     store: &StorageManager,
     lsu: &catalyst_consensus::types::LedgerStateUpdate,
@@ -2921,7 +3048,14 @@ pub(crate) async fn apply_lsu_to_storage(
     // Must be acquired BEFORE the idempotence check so that the check sees the updated
     // last_applied_cycle from whichever apply completed just before us.
     let _apply_guard = lsu_apply_lock().lock().await;
+    apply_lsu_to_storage_locked(store, lsu).await
+}
 
+/// Caller must already hold `lsu_apply_lock` (see [`apply_lsu_to_storage`]).
+async fn apply_lsu_to_storage_locked(
+    store: &StorageManager,
+    lsu: &catalyst_consensus::types::LedgerStateUpdate,
+) -> Result<[u8; 32]> {
     // Idempotence: only apply if this LSU advances the applied head.
     let already = store
         .get_metadata("consensus:last_applied_cycle")
@@ -3410,12 +3544,19 @@ async fn verify_lsu_finality_for_apply(
 }
 
 /// Apply stored `consensus:lsu:{cycle}` when `cycle == local_applied + 1` (sequential follower catch-up).
+///
+/// Holds `lsu_apply_lock` across its whole read-decide-apply sequence (not just the final write) so
+/// this decision can't race a concurrent production self-apply or reconcile transaction — see the
+/// TOCTOU note in docs/consensus-reliability-review-2026-07.md. Self-contained: neither of its two
+/// callers (the catch-up ticker, the `StateResponse` handler) holds the lock, and it never nests
+/// inside `try_reconcile_fork_from_quorum_lsu`.
 async fn try_apply_stored_lsu_at_cycle(
     store: &StorageManager,
     dfs: Option<&crate::dfs_store::LocalContentStore>,
     cycle: u64,
     require_lsu_finality: bool,
 ) -> bool {
+    let _apply_guard = lsu_apply_lock().lock().await;
     let head = local_applied_cycle(store).await;
     if cycle != head.saturating_add(1) {
         return false;
@@ -3495,7 +3636,7 @@ async fn try_apply_stored_lsu_at_cycle(
     else {
         return false;
     };
-    apply_lsu_with_root_check(store, &lsu, expected_post)
+    apply_lsu_with_root_check_locked(store, &lsu, expected_post)
         .await
         .ok()
         .unwrap_or(false)
@@ -3879,6 +4020,38 @@ async fn try_reconcile_fork_from_quorum_lsu(
         return Ok(false);
     }
 
+    // Hold the apply lock for the rest of this function (freshness check through commit-or-revert).
+    // This makes the whole decide-then-mutate transaction atomic with respect to concurrent
+    // production self-applies and other reconcile/catch-up attempts, closing the TOCTOU window that
+    // let a stale caller trigger this function in the first place. Every apply call below this point
+    // must use the `_locked` variant (apply_lsu_to_storage_locked / apply_lsu_with_root_check_locked)
+    // — the public wrappers re-acquire this same non-reentrant mutex and would deadlock.
+    let _apply_guard = lsu_apply_lock().lock().await;
+
+    // Freshness re-check: callers (gossip handlers) may invoke this with a local state snapshot
+    // taken before a concurrent self-apply completed (see the TOCTOU note in
+    // docs/consensus-reliability-review-2026-07.md). fork_choice_reject_weaker_incoming above does
+    // NOT reject an equal-hash incoming LSU (self-echo of what we already applied), so without this
+    // check a stale caller falls all the way into the purge/rebuild path below for state that is
+    // already exactly correct — deterministically failing the same way on every re-gossip. Re-read
+    // authoritatively here (local_applied_lsu_hash, not consensus:lsu_hash:{cycle} — the latter is
+    // written by persist_lsu_history for any fork-choice-winning LSU whether or not it was ever
+    // actually applied, so it isn't a valid "was applied" signal) and no-op if we've already applied
+    // exactly this LSU at this exact cycle. Scoped to local_cycle_now == cycle only: it can never
+    // short-circuit a legitimate forward catch-up, which requires local_cycle_now < cycle.
+    let local_cycle_now = local_applied_cycle(store).await;
+    if local_cycle_now == cycle {
+        if let Some(applied_hash_now) = local_applied_lsu_hash(store).await {
+            if applied_hash_now == *expected_lsu_hash {
+                catalyst_utils::increment_counter!(
+                    "consensus_fork_reconcile_noop_already_applied_total",
+                    1
+                );
+                return Ok(true);
+            }
+        }
+    }
+
     // L2 self-heal FAST-PATH (forward apply): if this certified/quorum LSU chains directly onto our
     // CURRENT applied head (its prev_root equals our applied root and it is exactly head+1), we do
     // not need the purge+replay-from-genesis machinery below. That machinery anchors at cycle 1 and
@@ -3891,7 +4064,7 @@ async fn try_reconcile_fork_from_quorum_lsu(
         let local_cycle = local_applied_cycle(store).await;
         let local_root = local_applied_state_root(store).await;
         if cycle == local_cycle.saturating_add(1) && expected_prev == local_root {
-            match apply_lsu_with_root_check(store, lsu, expected_post).await {
+            match apply_lsu_with_root_check_locked(store, lsu, expected_post).await {
                 Ok(true) => {
                     catalyst_utils::increment_counter!(
                         "consensus_fork_reconcile_fastpath_total",
@@ -4050,6 +4223,16 @@ async fn try_reconcile_fork_from_quorum_lsu(
         return Ok(false);
     };
 
+    // Circuit breaker: a genuinely unrecoverable divergence (distinct from the freshness/idempotency
+    // no-op above, which already handles the common spurious case) would otherwise fail identically
+    // on every re-gossip of the same LSU, forever, burning CPU on repeated snapshot/purge/replay —
+    // exactly the busy-loop observed in production (55k+ failed attempts over 3 days with no
+    // operator signal). Skip the expensive transaction entirely once tripped for this (cycle, hash).
+    if reconcile_circuit_is_broken(cycle, *expected_lsu_hash).await {
+        catalyst_utils::increment_counter!("consensus_fork_reconcile_circuit_broken_total", 1);
+        return Ok(false);
+    }
+
     let snap = format!(
         "quorum_reconcile_c{}_{}",
         cycle,
@@ -4108,7 +4291,7 @@ async fn try_reconcile_fork_from_quorum_lsu(
                     }
                 }
             }
-            apply_lsu_to_storage(store, &lsu_i)
+            apply_lsu_to_storage_locked(store, &lsu_i)
                 .await
                 .map_err(|e| anyhow::anyhow!("apply replay {i}: {e}"))?;
         }
@@ -4122,7 +4305,7 @@ async fn try_reconcile_fork_from_quorum_lsu(
             );
         }
 
-        match apply_lsu_with_root_check(store, lsu, expected_post).await {
+        match apply_lsu_with_root_check_locked(store, lsu, expected_post).await {
             Ok(true) => Ok(()),
             Ok(false) => anyhow::bail!("final lsu state_root mismatch"),
             Err(e) => Err(e),
@@ -4133,6 +4316,7 @@ async fn try_reconcile_fork_from_quorum_lsu(
         Ok(()) => {
             let _ = store.delete_snapshot(&snap).await;
             catalyst_utils::increment_counter!("consensus_fork_reconcile_succeeded_total", 1);
+            clear_reconcile_failure(cycle, *expected_lsu_hash).await;
             Ok(true)
         }
         Err(e) => {
@@ -4149,12 +4333,38 @@ async fn try_reconcile_fork_from_quorum_lsu(
             }
             let _ = store.delete_snapshot(&snap).await;
             catalyst_utils::increment_counter!("consensus_fork_reconcile_aborted_total", 1);
+            if record_reconcile_failure(cycle, *expected_lsu_hash).await {
+                // Transition into "broken": the per-attempt warn above will stop recurring from
+                // here on (the circuit-breaker check short-circuits before reconcile_inner runs
+                // again), so escalate once, loudly, since nothing else will.
+                error!(
+                    target: "catalyst.consensus.reconcile",
+                    cycle,
+                    lsu_hash = %hex_encode(expected_lsu_hash),
+                    threshold = crate::consensus_limits::reconcile_circuit_break_threshold(),
+                    "Reconcile circuit-broken after repeated consecutive failures; needs operator action (restart, resync, or investigate divergence)"
+                );
+            }
             Ok(false)
         }
     }
 }
 
+/// Acquires `lsu_apply_lock` then delegates to [`apply_lsu_with_root_check_locked`]. Use this from
+/// any caller that does not already hold the lock (the two direct gossip-handler fallback call
+/// sites). Callers that already hold it (reconcile, `try_apply_stored_lsu_at_cycle`) must call
+/// `apply_lsu_with_root_check_locked` directly to avoid deadlocking on the non-reentrant mutex.
 async fn apply_lsu_with_root_check(
+    store: &StorageManager,
+    lsu: &catalyst_consensus::types::LedgerStateUpdate,
+    expected_state_root: [u8; 32],
+) -> Result<bool> {
+    let _apply_guard = lsu_apply_lock().lock().await;
+    apply_lsu_with_root_check_locked(store, lsu, expected_state_root).await
+}
+
+/// Caller must already hold `lsu_apply_lock` (see [`apply_lsu_with_root_check`]).
+async fn apply_lsu_with_root_check_locked(
     store: &StorageManager,
     lsu: &catalyst_consensus::types::LedgerStateUpdate,
     expected_state_root: [u8; 32],
@@ -4165,7 +4375,7 @@ async fn apply_lsu_with_root_check(
         .await
         .map_err(|e| anyhow::anyhow!("snapshot create failed: {e}"))?;
 
-    let got = apply_lsu_to_storage(store, lsu).await?;
+    let got = apply_lsu_to_storage_locked(store, lsu).await?;
     if got == expected_state_root {
         // NOTE: this snapshot used to leak (neither branch deleted it). With `max_snapshots`
         // capped (default 10), this function is called far more often than a checkpoint is
@@ -7522,8 +7732,8 @@ mod fork_choice_integration_tests {
         apply_lsu_to_storage, apply_lsu_to_storage_without_root_check, ensure_chain_identity_and_genesis,
         fork_choice_apply_gate, get_balance_i64, hex_encode, load_stored_certified_hash_at_cycle,
         local_applied_cycle, local_applied_lsu_hash, local_applied_state_root, persist_lsu_history,
-        try_reconcile_fork_from_quorum_lsu, try_reorg_stronger_lsu_at_applied_cycle,
-        ForkChoiceApplyGate,
+        reconcile_failure_state_for_test, set_balance_i64, try_reconcile_fork_from_quorum_lsu,
+        try_reorg_stronger_lsu_at_applied_cycle, ForkChoiceApplyGate,
     };
     use crate::config::NodeConfig;
     use crate::dfs_store::LocalContentStore;
@@ -8082,6 +8292,283 @@ mod fork_choice_integration_tests {
             local_applied_lsu_hash(&env.store).await,
             Some(hash_cert_c2)
         );
+    }
+
+    /// Regression test for the traced TOCTOU incident (docs/consensus-reliability-review-2026-07.md):
+    /// a gossip handler can invoke `try_reconcile_fork_from_quorum_lsu` with a caller-side
+    /// local_prev/local_applied_now snapshot that went stale because a concurrent self-apply landed
+    /// the exact same LSU in the meantime — i.e. this call is effectively a self-echo of what's
+    /// already correctly applied. `fork_choice_reject_weaker_incoming` does not reject an
+    /// equal-hash incoming LSU, so without an idempotency check this used to fall all the way into
+    /// the purge/rebuild path for state that was already exactly correct, deterministically failing
+    /// the same way on every re-gossip. Must instead no-op cheaply.
+    #[tokio::test]
+    async fn reconcile_is_idempotent_noop_for_self_echo_of_own_applied_lsu() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let lsu_c1 = lsu_with_tx_seed(&committee, 1, 5);
+        let hash_c1 = hash_data(&lsu_c1).expect("hash");
+        let root_c1 = apply_lsu_to_storage(&env.store, &lsu_c1)
+            .await
+            .expect("apply cycle 1");
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            1,
+            &lsu_c1.serialize().expect("ser"),
+            &hash_c1,
+            "",
+            &root_c1,
+            "",
+            false,
+        )
+        .await;
+
+        // Prove no purge happens: mark an unrelated account. purge_mutable_chain_state_
+        // preserving_lsu_history unconditionally wipes the whole accounts column family; only
+        // metadata keys are selectively preserved. If reconcile purges, this sentinel is gone
+        // regardless of whether the final replayed root happens to match (replaying the same
+        // single LSU from empty state is also deterministic, so root/balance equality on the
+        // *tx* account alone would not prove "no purge occurred").
+        let sentinel_pk = committee.keys[2].public_key().to_bytes();
+        set_balance_i64(&env.store, &sentinel_pk, 4242)
+            .await
+            .expect("set sentinel balance");
+        let snaps_before = env.store.list_snapshots().await.expect("list snapshots");
+
+        let reconciled = try_reconcile_fork_from_quorum_lsu(
+            &env.store,
+            &lsu_c1,
+            1,
+            [0u8; 32],
+            root_c1,
+            &hash_c1,
+            None,
+            Some(&env.dfs),
+            "",
+            false,
+        )
+        .await
+        .expect("reconcile");
+
+        assert!(
+            reconciled,
+            "self-echo reconcile of an already-applied identical LSU must succeed"
+        );
+        assert_eq!(local_applied_cycle(&env.store).await, 1);
+        assert_eq!(local_applied_lsu_hash(&env.store).await, Some(hash_c1));
+        assert_eq!(local_applied_state_root(&env.store).await, root_c1);
+        assert_eq!(
+            get_balance_i64(&env.store, &sentinel_pk).await,
+            4242,
+            "no purge: unrelated account balance must survive"
+        );
+        assert_eq!(
+            env.store.list_snapshots().await.expect("list snapshots"),
+            snaps_before,
+            "no quorum_reconcile_* snapshot created: idempotent path must never reach create_snapshot"
+        );
+    }
+
+    /// Regression test for the transactional-atomicity gap: a concurrent, unrelated apply (standing
+    /// in for a production self-apply on a separate task) must never be corrupted or lost by an
+    /// in-flight `try_reconcile_fork_from_quorum_lsu` transaction's purge/revert, regardless of
+    /// scheduling order. Before this fix, `lsu_apply_lock` only guarded the individual storage-write
+    /// step inside `apply_lsu_to_storage`, not reconcile's whole snapshot-purge-replay-revert
+    /// transaction, so a concurrent apply landing inside that window could be silently wiped by
+    /// reconcile's purge and never restored by its revert-to-pre-transaction-snapshot (taken before
+    /// the concurrent apply happened). Forces the destructive case-B purge path deterministically
+    /// (a certified LSU always beats a non-certified one, regardless of hash tie-break luck) with a
+    /// deliberately-wrong `expected_prev` so reconcile is guaranteed to fail its final check and
+    /// revert — the concurrent apply's effect must survive regardless of interleaving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_apply_survives_in_flight_reconcile_purge_and_revert() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let pk0 = committee.keys[0].public_key().to_bytes();
+
+        let lsu_c1 = lsu_with_tx_seed(&committee, 1, 5);
+        let hash_c1 = hash_data(&lsu_c1).expect("hash c1");
+        let root_c1 = apply_lsu_to_storage(&env.store, &lsu_c1)
+            .await
+            .expect("apply cycle 1");
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            1,
+            &lsu_c1.serialize().expect("ser"),
+            &hash_c1,
+            "",
+            &root_c1,
+            "",
+            false,
+        )
+        .await;
+
+        // Concurrent, unrelated apply for the next cycle — stands in for a production self-apply
+        // racing an in-flight reconcile transaction on a separate task.
+        let lsu_c2 = lsu_with_tx_seed(&committee, 2, 7);
+        let apply_fut = apply_lsu_to_storage(&env.store, &lsu_c2);
+
+        // Reconcile targeting the ALREADY-applied cycle 1 with a different, certified LSU (so
+        // fork_choice_reject_weaker_incoming reliably lets it through regardless of hash bytes) and
+        // a deliberately-wrong expected_prev, forcing the destructive purge-then-rebuild (case B)
+        // path and guaranteeing it fails the final root check and reverts.
+        let lsu_c1_alt = lsu_with_tx_seed(&committee, 1, 9);
+        let hash_c1_alt = hash_data(&lsu_c1_alt).expect("hash c1 alt");
+        let cid_alt = install_finality_cert(&env, &lsu_c1_alt, &committee).await;
+        let reconcile_fut = try_reconcile_fork_from_quorum_lsu(
+            &env.store,
+            &lsu_c1_alt,
+            1,
+            [0xFFu8; 32],
+            [0u8; 32],
+            &hash_c1_alt,
+            None,
+            Some(&env.dfs),
+            &cid_alt,
+            true,
+        );
+
+        let (apply_result, reconcile_result) = tokio::join!(apply_fut, reconcile_fut);
+        apply_result.expect("concurrent cycle-2 apply must not error");
+        reconcile_result.expect("reconcile must fail its internal check and revert cleanly, not hard-error");
+
+        // Regardless of which critical section ran first, both effects must be present: cycle 2
+        // fully applied, and cycle 1's original balance intact underneath it. Under the old race,
+        // one of these could be silently lost depending on scheduling.
+        assert_eq!(local_applied_cycle(&env.store).await, 2);
+        assert_eq!(
+            get_balance_i64(&env.store, &pk0).await,
+            5 + 7,
+            "concurrent reconcile purge/revert must never lose or duplicate a concurrently-applied cycle"
+        );
+    }
+
+    /// Regression test for the circuit breaker: a genuinely unrecoverable reconcile (forced to
+    /// fail every time via a deliberately-wrong `expected_prev`, same as the concurrency test
+    /// above) must stop attempting the expensive purge/replay after
+    /// `reconcile_circuit_break_threshold()` consecutive failures for the same `(cycle, lsu_hash)`,
+    /// instead of retrying identically forever — the busy-loop failure mode observed in production.
+    #[tokio::test]
+    async fn reconcile_circuit_breaker_trips_after_threshold_and_skips_further_attempts() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+
+        let lsu_c1 = lsu_with_tx_seed(&committee, 1, 5);
+        let hash_c1 = hash_data(&lsu_c1).expect("hash c1");
+        let root_c1 = apply_lsu_to_storage(&env.store, &lsu_c1)
+            .await
+            .expect("apply cycle 1");
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            1,
+            &lsu_c1.serialize().expect("ser"),
+            &hash_c1,
+            "",
+            &root_c1,
+            "",
+            false,
+        )
+        .await;
+
+        // Same shape as concurrent_apply_survives_in_flight_reconcile_purge_and_revert: a
+        // certified LSU at the already-applied cycle 1 with a deliberately-wrong expected_prev,
+        // guaranteed to fail the final root check and revert on every attempt.
+        let lsu_c1_alt = lsu_with_tx_seed(&committee, 1, 9);
+        let hash_c1_alt = hash_data(&lsu_c1_alt).expect("hash c1 alt");
+        let cid_alt = install_finality_cert(&env, &lsu_c1_alt, &committee).await;
+
+        let threshold = crate::consensus_limits::reconcile_circuit_break_threshold();
+        for attempt in 1..=threshold {
+            let reconciled = try_reconcile_fork_from_quorum_lsu(
+                &env.store,
+                &lsu_c1_alt,
+                1,
+                [0xFFu8; 32],
+                [0u8; 32],
+                &hash_c1_alt,
+                None,
+                Some(&env.dfs),
+                &cid_alt,
+                true,
+            )
+            .await
+            .expect("reconcile must fail cleanly, not hard-error");
+            assert!(!reconciled, "deliberately-wrong expected_prev must never succeed");
+
+            let (count, broken) = reconcile_failure_state_for_test(1, hash_c1_alt)
+                .await
+                .expect("failure entry must exist after a failed attempt");
+            assert_eq!(count, attempt, "consecutive_failures must track each attempt exactly");
+            assert_eq!(
+                broken,
+                attempt >= threshold,
+                "must trip exactly on reaching the threshold, not before"
+            );
+        }
+
+        // Circuit is now open. The (threshold + 1)th attempt must be skipped entirely — assert via
+        // list_snapshots() that it never reaches create_snapshot (i.e. never touches the expensive
+        // purge/replay machinery at all).
+        let snaps_before = env.store.list_snapshots().await.expect("list snapshots");
+        let reconciled = try_reconcile_fork_from_quorum_lsu(
+            &env.store,
+            &lsu_c1_alt,
+            1,
+            [0xFFu8; 32],
+            [0u8; 32],
+            &hash_c1_alt,
+            None,
+            Some(&env.dfs),
+            &cid_alt,
+            true,
+        )
+        .await
+        .expect("circuit-broken reconcile must return cleanly, not error");
+        assert!(!reconciled);
+        assert_eq!(
+            env.store.list_snapshots().await.expect("list snapshots"),
+            snaps_before,
+            "circuit-broken attempt must never reach create_snapshot"
+        );
+
+        // A different (cycle, hash) key is unaffected by this open circuit: apply cycle 2 for
+        // real, then reconcile a self-echo of it (hits the item-1 idempotency no-op path) and
+        // confirm it succeeds cleanly rather than being caught by cycle 1's tripped breaker.
+        let lsu_c2 = lsu_with_tx_seed(&committee, 2, 7);
+        let hash_c2 = hash_data(&lsu_c2).expect("hash c2");
+        let root_c2 = apply_lsu_to_storage(&env.store, &lsu_c2)
+            .await
+            .expect("apply cycle 2");
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            2,
+            &lsu_c2.serialize().expect("ser"),
+            &hash_c2,
+            "",
+            &root_c2,
+            "",
+            false,
+        )
+        .await;
+        let reconciled = try_reconcile_fork_from_quorum_lsu(
+            &env.store,
+            &lsu_c2,
+            2,
+            root_c1,
+            root_c2,
+            &hash_c2,
+            None,
+            Some(&env.dfs),
+            "",
+            false,
+        )
+        .await
+        .expect("reconcile for an unrelated (cycle, hash) key must not be affected by cycle 1's open circuit");
+        assert!(reconciled, "self-echo of cycle 2 must hit the idempotent no-op path and succeed");
     }
 
     /// Regression test for the "purge before checkpoint restore" / "purge from an arbitrary
