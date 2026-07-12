@@ -88,6 +88,27 @@ fn should_defer_production_when_behind(applied: u64, observed_head: u64) -> bool
     observed_head > applied
 }
 
+/// Decision helper for the `stale_observed_head_reset_ms` liveness backstop: given how long
+/// we've made zero applied-head progress and the configured budget, whether to abandon the
+/// missing cycle now and reset `observed_head_cycle` down to our own applied head.
+///
+/// `peer_confirmed_reachable` is true when an `LsuRangeResponse` has positively confirmed a peer
+/// has exactly the cycle we need next (see `CatchupState::confirmed_next_cycle`). Caught live: a
+/// validator gave up and skipped several cycles ahead on the normal timer alone, while a peer had
+/// legitimately applied the very cycle it abandoned — a silent fork with no correctness signal
+/// (both nodes kept voting/producing normally afterward). Confirmed-reachable data gets
+/// `CONFIRMED_STALE_BUDGET_MULTIPLIER`x longer before giving up, so the fetch pipeline has a real
+/// chance to land it, while staying bounded in case that pipeline itself is broken.
+fn should_reset_stale_observed_head(elapsed_ms: u64, budget_ms: u64, peer_confirmed_reachable: bool) -> bool {
+    const CONFIRMED_STALE_BUDGET_MULTIPLIER: u64 = 5;
+    let effective_budget_ms = if peer_confirmed_reachable {
+        budget_ms.saturating_mul(CONFIRMED_STALE_BUDGET_MULTIPLIER)
+    } else {
+        budget_ms
+    };
+    elapsed_ms > effective_budget_ms
+}
+
 /// Deterministic per-cycle batch leader, rotating through the canonical (sorted, deduped) producer
 /// set. Liveness: a single stuck/faulty producer must not permanently halt the network. With a fixed
 /// `selected.first()` leader, if that node wedges (e.g. it diverged and is catching up, or is down)
@@ -5106,6 +5127,18 @@ impl CatalystNode {
                 // and when that "behind" state started, so we can detect zero progress over time.
                 stale_last_head: u64,
                 stale_since_ms: Option<u64>,
+                // Asymmetric-reset mitigation (docs/consensus-reliability-review-2026-07.md): the
+                // stale-reset backstop above used to abandon a missing cycle purely on elapsed time,
+                // with no way to know whether a peer had actually SUCCEEDED at producing it -- caught
+                // live: one validator gave up and resumed several cycles ahead while a peer had
+                // legitimately applied the cycle it abandoned, silently diverging their account
+                // histories underneath an apparently-healthy vote count. When an `LsuRangeResponse`
+                // positively confirms a peer has exactly the cycle we need next (`head+1`), record it
+                // here so the reset logic gives that confirmed-reachable data substantially more time
+                // before giving up, instead of treating "peer has it but our fetch hasn't landed yet"
+                // the same as "genuinely nobody produced it".
+                confirmed_next_cycle: Option<u64>,
+                confirmed_next_cycle_since_ms: Option<u64>,
             }
             let catchup: Arc<tokio::sync::Mutex<CatchupState>> =
                 Arc::new(tokio::sync::Mutex::new(CatchupState::default()));
@@ -5164,19 +5197,37 @@ impl CatalystNode {
                             } else {
                                 let since = *c.stale_since_ms.get_or_insert(now_ms);
                                 let stale_budget_ms = crate::consensus_limits::stale_observed_head_reset_ms();
-                                if now_ms.saturating_sub(since) > stale_budget_ms {
-                                    warn!(
-                                        "observed_head_cycle {} stale for {}ms with no applied-head progress past {}; resetting to applied head (peers are not serving the requested range)",
-                                        c.observed_head_cycle,
-                                        now_ms.saturating_sub(since),
-                                        head
-                                    );
+                                let need = head.saturating_add(1);
+                                let peer_confirmed_reachable = c.confirmed_next_cycle == Some(need);
+                                let elapsed_ms = now_ms.saturating_sub(since);
+                                if should_reset_stale_observed_head(elapsed_ms, stale_budget_ms, peer_confirmed_reachable) {
+                                    if peer_confirmed_reachable {
+                                        error!(
+                                            "observed_head_cycle {} stale for {}ms despite a peer confirming they have cycle {}; resetting anyway (fetch pipeline may be broken) — needs operator attention",
+                                            c.observed_head_cycle,
+                                            elapsed_ms,
+                                            need
+                                        );
+                                        catalyst_utils::increment_counter!(
+                                            "consensus_observed_head_stale_reset_despite_confirmed_total",
+                                            1
+                                        );
+                                    } else {
+                                        warn!(
+                                            "observed_head_cycle {} stale for {}ms with no applied-head progress past {}; resetting to applied head (peers are not serving the requested range)",
+                                            c.observed_head_cycle,
+                                            elapsed_ms,
+                                            head
+                                        );
+                                    }
                                     catalyst_utils::increment_counter!(
                                         "consensus_observed_head_stale_reset_total",
                                         1
                                     );
                                     c.observed_head_cycle = head;
                                     c.stale_since_ms = Some(now_ms);
+                                    c.confirmed_next_cycle = None;
+                                    c.confirmed_next_cycle_since_ms = None;
                                 }
                             }
                         } else {
@@ -6309,6 +6360,19 @@ impl CatalystNode {
                                     let mut c = catchup.lock().await;
                                     c.observed_head_cycle = c.observed_head_cycle.max(max_cycle);
                                 }
+                                // Asymmetric-reset mitigation: if this response positively confirms a
+                                // peer has exactly the cycle we need next, record it so the stale-reset
+                                // backstop (advance_handle ticker) doesn't abandon it out from under
+                                // them -- see the CatchupState doc comment and
+                                // docs/consensus-reliability-review-2026-07.md.
+                                if let Some(store) = &storage {
+                                    let need = local_applied_cycle(store.as_ref()).await.saturating_add(1);
+                                    if resp.refs.iter().any(|r| r.cycle == need) {
+                                        let mut c = catchup.lock().await;
+                                        c.confirmed_next_cycle = Some(need);
+                                        c.confirmed_next_cycle_since_ms = Some(now_ms);
+                                    }
+                                }
                                 // For each reference, if we don't have bytes locally, request via FileRequest.
                                 for r in resp.refs {
                                     if !crate::consensus_limits::p2p_lsu_cycle_within_wall_lead(
@@ -7398,6 +7462,26 @@ mod bft_quorum_tests {
         // lagging node defers indefinitely and relies on the >=1-behind forward catch-up to converge.
         assert!(should_defer_production_when_behind(89_043_100, 89_043_101));
         assert!(should_defer_production_when_behind(89_043_100, 89_045_827));
+    }
+
+    /// Regression test for the asymmetric-reset fork (docs/consensus-reliability-review-2026-07.md):
+    /// a validator must not abandon a cycle a peer has positively confirmed having, on the same
+    /// timer as a cycle nobody has. Confirmed-reachable data gets a longer budget before giving up.
+    #[test]
+    fn stale_observed_head_reset_gives_confirmed_reachable_cycles_more_time() {
+        use super::should_reset_stale_observed_head;
+        let budget = 60_000u64;
+        // Unconfirmed: reset exactly at the normal budget boundary.
+        assert!(!should_reset_stale_observed_head(budget, budget, false));
+        assert!(should_reset_stale_observed_head(budget + 1, budget, false));
+        // Confirmed reachable: must NOT reset at the normal budget -- this is exactly the case
+        // that caused a live silent fork (one validator gave up while a peer legitimately had the
+        // cycle it abandoned).
+        assert!(!should_reset_stale_observed_head(budget + 1, budget, true));
+        assert!(!should_reset_stale_observed_head(budget * 4, budget, true));
+        // Still bounded, not literally forever: eventually resets even when confirmed, in case the
+        // fetch pipeline itself is broken.
+        assert!(should_reset_stale_observed_head(budget * 5 + 1, budget, true));
     }
 
     fn empty_lsu(
