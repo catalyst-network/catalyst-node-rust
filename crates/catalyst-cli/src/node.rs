@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use catalyst_core::{NodeId, NodeRole, ResourceProof, WorkerPass};
 use catalyst_core::protocol::select_producers_for_next_cycle;
@@ -1255,16 +1255,32 @@ fn lsu_apply_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+/// Despite the name (kept for call-site continuity — both callers already treat a falsy result
+/// as "fall back to the verifying path"), this now DOES verify: `new_root` is a peer's *claim*
+/// (from a `StateProofBundle` whose Merkle proofs only cover the touched keys, not this node's
+/// full prior state), and it used to be cached via `set_state_root_cache` without ever comparing
+/// it to a fresh recompute over this node's actual `accounts` column family. If this node's own
+/// prior state had ever silently diverged from the peer's (from any cause), that divergence was
+/// accepted as fact here and baked in permanently. Returns `Ok(true)` only if a full recompute
+/// matches the claim; `Ok(false)` on mismatch (mutations are reverted first — the caller's
+/// existing `apply_lsu_with_root_check` fallback then re-derives the state honestly).
+///
+/// NOTE: this path intentionally has no cycle-number idempotence guard. It is used both
+/// for forward application (proof-verified, chains onto the current root) and for same-cycle
+/// reorg/reconcile that replaces the applied head's LSU with a stronger certified one; the callers
+/// are responsible for verifying chaining / fork-choice before invoking it.
 async fn apply_lsu_to_storage_without_root_check(
     store: &StorageManager,
     lsu: &catalyst_consensus::types::LedgerStateUpdate,
     new_root: [u8; 32],
-) -> Result<()> {
-    // NOTE: this trusted path intentionally has no cycle-number idempotence guard. It is used both
-    // for forward application (proof-verified, chains onto the current root) and for same-cycle
-    // reorg/reconcile that replaces the applied head's LSU with a stronger certified one; the callers
-    // are responsible for verifying chaining / fork-choice before invoking it.
+) -> Result<bool> {
     let _apply_guard = lsu_apply_lock().lock().await;
+
+    let snap = format!("trusted_apply_verify_{}_{}", lsu.cycle_number, current_timestamp_ms());
+    store
+        .create_snapshot(&snap)
+        .await
+        .map_err(|e| anyhow::anyhow!("snapshot create failed: {e}"))?;
 
     #[derive(Clone, Debug, Default)]
     struct ApplyOutcome {
@@ -1409,8 +1425,30 @@ async fn apply_lsu_to_storage_without_root_check(
     settle_fee_credit_spend_for_applied_cycle(store, lsu).await;
     distribute_waiting_pool_rewards_and_fee_credits(store, lsu).await;
 
-    // Persist head metadata (trusted).
-    store.set_state_root_cache(new_root);
+    // Verify the claimed root against a full recompute over this node's actual `accounts` state
+    // — do not trust `new_root` (see doc comment above). On mismatch, revert every mutation made
+    // above and let the caller fall back to `apply_lsu_with_root_check`, which re-derives the
+    // state honestly instead of silently adopting a peer's unverified claim.
+    let recomputed = store
+        .commit()
+        .await
+        .map_err(|e| anyhow::anyhow!("state root recompute failed: {e}"))?;
+    if recomputed != new_root {
+        tracing::warn!(
+            target: "catalyst.consensus.apply",
+            cycle = lsu.cycle_number,
+            claimed = %hex_encode(&new_root),
+            recomputed = %hex_encode(&recomputed),
+            "Trusted apply path: claimed state_root did not match local recompute; reverting and falling back to verified apply"
+        );
+        catalyst_utils::increment_counter!("consensus_trusted_apply_root_mismatch_total", 1);
+        let _ = store.load_snapshot(&snap).await;
+        let _ = store.delete_snapshot(&snap).await;
+        return Ok(false);
+    }
+    let _ = store.delete_snapshot(&snap).await;
+
+    // Persist head metadata (verified above, not merely trusted).
     let _ = store
         .set_metadata("consensus:last_applied_cycle", &lsu.cycle_number.to_le_bytes())
         .await;
@@ -1426,6 +1464,18 @@ async fn apply_lsu_to_storage_without_root_check(
     // Update per-tx receipts for this cycle (best-effort): mark Applied + attach outcomes.
     let cycle = lsu.cycle_number;
     let lsu_hash = catalyst_consensus::types::hash_data(lsu).unwrap_or([0u8; 32]);
+
+    // Guarantee the per-cycle history record exists — see the matching comment in
+    // `apply_lsu_to_storage`. This path (proof-driven fast catch-up) is exactly the one observed
+    // in production leaving holes in local history when it was the only apply that ran for a cycle.
+    if let Ok(lsu_bytes) = lsu.serialize() {
+        let _ = store
+            .set_metadata(&format!("consensus:lsu:{}", cycle), &lsu_bytes)
+            .await;
+        let _ = store
+            .set_metadata(&format!("consensus:lsu_hash:{}", cycle), &lsu_hash)
+            .await;
+    }
     let txids = load_cycle_txids(store, cycle).await;
     for txid in txids {
         let key = tx_meta_key(&txid);
@@ -1483,11 +1533,11 @@ async fn apply_lsu_to_storage_without_root_check(
     // Opportunistic disk-bounding: prune old historical metadata (if enabled).
     crate::pruning::maybe_prune_history(store).await;
 
-    // Flush without recomputing.
+    // Flush (root already recomputed and verified above via `store.commit()`).
     for cf_name in store.engine().cf_names() {
         let _ = store.engine().flush_cf(&cf_name);
     }
-    Ok(())
+    Ok(true)
 }
 fn nonce_key_for_pubkey(pubkey: &[u8; 32]) -> Vec<u8> {
     let mut k = b"nonce:".to_vec();
@@ -1905,6 +1955,10 @@ pub(crate) fn ensure_consensus_p2p_cli_metrics_registered() {
         (
             "consensus_lsu_apply_skipped_prev_root_total",
             "LsuCidGossip apply skipped after prev_root mismatch and reconcile did not complete",
+        ),
+        (
+            "consensus_trusted_apply_root_mismatch_total",
+            "Proof-driven fast-apply path: peer's claimed state_root did not match a local recompute; reverted and fell back to verified apply",
         ),
         (
             "consensus_fork_choice_rejected_weaker_total",
@@ -3142,6 +3196,24 @@ pub(crate) async fn apply_lsu_to_storage(
         .set_metadata("consensus:last_applied_state_root", &state_root)
         .await;
 
+    // Guarantee the per-cycle history record (`consensus:lsu:{cycle}` / `consensus:lsu_hash:{cycle}`)
+    // exists for any cycle actually applied. This used to be left entirely to callers to remember
+    // via `persist_lsu_history`, and at least two paths never called it — the reconcile L2
+    // fast-path and the main per-cycle production/completion path — leaving holes in a node's own
+    // local history that a later reconcile attempt would find missing and be unable to bridge
+    // (observed in production: "missing stored LSU for cycle N" for cycles that were, in fact,
+    // already correctly applied). By the time this function runs, the caller has already decided
+    // this LSU is the one to apply for this cycle (via fork choice / reconcile), so recording it
+    // as canonical here unconditionally is always correct.
+    if let Ok(lsu_bytes) = lsu.serialize() {
+        let _ = store
+            .set_metadata(&format!("consensus:lsu:{}", lsu.cycle_number), &lsu_bytes)
+            .await;
+        let _ = store
+            .set_metadata(&format!("consensus:lsu_hash:{}", lsu.cycle_number), &lsu_hash)
+            .await;
+    }
+
     info!(
         "Applied LSU to storage cycle={} state_root={}",
         lsu.cycle_number,
@@ -3172,8 +3244,8 @@ pub(crate) async fn apply_lsu_to_storage(
     Ok(state_root)
 }
 
-/// Before giving up on fork reconcile, poll for missing `consensus:lsu:*` metadata after
-/// broadcasting `LsuRangeRequest` (best-effort WAN repair). `0` disables.
+/// Before giving up on fork reconcile, request missing `consensus:lsu:*` metadata via
+/// `LsuRangeRequest` (best-effort WAN repair). `0` disables.
 fn catalyst_reconcile_prefetch_wait_ms() -> u64 {
     std::env::var("CATALYST_RECONCILE_PREFETCH_MS")
         .ok()
@@ -3181,8 +3253,20 @@ fn catalyst_reconcile_prefetch_wait_ms() -> u64 {
         .unwrap_or(8000)
 }
 
-/// Ask peers for missing LSU metadata in `[scan_start, end_exclusive)` and poll local storage until filled
-/// or `wait_ms` elapses.
+/// Ask peers for missing LSU metadata in `[scan_start, end_exclusive)`, fire-and-forget.
+///
+/// This runs inline inside the single shared gossip-processing task (the `events.recv().await`
+/// loop), so it must return promptly: it used to poll local storage in a loop, sleeping up to
+/// `wait_ms` (default 8s) between attempts, which stalled ALL inbound P2P message handling for the
+/// full window on every call. When the requested history could never be satisfied (e.g. genesis-era
+/// history that no longer exists after a reset), this recurred on every conflicting gossip message
+/// and wedged the node indefinitely — no further gossip, votes, or LSUs could be processed.
+///
+/// Now it does one local scan, fires a single `LsuRangeRequest` broadcast if anything is missing,
+/// and returns immediately without waiting for a response. `wait_ms` is kept only as an on/off gate
+/// (`0` disables); a follow-up reconcile attempt — naturally retried on the next conflicting gossip
+/// message, or by the periodic `advance_handle`/`gap_handle` background tickers — picks up whatever
+/// arrived in response.
 async fn reconcile_prefetch_lsu_metadata_if_missing(
     store: &StorageManager,
     network: &P2pService,
@@ -3195,44 +3279,31 @@ async fn reconcile_prefetch_lsu_metadata_if_missing(
     if wait_ms == 0 || end_exclusive <= scan_start {
         return;
     }
-    let deadline = current_timestamp_ms().saturating_add(wait_ms);
-    loop {
-        let mut first_missing: Option<u64> = None;
-        for i in scan_start..end_exclusive {
-            let has = store
-                .get_metadata(&format!("consensus:lsu:{}", i))
-                .await
-                .ok()
-                .flatten()
-                .is_some();
-            if !has {
-                first_missing = Some(i);
-                break;
-            }
+    let mut first_missing: Option<u64> = None;
+    for i in scan_start..end_exclusive {
+        let has = store
+            .get_metadata(&format!("consensus:lsu:{}", i))
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+        if !has {
+            first_missing = Some(i);
+            break;
         }
-        if first_missing.is_none() {
-            return;
-        }
-        if current_timestamp_ms() >= deadline {
-            tracing::info!(
-                target: "catalyst.consensus.reconcile",
-                "reconcile_prefetch: deadline reached with missing LSU metadata before cycle {}",
-                end_exclusive
-            );
-            return;
-        }
-        let start = first_missing.unwrap_or(1);
-        let remaining = end_exclusive.saturating_sub(start);
-        let count = remaining.min(256) as u32;
-        let req = LsuRangeRequest {
-            requester: requester.to_string(),
-            start_cycle: start,
-            count,
-        };
-        if let Ok(env) = MessageEnvelope::from_message(&req, "reconcile_prefetch_lsu".to_string(), None) {
-            let _ = network.broadcast_envelope(&env).await;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let Some(start) = first_missing else {
+        return;
+    };
+    let remaining = end_exclusive.saturating_sub(start);
+    let count = remaining.min(256) as u32;
+    let req = LsuRangeRequest {
+        requester: requester.to_string(),
+        start_cycle: start,
+        count,
+    };
+    if let Ok(env) = MessageEnvelope::from_message(&req, "reconcile_prefetch_lsu".to_string(), None) {
+        let _ = network.broadcast_envelope(&env).await;
     }
 }
 
@@ -3707,6 +3778,12 @@ fn metadata_logical_name_is_preserved(name: &[u8]) -> bool {
 
 /// Wipe mutable chain state while keeping `protocol:*` metadata and per-cycle LSU history keys
 /// (`consensus:lsu:*`, hashes, CIDs, state roots) for bounded replay.
+///
+/// Used only when reconciling a cycle we have already (wrongly) applied: there is no way to
+/// "undo" forward from an already-applied wrong LSU, so we deliberately discard all mutable
+/// state and rebuild it via hash-verified replay from a trustworthy anchor (the chain's true
+/// first cycle, or a checkpoint restored immediately afterward). Do NOT call this when merely
+/// catching up from behind — that path replays forward onto the existing, still-correct state.
 async fn purge_mutable_chain_state_preserving_lsu_history(
     store: &StorageManager,
 ) -> anyhow::Result<()> {
@@ -3875,12 +3952,55 @@ async fn try_reconcile_fork_from_quorum_lsu(
         })
         .unwrap_or(0);
 
-    let mut replay_start = 1u64;
-    if cycle > 1 {
-        // Resolve a checkpoint prefix FIRST so the P2P backfill below targets the actual
-        // replay window (checkpoint+1..cycle) rather than always anchoring to the local head.
-        // Without this, a node missing genesis-era LSU history can never satisfy the replay
-        // loop and aborts with "missing stored LSU for cycle 1".
+    // Two distinct scenarios reach this point, and they require different repair strategies:
+    //
+    // (A) We are BEHIND (`local_cycle < cycle`): we have not yet applied anything for `cycle`.
+    //     Our own applied state up to `local_cycle` is presumptively correct, so we build
+    //     FORWARD onto it — replaying only `local_cycle+1..cycle` — and never touch existing
+    //     account balances. This is the common case (a few cycles behind, not diverged).
+    //
+    // (B) We are AT OR PAST `cycle` (`local_cycle >= cycle`): we already applied a *different*
+    //     (weaker) LSU for `cycle` and a stronger one has since arrived. There is no "forward"
+    //     fix here — the only way to get the correct pre-`cycle` state is to discard everything
+    //     we hold and rebuild it via a hash-verified replay of stored history, anchored at
+    //     either the chain's true first cycle (`1`, for a from-genesis archival node/test chain)
+    //     or the most recent checkpoint. This is the one case where wiping mutable state
+    //     (`purge_mutable_chain_state_preserving_lsu_history`) is correct: we are intentionally
+    //     discarding the wrong state, not risking a correct one.
+    //
+    // Using case (A)'s forward-only strategy for case (B), or vice versa, silently produces
+    // wrong account balances (case A's purge would erase trusted history; case B's forward-only
+    // replay can never undo an already-applied wrong LSU at the same cycle).
+    let behind = local_cycle < cycle;
+
+    // Bounded lookup: find the best checkpoint (if any) that bridges the needed window, and
+    // fail loudly — never guess — if it can't be bridged locally, via checkpoint, or via peers.
+    // Returns the resolved `replay_start` on success.
+    async fn resolve_replay_start(
+        store: &StorageManager,
+        cycle: u64,
+        pruned_up_to: u64,
+        fetch: Option<(&P2pService, &str)>,
+        default_start: u64,
+    ) -> Result<Option<u64>> {
+        let mut replay_start = default_start;
+        if replay_start >= cycle {
+            return Ok(Some(replay_start));
+        }
+
+        let mut gap: Option<u64> = None;
+        for i in replay_start..cycle {
+            if store.get_metadata(&format!("consensus:lsu:{}", i)).await.ok().flatten().is_none() {
+                gap = Some(i);
+                break;
+            }
+        }
+        if gap.is_none() {
+            return Ok(Some(replay_start));
+        }
+
+        // This is a bounded lookup (never a walk from literal cycle 1 — see
+        // `reconcile_checkpoint_for_missing_prefix`).
         if let Some(cp) =
             crate::checkpoint::reconcile_checkpoint_for_missing_prefix(store, cycle, pruned_up_to).await
         {
@@ -3888,65 +4008,47 @@ async fn try_reconcile_fork_from_quorum_lsu(
                 target: "catalyst.consensus.checkpoint",
                 checkpoint_cycle = cp.cycle,
                 target_cycle = cycle,
-                "Using checkpoint for reconcile prefix (pruned LSU metadata)"
+                "Using checkpoint for reconcile prefix"
             );
-            if let Err(e) = crate::checkpoint::restore_reconcile_from_checkpoint(store, &cp, local_cycle).await {
-                warn!(
-                    target: "catalyst.consensus.checkpoint",
-                    "Checkpoint restore failed: {e}"
-                );
-                catalyst_utils::increment_counter!("consensus_fork_reconcile_aborted_total", 1);
-                return Ok(false);
-            }
             replay_start = cp.cycle.saturating_add(1);
         }
+
         if let Some((net, requester)) = fetch {
             let prefetch_ms = catalyst_reconcile_prefetch_wait_ms();
             if prefetch_ms > 0 {
-                // When a checkpoint anchored the prefix, backfill from there; otherwise preserve
-                // the legacy window (local head onward) — genesis backfill over P2P is infeasible.
-                let prefetch_from = if replay_start > 1 {
-                    replay_start
-                } else {
-                    local_cycle.saturating_add(1).max(1)
-                };
-                reconcile_prefetch_lsu_metadata_if_missing(
-                    store,
-                    net,
-                    requester,
-                    prefetch_from,
-                    cycle,
-                    prefetch_ms,
-                )
-                .await;
+                reconcile_prefetch_lsu_metadata_if_missing(store, net, requester, replay_start, cycle, prefetch_ms)
+                    .await;
             }
         }
+
         for i in replay_start..cycle {
-            if store
-                .get_metadata(&format!("consensus:lsu:{}", i))
-                .await
-                .ok()
-                .flatten()
-                .is_none()
-            {
+            if store.get_metadata(&format!("consensus:lsu:{}", i)).await.ok().flatten().is_none() {
                 if i <= pruned_up_to {
-                    warn!(
+                    error!(
                         target: "catalyst.consensus.reconcile",
-                        "Quorum fork reconcile skipped: LSU metadata for cycle {} was pruned (pruned_up_to={}); use checkpoint, archival history, or P2P fetch",
+                        "Quorum fork reconcile FAILED (needs operator action): LSU metadata for cycle {} was pruned (pruned_up_to={}) and no checkpoint covers it; restore archival metadata or a peer snapshot",
                         i, pruned_up_to
                     );
                 } else {
-                    warn!(
+                    error!(
                         target: "catalyst.consensus.reconcile",
-                        "Quorum fork reconcile skipped: missing stored LSU for cycle {} (set CATALYST_RECONCILE_PREFETCH_MS>0 with P2P peers for backfill, or restore archival metadata)",
-                        i
+                        "Quorum fork reconcile FAILED: missing stored LSU for cycle {} and no checkpoint or peer bridged it before cycle {}; this node cannot safely verify a path forward and will keep deferring until this resolves",
+                        i, cycle
                     );
                 }
                 catalyst_utils::increment_counter!("consensus_fork_reconcile_aborted_total", 1);
-                return Ok(false);
+                return Ok(None);
             }
         }
+        Ok(Some(replay_start))
     }
+
+    let default_start = if behind { local_cycle.saturating_add(1).max(1) } else { 1u64 };
+    let Some(mut replay_start) =
+        resolve_replay_start(store, cycle, pruned_up_to, fetch, default_start).await?
+    else {
+        return Ok(false);
+    };
 
     let snap = format!(
         "quorum_reconcile_c{}_{}",
@@ -3959,11 +4061,27 @@ async fn try_reconcile_fork_from_quorum_lsu(
         .map_err(|e| anyhow::anyhow!("reconcile snapshot create: {e}"))?;
 
     let reconcile_inner = async {
-        purge_mutable_chain_state_preserving_lsu_history(store).await?;
-        store
-            .refresh_cached_state_root()
-            .await
-            .map_err(|e| anyhow::anyhow!("refresh root: {e}"))?;
+        if !behind {
+            // Case (B): discard whatever we applied at/after `cycle` and rebuild from scratch.
+            // Purge FIRST, then (if a checkpoint anchors the prefix) restore it — restoring
+            // onto an already-empty base makes the checkpoint's snapshot a true replace rather
+            // than a merge on top of stale data.
+            purge_mutable_chain_state_preserving_lsu_history(store).await?;
+            if replay_start > 1 {
+                let cp = crate::checkpoint::load_checkpoint_at_cycle(store, replay_start.saturating_sub(1))
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("checkpoint at cycle {} vanished", replay_start - 1))?;
+                crate::checkpoint::restore_reconcile_from_checkpoint(store, &cp, local_cycle)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("checkpoint restore: {e}"))?;
+            } else {
+                store
+                    .refresh_cached_state_root()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("refresh root: {e}"))?;
+            }
+        }
+        // Case (A) needs no purge: we replay directly onto our own trusted current state.
 
         for i in replay_start..cycle {
             let key = format!("consensus:lsu:{}", i);
@@ -4049,6 +4167,13 @@ async fn apply_lsu_with_root_check(
 
     let got = apply_lsu_to_storage(store, lsu).await?;
     if got == expected_state_root {
+        // NOTE: this snapshot used to leak (neither branch deleted it). With `max_snapshots`
+        // capped (default 10), this function is called far more often than a checkpoint is
+        // written, so the leaked snapshots accumulated and eventually caused
+        // `cleanup_old_snapshots` to evict the checkpoint snapshot itself as "oldest" — breaking
+        // reconcile's ability to restore it (observed as "checkpoint restore: load checkpoint
+        // snapshot ... failed" once reconcile could otherwise succeed).
+        let _ = store.delete_snapshot(&snap).await;
         return Ok(true);
     }
 
@@ -4057,6 +4182,7 @@ async fn apply_lsu_with_root_check(
         .load_snapshot(&snap)
         .await
         .map_err(|e| anyhow::anyhow!("snapshot revert failed: {e}"))?;
+    let _ = store.delete_snapshot(&snap).await;
     Ok(false)
 }
 
@@ -4738,6 +4864,11 @@ impl CatalystNode {
             struct CatchupState {
                 observed_head_cycle: u64,
                 last_req_ms: u64,
+                // Liveness backstop for a stale/unreachable `observed_head_cycle` (see
+                // `stale_observed_head_reset_ms`): tracks the applied head last seen while behind,
+                // and when that "behind" state started, so we can detect zero progress over time.
+                stale_last_head: u64,
+                stale_since_ms: Option<u64>,
             }
             let catchup: Arc<tokio::sync::Mutex<CatchupState>> =
                 Arc::new(tokio::sync::Mutex::new(CatchupState::default()));
@@ -4780,8 +4911,44 @@ impl CatalystNode {
                         );
                     }
                     let head = local_applied_cycle(store.as_ref()).await;
-                    let observed = catchup_advance.lock().await.observed_head_cycle;
-                    observed_head_advance.fetch_max(observed, std::sync::atomic::Ordering::Relaxed);
+                    let now_ms = crate::consensus_limits::wall_now_ms();
+                    // Liveness backstop: `observed_head_cycle` is monotonic (only ever raised by P2P
+                    // gossip) so a phantom/unreachable head can never self-correct. If we've made zero
+                    // applied-head progress for `stale_observed_head_reset_ms()` despite sitting behind
+                    // and re-requesting the range every tick, nobody on the network can actually serve
+                    // that cycle — abandon it and resume production from our own confirmed head rather
+                    // than deferring forever (see `consensus_limits::stale_observed_head_reset_ms`).
+                    let observed = {
+                        let mut c = catchup_advance.lock().await;
+                        if c.observed_head_cycle > head {
+                            if c.stale_last_head != head {
+                                c.stale_last_head = head;
+                                c.stale_since_ms = Some(now_ms);
+                            } else {
+                                let since = *c.stale_since_ms.get_or_insert(now_ms);
+                                let stale_budget_ms = crate::consensus_limits::stale_observed_head_reset_ms();
+                                if now_ms.saturating_sub(since) > stale_budget_ms {
+                                    warn!(
+                                        "observed_head_cycle {} stale for {}ms with no applied-head progress past {}; resetting to applied head (peers are not serving the requested range)",
+                                        c.observed_head_cycle,
+                                        now_ms.saturating_sub(since),
+                                        head
+                                    );
+                                    catalyst_utils::increment_counter!(
+                                        "consensus_observed_head_stale_reset_total",
+                                        1
+                                    );
+                                    c.observed_head_cycle = head;
+                                    c.stale_since_ms = Some(now_ms);
+                                }
+                            }
+                        } else {
+                            c.stale_last_head = head;
+                            c.stale_since_ms = None;
+                        }
+                        c.observed_head_cycle
+                    };
+                    observed_head_advance.store(observed, std::sync::atomic::Ordering::Relaxed);
                     // Fetch the missing certified LSU(s) whenever we are behind by even ONE cycle.
                     // CRITICAL liveness fix: the production depth-gate defers at `observed > applied`
                     // (>=1 behind), so the catch-up fetch MUST also trigger at >=1 behind. The previous
@@ -4790,7 +4957,6 @@ impl CatalystNode {
                     // At N=3 with one validator down, that wedged node holds a vote the quorum needs, so a
                     // single missed tip-LSU froze the whole network permanently (observed testnet freeze).
                     if observed > head {
-                        let now_ms = crate::consensus_limits::wall_now_ms();
                         let mut c = catchup_advance.lock().await;
                         if now_ms.saturating_sub(c.last_req_ms) > 2000 {
                             let start = head.saturating_add(1);
@@ -5393,7 +5559,7 @@ impl CatalystNode {
                                                                                 bundle.new_state_root,
                                                                             )
                                                                             .await
-                                                                            .is_ok()
+                                                                            .unwrap_or(false)
                                                                             {
                                                                                 applied = true;
                                                                             }
@@ -6178,7 +6344,7 @@ impl CatalystNode {
                                                                         bundle.new_state_root,
                                                                     )
                                                                     .await
-                                                                    .is_ok();
+                                                                    .unwrap_or(false);
                                                                 }
                                                             }
                                                         }
@@ -6979,9 +7145,14 @@ mod bft_quorum_tests {
     #[test]
     fn depth_gate_defers_only_when_behind_observed_head() {
         use super::should_defer_production_when_behind;
-        // Bootstrap (no applied head yet): never defer, we must start the chain.
+        // True fresh genesis start (no applied head, no peer gossip observed yet either):
+        // never defer, we must start the chain.
         assert!(!should_defer_production_when_behind(0, 0));
-        assert!(!should_defer_production_when_behind(0, 89_043_100));
+        // Fresh-restart node (wiped data, applied=0) that has already heard gossip from a live
+        // network (observed_head > 0): must defer, not produce from genesis state, or it forks
+        // itself off the canonical chain. Deliberately NOT gated on `applied != 0` (see
+        // `should_defer_production_when_behind` doc comment).
+        assert!(should_defer_production_when_behind(0, 89_043_100));
         // Caught up (observed <= applied): produce, even across skipped cycle numbers.
         assert!(!should_defer_production_when_behind(89_043_100, 89_043_100));
         assert!(!should_defer_production_when_behind(89_043_100, 89_043_090));
@@ -7348,9 +7519,9 @@ mod storage_state_root_convergence_tests {
 #[cfg(test)]
 mod fork_choice_integration_tests {
     use super::{
-        apply_lsu_to_storage, ensure_chain_identity_and_genesis,
-        fork_choice_apply_gate, hex_encode, load_stored_certified_hash_at_cycle,
-        local_applied_lsu_hash, local_applied_state_root, persist_lsu_history,
+        apply_lsu_to_storage, apply_lsu_to_storage_without_root_check, ensure_chain_identity_and_genesis,
+        fork_choice_apply_gate, get_balance_i64, hex_encode, load_stored_certified_hash_at_cycle,
+        local_applied_cycle, local_applied_lsu_hash, local_applied_state_root, persist_lsu_history,
         try_reconcile_fork_from_quorum_lsu, try_reorg_stronger_lsu_at_applied_cycle,
         ForkChoiceApplyGate,
     };
@@ -7910,6 +8081,298 @@ mod fork_choice_integration_tests {
         assert_eq!(
             local_applied_lsu_hash(&env.store).await,
             Some(hash_cert_c2)
+        );
+    }
+
+    /// Regression test for the "purge before checkpoint restore" / "purge from an arbitrary
+    /// replay_start" bug: catching up more than one cycle behind (so the single-cycle L2
+    /// fast-path in `try_reconcile_fork_from_quorum_lsu` doesn't apply) must replay forward
+    /// onto the existing account state, never wipe it. A prior version of this function always
+    /// purged mutable state and replayed from either literal cycle 1 or a checkpoint, which
+    /// silently truncated every balance accumulated before the replay window.
+    #[tokio::test]
+    async fn reconcile_forward_catchup_beyond_one_cycle_preserves_prior_balances() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let pk0 = committee.keys[0].public_key().to_bytes();
+
+        // Cycles 1 and 2 are applied normally, accumulating a non-trivial balance.
+        let lsu_c1 = lsu_with_tx_seed(&committee, 1, 5);
+        let root_c1 = apply_lsu_to_storage(&env.store, &lsu_c1)
+            .await
+            .expect("apply cycle 1");
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            1,
+            &lsu_c1.serialize().expect("ser"),
+            &hash_data(&lsu_c1).expect("h1"),
+            "",
+            &root_c1,
+            "",
+            false,
+        )
+        .await;
+
+        let lsu_c2 = lsu_with_tx_seed(&committee, 2, 7);
+        let root_c2 = apply_lsu_to_storage(&env.store, &lsu_c2)
+            .await
+            .expect("apply cycle 2");
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            2,
+            &lsu_c2.serialize().expect("ser"),
+            &hash_data(&lsu_c2).expect("h2"),
+            "",
+            &root_c2,
+            "",
+            false,
+        )
+        .await;
+
+        let balance_before = get_balance_i64(&env.store, &pk0).await;
+        assert_eq!(balance_before, 5 + 7, "sanity: balances accrue normally");
+
+        // Cycle 3's LSU is already known/stored locally (e.g. from earlier gossip) but has not
+        // yet been applied as our own head — we are still at applied cycle 2. Compute its
+        // effect and cycle 4's (the reconcile target) via a scratch snapshot, then restore back
+        // to the cycle-2 state so the test's starting point is genuinely "2 cycles behind".
+        let lsu_c3 = lsu_with_tx_seed(&committee, 3, 11);
+        let lsu_c4 = lsu_with_tx_seed(&committee, 4, 13);
+        let scratch_snap = "scratch_c3_c4";
+        env.store
+            .create_snapshot(scratch_snap)
+            .await
+            .expect("scratch snapshot");
+        let root_c3 = apply_lsu_to_storage(&env.store, &lsu_c3)
+            .await
+            .expect("compute cycle 3 root");
+        let expected_post_c4 = apply_lsu_to_storage(&env.store, &lsu_c4)
+            .await
+            .expect("compute cycle 4 root");
+        env.store
+            .load_snapshot(scratch_snap)
+            .await
+            .expect("restore to cycle 2");
+        let _ = env.store.delete_snapshot(scratch_snap).await;
+        assert_eq!(
+            local_applied_cycle(&env.store).await,
+            2,
+            "sanity: still 2 cycles behind after scratch restore"
+        );
+
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            3,
+            &lsu_c3.serialize().expect("ser"),
+            &hash_data(&lsu_c3).expect("h3"),
+            "",
+            &root_c3,
+            "",
+            false,
+        )
+        .await;
+
+        let hash_c4 = hash_data(&lsu_c4).expect("h4");
+        let cid = install_finality_cert(&env, &lsu_c4, &committee).await;
+
+        let reconciled = try_reconcile_fork_from_quorum_lsu(
+            &env.store,
+            &lsu_c4,
+            4,
+            root_c3,
+            expected_post_c4,
+            &hash_c4,
+            None,
+            Some(&env.dfs),
+            &cid,
+            true,
+        )
+        .await
+        .expect("reconcile");
+        assert!(
+            reconciled,
+            "reconcile should replay stored cycle 3 forward onto the existing cycle-2 state, then apply cycle 4"
+        );
+
+        let balance_after = get_balance_i64(&env.store, &pk0).await;
+        assert_eq!(
+            balance_after,
+            5 + 7 + 11 + 13,
+            "forward catch-up must accumulate onto prior balances, not truncate them"
+        );
+        assert_eq!(local_applied_cycle(&env.store).await, 4);
+    }
+
+    /// Regression test for the "trust a peer's claimed state_root without verifying it" bug in
+    /// `apply_lsu_to_storage_without_root_check`: a mismatched claim must be rejected (not
+    /// silently cached as fact) and every mutation it made must be fully reverted, so the
+    /// caller's existing fallback (`apply_lsu_with_root_check`) starts from a clean state.
+    #[tokio::test]
+    async fn trusted_apply_rejects_and_reverts_mismatched_claimed_root() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let pk0 = committee.keys[0].public_key().to_bytes();
+
+        let lsu_c1 = lsu_with_tx_seed(&committee, 1, 5);
+        let _root_c1 = apply_lsu_to_storage(&env.store, &lsu_c1)
+            .await
+            .expect("apply cycle 1");
+        assert_eq!(get_balance_i64(&env.store, &pk0).await, 5);
+        assert_eq!(local_applied_cycle(&env.store).await, 1);
+
+        // Compute the TRUE root cycle 2 would produce, via a scratch snapshot, then restore so
+        // the "trusted" call below starts from the same state a real caller would see.
+        let lsu_c2 = lsu_with_tx_seed(&committee, 2, 7);
+        let scratch_snap = "scratch_true_root_c2";
+        env.store.create_snapshot(scratch_snap).await.expect("snap");
+        let true_root_c2 = apply_lsu_to_storage(&env.store, &lsu_c2)
+            .await
+            .expect("compute true cycle 2 root");
+        env.store.load_snapshot(scratch_snap).await.expect("restore");
+        let _ = env.store.delete_snapshot(scratch_snap).await;
+
+        // A deliberately wrong claimed root (flip the true root's first byte).
+        let mut wrong_root = true_root_c2;
+        wrong_root[0] ^= 0xFF;
+
+        let ok = apply_lsu_to_storage_without_root_check(&env.store, &lsu_c2, wrong_root)
+            .await
+            .expect("no hard error, just a verified rejection");
+        assert!(!ok, "mismatched claimed root must be rejected");
+        assert_eq!(
+            get_balance_i64(&env.store, &pk0).await,
+            5,
+            "rejected claim must leave no partial mutation behind"
+        );
+        assert_eq!(
+            local_applied_cycle(&env.store).await,
+            1,
+            "rejected claim must not advance the applied head"
+        );
+
+        // The correct claimed root is accepted and applied.
+        let ok = apply_lsu_to_storage_without_root_check(&env.store, &lsu_c2, true_root_c2)
+            .await
+            .expect("apply with correct root");
+        assert!(ok, "correctly-claimed root must be accepted");
+        assert_eq!(get_balance_i64(&env.store, &pk0).await, 5 + 7);
+        assert_eq!(local_applied_cycle(&env.store).await, 2);
+    }
+
+    /// `StorageManager::load_snapshot` restores by writing back the snapshot's captured keys —
+    /// it does not first delete keys that exist now but did not exist when the snapshot was
+    /// taken (a separate, pre-existing gap: `clear_database` is a no-op). So a revert-on-mismatch
+    /// only fully undoes a failed apply if every mutation it made overwrote an *existing* key;
+    /// a mutation that *creates* a new key (e.g. this session's new unconditional
+    /// `consensus:lsu:{cycle}` write) would survive a "clean" revert as a stray leftover. This
+    /// test uses a cycle with NO prior history at all, so any survival is unambiguous.
+    #[tokio::test]
+    async fn trusted_apply_revert_does_not_leave_stray_lsu_history_on_rejection() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+
+        // No cycle has ever been applied or recorded here — a totally clean slate.
+        assert_eq!(local_applied_cycle(&env.store).await, 0);
+        assert!(
+            env.store.get_metadata("consensus:lsu:1").await.ok().flatten().is_none(),
+            "sanity: no history before the call"
+        );
+
+        let lsu_c1 = lsu_with_tx_seed(&committee, 1, 5);
+        let bogus_root = [0xABu8; 32];
+
+        let ok = apply_lsu_to_storage_without_root_check(&env.store, &lsu_c1, bogus_root)
+            .await
+            .expect("no hard error, just a verified rejection");
+        assert!(!ok, "bogus claimed root must be rejected");
+
+        assert_eq!(
+            local_applied_cycle(&env.store).await,
+            0,
+            "rejected claim must not advance the applied head"
+        );
+        assert!(
+            env.store.get_metadata("consensus:lsu:1").await.ok().flatten().is_none(),
+            "rejected claim must not leave a stray consensus:lsu:{{cycle}} record behind"
+        );
+        assert!(
+            env.store.get_metadata("consensus:lsu_hash:1").await.ok().flatten().is_none(),
+            "rejected claim must not leave a stray consensus:lsu_hash:{{cycle}} record behind"
+        );
+    }
+
+    /// Regression test for the "LSU history not persisted" bug: applying a cycle via the L2
+    /// self-heal fast-path in `try_reconcile_fork_from_quorum_lsu` (chains directly onto the
+    /// current head) must leave `consensus:lsu:{cycle}` / `consensus:lsu_hash:{cycle}` behind,
+    /// just like a normal forward apply would. Previously this fast-path applied the LSU (via
+    /// `apply_lsu_with_root_check`) and returned success without ever persisting the history
+    /// record, leaving a hole that a later reconcile attempt would find missing and be unable to
+    /// bridge — observed in production as "missing stored LSU for cycle N" for cycles that had,
+    /// in fact, already been correctly applied.
+    #[tokio::test]
+    async fn l2_fastpath_reconcile_persists_lsu_history() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+
+        let lsu_c1 = lsu_with_tx_seed(&committee, 1, 3);
+        let root_c1 = apply_lsu_to_storage(&env.store, &lsu_c1)
+            .await
+            .expect("apply cycle 1");
+        assert_eq!(local_applied_cycle(&env.store).await, 1);
+
+        // Cycle 2's LSU chains directly onto the current head (root_c1), so this reconcile call
+        // will hit the L2 fast-path, not the replay machinery.
+        let lsu_c2 = lsu_with_tx_seed(&committee, 2, 9);
+        let hash_c2 = hash_data(&lsu_c2).expect("hash c2");
+        let cid = install_finality_cert(&env, &lsu_c2, &committee).await;
+
+        // Compute the expected post-cycle-2 root using a separate, isolated store (not a
+        // snapshot/restore on `env.store`): `StorageManager::load_snapshot` does not actually
+        // clear existing keys before restoring (a separate, pre-existing bug), so a scratch
+        // apply on the same store would leave a stray `consensus:lsu:2` behind that confuses
+        // this test's own fork-choice pre-check before ever reaching the L2 fast-path.
+        let scratch_env = test_env().await;
+        let _ = apply_lsu_to_storage(&scratch_env.store, &lsu_c1)
+            .await
+            .expect("scratch apply cycle 1");
+        let expected_post_c2 = apply_lsu_to_storage(&scratch_env.store, &lsu_c2)
+            .await
+            .expect("compute expected cycle 2 root");
+
+        let reconciled = try_reconcile_fork_from_quorum_lsu(
+            &env.store,
+            &lsu_c2,
+            2,
+            root_c1,
+            expected_post_c2,
+            &hash_c2,
+            None,
+            Some(&env.dfs),
+            &cid,
+            true,
+        )
+        .await
+        .expect("reconcile");
+        assert!(reconciled, "should hit the L2 fast-path and apply cycle 2");
+        assert_eq!(local_applied_cycle(&env.store).await, 2);
+
+        let stored_lsu = env
+            .store
+            .get_metadata("consensus:lsu:2")
+            .await
+            .ok()
+            .flatten();
+        assert!(
+            stored_lsu.is_some(),
+            "L2 fast-path must persist consensus:lsu:{{cycle}}, not just apply state"
+        );
+        assert_eq!(
+            canonical_hash_at_cycle(&env.store, 2).await,
+            Some(hash_c2),
+            "L2 fast-path must persist consensus:lsu_hash:{{cycle}} matching what was applied"
         );
     }
 

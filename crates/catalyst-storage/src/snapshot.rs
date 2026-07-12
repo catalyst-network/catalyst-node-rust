@@ -450,21 +450,33 @@ impl SnapshotManager {
         Ok(())
     }
     
+    /// Snapshots named with this prefix are long-lived anchors (consensus checkpoints, written
+    /// once per `CATALYST_CHECKPOINT_EVERY_CYCLES` and expected to remain loadable until the next
+    /// one supersedes them) and must never be evicted by [`cleanup_old_snapshots`]'s count-based
+    /// retention, which otherwise treats every snapshot as equally disposable scratch space. A
+    /// caller-side snapshot leak elsewhere (short-lived verify/reconcile snapshots not deleted
+    /// after use) previously accumulated past `max_snapshots` and caused this cleanup to evict the
+    /// checkpoint as "oldest", breaking consensus fork-reconcile's ability to restore it.
+    const PROTECTED_SNAPSHOT_PREFIX: &'static str = "consensus_checkpoint_";
+
     /// Cleanup old snapshots based on configuration
     pub async fn cleanup_old_snapshots(&self) -> StorageResult<()> {
         let old_snapshots: Vec<String> = {
             let snapshots = self.snapshots.read();
-            let snapshot_count = snapshots.len();
 
+            // Collect owned (created_at, name) so we don't hold a non-Send lock guard across
+            // awaits. Checkpoint snapshots are excluded entirely: they neither count against
+            // `max_snapshots` nor are ever selected for eviction.
+            let mut snapshot_times: Vec<(u64, String)> = snapshots
+                .values()
+                .filter(|s| !s.name.starts_with(Self::PROTECTED_SNAPSHOT_PREFIX))
+                .map(|s| (s.created_at, s.name.clone()))
+                .collect();
+
+            let snapshot_count = snapshot_times.len();
             if snapshot_count <= self.config.max_snapshots {
                 return Ok(());
             }
-
-            // Collect owned (created_at, name) so we don't hold a non-Send lock guard across awaits
-            let mut snapshot_times: Vec<(u64, String)> = snapshots
-                .values()
-                .map(|s| (s.created_at, s.name.clone()))
-                .collect();
 
             // Sort snapshots by creation time
             snapshot_times.sort_by_key(|(created_at, _name)| *created_at);
@@ -803,7 +815,35 @@ mod tests {
             assert!(snapshots.contains(&format!("cleanup_test_{}", i)));
         }
     }
-    
+
+    /// Regression test: a `consensus_checkpoint_*`-named snapshot must survive cleanup
+    /// regardless of age or how many other (scratch) snapshots churn through afterward. A prior
+    /// bug in an unrelated caller leaked short-lived verify/reconcile snapshots, which
+    /// accumulated past `max_snapshots` and caused cleanup to evict the oldest snapshot — which
+    /// was, in production, always the checkpoint — breaking consensus fork-reconcile.
+    #[tokio::test]
+    async fn test_snapshot_cleanup_never_evicts_checkpoint() {
+        let (_engine, manager, _temp_dir) = create_test_setup().await;
+
+        manager.create_snapshot("consensus_checkpoint_100").await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // Flood with far more scratch snapshots than max_snapshots (5).
+        for i in 0..12 {
+            manager.create_snapshot(&format!("scratch_{}", i)).await.unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+
+        let snapshots = manager.list_snapshots().await.unwrap();
+        assert!(
+            snapshots.contains(&"consensus_checkpoint_100".to_string()),
+            "checkpoint snapshot must never be evicted by count-based cleanup"
+        );
+        // Scratch snapshots are still capped at max_snapshots (5), independent of the checkpoint.
+        let scratch_count = snapshots.iter().filter(|n| n.starts_with("scratch_")).count();
+        assert_eq!(scratch_count, 5);
+    }
+
     #[tokio::test]
     async fn test_snapshot_statistics() {
         let (_engine, manager, _temp_dir) = create_test_setup().await;

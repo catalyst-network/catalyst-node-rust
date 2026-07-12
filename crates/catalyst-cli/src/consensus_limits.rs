@@ -148,6 +148,29 @@ pub fn p2p_lsu_cycle_within_wall_lead(
     cycle <= w.saturating_add(max_lead_cycles)
 }
 
+/// How long (ms) `observed_head_cycle` may sit above `applied_head` with **zero** applied-head
+/// progress before it is treated as stale and reset down to `applied_head`
+/// (`CATALYST_STALE_OBSERVED_HEAD_RESET_MS`, default `60_000`, max `3_600_000`).
+///
+/// Guards against a permanent liveness deadlock: `observed_head_cycle` only ever rises
+/// (`fetch_max` from P2P LSU gossip), by design — a late/reordered message must never lower a
+/// node's view of the network head. But if it is raised to a cycle that never actually reaches
+/// quorum on the canonical chain (e.g. a peer's solo/non-finalized production, or a message from
+/// a since-restarted/diverged peer), no `LsuRangeResponse` will ever carry that cycle's bytes, and
+/// a depth-gated node ([`crate::node`]'s `should_defer_production_when_behind`) defers production
+/// forever waiting for something that will never arrive. If `applied_head` fails to advance for
+/// this long despite repeated range requests, the node abandons the phantom head and resumes
+/// production from its own confirmed state.
+pub fn stale_observed_head_reset_ms() -> u64 {
+    const MAX: u64 = 3_600_000;
+    const DEFAULT: u64 = 60_000;
+    std::env::var("CATALYST_STALE_OBSERVED_HEAD_RESET_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0 && v <= MAX)
+        .unwrap_or(DEFAULT)
+}
+
 /// On-disk / metadata encoding for `consensus:tx_batch_commit:{cycle}` (36 bytes).
 pub fn parse_tx_batch_commit_value(bytes: &[u8]) -> Option<([u8; 32], u32)> {
     if bytes.len() != 36 {
@@ -431,6 +454,26 @@ mod tests {
         {
             let _e = EnvGuard::set("CATALYST_P2P_LSU_MAX_WALL_LEAD", "9999999999");
             assert_eq!(p2p_lsu_cycle_max_wall_lead(), 8192);
+        }
+    }
+
+    #[test]
+    fn stale_observed_head_reset_ms_env_and_fallbacks() {
+        {
+            let _e = EnvGuard::set("CATALYST_STALE_OBSERVED_HEAD_RESET_MS", "15000");
+            assert_eq!(stale_observed_head_reset_ms(), 15000);
+        }
+        {
+            let _e = EnvGuard::set("CATALYST_STALE_OBSERVED_HEAD_RESET_MS", "0");
+            assert_eq!(stale_observed_head_reset_ms(), 60_000);
+        }
+        {
+            let _e = EnvGuard::set("CATALYST_STALE_OBSERVED_HEAD_RESET_MS", "9999999999");
+            assert_eq!(stale_observed_head_reset_ms(), 60_000);
+        }
+        {
+            let _e = EnvGuard::unset("CATALYST_STALE_OBSERVED_HEAD_RESET_MS");
+            assert_eq!(stale_observed_head_reset_ms(), 60_000);
         }
     }
 

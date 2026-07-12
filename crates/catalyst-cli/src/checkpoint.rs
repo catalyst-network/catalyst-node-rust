@@ -274,7 +274,7 @@ async fn lsu_metadata_present(store: &StorageManager, cycle: u64) -> bool {
         .is_some()
 }
 
-/// If cycles `1..target_cycle` have gaps that a checkpoint can bridge, return that checkpoint.
+/// If there is a checkpoint that can bridge the gap up to `target_cycle`, return it.
 ///
 /// Two scenarios are handled identically:
 ///
@@ -286,9 +286,17 @@ async fn lsu_metadata_present(store: &StorageManager, cycle: u64) -> bool {
 ///   fresh testnet), so cycles 1..first_real_cycle are simply absent from storage.
 ///   A checkpoint written after the first real cycle covers this gap.
 ///
-/// In both cases the requirement is: a checkpoint exists, and every cycle between the
-/// checkpoint and `target_cycle` is present locally (needed for forward replay).  Any
-/// missing cycle *after* the checkpoint means the replay would stall — return `None`.
+/// The requirement is: a checkpoint exists, and every cycle strictly *after* the
+/// checkpoint (or the pruned boundary, whichever is later) up to `target_cycle` is
+/// present locally, so a bounded forward replay from `checkpoint.cycle + 1` can reach
+/// `target_cycle`. Cycles at or before that boundary are never inspected: they are
+/// always considered "covered" by the checkpoint's restored snapshot (or intentional
+/// pruning) regardless of whether metadata for them happens to still exist locally.
+///
+/// This scan is intentionally bounded to `(safe_gap_end, target_cycle)` — cycle numbers
+/// are wall-clock-derived (~10^9), so scanning from literal cycle `1` (as an earlier
+/// version of this function did) meant up to ~10^9 individual async storage reads on
+/// every call once any checkpoint existed, effectively hanging the caller.
 pub async fn reconcile_checkpoint_for_missing_prefix(
     store: &StorageManager,
     target_cycle: u64,
@@ -308,21 +316,11 @@ pub async fn reconcile_checkpoint_for_missing_prefix(
     // explicitly pruned or never existed on a wall-clock chain.
     let safe_gap_end = cp.cycle.max(pruned_up_to);
 
-    let mut missing_in_prefix = false;
-    for i in 1..target_cycle {
+    for i in safe_gap_end.saturating_add(1)..target_cycle {
         if !lsu_metadata_present(store, i).await {
-            if i <= safe_gap_end {
-                missing_in_prefix = true;
-            } else {
-                // Gap after checkpoint and outside pruned range — forward replay would stall.
-                return None;
-            }
+            // Gap after checkpoint and outside pruned range — forward replay would stall.
+            return None;
         }
-    }
-
-    // If no cycles are missing the caller already has full history; no checkpoint needed.
-    if !missing_in_prefix {
-        return None;
     }
 
     Some(cp)
