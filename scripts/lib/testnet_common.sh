@@ -98,6 +98,12 @@ ensure_isolation_user() {
 start_node_as_user() {
   local n="$1" user="$2"; shift 2
   ensure_isolation_user "$user"
+  # The isolated user also needs to reach and execute $BIN: GH Actions checks out the repo under
+  # a directory tree only the runner account can otherwise traverse. Grant traverse+read/execute
+  # along that specific path (not a blanket recursive chmod over the whole checkout, which would
+  # be slow and unnecessary given target/ can hold many thousands of build artifacts).
+  local bin_dir; bin_dir="$(dirname "$BIN")"
+  sudo chmod o+rx "$ROOT_DIR" "$(dirname "$bin_dir")" "$bin_dir" "$BIN"
   sudo chown -R "$user":"$user" "testnet/node${n}"
   # o+rwx, not just the chown above: node.pid and logs/stdout.log are opened by *this* calling
   # shell's redirects below (`>`, `>>`), not by the `sudo -u` child - the calling user (the
