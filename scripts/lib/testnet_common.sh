@@ -19,6 +19,21 @@ die() {
   exit 1
 }
 
+# Grant traverse+read (o+rx) on every directory from $1 up to (but not including) "/", plus
+# execute on $1 itself if it's a regular file. Needed so a brand-new, unrelated OS user (see
+# start_node_as_user) can reach $BIN: GH Actions checks out under a directory tree
+# (/home/runner/work/...) where every ancestor, not just the repo root, is restricted to the
+# runner account by default. Idempotent; safe to call repeatedly.
+grant_traverse_to_root() {
+  local path="$1"
+  sudo chmod o+rx "$path" 2>/dev/null || true
+  path="$(dirname "$path")"
+  while [ "$path" != "/" ] && [ -n "$path" ]; do
+    sudo chmod o+rx "$path" 2>/dev/null || true
+    path="$(dirname "$path")"
+  done
+}
+
 rpc_field() {
   local url="$1" field="$2"
   curl -s -X POST "$url" -H 'content-type: application/json' \
@@ -98,12 +113,10 @@ ensure_isolation_user() {
 start_node_as_user() {
   local n="$1" user="$2"; shift 2
   ensure_isolation_user "$user"
-  # The isolated user also needs to reach and execute $BIN: GH Actions checks out the repo under
-  # a directory tree only the runner account can otherwise traverse. Grant traverse+read/execute
-  # along that specific path (not a blanket recursive chmod over the whole checkout, which would
-  # be slow and unnecessary given target/ can hold many thousands of build artifacts).
-  local bin_dir; bin_dir="$(dirname "$BIN")"
-  sudo chmod o+rx "$ROOT_DIR" "$(dirname "$bin_dir")" "$bin_dir" "$BIN"
+  # The isolated user also needs to reach and execute $BIN, all the way up to "/" - GH Actions
+  # checks out under a directory tree (/home/runner/work/...) where *every* ancestor, not just
+  # the repo root, is restricted to the runner account by default.
+  grant_traverse_to_root "$BIN"
   sudo chown -R "$user":"$user" "testnet/node${n}"
   # o+rwx, not just the chown above: node.pid and logs/stdout.log are opened by *this* calling
   # shell's redirects below (`>`, `>>`), not by the `sudo -u` child - the calling user (the
