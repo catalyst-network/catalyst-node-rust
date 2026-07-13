@@ -195,9 +195,12 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         assert!(r1.try_recv().is_ok());
-        assert!(r2.try_recv().is_err());
-        let got_commit = r2.try_recv().is_ok();
-        assert!(got_commit, "other message types must still be delivered");
+        // peer2 is configured to drop TransactionBatch: by the time both publishes have settled,
+        // its inbox holds exactly the TransactionRequest (delivered first-and-only), not an empty
+        // inbox followed later by an arrival — both sends already completed before any recv here.
+        let got_other = r2.try_recv();
+        assert!(got_other.is_ok(), "other message types must still be delivered");
+        assert!(r2.try_recv().is_err(), "TransactionBatch must have been dropped for peer2");
         let _ = r0.try_recv();
     }
 }
