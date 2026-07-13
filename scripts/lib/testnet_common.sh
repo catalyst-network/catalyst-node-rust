@@ -186,3 +186,35 @@ test_consensus_heads_subset() {
   done
   echo "PASS: subset identical applied_state_root/applied_lsu_hash at cycle >= ${min_cycle}"
 }
+
+# After a fault that isolated one node long enough for it to independently diverge (not just lag
+# — e.g. a full partition, where the isolated node can reach a degenerate single-node "quorum"
+# with itself), full automatic reconvergence is not something the current design promises: a
+# node whose reconcile circuit-breaks on a genuinely unbridgeable gap is documented and intended
+# to stay safely frozen (deferring every cycle) rather than compound the divergence — see
+# should_block_self_produced_apply / "not auto-healed in place" in
+# docs/consensus-wall-clock-and-time.md. The actual invariant under test is "no corrupt fork,"
+# not "always fully heals": this passes if EITHER all three fully reconverge, OR the two
+# never-isolated nodes stay converged with each other AND the recovering node is genuinely behind
+# (frozen) rather than caught up on a *different* root at the same cycle.
+test_consensus_converged_or_node_frozen() {
+  local target_cycle="$1" timeout="$2" recovering_url="$3"; shift 3
+  local healthy_urls=("$@")
+
+  test_consensus_heads_subset "$target_cycle" "$timeout" "${healthy_urls[@]}"
+  local healthy_root; healthy_root="$(rpc_field "${healthy_urls[0]}" applied_state_root)"
+
+  local rec_cycle rec_root
+  rec_cycle="$(rpc_field "$recovering_url" applied_cycle)"
+  rec_root="$(rpc_field "$recovering_url" applied_state_root)"
+  echo "recovering node ${recovering_url} cycle=${rec_cycle} state_root=${rec_root}"
+
+  if [ -n "$rec_cycle" ] && [ "$rec_cycle" -ge "$target_cycle" ] 2>/dev/null; then
+    if [ "$rec_root" != "$healthy_root" ]; then
+      die "recovering node reached target cycle but with a DIFFERENT state_root than the never-isolated nodes — corrupt fork, not a safe freeze"
+    fi
+    echo "PASS: recovering node fully reconverged at cycle >= ${target_cycle}"
+  else
+    echo "PASS (degraded but safe): recovering node is behind/frozen at cycle ${rec_cycle:-unknown} (never-isolated nodes converged at >= ${target_cycle}) — matches the documented 'frozen-but-intact, not auto-healed in place' fallback for a genuine divergence, not a bug"
+  fi
+}

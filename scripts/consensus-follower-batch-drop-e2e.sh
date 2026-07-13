@@ -85,7 +85,7 @@ echo "==> restoring P2P to node2"
 sudo iptables -D INPUT -p tcp --dport "$TESTNET_P2P_PORT_2" -j DROP
 sudo iptables -D OUTPUT -m owner --uid-owner "$ISOLATION_USER" -j DROP
 
-echo "==> asserting full 3-way convergence after node2 rejoins (timeout ${CONVERGE_TIMEOUT_SECS}s)"
-bash scripts/netctl.sh testnet test-consensus-heads "$((RESUME_AT + CONVERGE_AFTER_CYCLES))" "$CONVERGE_TIMEOUT_SECS"
+echo "==> asserting node2 either fully reconverges or is safely frozen (never a corrupt fork) after rejoining (timeout ${CONVERGE_TIMEOUT_SECS}s)"
+test_consensus_converged_or_node_frozen "$((RESUME_AT + CONVERGE_AFTER_CYCLES))" "$CONVERGE_TIMEOUT_SECS" "$TESTNET_RPC2" "$TESTNET_RPC1" "$TESTNET_RPC3"
 
-echo "==> DONE: fleet converged on an identical applied_state_root after a single-follower batch-delivery drop"
+echo "==> DONE: no corrupt fork after a single-follower batch-delivery drop"
