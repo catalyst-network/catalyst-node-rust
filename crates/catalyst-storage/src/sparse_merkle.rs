@@ -229,3 +229,110 @@ where
     Ok((root, out))
 }
 
+/// Verify that `key` -> `value` is a member of the tree with the given `root`.
+///
+/// Unlike `merkle::verify_proof`, this independently re-derives both the expected leaf hash
+/// (from `key`/`value`) and the expected per-level sibling direction (from `key`'s own
+/// sha256 path bits) instead of trusting `proof.leaf` / `step.sibling_is_left` verbatim — a
+/// proof that is internally hash-consistent but was built for a different key/value (or has a
+/// forged direction bit) is rejected.
+pub fn verify_proof_for_key(root: &Hash, key: &[u8], value: &[u8], proof: &MerkleProof) -> bool {
+    verify_proof_for_key_and_leaf(root, key, leaf_hash_for_kv(key, value), proof)
+}
+
+/// Verify that `key` is absent from the tree with the given `root` (non-membership proof).
+pub fn verify_absence_proof_for_key(root: &Hash, key: &[u8], proof: &MerkleProof) -> bool {
+    verify_proof_for_key_and_leaf(root, key, h_empty_leaf(), proof)
+}
+
+fn verify_proof_for_key_and_leaf(
+    root: &Hash,
+    key: &[u8],
+    expected_leaf: Hash,
+    proof: &MerkleProof,
+) -> bool {
+    if proof.steps.len() != TREE_DEPTH {
+        return false;
+    }
+    if proof.leaf != expected_leaf {
+        return false;
+    }
+    let mut idx = key_path(key);
+    let mut cur = proof.leaf;
+    for step in &proof.steps {
+        let expected_sibling_is_left = idx_lsb(&idx) == 1;
+        if step.sibling_is_left != expected_sibling_is_left {
+            return false;
+        }
+        cur = if step.sibling_is_left {
+            h_node(&step.sibling, &cur)
+        } else {
+            h_node(&cur, &step.sibling)
+        };
+        idx = idx_shr1(&idx);
+    }
+    &cur == root
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kv(k: &str, v: &str) -> (Box<[u8]>, Box<[u8]>) {
+        (k.as_bytes().into(), v.as_bytes().into())
+    }
+
+    #[test]
+    fn key_confusion_forgery_is_rejected() {
+        let leaves = vec![kv("alice", "100"), kv("bob", "200")];
+        let (root, proofs) = compute_root_and_multi_proofs_from_iter(
+            leaves.clone(),
+            &[b"alice".to_vec(), b"bob".to_vec()],
+        )
+        .unwrap();
+        let (_, _, proof_alice) = &proofs[0];
+
+        // The old, unkeyed verifier has no opinion on *which* key a proof is for — it accepts
+        // alice's real proof outright.
+        assert!(crate::merkle::verify_proof(&root, proof_alice));
+
+        // Relabeled as bob's proof (attacker lies about key/value, reuses a real proof it holds
+        // for an unrelated key) it must be rejected once bound to the claimed key/value.
+        assert!(!verify_proof_for_key(&root, b"bob", b"200", proof_alice));
+        // The real key/value it was actually built for must still verify.
+        assert!(verify_proof_for_key(&root, b"alice", b"100", proof_alice));
+    }
+
+    #[test]
+    fn flipped_sibling_direction_on_absence_proof_is_rejected() {
+        // A fully empty tree: every sibling at every level is byte-identical to `cur` (both
+        // equal `empty[height]`), so flipping `sibling_is_left` at *any* step is a genuine,
+        // collision-free forgery — h_node(a, a) is order-invariant when both args are
+        // byte-identical, so the old unkeyed verifier cannot catch it.
+        let leaves: Vec<(Box<[u8]>, Box<[u8]>)> = Vec::new();
+        let absent_key = b"nonexistent-key-xyz".to_vec();
+        let (root, proofs) =
+            compute_root_and_multi_proofs_from_iter(leaves, &[absent_key.clone()]).unwrap();
+        let (_, value, proof) = &proofs[0];
+        assert!(value.is_none());
+
+        assert!(verify_absence_proof_for_key(&root, &absent_key, proof));
+
+        let mut forged = proof.clone();
+        forged.steps[0].sibling_is_left = !forged.steps[0].sibling_is_left;
+        assert!(crate::merkle::verify_proof(&root, &forged));
+        assert!(!verify_absence_proof_for_key(&root, &absent_key, &forged));
+    }
+
+    #[test]
+    fn truncated_proof_is_rejected() {
+        let leaves = vec![kv("alice", "100")];
+        let (root, proofs) =
+            compute_root_and_multi_proofs_from_iter(leaves, &[b"alice".to_vec()]).unwrap();
+        let (_, _, proof) = &proofs[0];
+        let mut truncated = proof.clone();
+        truncated.steps.truncate(4);
+        assert!(!verify_proof_for_key(&root, b"alice", b"100", &truncated));
+    }
+}
+

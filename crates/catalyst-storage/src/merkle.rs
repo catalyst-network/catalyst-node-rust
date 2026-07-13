@@ -95,6 +95,11 @@ pub fn merkle_proof(leaves: &[Hash], index: usize) -> StorageResult<MerkleProof>
     })
 }
 
+/// Verifies only that `proof.leaf` hash-chains to `root` via `proof.steps`. Does **not** bind
+/// the proof to any key — `proof.leaf` and every `step.sibling_is_left` are trusted verbatim.
+/// Unsafe for key-addressed sparse-tree claims (a proof legitimately held for one key can be
+/// relabeled and passed off as proof for another). Use
+/// `sparse_merkle::verify_proof_for_key` / `verify_absence_proof_for_key` for those.
 pub fn verify_proof(root: &Hash, proof: &MerkleProof) -> bool {
     let mut cur = proof.leaf;
     for step in &proof.steps {

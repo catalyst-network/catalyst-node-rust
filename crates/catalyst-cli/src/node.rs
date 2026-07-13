@@ -1164,6 +1164,26 @@ fn touched_keys_for_lsu(lsu: &catalyst_consensus::types::LedgerStateUpdate) -> V
     keys.into_iter().collect()
 }
 
+/// Verifies a single `KeyProofChange` leg (old or new) against its claimed root, binding the
+/// proof to `key`/`value` instead of trusting the proof's own claims (see
+/// `catalyst_storage::sparse_merkle::verify_proof_for_key`). `old_value`/`new_value` use an
+/// empty `Vec` to represent "key absent" on the wire (`ov.unwrap_or_default()` when building the
+/// bundle) — detect that case via the proof's leaf hash (an absence proof's leaf is the fixed
+/// `empty_leaf_hash()`, which a real key/value leaf can't collide with, different domain byte)
+/// rather than trusting an attacker-supplied empty value on its own.
+fn verify_state_proof_for_change(
+    root: &catalyst_utils::Hash,
+    key: &[u8],
+    value: &[u8],
+    proof: &catalyst_storage::merkle::MerkleProof,
+) -> bool {
+    if proof.leaf == catalyst_storage::sparse_merkle::empty_leaf_hash() {
+        value.is_empty() && catalyst_storage::sparse_merkle::verify_absence_proof_for_key(root, key, proof)
+    } else {
+        catalyst_storage::sparse_merkle::verify_proof_for_key(root, key, value, proof)
+    }
+}
+
 fn verify_state_transition_bundle(
     lsu: &catalyst_consensus::types::LedgerStateUpdate,
     bundle: &StateProofBundle,
@@ -1181,10 +1201,10 @@ fn verify_state_transition_bundle(
     let mut new: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
     for c in &bundle.changes {
-        if !catalyst_storage::merkle::verify_proof(&bundle.prev_state_root, &c.old_proof) {
+        if !verify_state_proof_for_change(&bundle.prev_state_root, &c.key, &c.old_value, &c.old_proof) {
             return false;
         }
-        if !catalyst_storage::merkle::verify_proof(&bundle.new_state_root, &c.new_proof) {
+        if !verify_state_proof_for_change(&bundle.new_state_root, &c.key, &c.new_value, &c.new_proof) {
             return false;
         }
         old.insert(c.key.clone(), c.old_value.clone());
@@ -2140,6 +2160,10 @@ pub(crate) fn ensure_consensus_p2p_cli_metrics_registered() {
         (
             "consensus_certified_equivocation_tiebreak_total",
             "Two distinct verified certificates at same cycle; testnet tie-break policy",
+        ),
+        (
+            "consensus_state_root_certificate_published_total",
+            "ADR 0002 LsuStateRootCertificateV1 published: BFT quorum of state-root attestations reached for a cycle",
         ),
     ];
     for (name, desc) in EXTRA {
@@ -4206,6 +4230,7 @@ async fn try_publish_state_root_certificate_from_bucket(
     if let Ok(env) = MessageEnvelope::from_message(&msg, producer_id_for_broadcast.to_string(), None) {
         let _ = net.broadcast_envelope(&env).await;
     }
+    catalyst_utils::increment_counter!("consensus_state_root_certificate_published_total", 1);
     info!("Published LSU state-root certificate cycle={} state_root={}", cycle, hex_encode(&state_root));
 }
 
