@@ -80,6 +80,44 @@ start_node() {
   echo $! >"testnet/node${n}/node.pid"
 }
 
+# Create (if missing) a dedicated unprivileged OS user to run an isolated node under. All three
+# testnet processes share one loopback interface/network stack in this harness (plain processes,
+# no netns) — a plain iptables port rule can't distinguish "node2's outbound to port 30333" from
+# "node3's outbound to port 30333"; both would match. Running the isolated node as its own user
+# lets `iptables -m owner --uid-owner` (OUTPUT-chain only) block exactly and only that node's own
+# traffic, regardless of destination port or which side initiated the connection.
+ensure_isolation_user() {
+  local user="$1"
+  if ! id -u "$user" >/dev/null 2>&1; then
+    sudo useradd --system --no-create-home --shell /usr/sbin/nologin "$user"
+  fi
+}
+
+# Start node $1 (2 or 3) under dedicated OS user $2 (see ensure_isolation_user). Grants that user
+# ownership of the node's own directory tree first. Extra env assignments may be passed as $3, $4,...
+start_node_as_user() {
+  local n="$1" user="$2"; shift 2
+  ensure_isolation_user "$user"
+  sudo chown -R "$user":"$user" "testnet/node${n}"
+  # testnet/shared_dfs is a cross-node resource (DFS cache_dir), normally created/owned by
+  # whichever node touches it first (root, in CI) with default permissions that would not be
+  # writable by this dedicated user otherwise.
+  mkdir -p testnet/shared_dfs
+  sudo chmod -R o+rwx testnet/shared_dfs
+  local rpc_port
+  case "$n" in
+    2) rpc_port=8546 ;;
+    3) rpc_port=8547 ;;
+    *) die "start_node_as_user: only node2/node3 are restartable follower roles (got $n)" ;;
+  esac
+  sudo -u "$user" env RUST_LOG="${RUST_LOG:-info}" CATALYST_REQUIRE_LSU_FINALITY="${CATALYST_REQUIRE_LSU_FINALITY:-0}" "$@" \
+    stdbuf -oL -eL "$BIN" --config "testnet/node${n}/config.toml" start \
+    --validator --storage --rpc --rpc-port "$rpc_port" \
+    --bootstrap-peers "/ip4/127.0.0.1/tcp/30333" \
+    >>"testnet/node${n}/logs/stdout.log" 2>&1 &
+  echo $! >"testnet/node${n}/node.pid"
+}
+
 # Checklist §7.1-style convergence check restricted to a subset of RPC URLs (e.g. two nodes
 # still connected during a partition/drop window, while a third is deliberately isolated).
 # Complements `netctl.sh testnet test-consensus-heads`, which requires all three.
