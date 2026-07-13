@@ -6,6 +6,11 @@ on:
       - main
       - tna_testnet
   pull_request:
+  schedule:
+    # Nightly, not on every PR — matches the resource-bound adversarial-test exit criteria in
+    # docs/consensus-implementation-completion-checklist.md §8.
+    - cron: '17 3 * * *'
+  workflow_dispatch: {}
 
 jobs:
   test:
@@ -22,4 +27,33 @@ jobs:
 
       - name: Test (workspace)
         run: cargo test --workspace --locked
+
+  consensus-restart-recovery:
+    # Real 3-process testnet: kills a validator mid-run and resumes it on a stale (rolled-back)
+    # data directory, then asserts the fleet reconverges. Nightly/manual only (not per-PR) — it
+    # builds a release binary and runs a multi-minute local testnet. See
+    # docs/consensus-implementation-completion-checklist.md Phase 10 and
+    # scripts/consensus-restart-recovery-e2e.sh.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Restart-recovery E2E
+        run: bash scripts/consensus-restart-recovery-e2e.sh
+
+      - name: Upload node logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: consensus-restart-recovery-logs
+          path: testnet/node*/logs/
+          if-no-files-found: ignore
 
