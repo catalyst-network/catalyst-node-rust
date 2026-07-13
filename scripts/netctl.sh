@@ -51,6 +51,150 @@ wait_tcp() {
   return 0
 }
 
+testnet_write_config() {
+  local n="$1" p2p_port="$2" rpc_port="$3" ws_port="$4" min_producer_count="$5"
+  local pk1="$6" pk2="$7" pk3="$8"
+  cat > "testnet/node${n}/config.toml" <<EOF
+validator = false
+
+[protocol]
+chain_id = 31337
+network_id = "tna_testnet"
+faucet_mode = "deterministic"
+allow_deterministic_faucet = true
+faucet_balance = 1000000
+
+[node]
+name = "catalyst-node-${n}"
+private_key_file = "testnet/node${n}/node.key"
+auto_generate_identity = true
+
+[network]
+listen_addresses = [
+    "/ip4/0.0.0.0/tcp/${p2p_port}",
+    "/ip6/::/tcp/${p2p_port}",
+]
+bootstrap_peers = []
+dns_seeds = []
+max_peers = 50
+min_peers = 5
+protocol_version = "catalyst/1.0"
+mdns_discovery = true
+dht_enabled = true
+
+[network.timeouts]
+connection_timeout = 30
+request_timeout = 10
+keep_alive_interval = 30
+
+[network.safety_limits]
+max_gossip_message_bytes = 8388608
+per_peer_max_msgs_per_sec = 200
+per_peer_max_bytes_per_sec = 8388608
+max_tcp_frame_bytes = 8388608
+per_conn_max_msgs_per_sec = 200
+per_conn_max_bytes_per_sec = 8388608
+max_hops = 10
+dedup_cache_max_entries = 20000
+dial_jitter_max_ms = 250
+dial_backoff_max_ms = 60000
+
+[network.relay_cache]
+max_entries = 5000
+target_entries = 4000
+retention_seconds = 600
+
+[storage]
+data_dir = "testnet/node${n}/data"
+enabled = false
+capacity_gb = 10
+cache_size_mb = 256
+write_buffer_size_mb = 64
+max_open_files = 1000
+compression_enabled = true
+history_prune_enabled = false
+history_keep_cycles = 604800
+history_prune_interval_seconds = 300
+history_prune_batch_cycles = 1000
+
+[consensus]
+cycle_duration_seconds = 20
+freeze_time_seconds = 1
+max_transactions_per_block = 1000
+min_producer_count = ${min_producer_count}
+max_producer_count = 100
+validator_worker_ids = [
+    "${pk1}",
+    "${pk2}",
+    "${pk3}",
+]
+require_lsu_finality = true
+require_state_root_finality = false
+
+[consensus.phase_timeouts]
+construction_timeout = 4
+campaigning_timeout = 4
+voting_timeout = 4
+synchronization_timeout = 4
+
+[runtimes.evm]
+enabled = true
+gas_limit = 8000000
+gas_price = 1000000000
+max_code_size = 24576
+debug_enabled = false
+
+[runtimes.svm]
+enabled = false
+compute_unit_limit = 200000
+max_account_data_size = 10485760
+
+[runtimes.wasm]
+enabled = false
+max_memory_pages = 1024
+execution_timeout_ms = 5000
+
+[service_bus]
+enabled = true
+websocket_address = "0.0.0.0"
+websocket_port = ${ws_port}
+max_connections = 1000
+event_buffer_size = 10000
+webhooks_enabled = true
+webhook_timeout = 30
+webhook_max_retries = 3
+
+[dfs]
+enabled = true
+ipfs_api_url = "http://127.0.0.1:5001"
+ipfs_gateway_url = "http://127.0.0.1:8080"
+cache_dir = "testnet/shared_dfs"
+cache_size_gb = 5
+pinning_enabled = true
+gc_enabled = true
+gc_interval_hours = 24
+
+[rpc]
+enabled = false
+address = "127.0.0.1"
+port = ${rpc_port}
+cors_enabled = true
+cors_origins = ["*"]
+auth_enabled = false
+rate_limit = 100
+request_timeout = 30
+
+[logging]
+level = "info"
+format = "text"
+file_enabled = true
+file_path = "testnet/node${n}/logs/catalyst.log"
+max_file_size_mb = 100
+max_files = 10
+console_enabled = true
+EOF
+}
+
 testnet_up() {
   local clean="${1:-false}"
   if [ "$clean" = "true" ]; then
@@ -79,6 +223,15 @@ testnet_up() {
   PK2="$("$BIN" --log-level error pubkey --key-file testnet/node2/node.key | tail -n 1)"
   PK3="$("$BIN" --log-level error pubkey --key-file testnet/node3/node.key | tail -n 1)"
   printf 'validator_worker_ids = ["%s", "%s", "%s"]\n' "$PK1" "$PK2" "$PK3" > testnet/validators.toml
+
+  # config.toml is gitignored (local runtime state) and not generated anywhere else, so a fresh
+  # checkout (e.g. CI) has none — generate one per node if missing, wired to this run's freshly
+  # derived validator ids. Never overwrites an existing config.toml (preserves local customization
+  # on machines that already have one from prior manual setup); --clean removes them first so a
+  # clean run always regenerates with the current node.key-derived ids.
+  [ -f testnet/node1/config.toml ] || testnet_write_config 1 30333 8545 8546 2 "$PK1" "$PK2" "$PK3"
+  [ -f testnet/node2/config.toml ] || testnet_write_config 2 30334 8546 8547 3 "$PK1" "$PK2" "$PK3"
+  [ -f testnet/node3/config.toml ] || testnet_write_config 3 30335 8547 8548 3 "$PK1" "$PK2" "$PK3"
 
   local finality_env=()
   if [ -n "${CATALYST_REQUIRE_LSU_FINALITY:-}" ]; then

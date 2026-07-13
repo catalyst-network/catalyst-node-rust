@@ -57,3 +57,41 @@ jobs:
           path: testnet/node*/logs/
           if-no-files-found: ignore
 
+  consensus-e2e:
+    # Checklist §7.2-7.4: real 3-process testnet under single-follower batch-delivery drop,
+    # asymmetric partition, and clock skew. Nightly/manual only, same rationale as
+    # consensus-restart-recovery above. One shared release build amortized across all three
+    # scenarios. Each script has its own `trap cleanup EXIT` (netctl.sh testnet down + iptables
+    # rule cleanup), so a mid-sequence failure still tears down before the next step runs.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release -p catalyst-cli
+
+      - name: Single-follower batch-drop E2E (§7.2)
+        run: CLEAN=false bash scripts/consensus-follower-batch-drop-e2e.sh
+
+      - name: Asymmetric partition E2E (§7.3)
+        run: CLEAN=false bash scripts/consensus-partition-e2e.sh
+
+      - name: Clock-skew E2E (§7.4)
+        run: CLEAN=false bash scripts/consensus-clock-skew-e2e.sh
+
+      - name: Upload node logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: consensus-e2e-logs
+          path: testnet/node*/logs/
+          if-no-files-found: ignore
+
