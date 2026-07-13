@@ -1413,6 +1413,26 @@ async fn record_reconcile_failure(local_cycle: u64) -> bool {
     false
 }
 
+/// Whether a locally-produced LSU for the *next* cycle must be refused rather than applied,
+/// because reconcile's circuit breaker is open for the applied head it would be built on top of
+/// (a divergent/unrecoverable local state, not merely a behind one). Returns the applied cycle
+/// the caller should log/report if blocking is required.
+///
+/// Complements `should_defer_production_when_behind` (which handles *behind*): this handles
+/// *diverged-but-not-behind* — a node whose own local head keeps advancing via self-production
+/// is never "behind" by that gate's definition, so without this check it would keep minting new
+/// cycles on top of state its own reconcile has already given up trying to heal. Caught live via
+/// the consensus-follower-batch-drop-e2e (§7.2) harness: a node cut off from P2P self-produced
+/// and applied several cycles on its own already-diverged state after reconcile circuit-broke.
+async fn should_block_self_produced_apply(store: &catalyst_storage::StorageManager) -> Option<u64> {
+    let applied = local_applied_cycle(store).await;
+    if reconcile_circuit_is_broken(applied).await {
+        Some(applied)
+    } else {
+        None
+    }
+}
+
 /// Clears any failure history for `local_cycle` on a successful reconcile.
 async fn clear_reconcile_failure(local_cycle: u64) {
     let mut tracker = reconcile_failure_tracker().lock().await;
@@ -2164,6 +2184,10 @@ pub(crate) fn ensure_consensus_p2p_cli_metrics_registered() {
         (
             "consensus_state_root_certificate_published_total",
             "ADR 0002 LsuStateRootCertificateV1 published: BFT quorum of state-root attestations reached for a cycle",
+        ),
+        (
+            "consensus_self_produced_apply_blocked_circuit_broken_total",
+            "Locally-produced LSU not applied: reconcile circuit breaker is open for the current applied head (divergent/unrecoverable local state); needs operator action",
         ),
     ];
     for (name, desc) in EXTRA {
@@ -7597,6 +7621,34 @@ impl CatalystNode {
 
                     match consensus.start_cycle(cycle, selected, transactions).await {
                         Ok(Some(update)) => {
+                            // Refuse to commit a locally-produced LSU on top of local state whose
+                            // reconcile has circuit-broken (repeated, unrecoverable prev_root
+                            // mismatches against gossiped peer LSUs). Applying anyway compounds
+                            // the divergence instead of healing it: the four-phase round above
+                            // (start_cycle) can take many seconds (phase timeouts), long enough
+                            // for the circuit to trip on *this exact* applied head in the
+                            // meantime -- caught live via the consensus-follower-batch-drop-e2e
+                            // (§7.2) harness, where a node cut off from P2P kept self-producing
+                            // and applying new cycles atop its own already-diverged state even
+                            // after reconcile gave up, reproducing the "recipe agreed, result
+                            // diverges" fork class (docs/consensus-reliability-review-2026-07.md)
+                            // via self-production instead of the peer-apply path. Same
+                            // "never release the gate to preserve liveness" principle as
+                            // should_defer_production_when_behind.
+                            if let Some(store) = &storage {
+                                if let Some(applied_before) = should_block_self_produced_apply(store.as_ref()).await {
+                                    warn!(
+                                        "Refusing to apply self-produced LSU for cycle {}: reconcile circuit breaker is open for applied head {} (divergent/unrecoverable local state); needs operator action",
+                                        cycle, applied_before
+                                    );
+                                    catalyst_utils::increment_counter!(
+                                        "consensus_self_produced_apply_blocked_circuit_broken_total",
+                                        1
+                                    );
+                                    continue;
+                                }
+                            }
+
                             if let Ok(h) = hash_data(&update) {
                                 prev_seed = h;
                             }
@@ -8399,7 +8451,8 @@ mod fork_choice_integration_tests {
         apply_lsu_to_storage, apply_lsu_to_storage_without_root_check, ensure_chain_identity_and_genesis,
         fork_choice_apply_gate, get_balance_i64, hex_encode, load_stored_certified_hash_at_cycle,
         local_applied_cycle, local_applied_lsu_hash, local_applied_state_root, persist_lsu_history,
-        reconcile_failure_state_for_test, set_balance_i64, try_reconcile_fork_from_quorum_lsu,
+        reconcile_failure_state_for_test, record_reconcile_failure, set_balance_i64,
+        should_block_self_produced_apply, try_reconcile_fork_from_quorum_lsu,
         try_reorg_stronger_lsu_at_applied_cycle, verify_state_root_finality_for_apply, ForkChoiceApplyGate,
     };
     use crate::config::NodeConfig;
@@ -9370,6 +9423,55 @@ mod fork_choice_integration_tests {
         assert!(
             reconcile_failure_state_for_test(BASE).await.unwrap().1,
             "breaker must be tripped after `threshold` attempts, even though no target (cycle, hash) ever repeated"
+        );
+    }
+
+    /// Regression test for a node that keeps self-producing/applying new cycles on top of its
+    /// own already-diverged state even after reconcile has given up on it — caught live via the
+    /// consensus-follower-batch-drop-e2e (§7.2) harness: a node cut off from P2P for a few
+    /// cycles reconnected, its reconcile circuit-broke trying to heal the resulting mismatch, but
+    /// nothing stopped it from producing and applying several more self-consistent-but-wrong
+    /// cycles anyway, landing on a different `state_root` than its peers at the same cycle
+    /// number. `should_block_self_produced_apply` is the guard that closes this: it must report
+    /// the applied head as blocked once that head's reconcile circuit is open, and not before.
+    #[tokio::test]
+    async fn self_produced_apply_blocked_once_reconcile_circuit_broken_for_applied_head() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+
+        // Distinctive base cycle -- see the comment on the unbridgeable-gap test above for why
+        // (process-global tracker shared across concurrently-run tests).
+        const BASE: u64 = 900_501;
+
+        let lsu_base = lsu_with_tx_seed(&committee, BASE, 5);
+        apply_lsu_to_storage(&env.store, &lsu_base)
+            .await
+            .expect("apply base cycle");
+        assert_eq!(local_applied_cycle(&env.store).await, BASE);
+
+        assert_eq!(
+            should_block_self_produced_apply(&env.store).await,
+            None,
+            "must not block before the circuit has tripped for this applied head"
+        );
+
+        let threshold = crate::consensus_limits::reconcile_circuit_break_threshold();
+        for _ in 1..threshold {
+            let tripped = record_reconcile_failure(BASE).await;
+            assert!(!tripped, "must not report tripped before reaching threshold");
+            assert_eq!(
+                should_block_self_produced_apply(&env.store).await,
+                None,
+                "must not block while under threshold"
+            );
+        }
+        let tripped = record_reconcile_failure(BASE).await;
+        assert!(tripped, "must report tripped exactly on reaching threshold");
+
+        assert_eq!(
+            should_block_self_produced_apply(&env.store).await,
+            Some(BASE),
+            "must block self-produced apply once the circuit is open for the current applied head"
         );
     }
 
