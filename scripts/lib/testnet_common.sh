@@ -99,6 +99,11 @@ start_node_as_user() {
   local n="$1" user="$2"; shift 2
   ensure_isolation_user "$user"
   sudo chown -R "$user":"$user" "testnet/node${n}"
+  # o+rwx, not just the chown above: node.pid and logs/stdout.log are opened by *this* calling
+  # shell's redirects below (`>`, `>>`), not by the `sudo -u` child - the calling user (the
+  # unprivileged CI runner account, not root) needs write access too, in addition to the
+  # isolated user needing to read/write everything else under here.
+  sudo chmod -R o+rwx "testnet/node${n}"
   # testnet/shared_dfs is a cross-node resource (DFS cache_dir), normally created/owned by
   # whichever node touches it first (root, in CI) with default permissions that would not be
   # writable by this dedicated user otherwise.
