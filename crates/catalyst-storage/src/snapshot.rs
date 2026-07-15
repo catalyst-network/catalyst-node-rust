@@ -343,25 +343,41 @@ impl SnapshotManager {
         Ok(())
     }
     
-    /// Clear all data from the database
+    /// Clear all data from the database.
+    ///
+    /// This is a destructive operation used only as the first step of `load_snapshot`, which
+    /// immediately overlays the snapshot's own keys back in. Deletes every key in every
+    /// non-default column family so `load_snapshot` is a true point-in-time restore rather than
+    /// an additive overlay onto whatever is currently live (the prior no-op implementation here
+    /// silently left post-checkpoint writes in place, which is what caused reconcile's
+    /// checkpoint-restore to produce contaminated, non-reproducible state).
     async fn clear_database(&self) -> StorageResult<()> {
-        // Note: In a real implementation, you'd want to be more careful about this
-        // This is a destructive operation that should be used with caution
-        
         for cf_name in self.engine.cf_names() {
             if cf_name == "default" {
                 continue; // Skip default CF
             }
-            
-            // Drop and recreate column family
-            // This is a simplified approach - in practice you'd iterate and delete keys
+
+            let keys: Vec<Box<[u8]>> = self
+                .engine
+                .iterator(&cf_name)?
+                .map(|item| {
+                    item.map(|(key, _value)| key)
+                        .map_err(|e| StorageError::internal(format!("Iterator error: {}", e)))
+                })
+                .collect::<StorageResult<Vec<_>>>()?;
+
+            for key in &keys {
+                self.engine.delete(&cf_name, key)?;
+            }
+
             log_warn!(
                 LogCategory::Storage,
-                "Clearing column family '{}' for snapshot restore",
+                "Cleared {} keys from column family '{}' for snapshot restore",
+                keys.len(),
                 cf_name
             );
         }
-        
+
         Ok(())
     }
     
@@ -750,6 +766,46 @@ mod tests {
         assert!(snapshot.metadata().total_size > 0);
     }
     
+    /// Regression test for the bug where `clear_database()` was a no-op stub: `load_snapshot`
+    /// must be a true point-in-time restore, not an additive overlay onto whatever is currently
+    /// live. Writes made *after* the checkpoint must be gone post-restore, and keys present *at*
+    /// the checkpoint must be restored to their checkpoint-time value even if overwritten since.
+    #[tokio::test]
+    async fn load_snapshot_removes_post_checkpoint_writes() {
+        let (engine, manager, _temp_dir) = create_test_setup().await;
+
+        let addr_a = [1u8; 21];
+        let key_a = catalyst_utils::state::state_keys::account_key(&addr_a);
+        let account_a_v1 = AccountState::new_non_confidential(addr_a, 1000);
+        engine.put("accounts", &key_a, &account_a_v1.serialize().unwrap()).unwrap();
+
+        manager.create_snapshot("checkpoint").await.unwrap();
+
+        // Simulate cycles applied after the checkpoint: mutate the existing key and add a new one.
+        let account_a_v2 = AccountState::new_non_confidential(addr_a, 2000);
+        engine.put("accounts", &key_a, &account_a_v2.serialize().unwrap()).unwrap();
+
+        let addr_b = [2u8; 21];
+        let key_b = catalyst_utils::state::state_keys::account_key(&addr_b);
+        let account_b = AccountState::new_non_confidential(addr_b, 500);
+        engine.put("accounts", &key_b, &account_b.serialize().unwrap()).unwrap();
+
+        manager.load_snapshot("checkpoint").await.unwrap();
+
+        let restored_a = engine.get("accounts", &key_a).unwrap();
+        assert_eq!(
+            restored_a,
+            Some(account_a_v1.serialize().unwrap()),
+            "key present at checkpoint time must be restored to its checkpoint value"
+        );
+
+        let restored_b = engine.get("accounts", &key_b).unwrap();
+        assert_eq!(
+            restored_b, None,
+            "key written after the checkpoint must not survive load_snapshot"
+        );
+    }
+
     #[tokio::test]
     async fn test_snapshot_list() {
         let (_engine, manager, _temp_dir) = create_test_setup().await;
