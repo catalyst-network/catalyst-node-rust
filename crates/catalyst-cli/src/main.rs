@@ -10,6 +10,7 @@ mod node;
 mod commands;
 mod config;
 mod consensus_limits;
+mod alerting;
 mod fork_choice;
 mod tx;
 mod tx_batch_p2p;
@@ -603,6 +604,7 @@ async fn start_node(config: NodeConfig, generate_txs: bool, tx_interval_ms: u64)
     let mut node = CatalystNode::new(config, generate_txs, tx_interval_ms).await?;
 
     crate::node::ensure_consensus_p2p_cli_metrics_registered();
+    crate::alerting::log_alerting_status();
 
     // Start the node
     node.start().await?;

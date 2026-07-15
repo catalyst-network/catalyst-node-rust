@@ -129,7 +129,7 @@ validator_worker_ids = [
     "${pk3}",
 ]
 require_lsu_finality = true
-require_state_root_finality = false
+require_state_root_finality = true
 
 [consensus.phase_timeouts]
 construction_timeout = 4

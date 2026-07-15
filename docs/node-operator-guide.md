@@ -334,6 +334,47 @@ refused to guess rather than silently apply divergent state — it needs operato
   because the alternative is a silent, permanent state fork (see
   [`consensus-reliability-review-2026-07.md`](./consensus-reliability-review-2026-07.md)).
 
+### Circuit breaker tripped: consensus halted, needs operator action
+
+**Symptom:** a node's applied head stops advancing (the block explorer flatlines for that node, or
+for the whole network if the diverged node was the one others were tracking) even though the
+process is still running and connected.
+
+This is the escalation of the "no checkpoint or peer bridged" case above: after
+`CATALYST_RECONCILE_CIRCUIT_BREAK_THRESHOLD` (default `5`) consecutive reconcile failures for the
+same applied head within `CATALYST_RECONCILE_CIRCUIT_BREAK_WINDOW_MS` (default `30000`), the node
+deliberately **stops trying to heal itself** — both the reconcile path and, separately, its own
+cycle production are gated shut for that head — rather than burning CPU on a doomed
+purge/replay loop forever (the historical failure mode: 55,000+ failed reconcile attempts over 3
+days with no operator signal). This is **correct, intentional behavior**: it trades "network keeps
+producing empty-looking progress while quietly diverged" for "network visibly stops and waits for a
+human." Look for:
+
+- Log lines (tracing target `catalyst.consensus.reconcile`): `"Reconcile circuit-broken after
+  repeated consecutive failures resolving a replay gap"` and/or `"Refusing to apply self-produced
+  LSU for cycle N: reconcile circuit breaker is open for applied head M"`.
+- Counters: `consensus_fork_reconcile_circuit_broken_total`,
+  `consensus_self_produced_apply_blocked_circuit_broken_total`.
+
+Remediation (same as the checkpoint case above — this is the same underlying condition, just past
+the point where the node will keep retrying on its own):
+
+- Pull a `db-backup` from a healthy, caught-up peer and `db-restore` it onto this node, then restart
+  (see [Upgrades, backups, and rollback safety](#upgrades-backups-and-rollback-safety) above).
+- Investigate *why* the divergence happened before just restoring and moving on — a repeated trip on
+  the same node points at a local bug or environment issue (clock skew, disk corruption, etc.), not
+  bad luck.
+- Do **not** manually delete/edit `consensus:*` metadata to force past this, for the same reason as
+  above.
+
+**Alerting:** set `CATALYST_ALERT_WEBHOOK_URL` to a Discord incoming-webhook URL and the node will
+post a message there the moment either counter above trips, instead of relying on someone noticing
+the explorer stalled. `CATALYST_ALERT_COOLDOWN_SECS` (default `900` = 15 min) limits repeat alerts
+for the same failure so a node stuck for hours doesn't spam the channel. This is best-effort
+(fire-and-forget, logged-not-propagated on failure) and does not replace watching the metrics/logs —
+if `CATALYST_ALERT_WEBHOOK_URL` is unset, the process logs a startup warning
+(`catalyst.alerting` target) saying so.
+
 ### `TX_BATCH_MISS_FATAL` / validators stop producing the same head
 
 Multi-validator nodes agree on **per-cycle transaction batches** via a deterministic batch leader. If a follower cannot obtain the canonical batch before the end of the cycle window, it **skips producing** for that cycle (preferable to forking with an empty construction set).

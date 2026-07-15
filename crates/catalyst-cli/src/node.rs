@@ -4517,6 +4517,12 @@ async fn try_reconcile_fork_from_quorum_lsu(
     // `ReconcileFailureTracker`'s doc comment for why.
     if reconcile_circuit_is_broken(local_cycle).await {
         catalyst_utils::increment_counter!("consensus_fork_reconcile_circuit_broken_total", 1);
+        crate::alerting::notify(
+            "reconcile_circuit_broken",
+            format!(
+                "🔴 Consensus reconcile circuit breaker OPEN — target cycle {cycle}, local applied cycle {local_cycle}. Needs operator action — see node-operator-guide.md."
+            ),
+        );
         return Ok(false);
     }
 
@@ -7644,6 +7650,12 @@ impl CatalystNode {
                                     catalyst_utils::increment_counter!(
                                         "consensus_self_produced_apply_blocked_circuit_broken_total",
                                         1
+                                    );
+                                    crate::alerting::notify(
+                                        "self_produced_apply_blocked",
+                                        format!(
+                                            "🔴 Node stopped self-producing — reconcile circuit breaker open for applied head {applied_before} (cycle {cycle}). Needs operator action."
+                                        ),
                                     );
                                     continue;
                                 }
