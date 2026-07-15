@@ -13,6 +13,16 @@ This file is intended to be handed to an external agent/tooling team building a 
 > underlying incident this reset was recovering from. Old genesis hash (now invalid):
 > `0xeea16848e6b1d39d6b7a5e094ad9189d5382a6a4b19fb95342ef9846258fee5a`.
 
+> **2026-07-15 genesis reset.** A real bug in `clear_database()` (`crates/catalyst-storage/src/snapshot.rs`,
+> fixed in `0beeea4`) meant checkpoint restore never actually rolled back state — every reconcile
+> was a silent additive overlay onto live data. This caused a genuine 3-way `state_root` fork across
+> `eu`/`us`/`asia` at cycle `89204746`, each node's circuit breaker correctly halted, and the network
+> was frozen from 05:55:43 UTC until this reset. See `docs/explorer-genesis-reset-2026-07-15.md` for
+> full detail and explorer/indexer action. Unlike the 2026-07-12 reset, **`genesis_hash` did NOT
+> change** (same chain_id/network_id/faucet config) — only re-indexing from the new starting cycle
+> (`89205458`) is required, not a chain-identity update. `require_state_root_finality = true` is now
+> enforced fleet-wide (ADR 0002), closing the gap that caused this fork.
+
 ## Network identity (MUST match)
 
 - **network_id**: `catalyst-testnet`
