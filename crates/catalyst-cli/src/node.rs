@@ -1448,6 +1448,69 @@ async fn reconcile_failure_state_for_test(local_cycle: u64) -> Option<(u32, bool
         .map(|e| (e.consecutive_failures, e.broken))
 }
 
+/// Checks a bounded window of recently-applied cycles for **self-produced state-root
+/// divergence**: this node's own `lsu_hash` for a cycle matches the network's BFT-certified
+/// `LsuStateRootCertificateV1` (same recipe, agreed by all producers), but this node's own
+/// locally-computed `state_root` for that cycle does not match the certificate's `state_root`
+/// (different result). ADR 0002 certification only ever gated the catch-up/trusted-apply path
+/// (`verify_state_root_finality_for_apply`); a node's own self-produced applies were never
+/// cross-checked against it at all, so a node whose local execution ever diverged kept
+/// self-producing on top of its own wrong state forever with nothing to catch it — the failure
+/// mode observed live on `asia` in the 2026-07-16 soak-test incident.
+///
+/// A mismatched `lsu_hash` (different recipe) is deliberately ignored here — that is
+/// `try_reorg_stronger_lsu_at_applied_cycle`'s job, not this function's.
+///
+/// On detection, reuses the *existing* reconcile circuit breaker (`record_reconcile_failure`,
+/// keyed on the current applied `head`) rather than any new recovery machinery: once tripped,
+/// `should_block_self_produced_apply` halts further self-production and the existing Discord
+/// alert fires automatically. Recovery is a manual db-backup/restore from a healthy peer (see
+/// `node-operator-guide.md`), not automated here — deliberately, to avoid adding new,
+/// under-scrutinized state-recovery logic on top of a chain whose own state is what's suspect.
+async fn scan_for_self_produced_state_root_divergence(
+    store: &catalyst_storage::StorageManager,
+    dfs: Option<&crate::dfs_store::LocalContentStore>,
+    head: u64,
+) {
+    const SCAN_WINDOW: u64 = 32; // matches the existing follower-advance cap elsewhere in this file
+    let Some(dfs) = dfs else { return };
+    let start = head.saturating_sub(SCAN_WINDOW).max(1);
+    for cycle in start..=head {
+        let Some(local_root) = meta_32(store, &format!("consensus:lsu_state_root:{cycle}")).await else {
+            continue;
+        };
+        let Some(local_lsu_hash) = meta_32(store, &format!("consensus:lsu_hash:{cycle}")).await else {
+            continue;
+        };
+        let Some(cid) = meta_string(store, &format!("consensus:lsu_state_root_cid:{cycle}")).await else {
+            continue;
+        };
+        let Ok(bytes) = dfs.get(&cid).await else {
+            continue; // certificate not fetched locally yet -- fine, re-check next tick
+        };
+        let Ok(cert) = bincode::deserialize::<catalyst_consensus::LsuStateRootCertificateV1>(&bytes) else {
+            continue;
+        };
+        if cert.lsu_hash != local_lsu_hash {
+            continue; // different recipe -- not this function's failure mode
+        }
+        if cert.state_root == local_root {
+            continue; // matches, all good
+        }
+
+        error!(
+            target: "catalyst.consensus.apply",
+            cycle,
+            local_root = %hex_encode(&local_root),
+            certified_root = %hex_encode(&cert.state_root),
+            "Self-produced state_root does not match network-certified root (same recipe, different result) -- local state from this cycle forward is untrustworthy; needs operator action"
+        );
+        catalyst_utils::increment_counter!("consensus_self_produced_state_root_mismatch_total", 1);
+        record_reconcile_failure(head).await;
+        break; // one detection per tick is enough; the breaker accumulates across ticks
+    }
+}
+
 /// Despite the name (kept for call-site continuity — both callers already treat a falsy result
 /// as "fall back to the verifying path"), this now DOES verify: `new_root` is a peer's *claim*
 /// (from a `StateProofBundle` whose Merkle proofs only cover the touched keys, not this node's
@@ -2188,6 +2251,10 @@ pub(crate) fn ensure_consensus_p2p_cli_metrics_registered() {
         (
             "consensus_self_produced_apply_blocked_circuit_broken_total",
             "Locally-produced LSU not applied: reconcile circuit breaker is open for the current applied head (divergent/unrecoverable local state); needs operator action",
+        ),
+        (
+            "consensus_self_produced_state_root_mismatch_total",
+            "Self-produced state_root disagrees with the network's ADR 0002 certified root for the same lsu_hash (same recipe, different result); trips the reconcile circuit breaker",
         ),
     ];
     for (name, desc) in EXTRA {
@@ -5569,6 +5636,12 @@ impl CatalystNode {
                         );
                     }
                     let head = local_applied_cycle(store.as_ref()).await;
+                    scan_for_self_produced_state_root_divergence(
+                        store.as_ref(),
+                        dfs_advance.as_ref(),
+                        head,
+                    )
+                    .await;
                     let now_ms = crate::consensus_limits::wall_now_ms();
                     // Liveness backstop: `observed_head_cycle` is monotonic (only ever raised by P2P
                     // gossip) so a phantom/unreachable head can never self-correct. If we've made zero
@@ -8478,7 +8551,8 @@ mod fork_choice_integration_tests {
         apply_lsu_to_storage, apply_lsu_to_storage_without_root_check, ensure_chain_identity_and_genesis,
         fork_choice_apply_gate, get_balance_i64, hex_encode, load_stored_certified_hash_at_cycle,
         local_applied_cycle, local_applied_lsu_hash, local_applied_state_root, persist_lsu_history,
-        reconcile_failure_state_for_test, record_reconcile_failure, set_balance_i64,
+        reconcile_failure_state_for_test, record_reconcile_failure,
+        scan_for_self_produced_state_root_divergence, set_balance_i64,
         should_block_self_produced_apply, try_reconcile_fork_from_quorum_lsu,
         try_reorg_stronger_lsu_at_applied_cycle, verify_state_root_finality_for_apply, ForkChoiceApplyGate,
     };
@@ -9819,6 +9893,153 @@ mod fork_choice_integration_tests {
         )
         .await;
         assert!(!ok, "certificate for a different root than the claimed one must be rejected");
+    }
+
+    /// Regression test for the 2026-07-16 live incident: a node's own self-produced `state_root`
+    /// for a cycle must be checked against the network's ADR 0002 certificate for that same
+    /// `lsu_hash` -- if they disagree (same recipe, different result), the existing reconcile
+    /// circuit breaker must trip so `should_block_self_produced_apply` halts further
+    /// self-production, exactly as if a peer-gossip reconcile had failed repeatedly.
+    #[tokio::test]
+    async fn self_produced_state_root_mismatch_trips_circuit_breaker() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        // A distinct, otherwise-unused cycle number: `reconcile_failure_tracker()` is a
+        // process-wide singleton keyed on cycle, and test binaries run tests concurrently, so
+        // sharing a cycle number with any other test that trips (or must not trip) the breaker
+        // would make this test's outcome depend on execution order/timing.
+        let lsu = lsu_with_tx_seed(&committee, 950_001, 5);
+        let lsu_hash = hash_data(&lsu).expect("lsu hash");
+        let local_root = [7u8; 32];
+        let certified_root = [9u8; 32]; // different from local_root -- the divergence
+
+        env.store
+            .set_metadata(&format!("consensus:lsu_state_root:{}", lsu.cycle_number), &local_root)
+            .await
+            .expect("set local state root");
+        env.store
+            .set_metadata(&format!("consensus:lsu_hash:{}", lsu.cycle_number), &lsu_hash)
+            .await
+            .expect("set local lsu hash");
+        let cid = install_state_root_cert(&env, &lsu, &committee, certified_root).await;
+        env.store
+            .set_metadata(
+                &format!("consensus:lsu_state_root_cid:{}", lsu.cycle_number),
+                cid.as_bytes(),
+            )
+            .await
+            .expect("set state root cid");
+        // `should_block_self_produced_apply` keys off `local_applied_cycle`, which this test's
+        // scan calls (below) key their `record_reconcile_failure` on via `head` -- these must
+        // agree for the assertion to observe the same tracker entry the scan tripped.
+        env.store
+            .set_metadata("consensus:last_applied_cycle", &lsu.cycle_number.to_le_bytes())
+            .await
+            .expect("set last applied cycle");
+
+        assert!(
+            should_block_self_produced_apply(&env.store).await.is_none(),
+            "breaker must not be open before any divergence is detected"
+        );
+
+        let threshold = crate::consensus_limits::reconcile_circuit_break_threshold();
+        for _ in 0..threshold {
+            scan_for_self_produced_state_root_divergence(&env.store, Some(&env.dfs), lsu.cycle_number)
+                .await;
+        }
+
+        assert!(
+            should_block_self_produced_apply(&env.store).await.is_some(),
+            "sustained same-recipe/different-result divergence must trip the reconcile circuit breaker"
+        );
+    }
+
+    /// A certificate whose `state_root` matches what was locally applied must never trip
+    /// anything, however many times the scan runs -- no false positives on healthy nodes.
+    #[tokio::test]
+    async fn self_produced_state_root_match_does_not_trip_circuit_breaker() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let lsu = lsu_with_tx_seed(&committee, 950_002, 5); // see note in the mismatch test above
+        let lsu_hash = hash_data(&lsu).expect("lsu hash");
+        let agreed_root = [7u8; 32];
+
+        env.store
+            .set_metadata(&format!("consensus:lsu_state_root:{}", lsu.cycle_number), &agreed_root)
+            .await
+            .expect("set local state root");
+        env.store
+            .set_metadata(&format!("consensus:lsu_hash:{}", lsu.cycle_number), &lsu_hash)
+            .await
+            .expect("set local lsu hash");
+        let cid = install_state_root_cert(&env, &lsu, &committee, agreed_root).await;
+        env.store
+            .set_metadata(
+                &format!("consensus:lsu_state_root_cid:{}", lsu.cycle_number),
+                cid.as_bytes(),
+            )
+            .await
+            .expect("set state root cid");
+        env.store
+            .set_metadata("consensus:last_applied_cycle", &lsu.cycle_number.to_le_bytes())
+            .await
+            .expect("set last applied cycle");
+
+        for _ in 0..(crate::consensus_limits::reconcile_circuit_break_threshold() * 2) {
+            scan_for_self_produced_state_root_divergence(&env.store, Some(&env.dfs), lsu.cycle_number)
+                .await;
+        }
+
+        assert!(
+            should_block_self_produced_apply(&env.store).await.is_none(),
+            "a matching certificate must never trip the circuit breaker"
+        );
+    }
+
+    /// A certificate for a *different* `lsu_hash` (a genuinely different recipe, i.e. an ordinary
+    /// competing-fork scenario) is not this function's concern -- that's
+    /// `try_reorg_stronger_lsu_at_applied_cycle`'s job -- so it must be ignored here, not treated
+    /// as a same-recipe divergence.
+    #[tokio::test]
+    async fn self_produced_state_root_scan_ignores_different_lsu_hash() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let lsu = lsu_with_tx_seed(&committee, 950_003, 5); // see note in the mismatch test above
+        let other_lsu = lsu_with_tx_seed(&committee, 950_003, 99); // different recipe, same cycle
+        let local_lsu_hash = hash_data(&lsu).expect("lsu hash");
+        let local_root = [7u8; 32];
+
+        env.store
+            .set_metadata(&format!("consensus:lsu_state_root:{}", lsu.cycle_number), &local_root)
+            .await
+            .expect("set local state root");
+        env.store
+            .set_metadata(&format!("consensus:lsu_hash:{}", lsu.cycle_number), &local_lsu_hash)
+            .await
+            .expect("set local lsu hash");
+        // Certificate is for `other_lsu` (different lsu_hash) with some different root.
+        let cid = install_state_root_cert(&env, &other_lsu, &committee, [9u8; 32]).await;
+        env.store
+            .set_metadata(
+                &format!("consensus:lsu_state_root_cid:{}", lsu.cycle_number),
+                cid.as_bytes(),
+            )
+            .await
+            .expect("set state root cid");
+        env.store
+            .set_metadata("consensus:last_applied_cycle", &lsu.cycle_number.to_le_bytes())
+            .await
+            .expect("set last applied cycle");
+
+        for _ in 0..(crate::consensus_limits::reconcile_circuit_break_threshold() * 2) {
+            scan_for_self_produced_state_root_divergence(&env.store, Some(&env.dfs), lsu.cycle_number)
+                .await;
+        }
+
+        assert!(
+            should_block_self_produced_apply(&env.store).await.is_none(),
+            "a certificate for a different lsu_hash (different recipe) must be ignored, not treated as a same-recipe divergence"
+        );
     }
 
     /// Regression test for the "LSU history not persisted" bug: applying a cycle via the L2

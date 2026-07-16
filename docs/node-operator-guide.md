@@ -356,6 +356,17 @@ human." Look for:
 - Counters: `consensus_fork_reconcile_circuit_broken_total`,
   `consensus_self_produced_apply_blocked_circuit_broken_total`.
 
+**A second, distinct trigger for this same breaker:** `"Self-produced state_root does not match
+network-certified root (same recipe, different result)"` (target `catalyst.consensus.apply`,
+counter `consensus_self_produced_state_root_mismatch_total`). This fires when a node's *own*
+self-produced cycles agree with peers on the `lsu_hash` (recipe) but computed a different
+`state_root` — i.e. the node's local execution has silently diverged, something the ADR 0002
+state-root certificate now catches even though nothing self-produced was ever cross-checked
+against it before. This is a different root cause from the reconcile-failure case above (that one
+is triggered by a *peer's* gossiped LSU disagreeing; this one is caught by a periodic background
+scan comparing this node's own applied history against certificates it already has), but the same
+breaker and the same remediation apply once it trips.
+
 Remediation (same as the checkpoint case above — this is the same underlying condition, just past
 the point where the node will keep retrying on its own):
 
