@@ -23,6 +23,16 @@ This file is intended to be handed to an external agent/tooling team building a 
 > (`89205458`) is required, not a chain-identity update. `require_state_root_finality = true` is now
 > enforced fleet-wide (ADR 0002), closing the gap that caused this fork.
 
+> **2026-07-16 genesis reset.** A new detector shipped the same day (`scan_for_self_produced_state_root_divergence`,
+> commit `07e08de`) closed the remaining gap: self-produced applies were never cross-checked against
+> the network's certified `state_root`, only catch-up applies were. Deploying it caught `eu`/`us`
+> silently accumulating corrupted historical `state_root` records via a recurring failed-reconcile
+> loop, traced to `asia` (deliberately left running mid-incident on pre-fix code) continuously
+> gossiping bad data — stopping `asia` immediately stopped the corruption. Reset again rather than
+> attempt a targeted repair, since no node was confirmed clean. See
+> `docs/explorer-genesis-reset-2026-07-16.md`. Genesis hash unchanged again; re-index from cycle
+> `89210491`.
+
 ## Network identity (MUST match)
 
 - **network_id**: `catalyst-testnet`
