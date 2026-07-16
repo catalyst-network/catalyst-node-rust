@@ -7213,10 +7213,25 @@ impl CatalystNode {
                                 }
                             }
                         } else {
-                            // Forward to consensus engine, and also relay broadcast envelopes to support multi-hop WAN gossip.
-                            // (Consensus messages don't have local validity checks at this layer.)
+                            // Relay broadcast envelopes to support multi-hop WAN gossip regardless of
+                            // type (peer discovery/heartbeat/etc. still need to propagate). Only
+                            // forward to the consensus engine the message types it actually consumes
+                            // (`consensus.rs`'s `drain_pending_by_type` calls) -- everything else that
+                            // reaches this catch-all (PeerHeartbeat, PeerDiscovery, NodeStatus,
+                            // HealthCheck, etc.) has no consumer and was accumulating forever in
+                            // `pending_envelopes` with zero eviction, a confirmed unbounded-memory-growth
+                            // bug (validators leaked ~150-180MB/hour; see soak-test incident 2026-07-16).
                             let env = envelope;
-                            let _ = in_tx.send(env.clone());
+                            if matches!(
+                                env.message_type,
+                                MessageType::ProducerQuantity
+                                    | MessageType::ProducerCandidate
+                                    | MessageType::ProducerVote
+                                    | MessageType::ProducerOutput
+                                    | MessageType::ConsensusSync
+                            ) {
+                                let _ = in_tx.send(env.clone());
+                            }
                             let do_relay = {
                                 let mut rc = relay_cache.lock().await;
                                 rc.should_relay(&env, now_ms)

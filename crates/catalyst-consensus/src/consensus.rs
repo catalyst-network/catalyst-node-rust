@@ -47,6 +47,23 @@ impl CollaborativeConsensus {
         }
     }
 
+    /// Hard cap on `pending_envelopes` (defense in depth against any future/unforeseen
+    /// accumulation path -- oldest entries are evicted first). Normal steady-state depth should
+    /// stay far below this: only the 5 consensus `MessageType`s the drain calls below consume
+    /// ever reach this queue (node.rs's inbound handler only forwards those types), each drained
+    /// every cycle by its own phase.
+    const MAX_PENDING_ENVELOPES: usize = 10_000;
+
+    /// Push an envelope not matching the currently-awaited type onto `pending_envelopes` for a
+    /// later phase to drain, evicting the oldest entry first if already at `MAX_PENDING_ENVELOPES`.
+    async fn push_pending_bounded(&self, env: MessageEnvelope) {
+        let mut pending = self.pending_envelopes.lock().await;
+        if pending.len() >= Self::MAX_PENDING_ENVELOPES {
+            pending.pop_front();
+        }
+        pending.push_back(env);
+    }
+
     async fn drain_pending_by_type(&self, want: MessageType) -> Vec<MessageEnvelope> {
         let mut pending = self.pending_envelopes.lock().await;
         if pending.is_empty() {
@@ -398,7 +415,7 @@ impl CollaborativeConsensus {
                             }
                         }
                         _ => {
-                            self.pending_envelopes.lock().await.push_back(env);
+                            self.push_pending_bounded(env).await;
                         }
                     }
                 }
@@ -555,7 +572,7 @@ impl CollaborativeConsensus {
                         }
                     } else {
                         // Buffer for later phases instead of dropping it.
-                        self.pending_envelopes.lock().await.push_back(env);
+                        self.push_pending_bounded(env).await;
                     }
                 }
                 Ok(None) => break,
@@ -604,7 +621,7 @@ impl CollaborativeConsensus {
                             }
                         }
                     } else {
-                        self.pending_envelopes.lock().await.push_back(env);
+                        self.push_pending_bounded(env).await;
                     }
                 }
                 Ok(None) => break,
@@ -653,7 +670,7 @@ impl CollaborativeConsensus {
                             }
                         }
                     } else {
-                        self.pending_envelopes.lock().await.push_back(env);
+                        self.push_pending_bounded(env).await;
                     }
                 }
                 Ok(None) => break,
@@ -702,7 +719,7 @@ impl CollaborativeConsensus {
                             }
                         }
                     } else {
-                        self.pending_envelopes.lock().await.push_back(env);
+                        self.push_pending_bounded(env).await;
                     }
                 }
                 Ok(None) => break,
@@ -975,6 +992,38 @@ mod tests {
         ).unwrap();
         
         assert_eq!(selected, selected_again);
+    }
+
+    /// Regression test for the soak-test memory-leak fix: `push_pending_bounded` must evict the
+    /// oldest entry once `MAX_PENDING_ENVELOPES` is reached, not grow without bound.
+    #[tokio::test]
+    async fn push_pending_bounded_evicts_oldest_beyond_cap() {
+        let config = ConsensusConfig::default();
+        let consensus = CollaborativeConsensus::new(config);
+
+        let total = CollaborativeConsensus::MAX_PENDING_ENVELOPES + 5;
+        for i in 0..total {
+            let env = MessageEnvelope::new(
+                MessageType::ProducerQuantity,
+                "node1".to_string(),
+                None,
+                (i as u64).to_le_bytes().to_vec(),
+            );
+            consensus.push_pending_bounded(env).await;
+        }
+
+        let drained = consensus
+            .drain_pending_by_type(MessageType::ProducerQuantity)
+            .await;
+        assert_eq!(drained.len(), CollaborativeConsensus::MAX_PENDING_ENVELOPES);
+
+        // The oldest 5 (payloads 0..5) must have been evicted; the queue keeps the most recent
+        // MAX_PENDING_ENVELOPES entries in order (payloads 5..total).
+        let first_payload = u64::from_le_bytes(drained[0].payload.clone().try_into().unwrap());
+        assert_eq!(first_payload, 5);
+        let last_payload =
+            u64::from_le_bytes(drained.last().unwrap().payload.clone().try_into().unwrap());
+        assert_eq!(last_payload, (total - 1) as u64);
     }
 
     #[tokio::test]
