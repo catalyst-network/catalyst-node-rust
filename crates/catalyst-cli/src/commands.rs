@@ -384,6 +384,25 @@ pub async fn db_stats(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// TEST-ONLY (see `Commands::CorruptSelfProducedStateRootForTest` doc comment in `main.rs`).
+pub async fn corrupt_self_produced_state_root_for_test(data_dir: &Path, cycle: u64) -> Result<()> {
+    let mut cfg = StorageConfigLib::default();
+    cfg.data_dir = data_dir.to_path_buf();
+    let store = StorageManager::new(cfg).await?;
+
+    let key = format!("consensus:lsu_state_root:{cycle}");
+    let Some(mut val) = store.get_metadata(&key).await.ok().flatten() else {
+        anyhow::bail!("no existing {key} to corrupt -- has this node applied cycle {cycle} yet?");
+    };
+    if val.is_empty() {
+        anyhow::bail!("{key} is empty, nothing to flip");
+    }
+    val[0] ^= 0xFF;
+    store.set_metadata(&key, &val).await?;
+    println!("corrupted {key} -> 0x{}", hex::encode(&val));
+    Ok(())
+}
+
 /// Diagnostic (read-only): list every `workers:<pubkey>` entry in the `accounts` CF plus its
 /// eligibility inputs and balance, so two nodes' account state can be diffed directly when their
 /// `state_root`s disagree. Mirrors `load_workers_from_state`/`waiting_worker_is_eligible` in

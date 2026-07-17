@@ -2283,6 +2283,10 @@ pub(crate) fn ensure_consensus_p2p_cli_metrics_registered() {
             "consensus_self_produced_state_root_mismatch_total",
             "Self-produced state_root disagrees with the network's ADR 0002 certified root for the same lsu_hash (same recipe, different result); trips the reconcile circuit breaker",
         ),
+        (
+            "consensus_cycle_participation_withheld_circuit_broken_total",
+            "Withheld Construction/vote participation for a cycle because the reconcile circuit breaker is open for the applied head; needs operator action",
+        ),
     ];
     for (name, desc) in EXTRA {
         let _ = guard.register_metric(Metric::new(
@@ -7575,6 +7579,41 @@ impl CatalystNode {
                                 cycle, applied, observed_head
                             );
                             catalyst_utils::increment_counter!("consensus_cycle_deferred_behind_total", 1);
+                            continue;
+                        }
+
+                        // Withhold participation entirely (not just the final apply) while the
+                        // reconcile circuit breaker is open for our applied head.
+                        //
+                        // Root-cause fix for the 2026-07-17 rolling-recovery incident: the *only*
+                        // existing breaker check (further below, after `consensus.start_cycle`)
+                        // gates just this node's own local apply, not its Construction/vote
+                        // participation in the four-phase round. A circuit-broken node still ran
+                        // the full round and broadcast its own producer output/vote -- which
+                        // counts toward *other* nodes' BFT quorum (2-of-3) -- before bailing out
+                        // at the apply step and discarding the result for itself. Three validators
+                        // restarted at staggered times (repairing one at a time) reproduced this
+                        // live: a freshly-repaired node completed several cycles using a vote from
+                        // a peer that was still circuit-broken, and that peer never applied (or
+                        // later backfilled) those same cycles once repaired -- permanently
+                        // crediting the fresh node with compensation the broken peer never
+                        // received, a silent, discrete `accounts`-root divergence with no error
+                        // logged anywhere (nothing was technically "wrong" about either node's own
+                        // application, only their disagreement on which cycles happened at all).
+                        // A node that doesn't trust its own state enough to apply a cycle must not
+                        // help certify that cycle for anyone else either -- exactly the same
+                        // "never release the gate to preserve liveness" principle as the depth
+                        // gate above. With any healthy 2-of-3 quorum excluding this node, the rest
+                        // of the fleet still advances without it.
+                        if let Some(applied_before) = should_block_self_produced_apply(store.as_ref()).await {
+                            info!(
+                                "Withholding consensus participation for cycle {}: reconcile circuit breaker is open for applied head {} (divergent/unrecoverable local state); needs operator action",
+                                cycle, applied_before
+                            );
+                            catalyst_utils::increment_counter!(
+                                "consensus_cycle_participation_withheld_circuit_broken_total",
+                                1
+                            );
                             continue;
                         }
                     }

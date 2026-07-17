@@ -174,6 +174,21 @@ enum Commands {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// TEST-ONLY (not for operator/production use): flips a bit in the on-disk
+    /// `consensus:lsu_state_root:{cycle}` metadata value, deliberately desyncing it from this
+    /// node's own valid ADR 0002 certificate for that cycle. Used by
+    /// `scripts/consensus-circuit-breaker-participation-e2e.sh` to deterministically reproduce
+    /// the same circuit-breaker-open state as the 2026-07-17 incident (see
+    /// `scan_for_self_produced_state_root_divergence` in `node.rs`) without depending on
+    /// timing-sensitive replay/reconcile races. Node must be stopped first (exclusive DB access).
+    CorruptSelfProducedStateRootForTest {
+        /// Data directory (same as config.storage.data_dir)
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Cycle whose already-applied, already-certified state_root to corrupt
+        #[arg(long)]
+        cycle: u64,
+    },
     /// Diagnostic (read-only): dump the worker registry (`workers:*`) and each worker's
     /// eligibility inputs (`wfs:*` first-seen cycle, `wlr:*` last-registration cycle) plus
     /// balance, all from the `accounts` column family. Node must be stopped first (exclusive
@@ -535,6 +550,9 @@ async fn main() -> Result<()> {
         }
         Commands::DbMaintenance { data_dir } => {
             commands::db_maintenance(&data_dir).await?;
+        }
+        Commands::CorruptSelfProducedStateRootForTest { data_dir, cycle } => {
+            commands::corrupt_self_produced_state_root_for_test(&data_dir, cycle).await?;
         }
         Commands::DumpWorkerRegistry { data_dir } => {
             commands::dump_worker_registry(&data_dir).await?;
