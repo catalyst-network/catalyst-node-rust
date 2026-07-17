@@ -14,6 +14,7 @@ use catalyst_crypto::signatures::{Signature, SignatureScheme};
 use crate::evm::EvmTxKind;
 use alloy_primitives::Address as EvmAddress;
 use catalyst_storage::{StorageConfig as StorageConfigLib, StorageManager};
+use catalyst_utils::CatalystDeserialize;
 use tokio::io::AsyncWriteExt;
 use std::net::SocketAddr;
 
@@ -380,6 +381,117 @@ pub async fn db_stats(data_dir: &Path) -> Result<()> {
     if let Some(stats) = st.database_stats {
         println!("rocksdb_stats:\n{}", stats);
     }
+    Ok(())
+}
+
+/// One-time operator repair for the 2026-07-17 `persist_lsu_history` bug (see `node.rs`): for each
+/// cycle in `[from_cycle, to_cycle]`, if this node has a locally-recorded `state_root` that
+/// disagrees with its own already-published, already-verified ADR 0002 certificate for the *same*
+/// `lsu_hash` (same recipe), re-derive the local record from the certificate rather than leaving
+/// it as whatever an unrelated peer's unsigned gossip last happened to overwrite it with.
+///
+/// Deliberately conservative: a cycle is only touched when a certificate for the recorded
+/// `lsu_hash` exists, deserializes, and passes full signature/quorum re-verification against the
+/// stored LSU. Anything else (no cert yet, different `lsu_hash`, cert fails verification) is left
+/// untouched and reported, not guessed at.
+pub async fn repair_self_produced_state_root(
+    data_dir: &Path,
+    dfs_cache_dir: &Path,
+    from_cycle: u64,
+    to_cycle: u64,
+) -> Result<()> {
+    let mut cfg = StorageConfigLib::default();
+    cfg.data_dir = data_dir.to_path_buf();
+    let store = StorageManager::new(cfg).await?;
+    let dfs = crate::dfs_store::LocalContentStore::new(dfs_cache_dir.to_path_buf());
+
+    let mut repaired = 0u64;
+    let mut already_ok = 0u64;
+    let mut skipped = 0u64;
+
+    for cycle in from_cycle..=to_cycle {
+        let Some(local_root) = store
+            .get_metadata(&format!("consensus:lsu_state_root:{cycle}"))
+            .await
+            .ok()
+            .flatten()
+            .filter(|b| b.len() == 32)
+        else {
+            skipped += 1;
+            continue;
+        };
+        let Some(local_lsu_hash) = store
+            .get_metadata(&format!("consensus:lsu_hash:{cycle}"))
+            .await
+            .ok()
+            .flatten()
+            .filter(|b| b.len() == 32)
+        else {
+            println!("cycle {cycle}: skip (no local lsu_hash)");
+            skipped += 1;
+            continue;
+        };
+        let Some(cid) = store
+            .get_metadata(&format!("consensus:lsu_state_root_cid:{cycle}"))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| String::from_utf8(b).ok())
+        else {
+            println!("cycle {cycle}: skip (no state-root certificate published yet)");
+            skipped += 1;
+            continue;
+        };
+        let Ok(cert_bytes) = dfs.get(&cid).await else {
+            println!("cycle {cycle}: skip (certificate cid={cid} not fetchable locally)");
+            skipped += 1;
+            continue;
+        };
+        let Ok(cert) = bincode::deserialize::<catalyst_consensus::LsuStateRootCertificateV1>(&cert_bytes) else {
+            println!("cycle {cycle}: skip (certificate at cid={cid} does not deserialize)");
+            skipped += 1;
+            continue;
+        };
+        if cert.lsu_hash.as_slice() != local_lsu_hash.as_slice() {
+            println!("cycle {cycle}: skip (certificate is for a different lsu_hash -- a real fork, not this bug; needs operator investigation, not this tool)");
+            skipped += 1;
+            continue;
+        }
+        let Some(lsu_bytes) = store.get_metadata(&format!("consensus:lsu:{cycle}")).await.ok().flatten() else {
+            println!("cycle {cycle}: skip (no stored LSU to re-verify the certificate against)");
+            skipped += 1;
+            continue;
+        };
+        let Ok(lsu) = catalyst_consensus::LedgerStateUpdate::deserialize(&lsu_bytes) else {
+            println!("cycle {cycle}: skip (stored LSU does not deserialize)");
+            skipped += 1;
+            continue;
+        };
+        if catalyst_consensus::verify_lsu_state_root_certificate(&cert, &lsu).is_err() {
+            println!("cycle {cycle}: skip (certificate at cid={cid} FAILED signature/quorum re-verification -- do not trust)");
+            skipped += 1;
+            continue;
+        }
+
+        if cert.state_root.as_slice() == local_root.as_slice() {
+            already_ok += 1;
+            continue;
+        }
+
+        println!(
+            "cycle {cycle}: repairing local_root=0x{} -> certified_root=0x{} (cid={cid})",
+            hex::encode(&local_root),
+            hex::encode(cert.state_root),
+        );
+        store
+            .set_metadata(&format!("consensus:lsu_state_root:{cycle}"), &cert.state_root)
+            .await?;
+        repaired += 1;
+    }
+
+    println!("repaired: {repaired}");
+    println!("already_ok: {already_ok}");
+    println!("skipped: {skipped}");
     Ok(())
 }
 

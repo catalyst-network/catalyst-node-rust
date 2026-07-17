@@ -372,6 +372,27 @@ async fn persist_lsu_history(
             write_canonical_slot = false;
         }
     }
+    // `fork_choice_reject_weaker_incoming` only rejects a *different* (weaker) `lsu_hash` at this
+    // cycle -- it explicitly no-ops (never rejects) when the incoming `lsu_hash` matches what's
+    // already stored, since same-recipe gossip is normally harmless to re-persist. But
+    // `state_root`/`cid` are a separate, unsigned, unattested claim carried alongside the LSU
+    // reference, not derived from `lsu_hash` itself -- two gossip messages can carry the identical
+    // `lsu_hash` (and thus pass the check above) while disagreeing on `state_root`. If this node
+    // has already settled a `(lsu_hash, state_root)` pair for this cycle, a later same-recipe
+    // gossip message must never silently overwrite it: this is exactly what caused the
+    // 2026-07-17 fleet-wide false-positive halt -- this node had already self-applied and even
+    // published the correct ADR 0002 certificate for a cycle, then an unrelated peer's
+    // `LsuCidGossip` relay for the same `(cycle, lsu_hash)` overwrote `consensus:lsu_state_root`
+    // with that peer's differing claimed root, and `scan_for_self_produced_state_root_divergence`
+    // (which trusts this key as the node's own computation) tripped the reconcile circuit breaker
+    // on a node that was never actually wrong. A genuinely wrong "first settled" value is a job
+    // for the ADR 0002 certificate (BFT-signed, unlike this field) via the operator-invoked
+    // `repair-self-produced-state-root` command, not for whichever gossip happens to arrive next.
+    let already_settled_same_recipe = {
+        let existing_hash = store.get_metadata(&format!("consensus:lsu_hash:{cycle}")).await.ok().flatten();
+        let existing_root = store.get_metadata(&format!("consensus:lsu_state_root:{cycle}")).await.ok().flatten();
+        existing_hash.as_deref() == Some(lsu_hash.as_slice()) && existing_root.is_some()
+    };
     if write_canonical_slot {
         let _ = store
             .set_metadata(&format!("consensus:lsu:{}", cycle), lsu_bytes)
@@ -379,17 +400,23 @@ async fn persist_lsu_history(
         let _ = store
             .set_metadata(&format!("consensus:lsu_hash:{}", cycle), lsu_hash)
             .await;
+        // `lsu_cid` and `lsu_state_root` describe the SAME record as `lsu`/`lsu_hash` and must
+        // rise and fall together with them -- otherwise a losing/redundant incoming candidate can
+        // clobber this node's own recorded `state_root` even while `lsu`/`lsu_hash` correctly keep
+        // the winning/existing values.
+        if !already_settled_same_recipe {
+            if !cid.is_empty() {
+                let _ = store
+                    .set_metadata(&format!("consensus:lsu_cid:{}", cycle), cid.as_bytes())
+                    .await;
+            }
+            let _ = store
+                .set_metadata(&format!("consensus:lsu_state_root:{}", cycle), state_root)
+                .await;
+        }
     }
     let _ = store
         .set_metadata(&cycle_by_lsu_hash_key(lsu_hash), &cycle.to_le_bytes())
-        .await;
-    if !cid.is_empty() {
-        let _ = store
-            .set_metadata(&format!("consensus:lsu_cid:{}", cycle), cid.as_bytes())
-            .await;
-    }
-    let _ = store
-        .set_metadata(&format!("consensus:lsu_state_root:{}", cycle), state_root)
         .await;
 }
 
@@ -8550,8 +8577,8 @@ mod fork_choice_integration_tests {
     use super::{
         apply_lsu_to_storage, apply_lsu_to_storage_without_root_check, ensure_chain_identity_and_genesis,
         fork_choice_apply_gate, get_balance_i64, hex_encode, load_stored_certified_hash_at_cycle,
-        local_applied_cycle, local_applied_lsu_hash, local_applied_state_root, persist_lsu_history,
-        reconcile_failure_state_for_test, record_reconcile_failure,
+        local_applied_cycle, local_applied_lsu_hash, local_applied_state_root, meta_32, meta_string,
+        persist_lsu_history, reconcile_failure_state_for_test, record_reconcile_failure,
         scan_for_self_produced_state_root_divergence, set_balance_i64,
         should_block_self_produced_apply, try_reconcile_fork_from_quorum_lsu,
         try_reorg_stronger_lsu_at_applied_cycle, verify_state_root_finality_for_apply, ForkChoiceApplyGate,
@@ -9232,6 +9259,77 @@ mod fork_choice_integration_tests {
             env.store.list_snapshots().await.expect("list snapshots"),
             snaps_before,
             "no quorum_reconcile_* snapshot created: idempotent path must never reach create_snapshot"
+        );
+    }
+
+    /// Regression test for the 2026-07-17 live incident: a node that has already self-applied and
+    /// recorded the correct `state_root` for a cycle must not have that record silently overwritten
+    /// by a *later* `LsuCidGossip` relay for the exact same `(cycle, lsu_hash)` carrying a
+    /// different, unsigned, unverified claimed root -- `fork_choice_reject_weaker_incoming` never
+    /// rejects an equal-hash incoming candidate (it's not a competing fork), so before this fix
+    /// `persist_lsu_history` blindly re-persisted whatever `state_root` the second message
+    /// happened to carry, poisoning `consensus:lsu_state_root:{cycle}` -- the exact key
+    /// `scan_for_self_produced_state_root_divergence` trusts as this node's own computation,
+    /// tripping the reconcile circuit breaker on a node that was never actually wrong.
+    #[tokio::test]
+    async fn persist_lsu_history_ignores_later_same_recipe_claim_disagreeing_with_settled_root() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let lsu_c1 = lsu_with_tx_seed(&committee, 1, 5);
+        let hash_c1 = hash_data(&lsu_c1).expect("hash");
+        let root_c1 = apply_lsu_to_storage(&env.store, &lsu_c1)
+            .await
+            .expect("apply cycle 1");
+        let lsu_bytes = lsu_c1.serialize().expect("ser");
+
+        // First sighting: this node's own correct, just-applied root gets recorded.
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            1,
+            &lsu_bytes,
+            &hash_c1,
+            "cid-a",
+            &root_c1,
+            "",
+            false,
+        )
+        .await;
+        assert_eq!(
+            meta_32(&env.store, "consensus:lsu_state_root:1").await,
+            Some(root_c1)
+        );
+
+        // A later gossip relay for the identical (cycle, lsu_hash) -- same recipe -- arrives
+        // carrying a different, wrong claimed root (simulating another peer's bad/stale claim, or
+        // simply a duplicate relay hop with a corrupted field). This must be ignored, not adopted.
+        let poisoned_root = {
+            let mut r = root_c1;
+            r[0] ^= 0xFF;
+            r
+        };
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            1,
+            &lsu_bytes,
+            &hash_c1,
+            "cid-b-poisoned",
+            &poisoned_root,
+            "",
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            meta_32(&env.store, "consensus:lsu_state_root:1").await,
+            Some(root_c1),
+            "a later same-recipe gossip claim must never overwrite this node's already-settled state_root"
+        );
+        assert_eq!(
+            meta_string(&env.store, "consensus:lsu_cid:1").await,
+            Some("cid-a".to_string()),
+            "the cid describing the settled record must stay in sync with its state_root"
         );
     }
 

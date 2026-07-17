@@ -174,6 +174,26 @@ enum Commands {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// One-time operator repair for the 2026-07-17 `persist_lsu_history` bug: re-derive
+    /// `consensus:lsu_state_root:{cycle}` from this node's own already-verified ADR 0002
+    /// certificate wherever an unrelated peer's gossip clobbered it with a different claimed
+    /// root. Only touches a cycle when a certificate for the *same* `lsu_hash` (same recipe) is
+    /// found and passes full signature/quorum re-verification; never guesses. Node must be
+    /// stopped first (exclusive DB access).
+    RepairSelfProducedStateRoot {
+        /// Data directory (same as config.storage.data_dir)
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// DFS cache directory (same as config.dfs.cache_dir)
+        #[arg(long)]
+        dfs_cache_dir: PathBuf,
+        /// First cycle to check (inclusive)
+        #[arg(long)]
+        from_cycle: u64,
+        /// Last cycle to check (inclusive)
+        #[arg(long)]
+        to_cycle: u64,
+    },
     /// Publish snapshot metadata into the node DB (served via RPC for fast-sync tooling)
     SnapshotPublish {
         /// Data directory (same as config.storage.data_dir) of the RPC node
@@ -506,6 +526,9 @@ async fn main() -> Result<()> {
         }
         Commands::DbMaintenance { data_dir } => {
             commands::db_maintenance(&data_dir).await?;
+        }
+        Commands::RepairSelfProducedStateRoot { data_dir, dfs_cache_dir, from_cycle, to_cycle } => {
+            commands::repair_self_produced_state_root(&data_dir, &dfs_cache_dir, from_cycle, to_cycle).await?;
         }
         Commands::SnapshotPublish { data_dir, snapshot_dir, archive_url, archive_path, ttl_seconds } => {
             commands::snapshot_publish(&data_dir, &snapshot_dir, &archive_url, &archive_path, ttl_seconds).await?;
