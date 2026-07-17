@@ -33,6 +33,18 @@ This file is intended to be handed to an external agent/tooling team building a 
 > `docs/explorer-genesis-reset-2026-07-16.md`. Genesis hash unchanged again; re-index from cycle
 > `89210491`.
 
+> **2026-07-17 genesis reset.** Two more bugs found and fixed, both exposed by the detector shipped
+> 2026-07-16: (1) `persist_lsu_history` (commit `0900a3a`) unconditionally overwrote a node's own
+> already-applied `state_root` bookkeeping with an unsigned peer gossip claim, even when the node's
+> real applied state was correct — `asia`'s genuine, independent divergence at cycle `89213234`
+> propagated via gossip and falsely tripped `eu`/`us`'s breakers too, freezing the network for ~17h;
+> (2) circuit-broken nodes still cast BFT-counted votes on new cycles despite being blocked from
+> applying them (commit `799c089`) — during the rolling recovery from bug (1), this let recovering
+> validators complete cycles using votes from peers that never actually applied them, permanently
+> desyncing producer-compensation balances across `eu`/`us`/`asia`. See
+> `docs/explorer-genesis-reset-2026-07-17.md`. Genesis hash unchanged again; re-index from cycle
+> `89215966`.
+
 ## Network identity (MUST match)
 
 - **network_id**: `catalyst-testnet`
