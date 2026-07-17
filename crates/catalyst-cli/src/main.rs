@@ -174,6 +174,15 @@ enum Commands {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Diagnostic (read-only): dump the worker registry (`workers:*`) and each worker's
+    /// eligibility inputs (`wfs:*` first-seen cycle, `wlr:*` last-registration cycle) plus
+    /// balance, all from the `accounts` column family. Node must be stopped first (exclusive
+    /// DB access). Used to compare per-node account state directly when a state_root diverges.
+    DumpWorkerRegistry {
+        /// Data directory (same as config.storage.data_dir)
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
     /// One-time operator repair for the 2026-07-17 `persist_lsu_history` bug: re-derive
     /// `consensus:lsu_state_root:{cycle}` from this node's own already-verified ADR 0002
     /// certificate wherever an unrelated peer's gossip clobbered it with a different claimed
@@ -526,6 +535,9 @@ async fn main() -> Result<()> {
         }
         Commands::DbMaintenance { data_dir } => {
             commands::db_maintenance(&data_dir).await?;
+        }
+        Commands::DumpWorkerRegistry { data_dir } => {
+            commands::dump_worker_registry(&data_dir).await?;
         }
         Commands::RepairSelfProducedStateRoot { data_dir, dfs_cache_dir, from_cycle, to_cycle } => {
             commands::repair_self_produced_state_root(&data_dir, &dfs_cache_dir, from_cycle, to_cycle).await?;

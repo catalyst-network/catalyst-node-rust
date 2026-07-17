@@ -14,7 +14,7 @@ use catalyst_crypto::signatures::{Signature, SignatureScheme};
 use crate::evm::EvmTxKind;
 use alloy_primitives::Address as EvmAddress;
 use catalyst_storage::{StorageConfig as StorageConfigLib, StorageManager};
-use catalyst_utils::CatalystDeserialize;
+use catalyst_utils::{CatalystDeserialize, StateManager};
 use tokio::io::AsyncWriteExt;
 use std::net::SocketAddr;
 
@@ -381,6 +381,64 @@ pub async fn db_stats(data_dir: &Path) -> Result<()> {
     if let Some(stats) = st.database_stats {
         println!("rocksdb_stats:\n{}", stats);
     }
+    Ok(())
+}
+
+/// Diagnostic (read-only): list every `workers:<pubkey>` entry in the `accounts` CF plus its
+/// eligibility inputs and balance, so two nodes' account state can be diffed directly when their
+/// `state_root`s disagree. Mirrors `load_workers_from_state`/`waiting_worker_is_eligible` in
+/// `node.rs` (kept independent rather than exported, since this is a one-off diagnostic).
+pub async fn dump_worker_registry(data_dir: &Path) -> Result<()> {
+    let mut cfg = StorageConfigLib::default();
+    cfg.data_dir = data_dir.to_path_buf();
+    let store = StorageManager::new(cfg).await?;
+
+    let mut workers: Vec<[u8; 32]> = Vec::new();
+    for item in store.engine().iterator("accounts")? {
+        let (k, v) = item?;
+        if !k.starts_with(b"workers:") || k.len() != b"workers:".len() + 32 || v.as_ref() != [1u8] {
+            continue;
+        }
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&k[b"workers:".len()..]);
+        workers.push(pk);
+    }
+    workers.sort();
+    workers.dedup();
+
+    println!("worker_count: {}", workers.len());
+    for pk in &workers {
+        let mut wfs_key = b"wfs:".to_vec();
+        wfs_key.extend_from_slice(pk);
+        let mut wlr_key = b"wlr:".to_vec();
+        wlr_key.extend_from_slice(pk);
+        let mut bal_key = b"bal:".to_vec();
+        bal_key.extend_from_slice(pk);
+
+        let first_seen = store.get_state(&wfs_key).await.ok().flatten().and_then(|b| {
+            (b.len() == 8).then(|| u64::from_le_bytes(b.try_into().unwrap()))
+        });
+        let last_reg = store.get_state(&wlr_key).await.ok().flatten().and_then(|b| {
+            (b.len() == 8).then(|| u64::from_le_bytes(b.try_into().unwrap()))
+        });
+        let bal = store.get_state(&bal_key).await.ok().flatten().and_then(|b| {
+            (b.len() == 8).then(|| i64::from_le_bytes(b.try_into().unwrap()))
+        });
+
+        println!(
+            "worker=0x{} first_seen={:?} last_reg={:?} balance={:?}",
+            hex::encode(pk),
+            first_seen,
+            last_reg,
+            bal
+        );
+    }
+
+    let root = store.get_state_root();
+    println!(
+        "current_state_root: {}",
+        root.map(|h| format!("0x{}", hex::encode(h))).unwrap_or_else(|| "null".to_string())
+    );
     Ok(())
 }
 
