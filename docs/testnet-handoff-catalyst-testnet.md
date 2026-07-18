@@ -45,6 +45,17 @@ This file is intended to be handed to an external agent/tooling team building a 
 > `docs/explorer-genesis-reset-2026-07-17.md`. Genesis hash unchanged again; re-index from cycle
 > `89215966`.
 
+> **2026-07-18 genesis reset.** Two more issues: (1) the 2026-07-17 `persist_lsu_history` fix
+> (`0900a3a`) added a check-then-write guard but neither it nor the self-apply's own write of the
+> same keys held any lock, so the guard's "already settled?" read wasn't atomic with the concurrent
+> self-apply write it deferred to — the exact same fleet-wide false-positive halt reproduced again
+> on the already-fixed binary. Both write sites now serialize on `lsu_apply_lock` (commit `78275fa`).
+> (2) After repairing that and letting the fleet catch up, `asia` alone computed a genuinely
+> different `state_root` from the same LSU recipe as `eu`/`us`/`rpc` — a real, persistent
+> divergence (not bookkeeping), echoing the still-unexplained `asia`-specific pattern from
+> 2026-07-16. Root cause not yet identified. See `docs/explorer-genesis-reset-2026-07-18.md`.
+> Genesis hash unchanged again; re-index from cycle `89219239`.
+
 ## Network identity (MUST match)
 
 - **network_id**: `catalyst-testnet`
