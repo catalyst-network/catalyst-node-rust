@@ -388,6 +388,11 @@ async fn persist_lsu_history(
     // on a node that was never actually wrong. A genuinely wrong "first settled" value is a job
     // for the ADR 0002 certificate (BFT-signed, unlike this field) via the operator-invoked
     // `repair-self-produced-state-root` command, not for whichever gossip happens to arrive next.
+    // Locked against the self-produced-apply metadata write (search "_lsu_history_guard" in this
+    // file): the check below and the writes it guards must be atomic with respect to a concurrent
+    // self-apply's own write of the same keys, not just with respect to other concurrent calls of
+    // this function -- see that write site's comment for the incident this closes.
+    let _guard = lsu_apply_lock().lock().await;
     let already_settled_same_recipe = {
         let existing_hash = store.get_metadata(&format!("consensus:lsu_hash:{cycle}")).await.ok().flatten();
         let existing_root = store.get_metadata(&format!("consensus:lsu_state_root:{cycle}")).await.ok().flatten();
@@ -7974,7 +7979,18 @@ impl CatalystNode {
                                                 let _ = store
                                                     .set_metadata("consensus:last_lsu_state_root", &msg.state_root)
                                                     .await;
-                                                // Per-cycle CID history
+                                                // Per-cycle CID/state_root history. Locked against
+                                                // `persist_lsu_history`'s own already-settled-recipe check:
+                                                // that check-then-write is only atomic with respect to *this*
+                                                // write if both sides serialize on the same lock -- otherwise a
+                                                // concurrently-arriving gossip relay for this exact cycle can
+                                                // read "not yet settled" a moment before this block commits,
+                                                // then write its (possibly wrong, unsigned) claim a moment
+                                                // after, clobbering this node's own correct value with nothing
+                                                // in either function individually able to detect the race. Live
+                                                // 2026-07-18: this exact interleaving reproduced the 2026-07-17
+                                                // incident again even with that check in place, unlocked.
+                                                let _lsu_history_guard = lsu_apply_lock().lock().await;
                                                 let _ = store
                                                     .set_metadata(
                                                         &format!("consensus:lsu_cid:{}", cycle),
@@ -7987,6 +8003,7 @@ impl CatalystNode {
                                                         &msg.state_root,
                                                     )
                                                     .await;
+                                                drop(_lsu_history_guard);
                                             }
 
                                             // ADR 0001: sign and gossip finality attestation; merge quorum certificate.
@@ -8616,8 +8633,8 @@ mod fork_choice_integration_tests {
     use super::{
         apply_lsu_to_storage, apply_lsu_to_storage_without_root_check, ensure_chain_identity_and_genesis,
         fork_choice_apply_gate, get_balance_i64, hex_encode, load_stored_certified_hash_at_cycle,
-        local_applied_cycle, local_applied_lsu_hash, local_applied_state_root, meta_32, meta_string,
-        persist_lsu_history, reconcile_failure_state_for_test, record_reconcile_failure,
+        local_applied_cycle, local_applied_lsu_hash, local_applied_state_root, lsu_apply_lock, meta_32,
+        meta_string, persist_lsu_history, reconcile_failure_state_for_test, record_reconcile_failure,
         scan_for_self_produced_state_root_divergence, set_balance_i64,
         should_block_self_produced_apply, try_reconcile_fork_from_quorum_lsu,
         try_reorg_stronger_lsu_at_applied_cycle, verify_state_root_finality_for_apply, ForkChoiceApplyGate,
@@ -9369,6 +9386,72 @@ mod fork_choice_integration_tests {
             meta_string(&env.store, "consensus:lsu_cid:1").await,
             Some("cid-a".to_string()),
             "the cid describing the settled record must stay in sync with its state_root"
+        );
+    }
+
+    /// Regression test for the 2026-07-18 recurrence of the 2026-07-17 incident: the previous fix
+    /// (`persist_lsu_history_ignores_later_same_recipe_claim_disagreeing_with_settled_root`) added
+    /// a check-then-write guard, but neither that guard nor the self-produced-apply's own
+    /// unconditional write of the same keys held any lock -- so the guard's "is this already
+    /// settled" read and its write were not atomic *with respect to the concurrent self-apply write
+    /// it exists to defer to*. A gossip relay's `persist_lsu_history` call could read "not yet
+    /// settled" a moment before the self-apply's write landed, then write its own (possibly wrong)
+    /// claim a moment after, silently clobbering the correct value -- reproducing the exact same
+    /// fleet-wide false-positive halt live, on the already-fixed binary, the very next day. Both
+    /// write sites now serialize on `lsu_apply_lock`. This test forces the interleaving
+    /// deterministically (hold the lock, spawn a concurrent `persist_lsu_history` call that must
+    /// block on it, perform the "self-apply" write while still holding the lock, then release) --
+    /// before this fix this ordering wasn't enforced at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persist_lsu_history_serializes_against_concurrent_self_apply_write() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let lsu_c1 = lsu_with_tx_seed(&committee, 1, 5);
+        let hash_c1 = hash_data(&lsu_c1).expect("hash");
+        let lsu_bytes = lsu_c1.serialize().expect("ser");
+        let correct_root = [7u8; 32];
+        let poisoned_root = [9u8; 32];
+
+        let guard = lsu_apply_lock().lock().await;
+
+        // Race the gossip-relay call concurrently against the "self-apply" write below via
+        // tokio::join! (no Send/'static needed, unlike spawn -- both futures poll on this task,
+        // cooperatively yielding at .await points). The relay call must block acquiring the same
+        // lock inside persist_lsu_history until the write releases it.
+        let relay_call = persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            1,
+            &lsu_bytes,
+            &hash_c1,
+            "cid-poisoned",
+            &poisoned_root,
+            "",
+            false,
+        );
+        let self_apply_write = async {
+            // Give the relay call a chance to start and block on the lock (best-effort; the
+            // assertion below holds regardless of exactly how much progress it made).
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            // Simulate the self-apply's own unconditional write, still holding the lock -- matches
+            // the production write site (search "_lsu_history_guard" in this file).
+            env.store
+                .set_metadata("consensus:lsu_hash:1", &hash_c1)
+                .await
+                .expect("set lsu_hash");
+            env.store
+                .set_metadata("consensus:lsu_state_root:1", &correct_root)
+                .await
+                .expect("set correct state_root");
+            drop(guard);
+        };
+        tokio::join!(relay_call, self_apply_write);
+
+        assert_eq!(
+            meta_32(&env.store, "consensus:lsu_state_root:1").await,
+            Some(correct_root),
+            "a gossip relay call that was blocked until after the self-apply's write completed \
+             must observe it as already-settled and must not clobber it"
         );
     }
 
