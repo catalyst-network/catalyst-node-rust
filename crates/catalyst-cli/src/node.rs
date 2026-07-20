@@ -1530,6 +1530,29 @@ async fn scan_for_self_produced_state_root_divergence(
             continue; // matches, all good
         }
 
+        // The cert deserialized and claims the same recipe, but before trusting its
+        // `state_root` as "network-certified" it must actually pass full signature/quorum
+        // re-verification -- exactly like every other consumer of `LsuStateRootCertificateV1`
+        // (`verify_state_root_finality_for_apply`, `repair_self_produced_state_root`). The CID
+        // pointer this function dereferences can be set from an ungated peer gossip message
+        // (`StateRootFinalityCidMsg`) with no verification at receipt time, so an unverified or
+        // insufficient-quorum cert must never trip this node's circuit breaker.
+        let Some(lsu_bytes) = store.get_metadata(&format!("consensus:lsu:{cycle}")).await.ok().flatten() else {
+            continue; // no stored LSU to verify the certificate against -- re-check next tick
+        };
+        let Ok(lsu) = catalyst_consensus::types::LedgerStateUpdate::deserialize(&lsu_bytes) else {
+            continue;
+        };
+        if catalyst_consensus::verify_lsu_state_root_certificate(&cert, &lsu).is_err() {
+            tracing::warn!(
+                target: "catalyst.consensus.apply",
+                cycle,
+                cid,
+                "Self-produced state_root divergence scan: certificate failed signature/quorum verification -- not trusting it as certified"
+            );
+            continue;
+        }
+
         error!(
             target: "catalyst.consensus.apply",
             cycle,
@@ -10141,6 +10164,13 @@ mod fork_choice_integration_tests {
             .set_metadata(&format!("consensus:lsu_hash:{}", lsu.cycle_number), &lsu_hash)
             .await
             .expect("set local lsu hash");
+        env.store
+            .set_metadata(
+                &format!("consensus:lsu:{}", lsu.cycle_number),
+                &lsu.serialize().expect("serialize lsu"),
+            )
+            .await
+            .expect("set stored lsu");
         let cid = install_state_root_cert(&env, &lsu, &committee, certified_root).await;
         env.store
             .set_metadata(
@@ -10259,6 +10289,97 @@ mod fork_choice_integration_tests {
         assert!(
             should_block_self_produced_apply(&env.store).await.is_none(),
             "a certificate for a different lsu_hash (different recipe) must be ignored, not treated as a same-recipe divergence"
+        );
+    }
+
+    /// Regression test for the 2026-07-20 live incident: `scan_for_self_produced_state_root_divergence`
+    /// must not trust a certificate's `state_root` as "network-certified" unless it actually passes
+    /// full signature/quorum re-verification via `verify_lsu_state_root_certificate` -- exactly like
+    /// every other consumer of `LsuStateRootCertificateV1` in this file. Before this fix, the scan
+    /// only checked that `cert.lsu_hash` matched the recipe and trusted `cert.state_root` outright;
+    /// since the `consensus:lsu_state_root_cid:{cycle}` pointer it dereferences can be set from an
+    /// ungated peer gossip message (`StateRootFinalityCidMsg`) with no verification at receipt time,
+    /// an under-quorum (here: single-signature) certificate could trip the circuit breaker on a node
+    /// whose own locally-computed `state_root` was in fact correct.
+    #[tokio::test]
+    async fn self_produced_state_root_scan_ignores_under_quorum_cert() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let lsu = lsu_with_tx_seed(&committee, 950_004, 5); // see note in the mismatch test above
+        let lsu_hash = hash_data(&lsu).expect("lsu hash");
+        let local_root = [7u8; 32];
+        let claimed_root = [9u8; 32]; // different from local_root, but the "cert" backing it is bogus
+
+        env.store
+            .set_metadata(&format!("consensus:lsu_state_root:{}", lsu.cycle_number), &local_root)
+            .await
+            .expect("set local state root");
+        env.store
+            .set_metadata(&format!("consensus:lsu_hash:{}", lsu.cycle_number), &lsu_hash)
+            .await
+            .expect("set local lsu hash");
+        env.store
+            .set_metadata(
+                &format!("consensus:lsu:{}", lsu.cycle_number),
+                &lsu.serialize().expect("serialize lsu"),
+            )
+            .await
+            .expect("set stored lsu");
+
+        // Build a certificate with only ONE attestation -- below `bft_vote_threshold(3)` (2) --
+        // i.e. exactly what an ungated gossip message could hand this node.
+        let committee_hash =
+            committee_hash_ordered_producer_list(&lsu.producer_list).expect("committee hash");
+        let h = h_root_v1(
+            env.chain_id,
+            &env.genesis_hash,
+            lsu.cycle_number,
+            &lsu_hash,
+            &committee_hash,
+            &claimed_root,
+        );
+        let mut rng = OsRng;
+        let scheme = SignatureScheme::new();
+        let sig_a = scheme.sign(&mut rng, &committee.keys[0], &h).expect("sign a").to_bytes();
+        let under_quorum_cert = LsuStateRootCertificateV1 {
+            version: 1,
+            chain_id: env.chain_id,
+            genesis_hash: env.genesis_hash,
+            cycle: lsu.cycle_number,
+            lsu_hash,
+            state_root: claimed_root,
+            committee_hash,
+            attestations: vec![StateRootAttestation {
+                producer_id: committee.ids[0].clone(),
+                signature: sig_a.to_vec(),
+            }],
+        };
+        assert!(
+            catalyst_consensus::verify_lsu_state_root_certificate(&under_quorum_cert, &lsu).is_err(),
+            "test setup: single-signature cert must fail real verification"
+        );
+        let blob = bincode::serialize(&under_quorum_cert).expect("encode cert");
+        let cid = env.dfs.put(blob).await.expect("dfs put");
+        env.store
+            .set_metadata(
+                &format!("consensus:lsu_state_root_cid:{}", lsu.cycle_number),
+                cid.as_bytes(),
+            )
+            .await
+            .expect("set state root cid");
+        env.store
+            .set_metadata("consensus:last_applied_cycle", &lsu.cycle_number.to_le_bytes())
+            .await
+            .expect("set last applied cycle");
+
+        for _ in 0..(crate::consensus_limits::reconcile_circuit_break_threshold() * 2) {
+            scan_for_self_produced_state_root_divergence(&env.store, Some(&env.dfs), lsu.cycle_number)
+                .await;
+        }
+
+        assert!(
+            should_block_self_produced_apply(&env.store).await.is_none(),
+            "an under-quorum / unverifiable certificate must never trip the circuit breaker, however different its claimed root"
         );
     }
 
