@@ -56,6 +56,17 @@ This file is intended to be handed to an external agent/tooling team building a 
 > 2026-07-16. Root cause not yet identified. See `docs/explorer-genesis-reset-2026-07-18.md`.
 > Genesis hash unchanged again; re-index from cycle `89219239`.
 
+> **2026-07-20 genesis reset.** A third, previously-unpatched call site for the "unsigned peer
+> gossip clobbers a node's own correct `state_root` bookkeeping" bug class (the "Synced LSU via
+> CID" handler's `already_applied` branch) silently overwrote `eu`'s and `us`'s own correct,
+> BFT-attested `consensus:lsu_state_root:{cycle}` record with an unsigned peer claim, tripping
+> `scan_for_self_produced_state_root_divergence`'s circuit breaker on both — froze the network for
+> ~6h. Fixed in three commits (`05c8690`, `727368a`, `367f50d`; the middle one had a live bug of its
+> own, corrected same-day). While validating the fix, a separate, more severe, still-unexplained
+> 4-way mutual state_root divergence briefly appeared (see `docs/explorer-genesis-reset-2026-07-20.md`
+> "Open follow-up") — not reproduced after this reset, but not root-caused either. Genesis hash
+> unchanged; re-index from cycle `89227690`.
+
 ## Network identity (MUST match)
 
 - **network_id**: `catalyst-testnet`
