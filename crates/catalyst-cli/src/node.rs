@@ -1558,6 +1558,7 @@ async fn scan_for_self_produced_state_root_divergence(
             cycle,
             local_root = %hex_encode(&local_root),
             certified_root = %hex_encode(&cert.state_root),
+            attesters = ?cert.attestations.iter().map(|a| a.producer_id.clone()).collect::<Vec<_>>(),
             "Self-produced state_root does not match network-certified root (same recipe, different result) -- local state from this cycle forward is untrustworthy; needs operator action"
         );
         catalyst_utils::increment_counter!("consensus_self_produced_state_root_mismatch_total", 1);
