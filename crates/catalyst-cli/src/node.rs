@@ -6461,18 +6461,46 @@ impl CatalystNode {
                                                                     &ref_msg.cycle.to_le_bytes(),
                                                                 )
                                                                 .await;
-                                                            let _ = store
-                                                                .set_metadata(
-                                                                    &format!("consensus:lsu_cid:{}", ref_msg.cycle),
-                                                                    ref_msg.cid.as_bytes(),
-                                                                )
-                                                                .await;
-                                                            let _ = store
-                                                                .set_metadata(
-                                                                    &format!("consensus:lsu_state_root:{}", ref_msg.cycle),
-                                                                    &ref_msg.state_root,
-                                                                )
-                                                                .await;
+                                                            // `ref_msg.state_root` is only actually verified against this
+                                                            // node's own recompute above when `already_applied` was false
+                                                            // at entry (the proof-driven / apply_lsu_with_root_check
+                                                            // paths). When `already_applied` was already true -- e.g. this
+                                                            // node itself already self-produced and BFT-attested this
+                                                            // cycle's real state_root -- none of that verification runs,
+                                                            // and this is an unsigned peer claim carried alongside the CID
+                                                            // reference. Same bug class as the 2026-07-17/07-18 incidents
+                                                            // (see `persist_lsu_history`'s comment): must never silently
+                                                            // overwrite an already-settled same-recipe record.
+                                                            let _guard = lsu_apply_lock().lock().await;
+                                                            let already_settled_same_recipe = {
+                                                                let existing_hash = store
+                                                                    .get_metadata(&format!("consensus:lsu_hash:{}", ref_msg.cycle))
+                                                                    .await
+                                                                    .ok()
+                                                                    .flatten();
+                                                                let existing_root = store
+                                                                    .get_metadata(&format!("consensus:lsu_state_root:{}", ref_msg.cycle))
+                                                                    .await
+                                                                    .ok()
+                                                                    .flatten();
+                                                                existing_hash.as_deref() == Some(ref_msg.lsu_hash.as_slice())
+                                                                    && existing_root.is_some()
+                                                            };
+                                                            if !already_settled_same_recipe {
+                                                                let _ = store
+                                                                    .set_metadata(
+                                                                        &format!("consensus:lsu_cid:{}", ref_msg.cycle),
+                                                                        ref_msg.cid.as_bytes(),
+                                                                    )
+                                                                    .await;
+                                                                let _ = store
+                                                                    .set_metadata(
+                                                                        &format!("consensus:lsu_state_root:{}", ref_msg.cycle),
+                                                                        &ref_msg.state_root,
+                                                                    )
+                                                                    .await;
+                                                            }
+                                                            drop(_guard);
 
                                                             let _ = store
                                                                 .set_metadata("consensus:last_lsu", &bytes)
