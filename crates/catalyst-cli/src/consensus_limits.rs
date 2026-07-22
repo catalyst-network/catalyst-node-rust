@@ -193,6 +193,36 @@ pub fn stale_observed_head_reset_ms() -> u64 {
         .unwrap_or(DEFAULT)
 }
 
+/// How long (ms) to actively wait, after this node's own consensus round fails to produce a
+/// cycle, for a peer's `LsuRangeResponse` confirming they *did* produce it, before treating the
+/// gap as a legitimate network-wide skip and letting production proceed to the next wall-clock
+/// cycle (`CATALYST_ROUND_FAILURE_CONFIRMATION_GRACE_MS`, default `4_000`, max `60_000`).
+///
+/// Root-cause fix for the 2026-07-22 catalyst-testnet outage. Before this, the depth-gate
+/// (`should_defer_production_when_behind` in `crate::node`) was purely reactive: it only ever
+/// compared against whatever `observed_head_cycle` background gossip *happened* to have already
+/// delivered by the time the next tick fired. It never actively asked. A node whose own round
+/// failed (e.g. `Insufficient data collected`) while a peer's round for the identical cycle
+/// succeeded had no mechanism to find that out before its next tick silently treated the gap as a
+/// legitimate skip and produced past it — permanently and undetectably offsetting its cycle height
+/// from that peer's (see `docs/consensus-reliability-review-2026-07.md` for the full incident).
+///
+/// The fix: on a local round failure, broadcast an immediate `LsuRangeRequest` for exactly that
+/// cycle and hold production of the next cycle for up to this long, polling for either a positive
+/// confirmation (a peer's response references this exact cycle — `CatchupState::confirmed_next_cycle`
+/// or `observed_head_cycle` advancing past it) or the grace period elapsing with no such
+/// confirmation, which is then logged and counted as an explicit, audited "confirmed legitimate
+/// skip" decision rather than a silent default.
+pub fn round_failure_confirmation_grace_ms() -> u64 {
+    const MAX: u64 = 60_000;
+    const DEFAULT: u64 = 4_000;
+    std::env::var("CATALYST_ROUND_FAILURE_CONFIRMATION_GRACE_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0 && v <= MAX)
+        .unwrap_or(DEFAULT)
+}
+
 /// Consecutive `try_reconcile_fork_from_quorum_lsu` failures for the same `(cycle, lsu_hash)`
 /// before further attempts are skipped without doing the expensive purge/replay
 /// (`CATALYST_RECONCILE_CIRCUIT_BREAK_THRESHOLD`, default `5`, max `1000`).
@@ -280,14 +310,22 @@ pub fn tx_batch_follower_hard_stop_ms(cycle: u64, cycle_ms: u64) -> u64 {
 }
 
 /// After RAM and store recovery find no construction entries: classify terminal outcome.
+///
+/// The former third outcome, `FollowerLegacyEmpty` (gated by the now-removed
+/// `CATALYST_ALLOW_LEGACY_AMBIGUOUS_EMPTY_TX_BATCH` escape hatch), let a follower silently proceed
+/// with an empty tx batch whenever it couldn't confirm the canonical batch, instead of treating an
+/// unrecoverable ambiguous batch as fatal. That was a direct contributor to the 2026-07-22
+/// catalyst-testnet outage: it let a node whose own consensus round failed to reach quorum for a
+/// cycle quietly construct *a* result for that cycle rather than erroring loudly, which combined
+/// with the depth-gate's gossip-timing gap to produce a silently skipped cycle. Removed entirely —
+/// an ambiguous empty batch is now always fatal for a follower, matching the leader's existing
+/// `LeaderMissFatal` treatment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmptyConstructionResolution {
     /// `Commit` agreed zero transactions for this cycle.
     AgreedEmpty,
     /// Leader must not apply with zero / non-recovered txs.
     LeaderMissFatal,
-    /// Follower: legacy env allows ambiguous empty apply.
-    FollowerLegacyEmpty,
     /// Follower: refuse empty without agreed `tx_count = 0`.
     FollowerRefuseEmpty,
 }
@@ -295,15 +333,12 @@ pub enum EmptyConstructionResolution {
 pub fn resolve_empty_construction_takeaway(
     commit_meta: Option<([u8; 32], u32)>,
     is_leader: bool,
-    allow_legacy_ambiguous_empty: bool,
 ) -> EmptyConstructionResolution {
     if matches!(commit_meta.map(|(_, c)| c), Some(0)) {
         return EmptyConstructionResolution::AgreedEmpty;
     }
     if is_leader {
         EmptyConstructionResolution::LeaderMissFatal
-    } else if allow_legacy_ambiguous_empty {
-        EmptyConstructionResolution::FollowerLegacyEmpty
     } else {
         EmptyConstructionResolution::FollowerRefuseEmpty
     }
@@ -371,36 +406,28 @@ mod tests {
     fn resolve_empty_construction_takeaway_matrix() {
         let h = [1u8; 32];
         assert_eq!(
-            resolve_empty_construction_takeaway(Some((h, 0)), true, false),
+            resolve_empty_construction_takeaway(Some((h, 0)), true),
             EmptyConstructionResolution::AgreedEmpty
         );
         assert_eq!(
-            resolve_empty_construction_takeaway(Some((h, 0)), false, false),
+            resolve_empty_construction_takeaway(Some((h, 0)), false),
             EmptyConstructionResolution::AgreedEmpty
         );
         assert_eq!(
-            resolve_empty_construction_takeaway(Some((h, 3)), true, false),
+            resolve_empty_construction_takeaway(Some((h, 3)), true),
             EmptyConstructionResolution::LeaderMissFatal
         );
         assert_eq!(
-            resolve_empty_construction_takeaway(Some((h, 3)), false, false),
+            resolve_empty_construction_takeaway(Some((h, 3)), false),
             EmptyConstructionResolution::FollowerRefuseEmpty
         );
         assert_eq!(
-            resolve_empty_construction_takeaway(Some((h, 3)), false, true),
-            EmptyConstructionResolution::FollowerLegacyEmpty
-        );
-        assert_eq!(
-            resolve_empty_construction_takeaway(None, true, false),
+            resolve_empty_construction_takeaway(None, true),
             EmptyConstructionResolution::LeaderMissFatal
         );
         assert_eq!(
-            resolve_empty_construction_takeaway(None, false, false),
+            resolve_empty_construction_takeaway(None, false),
             EmptyConstructionResolution::FollowerRefuseEmpty
-        );
-        assert_eq!(
-            resolve_empty_construction_takeaway(None, false, true),
-            EmptyConstructionResolution::FollowerLegacyEmpty
         );
     }
 
@@ -529,6 +556,26 @@ mod tests {
         {
             let _e = EnvGuard::unset("CATALYST_STALE_OBSERVED_HEAD_RESET_MS");
             assert_eq!(stale_observed_head_reset_ms(), 60_000);
+        }
+    }
+
+    #[test]
+    fn round_failure_confirmation_grace_ms_env_and_fallbacks() {
+        {
+            let _e = EnvGuard::set("CATALYST_ROUND_FAILURE_CONFIRMATION_GRACE_MS", "2500");
+            assert_eq!(round_failure_confirmation_grace_ms(), 2500);
+        }
+        {
+            let _e = EnvGuard::set("CATALYST_ROUND_FAILURE_CONFIRMATION_GRACE_MS", "0");
+            assert_eq!(round_failure_confirmation_grace_ms(), 4_000);
+        }
+        {
+            let _e = EnvGuard::set("CATALYST_ROUND_FAILURE_CONFIRMATION_GRACE_MS", "9999999999");
+            assert_eq!(round_failure_confirmation_grace_ms(), 4_000);
+        }
+        {
+            let _e = EnvGuard::unset("CATALYST_ROUND_FAILURE_CONFIRMATION_GRACE_MS");
+            assert_eq!(round_failure_confirmation_grace_ms(), 4_000);
         }
     }
 

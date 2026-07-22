@@ -395,7 +395,8 @@ Mitigations:
 - Keep **NTP-synchronized** clocks and open `30333/tcp` between all validators.
 - Optionally raise the wait budget (milliseconds): `CATALYST_TX_BATCH_WAIT_BUDGET_MS` (default scales from `cycle_duration` minus a safety margin, minimum 12s; see `tx_batch_follower_wait_budget_default` in `crates/catalyst-cli/src/consensus_limits.rs`).
 - For **fork replay** gaps on pruned nodes, ensure peers answer `LsuRangeRequest` or raise `CATALYST_RECONCILE_PREFETCH_MS` (see [`protocol-params.md`](./protocol-params.md)).
-- **Only for mixed-version testnets** where some peers do not yet gossip `TxBatchControl::Commit`: `CATALYST_ALLOW_LEGACY_AMBIGUOUS_EMPTY_TX_BATCH=1` restores the old unsafe “timeout → empty batch” behavior (not for production).
+
+**Removed 2026-07-22:** `CATALYST_ALLOW_LEGACY_AMBIGUOUS_EMPTY_TX_BATCH` used to let a follower proceed with an empty construction set whenever it couldn't confirm the canonical batch was genuinely agreed-empty. It was a direct contributor to that day's catalyst-testnet outage (see `docs/consensus-reliability-review-2026-07.md`): it let a node whose own consensus round failed to reach quorum quietly construct a plausible-looking empty batch instead of erroring loudly, masking a real cycle skip. An ambiguous empty batch is now always fatal for a follower (`TX_BATCH_MISS_FATAL`) — same as it already was for a leader. If you see this on a live network, that's a real liveness problem (batch propagation or peer connectivity) to fix, not something to paper over.
 
 ### LSU finality on apply (ADR 0001)
 

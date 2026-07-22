@@ -948,6 +948,31 @@ fn balance_key_for_pubkey(pubkey: &[u8; 32]) -> Vec<u8> {
     k
 }
 
+/// Reserved `accounts`-CF key holding the last-applied cycle number (8-byte LE), written on every
+/// apply alongside real account mutations. Can never collide with a pubkey-derived key (`bal:`,
+/// `workers:`, `feecred:bal:` are all `<prefix><32 bytes>`; this is a fixed literal with no pubkey
+/// suffix).
+///
+/// Root-cause fix for the 2026-07-22 catalyst-testnet outage: `compute_state_root` hashes only the
+/// `accounts` CF, and before this, nothing in it was ever a function of the cycle number — only of
+/// the resulting balances. A node that silently skipped applying cycle N (see
+/// `docs/consensus-reliability-review-2026-07.md`) and instead applied cycle N+1's content onto
+/// state-after-(N-1) produced a `state_root` **byte-identical** to a healthy peer's correct
+/// cycle-N-onto-(N-1) result whenever the two cycles' balance-affecting content happened to match
+/// (e.g. two consecutive empty-tx-batch cycles with the same flat producer reward) — so the
+/// existing `prev_root`/`state_root` mismatch machinery, which is the *only* thing that would
+/// otherwise catch a cycle skip, saw nothing wrong. Folding the cycle number itself into the
+/// hashed state makes `state_root` sensitive to *which* cycle produced it, unconditionally, closing
+/// that gap regardless of whether the content happens to coincide.
+const ROOT_CYCLE_COUNTER_KEY: &[u8] = b"__root_cycle_counter__";
+
+async fn write_root_cycle_counter(store: &StorageManager, cycle: u64) -> Result<()> {
+    store
+        .set_state(ROOT_CYCLE_COUNTER_KEY, cycle.to_le_bytes().to_vec())
+        .await
+        .map_err(|e| anyhow::anyhow!("write root cycle counter: {e}"))
+}
+
 fn worker_key_for_pubkey(pubkey: &[u8; 32]) -> Vec<u8> {
     let mut k = b"workers:".to_vec();
     k.extend_from_slice(pubkey);
@@ -1736,6 +1761,10 @@ async fn apply_lsu_to_storage_without_root_check(
     // Fee-credit spend reimbursement and waiting-pool rewards/credits are deterministic from cycle LSU.
     settle_fee_credit_spend_for_applied_cycle(store, lsu).await;
     distribute_waiting_pool_rewards_and_fee_credits(store, lsu).await;
+
+    // See `write_root_cycle_counter` doc comment: binds `state_root` to the cycle number so a
+    // skipped cycle can never coincidentally hash-match a neighbor.
+    write_root_cycle_counter(store, lsu.cycle_number).await?;
 
     // Verify the claimed root against a full recompute over this node's actual `accounts` state
     // — do not trust `new_root` (see doc comment above). On mismatch, revert every mutation made
@@ -2856,17 +2885,6 @@ fn catalyst_tx_batch_wait_budget_ms(cycle_ms: u64) -> u64 {
     crate::consensus_limits::tx_batch_follower_wait_budget_ms(cycle_ms)
 }
 
-/// **Unsafe:** if true, a producer may run Construction with an empty tx list when the batch
-/// could not be recovered and no `TxBatchControl::Commit` was seen (pre-upgrade peers only).
-fn catalyst_allow_legacy_ambiguous_empty_tx_batch() -> bool {
-    matches!(
-        std::env::var("CATALYST_ALLOW_LEGACY_AMBIGUOUS_EMPTY_TX_BATCH")
-            .ok()
-            .as_deref(),
-        Some("1") | Some("true") | Some("yes")
-    )
-}
-
 /// Rebuild Construction inputs from persisted per-cycle tx ids + tx bytes (same validation as ingestion).
 async fn recover_entries_from_persisted_cycle_txs(
     store: &StorageManager,
@@ -3048,11 +3066,7 @@ pub(crate) async fn wait_for_tx_construction_entries(
         commit
     };
 
-    match crate::consensus_limits::resolve_empty_construction_takeaway(
-        commit_meta,
-        is_leader,
-        catalyst_allow_legacy_ambiguous_empty_tx_batch(),
-    ) {
+    match crate::consensus_limits::resolve_empty_construction_takeaway(commit_meta, is_leader) {
         crate::consensus_limits::EmptyConstructionResolution::AgreedEmpty => {
             tracing::info!(
                 target: "catalyst.consensus.tx_batch",
@@ -3071,20 +3085,10 @@ pub(crate) async fn wait_for_tx_construction_entries(
             );
             None
         }
-        crate::consensus_limits::EmptyConstructionResolution::FollowerLegacyEmpty => {
-            tracing::warn!(
-                target: "catalyst.consensus.tx_batch",
-                "CATALYST_ALLOW_LEGACY_AMBIGUOUS_EMPTY_TX_BATCH: proceeding with empty construction cycle={} leader={} self={}",
-                cycle,
-                leader,
-                producer_id
-            );
-            Some(Vec::new())
-        }
         crate::consensus_limits::EmptyConstructionResolution::FollowerRefuseEmpty => {
             tracing::error!(
                 target: "catalyst.consensus.tx_batch",
-                "TX_BATCH_MISS_FATAL cycle={} leader={} self={}: refuse empty construction (set CATALYST_ALLOW_LEGACY_AMBIGUOUS_EMPTY_TX_BATCH=1 only for pre-commit peers)",
+                "TX_BATCH_MISS_FATAL cycle={} leader={} self={}: refuse ambiguous empty construction (no agreed tx_count=0 commit was seen)",
                 cycle,
                 leader,
                 producer_id
@@ -3478,6 +3482,10 @@ async fn apply_lsu_to_storage_locked(
     // Fee-credit spend reimbursement and waiting-pool rewards/credits are deterministic from cycle LSU.
     settle_fee_credit_spend_for_applied_cycle(store, lsu).await;
     distribute_waiting_pool_rewards_and_fee_credits(store, lsu).await;
+
+    // See `write_root_cycle_counter` doc comment: binds `state_root` to the cycle number so a
+    // skipped cycle can never coincidentally hash-match a neighbor.
+    write_root_cycle_counter(store, lsu.cycle_number).await?;
 
     // Flush + compute a state root that commits the applied balances.
     let state_root = store.commit().await?;
@@ -5517,6 +5525,35 @@ impl CatalystNode {
         // consensus production loop so a node that is behind defers producing (see depth-gate below).
         let observed_head_shared = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+        #[derive(Debug, Default)]
+        struct CatchupState {
+            observed_head_cycle: u64,
+            last_req_ms: u64,
+            // Liveness backstop for a stale/unreachable `observed_head_cycle` (see
+            // `stale_observed_head_reset_ms`): tracks the applied head last seen while behind,
+            // and when that "behind" state started, so we can detect zero progress over time.
+            stale_last_head: u64,
+            stale_since_ms: Option<u64>,
+            // Asymmetric-reset mitigation (docs/consensus-reliability-review-2026-07.md): the
+            // stale-reset backstop above used to abandon a missing cycle purely on elapsed time,
+            // with no way to know whether a peer had actually SUCCEEDED at producing it -- caught
+            // live: one validator gave up and resumed several cycles ahead while a peer had
+            // legitimately applied the cycle it abandoned, silently diverging their account
+            // histories underneath an apparently-healthy vote count. When an `LsuRangeResponse`
+            // positively confirms a peer has exactly the cycle we need next (`head+1`), record it
+            // here so the reset logic gives that confirmed-reachable data substantially more time
+            // before giving up, instead of treating "peer has it but our fetch hasn't landed yet"
+            // the same as "genuinely nobody produced it".
+            confirmed_next_cycle: Option<u64>,
+            confirmed_next_cycle_since_ms: Option<u64>,
+        }
+        // Declared here (rather than inside the inbound-handling block below, which `move`s it into
+        // that block's own event-loop task) so the production loop can also hold a clone -- see
+        // `catchup_production` below and `consensus_limits::round_failure_confirmation_grace_ms`.
+        let catchup: Arc<tokio::sync::Mutex<CatchupState>> =
+            Arc::new(tokio::sync::Mutex::new(CatchupState::default()));
+        let catchup_production = catchup.clone();
+
         // Inbound: envelopes received from peers → update validator map / handle tx gossip / handle LSU gossip / forward consensus messages.
         {
             let mut events = network.subscribe_events().await;
@@ -5633,30 +5670,6 @@ impl CatalystNode {
             };
             let relay_cache: Arc<tokio::sync::Mutex<RelayCache>> =
                 Arc::new(tokio::sync::Mutex::new(RelayCache::new(relay_cfg)));
-            #[derive(Debug, Default)]
-            struct CatchupState {
-                observed_head_cycle: u64,
-                last_req_ms: u64,
-                // Liveness backstop for a stale/unreachable `observed_head_cycle` (see
-                // `stale_observed_head_reset_ms`): tracks the applied head last seen while behind,
-                // and when that "behind" state started, so we can detect zero progress over time.
-                stale_last_head: u64,
-                stale_since_ms: Option<u64>,
-                // Asymmetric-reset mitigation (docs/consensus-reliability-review-2026-07.md): the
-                // stale-reset backstop above used to abandon a missing cycle purely on elapsed time,
-                // with no way to know whether a peer had actually SUCCEEDED at producing it -- caught
-                // live: one validator gave up and resumed several cycles ahead while a peer had
-                // legitimately applied the cycle it abandoned, silently diverging their account
-                // histories underneath an apparently-healthy vote count. When an `LsuRangeResponse`
-                // positively confirms a peer has exactly the cycle we need next (`head+1`), record it
-                // here so the reset logic gives that confirmed-reachable data substantially more time
-                // before giving up, instead of treating "peer has it but our fetch hasn't landed yet"
-                // the same as "genuinely nobody produced it".
-                confirmed_next_cycle: Option<u64>,
-                confirmed_next_cycle_since_ms: Option<u64>,
-            }
-            let catchup: Arc<tokio::sync::Mutex<CatchupState>> =
-                Arc::new(tokio::sync::Mutex::new(CatchupState::default()));
             // Background: sequential follower apply (head+1) from stored LSU metadata + range backfill.
             let storage_advance = storage.clone();
             let dfs_advance = dfs.clone();
@@ -8203,6 +8216,72 @@ impl CatalystNode {
                         }
                         Err(e) => {
                             info!("Cycle {} failed: {}", cycle, e);
+
+                            // Root-cause fix for the 2026-07-22 outage (see
+                            // `consensus_limits::round_failure_confirmation_grace_ms`): a failed
+                            // local round is exactly the ambiguous moment the old depth-gate got
+                            // wrong -- it would silently let the NEXT tick presume this cycle was
+                            // a legitimate network-wide skip based purely on whatever
+                            // `observed_head_cycle` background gossip happened to already carry.
+                            // Actively ask instead of passively hoping: broadcast a range request
+                            // for exactly this cycle and hold here for a bounded grace window so a
+                            // peer's answer (handled by the inbound `StateResponse` path, which
+                            // updates `catchup.confirmed_next_cycle` / `observed_head_cycle`) has
+                            // a real chance to land before the next tick decides anything.
+                            catalyst_utils::increment_counter!(
+                                "consensus_cycle_round_failed_total",
+                                1
+                            );
+                            let range_req = LsuRangeRequest {
+                                requester: producer_id.clone(),
+                                start_cycle: cycle,
+                                count: 1,
+                            };
+                            if let Ok(env) = MessageEnvelope::from_message(
+                                &range_req,
+                                "lsu_range_req_round_failure".to_string(),
+                                None,
+                            ) {
+                                let _ = network.broadcast_envelope(&env).await;
+                            }
+                            let grace_ms =
+                                crate::consensus_limits::round_failure_confirmation_grace_ms();
+                            let deadline =
+                                crate::consensus_limits::wall_now_ms().saturating_add(grace_ms);
+                            let mut confirmed = false;
+                            loop {
+                                {
+                                    let c = catchup_production.lock().await;
+                                    if c.confirmed_next_cycle == Some(cycle)
+                                        || c.observed_head_cycle >= cycle
+                                    {
+                                        confirmed = true;
+                                    }
+                                }
+                                if confirmed || crate::consensus_limits::wall_now_ms() >= deadline {
+                                    break;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                            }
+                            if confirmed {
+                                warn!(
+                                    "Cycle {} round failure confirmed as a real peer-produced cycle we are missing (not a legitimate network-wide skip); depth-gate will defer until it is backfilled",
+                                    cycle
+                                );
+                                catalyst_utils::increment_counter!(
+                                    "consensus_cycle_skip_confirmed_real_total",
+                                    1
+                                );
+                            } else {
+                                info!(
+                                    "Cycle {} round failure: no peer confirmed holding it within {}ms; treating as a legitimate network-wide skip",
+                                    cycle, grace_ms
+                                );
+                                catalyst_utils::increment_counter!(
+                                    "consensus_cycle_skip_confirmed_legitimate_total",
+                                    1
+                                );
+                            }
                         }
                     }
                 }
