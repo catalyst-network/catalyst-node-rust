@@ -67,6 +67,19 @@ This file is intended to be handed to an external agent/tooling team building a 
 > "Open follow-up") — not reproduced after this reset, but not root-caused either. Genesis hash
 > unchanged; re-index from cycle `89227690`.
 
+> **2026-07-22 genesis reset.** The 4-way divergence flagged as unexplained in the 2026-07-20 reset
+> recurred, and this time was fully root-caused from live-captured evidence: the depth-gate that
+> stops a node producing past a cycle it doesn't have was purely gossip-reactive with no active
+> verification, letting `us` silently skip a cycle whose own local round failed to reach quorum
+> while `eu`'s succeeded — undetected because `state_root` was never a function of the cycle
+> number, only of resulting balances, and the skipped (empty-batch) cycle's content happened to
+> coincide with its neighbor's. See `docs/explorer-genesis-reset-2026-07-22.md`. Three fixes
+> shipped same-day (commit `cb3041a`): the depth-gate now actively confirms a round-failure gap
+> before treating it as legitimate; `state_root` is now bound to the cycle number (this is *why*
+> the reset was needed even with `genesis_hash` unchanged — the state-root formula itself changed);
+> and `CATALYST_ALLOW_LEGACY_AMBIGUOUS_EMPTY_TX_BATCH`, a direct contributor, was removed entirely
+> rather than just defaulted off. Genesis hash unchanged; re-index from cycle `89236345`.
+
 ## Network identity (MUST match)
 
 - **network_id**: `catalyst-testnet`
