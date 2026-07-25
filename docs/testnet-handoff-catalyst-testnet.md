@@ -80,6 +80,16 @@ This file is intended to be handed to an external agent/tooling team building a 
 > and `CATALYST_ALLOW_LEGACY_AMBIGUOUS_EMPTY_TX_BATCH`, a direct contributor, was removed entirely
 > rather than just defaulted off. Genesis hash unchanged; re-index from cycle `89236345`.
 
+> **2026-07-25 genesis reset.** `asia`'s already-open (older, still-unresolved) reconcile circuit
+> breaker had quietly degraded the live validator set to 2, leaving zero quorum slack; a transient
+> round hiccup then raced the 2026-07-22 fix's fixed 4-second round-failure confirmation grace
+> window against `eu`'s own (slower with only 2 real validators) round completion, and the grace
+> window lost — `us` confirmed a cycle `eu` had actually just produced as a legitimate skip,
+> diverging `state_root` between them. See `docs/explorer-genesis-reset-2026-07-25.md`. Fixed same
+> day (commit `e31d407`): the grace deadline is now the later of the fixed grace period and the end
+> of the current cycle's own wall-clock slot, so it can no longer resolve before a peer's in-flight
+> round has a full chance to finish. Genesis hash unchanged; re-index from cycle `89250764`.
+
 ## Network identity (MUST match)
 
 - **network_id**: `catalyst-testnet`
