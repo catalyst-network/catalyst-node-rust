@@ -973,6 +973,95 @@ async fn write_root_cycle_counter(store: &StorageManager, cycle: u64) -> Result<
         .map_err(|e| anyhow::anyhow!("write root cycle counter: {e}"))
 }
 
+/// Diagnostic only -- never read back, never affects consensus or `state_root`.
+///
+/// Root-cause investigation for the recurring "same recipe, different `state_root`" divergence
+/// (`asia` first flagged 2026-07-16; recurred cross-node 2026-07-23 and 2026-07-25 -- see
+/// `docs/consensus-reliability-review-2026-07.md` and the 2026-07-25 outage docs). Static review
+/// has ruled out every candidate reachable by reading code: the applied `LedgerStateUpdate` is
+/// proven byte-identical across diverging nodes (independently confirmed via matching
+/// `applied_lsu_hash`, a full-struct hash, over direct RPC), every write to the root-covered
+/// `accounts` CF is confined to functions that hold `lsu_apply_lock` for their entire body (audited
+/// every `set_state`/`delete_state` call site in the crate), and the Merkle computation itself is
+/// keyed by content hash in a `BTreeMap`, so RocksDB iteration order cannot matter. Given all of
+/// that, closing this out needs live per-key evidence at the moment of the actual divergence,
+/// which static reading cannot supply.
+///
+/// This logs one compact per-key-prefix fingerprint line alongside every applied `state_root`, so
+/// that when a future divergence is spotted (two nodes' RPC `catalyst_head` reports the same
+/// `applied_cycle` and `applied_lsu_hash` but a different `applied_state_root`), the two nodes'
+/// journalctl output for that exact cycle can be diffed directly to see which key-prefix category
+/// disagrees -- narrowing straight to the responsible subsystem (or, if literally every category
+/// matches, proving the bug is in the Merkle/commit machinery itself rather than any account
+/// mutation) -- without needing to catch the divergence live with an on-demand dump first, since by
+/// the time it is *noticed* the diverging node has typically already moved on and compounded.
+///
+/// 4-byte (not full 32-byte) fingerprints are intentional: this is a comparison aid for a handful
+/// of small testnet key sets, not a proof -- a suspected mismatch should be confirmed with a fuller
+/// per-key dump before drawing conclusions.
+async fn log_accounts_fingerprint_breakdown(store: &StorageManager, cycle: u64, state_root: [u8; 32]) {
+    use sha2::{Digest, Sha256};
+
+    const CATEGORIES: &[(&str, &[u8])] = &[
+        ("bal", b"bal:"),
+        ("nonce", b"nonce:"),
+        ("workers", b"workers:"),
+        ("wfs", b"wfs:"),
+        ("wlr", b"wlr:"),
+        ("feecred_bal", b"feecred:bal:"),
+        ("fcd", b"fcd:"),
+        ("evm_code", b"evm:code:"),
+        ("evm_nonce", b"evm:nonce:"),
+        ("evm_balance", b"evm:balance:"),
+        ("evm_storage", b"evm:storage:"),
+        ("evm_last_return", b"evm:last_return:"),
+        ("evm_last_logs", b"evm:last_logs:"),
+    ];
+    let mut hashers: Vec<Sha256> = CATEGORIES.iter().map(|_| Sha256::new()).collect();
+    let mut root_counter = Sha256::new();
+    let mut other = Sha256::new();
+    let mut other_count: u64 = 0;
+
+    let Ok(iter) = store.engine().iterator("accounts") else {
+        return;
+    };
+    for item in iter {
+        let Ok((k, v)) = item else { continue };
+        if k.as_ref() == ROOT_CYCLE_COUNTER_KEY {
+            root_counter.update(&k);
+            root_counter.update(&v);
+            continue;
+        }
+        if let Some(i) = CATEGORIES.iter().position(|(_, prefix)| k.starts_with(prefix)) {
+            hashers[i].update(&k);
+            hashers[i].update(&v);
+        } else {
+            other.update(&k);
+            other.update(&v);
+            other_count += 1;
+        }
+    }
+
+    let fp4 = |h: Sha256| -> String {
+        let full: [u8; 32] = h.finalize().into();
+        hex_encode(&full[..4])
+    };
+    let parts: Vec<String> = CATEGORIES
+        .iter()
+        .zip(hashers.into_iter())
+        .map(|((name, _), h)| format!("{}={}", name, fp4(h)))
+        .collect();
+    info!(
+        "Cycle {} accounts fingerprint: state_root={} {} root_counter={} other={}({})",
+        cycle,
+        hex_encode(&state_root),
+        parts.join(" "),
+        fp4(root_counter),
+        fp4(other),
+        other_count,
+    );
+}
+
 fn worker_key_for_pubkey(pubkey: &[u8; 32]) -> Vec<u8> {
     let mut k = b"workers:".to_vec();
     k.extend_from_slice(pubkey);
@@ -1788,6 +1877,7 @@ async fn apply_lsu_to_storage_without_root_check(
         return Ok(false);
     }
     let _ = store.delete_snapshot(&snap).await;
+    log_accounts_fingerprint_breakdown(store, lsu.cycle_number, recomputed).await;
 
     // Persist head metadata (verified above, not merely trusted).
     let _ = store
@@ -3490,6 +3580,7 @@ async fn apply_lsu_to_storage_locked(
     // Flush + compute a state root that commits the applied balances.
     let state_root = store.commit().await?;
     let lsu_hash = hash_data(lsu).unwrap_or([0u8; 32]);
+    log_accounts_fingerprint_breakdown(store, lsu.cycle_number, state_root).await;
 
     // Update per-tx receipts for this cycle (best-effort): mark Applied + attach execution outcomes.
     let cycle = lsu.cycle_number;
