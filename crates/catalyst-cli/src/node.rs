@@ -8244,10 +8244,21 @@ impl CatalystNode {
                             ) {
                                 let _ = network.broadcast_envelope(&env).await;
                             }
+                            // Root-cause fix for the 2026-07-25 outage: a fixed grace period
+                            // alone races a peer's own in-flight round completion and can lose
+                            // (see `round_failure_confirmation_deadline_ms`). Never resolve
+                            // before the current cycle's own wall-clock slot ends -- nothing
+                            // legitimately needs deciding earlier than that anyway.
                             let grace_ms =
                                 crate::consensus_limits::round_failure_confirmation_grace_ms();
+                            let wait_started_ms = crate::consensus_limits::wall_now_ms();
                             let deadline =
-                                crate::consensus_limits::wall_now_ms().saturating_add(grace_ms);
+                                crate::consensus_limits::round_failure_confirmation_deadline_ms(
+                                    wait_started_ms,
+                                    grace_ms,
+                                    cycle,
+                                    cycle_ms,
+                                );
                             let mut confirmed = false;
                             loop {
                                 {
@@ -8273,9 +8284,11 @@ impl CatalystNode {
                                     1
                                 );
                             } else {
+                                let waited_ms = crate::consensus_limits::wall_now_ms()
+                                    .saturating_sub(wait_started_ms);
                                 info!(
-                                    "Cycle {} round failure: no peer confirmed holding it within {}ms; treating as a legitimate network-wide skip",
-                                    cycle, grace_ms
+                                    "Cycle {} round failure: no peer confirmed holding it within {}ms (base grace={}ms); treating as a legitimate network-wide skip",
+                                    cycle, waited_ms, grace_ms
                                 );
                                 catalyst_utils::increment_counter!(
                                     "consensus_cycle_skip_confirmed_legitimate_total",

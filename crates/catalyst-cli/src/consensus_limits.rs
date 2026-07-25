@@ -223,6 +223,39 @@ pub fn round_failure_confirmation_grace_ms() -> u64 {
         .unwrap_or(DEFAULT)
 }
 
+/// Absolute wall-clock deadline (ms) for the round-failure confirmation grace window above.
+///
+/// Root-cause fix for the 2026-07-25 outage. A fixed grace period alone still races a peer's
+/// own in-flight round completion: when the live validator set is degraded (e.g. one
+/// validator's reconcile circuit breaker is open, as `asia`'s was), rounds routinely take
+/// longer than the fixed default because there are fewer real participants to reach quorum
+/// with. A peer that is still actively producing the very cycle being asked about — not idle,
+/// just slower — has nothing to broadcast yet when the fixed grace period expires, so the
+/// asking node confirms a real, in-progress cycle as a "legitimate network-wide skip" and
+/// permanently diverges from it. Traced live: `us` gave up after the 4000ms default at
+/// 2026-07-25T15:27:29Z; `eu` did not finish and broadcast that same cycle until 15:27:32Z —
+/// `eu` was simply still working, not skipping.
+///
+/// The protocol already commits to not expecting a new cycle before
+/// `(cycle + 1) * cycle_duration_ms` (the next wall-clock tick). The confirmation wait should
+/// never be shorter than the time actually remaining in the current cycle's own slot, since
+/// nothing legitimately needs to be decided before then anyway: the deadline is the later of
+/// the fixed grace period and that slot boundary, never earlier than the fixed grace period
+/// (so an explicit env override always still applies as a floor).
+pub fn round_failure_confirmation_deadline_ms(
+    now_ms: u64,
+    grace_ms: u64,
+    cycle: u64,
+    cycle_duration_ms: u64,
+) -> u64 {
+    let fixed_deadline = now_ms.saturating_add(grace_ms);
+    if cycle_duration_ms == 0 {
+        return fixed_deadline;
+    }
+    let slot_deadline = cycle.saturating_add(1).saturating_mul(cycle_duration_ms);
+    fixed_deadline.max(slot_deadline)
+}
+
 /// Consecutive `try_reconcile_fork_from_quorum_lsu` failures for the same `(cycle, lsu_hash)`
 /// before further attempts are skipped without doing the expensive purge/replay
 /// (`CATALYST_RECONCILE_CIRCUIT_BREAK_THRESHOLD`, default `5`, max `1000`).
@@ -577,6 +610,33 @@ mod tests {
             let _e = EnvGuard::unset("CATALYST_ROUND_FAILURE_CONFIRMATION_GRACE_MS");
             assert_eq!(round_failure_confirmation_grace_ms(), 4_000);
         }
+    }
+
+    #[test]
+    fn round_failure_confirmation_deadline_extends_to_remaining_cycle_slot() {
+        // Round failure detected 5s into a 20s slot (cycle 100 spans [2_000_000, 2_020_000)):
+        // the fixed 4s grace would expire at 2_009_000, well before the slot ends at
+        // 2_020_000 -- exactly the 2026-07-25 race. The deadline must not be earlier than the
+        // slot boundary.
+        let now_ms = 2_005_000;
+        let deadline = round_failure_confirmation_deadline_ms(now_ms, 4_000, 100, 20_000);
+        assert_eq!(deadline, 2_020_000);
+    }
+
+    #[test]
+    fn round_failure_confirmation_deadline_honors_larger_explicit_grace() {
+        // An operator-configured grace period longer than the remaining slot must still win
+        // (the slot boundary is a floor, not a ceiling).
+        let now_ms = 2_019_000;
+        let deadline = round_failure_confirmation_deadline_ms(now_ms, 30_000, 100, 20_000);
+        assert_eq!(deadline, 2_049_000);
+    }
+
+    #[test]
+    fn round_failure_confirmation_deadline_falls_back_to_fixed_grace_when_cycle_duration_zero() {
+        let now_ms = 2_005_000;
+        let deadline = round_failure_confirmation_deadline_ms(now_ms, 4_000, 100, 0);
+        assert_eq!(deadline, 2_009_000);
     }
 
     #[test]
