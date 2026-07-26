@@ -2506,6 +2506,18 @@ async fn waiting_worker_is_eligible(
     true
 }
 
+/// Short (4-byte) SHA-256 fingerprint of a sorted list of pubkeys, for compact cross-node log
+/// comparison (see `log_accounts_fingerprint_breakdown` for the same convention).
+fn pubkey_list_fingerprint(pks: &[[u8; 32]]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for pk in pks {
+        h.update(pk);
+    }
+    let full: [u8; 32] = h.finalize().into();
+    hex_encode(&full[..4])
+}
+
 async fn distribute_waiting_pool_rewards_and_fee_credits(
     store: &StorageManager,
     lsu: &catalyst_consensus::types::LedgerStateUpdate,
@@ -2525,12 +2537,17 @@ async fn distribute_waiting_pool_rewards_and_fee_credits(
     let paid_to_producers: u64 = lsu.compensation_entries.iter().map(|e| e.amount).sum();
     let waiting_pool = waiting_pool_from_formula.min(total_reward_pool.saturating_sub(paid_to_producers));
     if waiting_pool == 0 && !TOKENOMICS_FEE_CREDITS_ENABLED {
+        info!(
+            "Cycle {} waiting_pool_reward: waiting_pool=0 total_fees={} paid_to_producers={} fee_credits_enabled=false -- nothing to distribute",
+            lsu.cycle_number, total_fees, paid_to_producers
+        );
         return;
     }
 
     let mut workers = load_workers_from_state(store);
     workers.sort();
     workers.dedup();
+    let producers_hash = pubkey_list_fingerprint(&producers.iter().copied().collect::<Vec<_>>());
     let mut waiting: Vec<[u8; 32]> = Vec::new();
     for pk in workers {
         if producers.contains(&pk) {
@@ -2541,12 +2558,26 @@ async fn distribute_waiting_pool_rewards_and_fee_credits(
         }
     }
     if waiting.is_empty() {
+        // Diagnostic (2026-07-26 asia bal-lag investigation): if `waiting_pool` above is
+        // nonzero but no worker is eligible, that reward is silently forfeited this cycle
+        // (never distributed, never carried forward) -- a plausible source of a permanent,
+        // one-node-only balance shortfall if eligibility computation ever disagrees between
+        // nodes despite an otherwise-identical LSU and identical wfs:/wlr: state.
+        info!(
+            "Cycle {} waiting_pool_reward: waiting_pool={} but n_eligible=0 (forfeited, not carried forward) producers_hash={}",
+            lsu.cycle_number, waiting_pool, producers_hash
+        );
         return;
     }
 
     let n = waiting.len() as u64;
     let per = waiting_pool / n;
     let mut rem = waiting_pool % n;
+    info!(
+        "Cycle {} waiting_pool_reward: waiting_pool={} n_eligible={} per={} rem={} waiting_hash={} producers_hash={}",
+        lsu.cycle_number, waiting_pool, n, per, rem,
+        pubkey_list_fingerprint(&waiting), producers_hash
+    );
     for pk in waiting {
         if per > 0 || rem > 0 {
             let bonus = if rem > 0 {
