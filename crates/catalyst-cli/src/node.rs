@@ -1869,7 +1869,7 @@ async fn apply_lsu_to_storage_without_root_check(
             cycle = lsu.cycle_number,
             claimed = %hex_encode(&new_root),
             recomputed = %hex_encode(&recomputed),
-            "Trusted apply path: claimed state_root did not match local recompute; reverting and falling back to verified apply"
+            "APPLY_REVERTED: trusted apply path claimed state_root did not match local recompute; reverting and falling back to verified apply"
         );
         catalyst_utils::increment_counter!("consensus_trusted_apply_root_mismatch_total", 1);
         let _ = store.load_snapshot(&snap).await;
@@ -4973,10 +4973,19 @@ async fn try_reconcile_fork_from_quorum_lsu(
             Ok(true)
         }
         Err(e) => {
+            // Diagnostic note (2026-07-26 divergence investigation): `reconcile_inner` above may
+            // have already called `apply_lsu_to_storage_locked` once per cycle in
+            // `replay_start..cycle` (each unconditionally logging its own "accounts fingerprint"
+            // line) before hitting this failure -- all of those are about to be discarded by the
+            // snapshot restore below. Log the full reverted range with a searchable tag
+            // (`APPLY_REVERTED`) so a later cross-node fingerprint comparison can exclude every
+            // line in this range instead of mistaking any of them for genuinely-committed state.
             warn!(
                 target: "catalyst.consensus.reconcile",
-                "Quorum fork reconcile failed, restoring snapshot: {}",
-                e
+                replay_start,
+                cycle,
+                "APPLY_REVERTED: quorum fork reconcile failed, restoring snapshot (reverts cycles {}..{} if any were replayed): {}",
+                replay_start, cycle, e
             );
             if let Err(e2) = store.load_snapshot(&snap).await {
                 catalyst_utils::increment_counter!("consensus_fork_reconcile_error_total", 1);
@@ -5041,7 +5050,19 @@ async fn apply_lsu_with_root_check_locked(
         return Ok(true);
     }
 
-    // Revert
+    // Revert. Diagnostic note (2026-07-26 divergence investigation): `apply_lsu_to_storage_locked`
+    // above already logged an "accounts fingerprint" line for `got` unconditionally, before this
+    // mismatch was known -- that logged fingerprint does NOT reflect final committed state once we
+    // revert here. Log this explicitly (searchable tag `APPLY_REVERTED`) so a later cross-node
+    // fingerprint comparison can identify and exclude the now-stale line for this cycle instead of
+    // mistaking it for genuinely-committed state.
+    warn!(
+        target: "catalyst.consensus.apply",
+        cycle = lsu.cycle_number,
+        got = %hex_encode(&got),
+        expected = %hex_encode(&expected_state_root),
+        "APPLY_REVERTED: verified apply produced a different root than expected; reverting snapshot (the accounts fingerprint just logged for this cycle does not reflect final state)"
+    );
     let _ = store
         .load_snapshot(&snap)
         .await
