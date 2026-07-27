@@ -1816,6 +1816,7 @@ async fn apply_lsu_to_storage_without_root_check(
         let cur = get_balance_i64(store, &c.public_key).await;
         let _ = set_balance_i64(store, &c.public_key, cur.saturating_add(c.amount as i64)).await;
     }
+    log_compensation_entries_summary(lsu.cycle_number, &lsu.compensation_entries);
 
     // Nonce increments.
     use std::collections::BTreeMap;
@@ -2516,6 +2517,42 @@ fn pubkey_list_fingerprint(pks: &[[u8; 32]]) -> String {
     }
     let full: [u8; 32] = h.finalize().into();
     hex_encode(&full[..4])
+}
+
+/// Diagnostic (2026-07-26/27 `bal`-category divergence investigation): logs whether the
+/// compensation-entries loop actually ran and what it credited, on every apply. The waiting-pool
+/// reward path was just proven to be a no-op in the current worker configuration (always
+/// `n_eligible=0`), which leaves `compensation_entries` -- simple, deterministic, and part of the
+/// hashed LSU (so byte-identical across nodes for the same `applied_lsu_hash`) -- as the only
+/// remaining thing that mutates `bal:` on an empty-tx-batch cycle. If this logs the same
+/// `entries_hash`/`applied_count`/`total_amount` on every node for a cycle yet balances still end
+/// up different afterward, that proves the *starting* balance already differed (the deficit is
+/// from an earlier cycle, not this one). If the logged values themselves differ, that is the bug.
+fn log_compensation_entries_summary(
+    cycle: u64,
+    entries: &[catalyst_consensus::types::CompensationEntry],
+) {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let mut applied_count = 0u64;
+    let mut total_amount: u64 = 0;
+    for e in entries {
+        h.update(&e.public_key);
+        h.update(e.amount.to_le_bytes());
+        if e.amount != 0 {
+            applied_count += 1;
+            total_amount = total_amount.saturating_add(e.amount);
+        }
+    }
+    let full: [u8; 32] = h.finalize().into();
+    info!(
+        "Cycle {} compensation_entries: count={} applied_count={} total_amount={} entries_hash={}",
+        cycle,
+        entries.len(),
+        applied_count,
+        total_amount,
+        hex_encode(&full[..4])
+    );
 }
 
 async fn distribute_waiting_pool_rewards_and_fee_credits(
@@ -3559,6 +3596,7 @@ async fn apply_lsu_to_storage_locked(
         let cur = get_balance_i64(store, &c.public_key).await;
         let _ = set_balance_i64(store, &c.public_key, cur.saturating_add(c.amount as i64)).await;
     }
+    log_compensation_entries_summary(lsu.cycle_number, &lsu.compensation_entries);
 
     // Update nonces: group by signature bytes (our current "tx boundary" marker).
     use std::collections::BTreeMap;
