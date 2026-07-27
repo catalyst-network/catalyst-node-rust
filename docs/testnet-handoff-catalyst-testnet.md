@@ -90,6 +90,13 @@ This file is intended to be handed to an external agent/tooling team building a 
 > of the current cycle's own wall-clock slot, so it can no longer resolve before a peer's in-flight
 > round has a full chance to finish. Genesis hash unchanged; re-index from cycle `89250764`.
 
+> **2026-07-27 genesis reset.** A new `state_root` divergence (origin cycle `89253580-81`, isolated
+> to the `bal:` account-balance category — `asia`'s balance state fell progressively further behind
+> `eu`'s over time rather than forking cleanly) compounded into a full 4-way split before this reset.
+> Root cause not yet found; see `docs/explorer-genesis-reset-2026-07-27.md` for the investigation
+> and the four diagnostic-only logging commits deployed (`e7d21f6`, `16eacb1`, `c0a6d88`, `bf27f31`)
+> so the next occurrence is fully traceable. Genesis hash unchanged; re-index from cycle `89256698`.
+
 ## Network identity (MUST match)
 
 - **network_id**: `catalyst-testnet`
