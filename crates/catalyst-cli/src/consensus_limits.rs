@@ -193,6 +193,32 @@ pub fn stale_observed_head_reset_ms() -> u64 {
         .unwrap_or(DEFAULT)
 }
 
+/// Largest gap (in whole cycles) between `observed_head_cycle` and the applied head that the
+/// [`stale_observed_head_reset_ms`] backstop may silently forgive
+/// (`CATALYST_STALE_OBSERVED_HEAD_MAX_FORGIVABLE_GAP`, default `3`, max `1_000`).
+///
+/// Root-cause fix for a live 2026-07-27 divergence: the backstop's original design assumed a
+/// "phantom/unreachable head" -- a single bad or reordered gossip message pushing
+/// `observed_head_cycle` to a cycle nobody actually produced. That case is genuinely safe to
+/// forgive: resetting drops nothing real. But it was observed firing after a node fell many
+/// cycles behind (peers were serving that range fine; this node's own fetch pipeline just hadn't
+/// caught up within the budget) -- resetting there does NOT abandon a phantom, it silently drops
+/// every real, balance-affecting cycle in the gap from this node's local history forever, with no
+/// error raised about the dropped range itself (only a `state_root` mismatch, cycles later, once
+/// the damage is already permanent). A small gap is consistent with the original noise-tolerance
+/// intent; a large one is a real backlog and must never be silently forgiven -- staying deferred
+/// (a visible, operator-actionable liveness stall) is the safe failure mode, exactly as with the
+/// depth-gate above ("never release the gate to preserve liveness").
+pub fn stale_observed_head_max_forgivable_gap() -> u64 {
+    const MAX: u64 = 1_000;
+    const DEFAULT: u64 = 3;
+    std::env::var("CATALYST_STALE_OBSERVED_HEAD_MAX_FORGIVABLE_GAP")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v <= MAX)
+        .unwrap_or(DEFAULT)
+}
+
 /// How long (ms) to actively wait, after this node's own consensus round fails to produce a
 /// cycle, for a peer's `LsuRangeResponse` confirming they *did* produce it, before treating the
 /// gap as a legitimate network-wide skip and letting production proceed to the next wall-clock
@@ -589,6 +615,28 @@ mod tests {
         {
             let _e = EnvGuard::unset("CATALYST_STALE_OBSERVED_HEAD_RESET_MS");
             assert_eq!(stale_observed_head_reset_ms(), 60_000);
+        }
+    }
+
+    #[test]
+    fn stale_observed_head_max_forgivable_gap_env_and_fallbacks() {
+        {
+            let _e = EnvGuard::set("CATALYST_STALE_OBSERVED_HEAD_MAX_FORGIVABLE_GAP", "10");
+            assert_eq!(stale_observed_head_max_forgivable_gap(), 10);
+        }
+        {
+            // 0 is a valid, if strict, configuration (never forgive any gap) -- unlike the other
+            // *_MS limits in this module, 0 is not a footgun here, so it is not filtered out.
+            let _e = EnvGuard::set("CATALYST_STALE_OBSERVED_HEAD_MAX_FORGIVABLE_GAP", "0");
+            assert_eq!(stale_observed_head_max_forgivable_gap(), 0);
+        }
+        {
+            let _e = EnvGuard::set("CATALYST_STALE_OBSERVED_HEAD_MAX_FORGIVABLE_GAP", "9999999999");
+            assert_eq!(stale_observed_head_max_forgivable_gap(), 3);
+        }
+        {
+            let _e = EnvGuard::unset("CATALYST_STALE_OBSERVED_HEAD_MAX_FORGIVABLE_GAP");
+            assert_eq!(stale_observed_head_max_forgivable_gap(), 3);
         }
     }
 

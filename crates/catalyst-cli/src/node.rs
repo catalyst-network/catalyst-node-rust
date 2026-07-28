@@ -100,7 +100,26 @@ fn should_defer_production_when_behind(applied: u64, observed_head: u64) -> bool
 /// (both nodes kept voting/producing normally afterward). Confirmed-reachable data gets
 /// `CONFIRMED_STALE_BUDGET_MULTIPLIER`x longer before giving up, so the fetch pipeline has a real
 /// chance to land it, while staying bounded in case that pipeline itself is broken.
-fn should_reset_stale_observed_head(elapsed_ms: u64, budget_ms: u64, peer_confirmed_reachable: bool) -> bool {
+///
+/// `gap` is `observed_head_cycle - applied_head`: how many cycles' worth of history a reset would
+/// silently abandon. Root-cause fix for a second, distinct live divergence (2026-07-27, see
+/// `consensus_limits::stale_observed_head_max_forgivable_gap`): this backstop's time-based check
+/// alone cannot distinguish "a single bad/reordered gossip message" (safe to forgive -- nothing
+/// real is lost) from "we are genuinely far behind and our own fetch pipeline is failing even
+/// though peers have and are applying this real history" (unsafe -- resetting corrupts this
+/// node's balances forever with no error raised about the dropped range itself). Above
+/// `max_forgivable_gap`, refuse regardless of elapsed time; staying deferred is the safe failure
+/// mode, matching the depth-gate's own "never release the gate to preserve liveness" principle.
+fn should_reset_stale_observed_head(
+    elapsed_ms: u64,
+    budget_ms: u64,
+    peer_confirmed_reachable: bool,
+    gap: u64,
+    max_forgivable_gap: u64,
+) -> bool {
+    if gap > max_forgivable_gap {
+        return false;
+    }
     const CONFIRMED_STALE_BUDGET_MULTIPLIER: u64 = 5;
     let effective_budget_ms = if peer_confirmed_reachable {
         budget_ms.saturating_mul(CONFIRMED_STALE_BUDGET_MULTIPLIER)
@@ -5915,7 +5934,10 @@ impl CatalystNode {
                                 let need = head.saturating_add(1);
                                 let peer_confirmed_reachable = c.confirmed_next_cycle == Some(need);
                                 let elapsed_ms = now_ms.saturating_sub(since);
-                                if should_reset_stale_observed_head(elapsed_ms, stale_budget_ms, peer_confirmed_reachable) {
+                                let gap = c.observed_head_cycle.saturating_sub(head);
+                                let max_forgivable_gap =
+                                    crate::consensus_limits::stale_observed_head_max_forgivable_gap();
+                                if should_reset_stale_observed_head(elapsed_ms, stale_budget_ms, peer_confirmed_reachable, gap, max_forgivable_gap) {
                                     if peer_confirmed_reachable {
                                         error!(
                                             "observed_head_cycle {} stale for {}ms despite a peer confirming they have cycle {}; resetting anyway (fetch pipeline may be broken) — needs operator attention",
@@ -5943,6 +5965,26 @@ impl CatalystNode {
                                     c.stale_since_ms = Some(now_ms);
                                     c.confirmed_next_cycle = None;
                                     c.confirmed_next_cycle_since_ms = None;
+                                } else if elapsed_ms > stale_budget_ms && gap > max_forgivable_gap {
+                                    // Root-cause fix (2026-07-27, see
+                                    // `consensus_limits::stale_observed_head_max_forgivable_gap`):
+                                    // budget elapsed, but the gap is too large to safely forgive --
+                                    // stay deferred (visible, operator-actionable stall) instead of
+                                    // silently dropping `gap` real cycles from local history. Logs
+                                    // every tick while this persists, same cadence as other
+                                    // long-lived stall warnings in this loop.
+                                    error!(
+                                        "observed_head_cycle {} stale for {}ms with no applied-head progress past {}, but gap ({} cycles) exceeds max_forgivable_gap ({}); refusing to reset -- staying deferred rather than silently dropping real history. Investigate this node's LSU range-fetch pipeline.",
+                                        c.observed_head_cycle,
+                                        elapsed_ms,
+                                        head,
+                                        gap,
+                                        max_forgivable_gap
+                                    );
+                                    catalyst_utils::increment_counter!(
+                                        "consensus_observed_head_stale_reset_refused_gap_too_large_total",
+                                        1
+                                    );
                                 }
                             }
                         } else {
@@ -8592,17 +8634,39 @@ mod bft_quorum_tests {
     fn stale_observed_head_reset_gives_confirmed_reachable_cycles_more_time() {
         use super::should_reset_stale_observed_head;
         let budget = 60_000u64;
+        let gap = 1u64;
+        let max_gap = 3u64;
         // Unconfirmed: reset exactly at the normal budget boundary.
-        assert!(!should_reset_stale_observed_head(budget, budget, false));
-        assert!(should_reset_stale_observed_head(budget + 1, budget, false));
+        assert!(!should_reset_stale_observed_head(budget, budget, false, gap, max_gap));
+        assert!(should_reset_stale_observed_head(budget + 1, budget, false, gap, max_gap));
         // Confirmed reachable: must NOT reset at the normal budget -- this is exactly the case
         // that caused a live silent fork (one validator gave up while a peer legitimately had the
         // cycle it abandoned).
-        assert!(!should_reset_stale_observed_head(budget + 1, budget, true));
-        assert!(!should_reset_stale_observed_head(budget * 4, budget, true));
+        assert!(!should_reset_stale_observed_head(budget + 1, budget, true, gap, max_gap));
+        assert!(!should_reset_stale_observed_head(budget * 4, budget, true, gap, max_gap));
         // Still bounded, not literally forever: eventually resets even when confirmed, in case the
         // fetch pipeline itself is broken.
-        assert!(should_reset_stale_observed_head(budget * 5 + 1, budget, true));
+        assert!(should_reset_stale_observed_head(budget * 5 + 1, budget, true, gap, max_gap));
+    }
+
+    /// Regression test for a second, distinct live divergence (2026-07-27): a node fell many
+    /// cycles behind a real, peer-served range (not a phantom head), and the time-based backstop
+    /// alone reset past it anyway once the budget elapsed -- silently dropping every cycle in the
+    /// gap from its own history forever. The gap-size cap must refuse the reset regardless of how
+    /// much time has elapsed once the gap exceeds what is safe to treat as reorder noise.
+    #[test]
+    fn stale_observed_head_reset_refuses_when_gap_exceeds_max_forgivable() {
+        use super::should_reset_stale_observed_head;
+        let budget = 60_000u64;
+        let max_gap = 3u64;
+        // Small gap, well past budget: still resets (the original phantom-head case).
+        assert!(should_reset_stale_observed_head(budget * 10, budget, false, max_gap, max_gap));
+        // One cycle past the cap: refuses, no matter how long it's been stale.
+        assert!(!should_reset_stale_observed_head(budget * 10, budget, false, max_gap + 1, max_gap));
+        assert!(!should_reset_stale_observed_head(u64::MAX, budget, false, max_gap + 1, max_gap));
+        // Even a peer-confirmed-reachable large gap must not be forgiven -- confirmation only
+        // covers the immediate next cycle, not the whole abandoned range.
+        assert!(!should_reset_stale_observed_head(u64::MAX, budget, true, max_gap + 1, max_gap));
     }
 
     fn empty_lsu(
