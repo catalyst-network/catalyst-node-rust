@@ -97,6 +97,15 @@ This file is intended to be handed to an external agent/tooling team building a 
 > and the four diagnostic-only logging commits deployed (`e7d21f6`, `16eacb1`, `c0a6d88`, `bf27f31`)
 > so the next occurrence is fully traceable. Genesis hash unchanged; re-index from cycle `89256698`.
 
+> **2026-07-28 genesis reset.** Root cause of the 2026-07-27 divergence found: `asia` fell behind a
+> real, peer-served cycle range, and `stale_observed_head_reset_ms()`'s liveness backstop silently
+> reset past the gap and resumed production without ever backfilling it — permanently dropping
+> those cycles' `compensation_entries` credit from its own balance history. See
+> `docs/explorer-genesis-reset-2026-07-28.md`. Fixed same day (commit `2a1810a`): the reset is now
+> capped by gap size (`stale_observed_head_max_forgivable_gap`, default 3 cycles) — above the cap
+> it refuses to reset and stays loudly, visibly deferred instead. Genesis hash unchanged; re-index
+> from cycle `89262084`.
+
 ## Network identity (MUST match)
 
 - **network_id**: `catalyst-testnet`
