@@ -106,6 +106,17 @@ This file is intended to be handed to an external agent/tooling team building a 
 > it refuses to reset and stays loudly, visibly deferred instead. Genesis hash unchanged; re-index
 > from cycle `89262084`.
 
+> **2026-08-02 genesis reset.** The recurring `bal`-only divergence recurred, this time on `us`
+> rather than `asia` — root-caused via live per-producer balance queries to an exact ~1174-cycle
+> compensation deficit. `try_apply_stored_lsu_at_cycle` (the background catch-up loop, independent
+> of the reconcile machinery) silently no-op'd its own prev-root continuity check whenever
+> `consensus:lsu_state_root:{cycle-1}` metadata was missing, and was never gated by the reconcile
+> circuit breaker at all — a stuck node could creep forward one cycle at a time through this path
+> instead of staying stopped. See `docs/explorer-genesis-reset-2026-08-02.md`. Fixed same day
+> (commit `a4f5397`): the continuity check now fails closed on missing metadata (except genesis
+> bootstrap), and the same path now also honors the reconcile circuit breaker. Genesis hash
+> unchanged; re-index from cycle `89284014`.
+
 ## Network identity (MUST match)
 
 - **network_id**: `catalyst-testnet`
