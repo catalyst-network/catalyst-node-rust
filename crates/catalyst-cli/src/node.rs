@@ -4078,6 +4078,16 @@ async fn try_apply_stored_lsu_at_cycle(
     if cycle != head.saturating_add(1) {
         return false;
     }
+    // Fail closed once reconcile has given up on this exact applied head: this background
+    // catch-up loop is otherwise unaware of the reconcile circuit breaker
+    // (`should_block_self_produced_apply` only gates self-produced apply), so a node whose
+    // reconcile is stuck can still creep forward here via any partial backfill that happens to
+    // land the very next cycle's raw LSU bytes -- silently re-arming a "resolved" breaker (it's
+    // keyed on `local_cycle`, see `ReconcileFailureTracker`) without the underlying gap ever
+    // having been healed. Root-cause fix for the 2026-08-02 `us` bal-divergence incident.
+    if reconcile_circuit_is_broken(head).await {
+        return false;
+    }
     let Some(bytes) = store
         .get_metadata(&format!("consensus:lsu:{}", cycle))
         .await
@@ -4126,17 +4136,32 @@ async fn try_apply_stored_lsu_at_cycle(
         return false;
     }
     let local_prev = local_applied_state_root(store).await;
+    // Root-cause fix (2026-08-02 `us` bal-divergence incident): this used to fall back to
+    // `unwrap_or(local_prev)` when no canonical root was recorded for `cycle - 1`, which made the
+    // check below a no-op (`local_prev != local_prev` is always false) -- silently trusting
+    // whatever local state happened to be, correct or not. A node whose own history has a hole
+    // (e.g. raw LSU bytes for a range got batch-backfilled but the separately-relayed
+    // `consensus:lsu_state_root:{cycle-1}` metadata for the tail of that range never arrived) would
+    // apply straight through with zero verification, baking a permanent balance deficit into every
+    // cycle applied this way ("same recipe, different state_root" with no warning). Genesis
+    // bootstrap (a fresh node with no prior applied state, no prior recorded root) remains the one
+    // legitimate case where nothing is recorded yet -- allowed explicitly below rather than via a
+    // silent default. Every other "missing" case now fails closed like `resolve_replay_start`'s
+    // "never guess" checks elsewhere in this file.
     let expected_prev = if cycle == 0 {
-        [0u8; 32]
+        Some([0u8; 32])
     } else {
         meta_32(
             store,
             &format!("consensus:lsu_state_root:{}", cycle.saturating_sub(1)),
         )
         .await
-        .unwrap_or(local_prev)
     };
-    if local_prev != expected_prev && !(local_prev == [0u8; 32] && expected_prev == [0u8; 32]) {
+    let prev_ok = match expected_prev {
+        Some(expected) => local_prev == expected,
+        None => local_prev == [0u8; 32],
+    };
+    if !prev_ok {
         return false;
     }
     if require_lsu_finality {
@@ -9030,7 +9055,7 @@ mod fork_choice_integration_tests {
         local_applied_cycle, local_applied_lsu_hash, local_applied_state_root, lsu_apply_lock, meta_32,
         meta_string, persist_lsu_history, reconcile_failure_state_for_test, record_reconcile_failure,
         scan_for_self_produced_state_root_divergence, set_balance_i64,
-        should_block_self_produced_apply, try_reconcile_fork_from_quorum_lsu,
+        should_block_self_produced_apply, try_apply_stored_lsu_at_cycle, try_reconcile_fork_from_quorum_lsu,
         try_reorg_stronger_lsu_at_applied_cycle, verify_state_root_finality_for_apply, ForkChoiceApplyGate,
     };
     use crate::config::NodeConfig;
@@ -10187,6 +10212,161 @@ mod fork_choice_integration_tests {
             should_block_self_produced_apply(&env.store).await,
             Some(BASE),
             "must block self-produced apply once the circuit is open for the current applied head"
+        );
+    }
+
+    /// Root-cause regression test for the 2026-08-02 `us` bal-divergence incident: this
+    /// background catch-up path (`try_apply_stored_lsu_at_cycle`, called in a loop by
+    /// `try_advance_applied_head_from_storage` every ~2s independent of the reconcile machinery)
+    /// used to derive its "expected previous root" via `.unwrap_or(local_prev)` when no
+    /// `consensus:lsu_state_root:{cycle-1}` metadata was recorded -- making the continuity check
+    /// compare `local_prev` against itself, always true. A node whose own history has a hole in
+    /// exactly that key (plausible whenever raw LSU bytes for a cycle get backfilled before the
+    /// separately-relayed canonical-root metadata for the *previous* cycle does) would apply
+    /// straight through with no verification at all, baking a permanent, undetected balance
+    /// deficit into every cycle applied this way -- the "same recipe, different `state_root`"
+    /// signature. This is not the genesis-bootstrap case (that has its own explicit allow below);
+    /// here the node has already applied cycle 1 for real, with a real nonzero root, and only the
+    /// *metadata record* of that root is missing.
+    #[tokio::test]
+    async fn try_apply_stored_lsu_at_cycle_refuses_when_prev_root_metadata_missing() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let pk0 = committee.keys[0].public_key().to_bytes();
+
+        let lsu_c1 = lsu_with_tx_seed(&committee, 1, 5);
+        apply_lsu_to_storage(&env.store, &lsu_c1)
+            .await
+            .expect("apply cycle 1");
+        assert_eq!(local_applied_cycle(&env.store).await, 1);
+        assert!(
+            env.store
+                .get_metadata("consensus:lsu_state_root:1")
+                .await
+                .ok()
+                .flatten()
+                .is_none(),
+            "sanity: cycle 1's canonical-root metadata was deliberately never persisted"
+        );
+
+        // Cycle 2's raw LSU + hash + its own expected root ARE known locally (e.g. batch-fetched
+        // from peers) -- everything `try_apply_stored_lsu_at_cycle` needs except a way to verify
+        // continuity against cycle 1.
+        let lsu_c2 = lsu_with_tx_seed(&committee, 2, 7);
+        let scratch = "scratch_missing_prev_root_c2";
+        env.store.create_snapshot(scratch).await.expect("snap");
+        let root_c2 = apply_lsu_to_storage(&env.store, &lsu_c2)
+            .await
+            .expect("compute cycle 2 root");
+        env.store.load_snapshot(scratch).await.expect("restore");
+        let _ = env.store.delete_snapshot(scratch).await;
+
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            2,
+            &lsu_c2.serialize().expect("ser"),
+            &hash_data(&lsu_c2).expect("h2"),
+            "",
+            &root_c2,
+            "",
+            false,
+        )
+        .await;
+
+        let applied = try_apply_stored_lsu_at_cycle(&env.store, Some(&env.dfs), 2, false).await;
+        assert!(
+            !applied,
+            "must refuse to apply when the prior cycle's canonical root cannot be verified, not silently trust local state"
+        );
+        assert_eq!(
+            local_applied_cycle(&env.store).await,
+            1,
+            "applied head must not silently advance past an unverifiable gap"
+        );
+        assert_eq!(
+            get_balance_i64(&env.store, &pk0).await,
+            5,
+            "balance must not silently gain cycle 2's effect without verified continuity"
+        );
+    }
+
+    /// Companion regression test: the background catch-up loop was also entirely unaware of the
+    /// reconcile circuit breaker (only `should_block_self_produced_apply`, used by *self-produced*
+    /// apply, checked it) -- so a node stuck at a `local_cycle` the breaker has already given up on
+    /// could still creep forward here via any backfill that happened to land the very next cycle's
+    /// data, silently invalidating the breaker (it's keyed on `local_cycle`, see
+    /// `ReconcileFailureTracker`'s doc comment) without the underlying gap ever having been healed.
+    #[tokio::test]
+    async fn try_apply_stored_lsu_at_cycle_blocked_when_reconcile_circuit_broken() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let pk0 = committee.keys[0].public_key().to_bytes();
+
+        // Distinctive base cycle -- see the unbridgeable-gap breaker test above for why (process-
+        // global tracker shared across concurrently-run tests).
+        const BASE: u64 = 900_701;
+
+        let lsu_base = lsu_with_tx_seed(&committee, BASE, 5);
+        let root_base = apply_lsu_to_storage(&env.store, &lsu_base)
+            .await
+            .expect("apply base cycle");
+        assert_eq!(local_applied_cycle(&env.store).await, BASE);
+        // Persist BASE's own history/root so the (now-fixed) prev-root continuity check would
+        // otherwise happily allow the next apply -- isolating this test to the breaker gate alone.
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            BASE,
+            &lsu_base.serialize().expect("ser"),
+            &hash_data(&lsu_base).expect("hb"),
+            "",
+            &root_base,
+            "",
+            false,
+        )
+        .await;
+
+        let threshold = crate::consensus_limits::reconcile_circuit_break_threshold();
+        for _ in 0..threshold {
+            record_reconcile_failure(BASE).await;
+        }
+        assert!(
+            reconcile_failure_state_for_test(BASE).await.unwrap().1,
+            "sanity: breaker must be tripped for BASE before the assertion below means anything"
+        );
+
+        let lsu_next = lsu_with_tx_seed(&committee, BASE + 1, 7);
+        let scratch = "scratch_circuit_broken_next";
+        env.store.create_snapshot(scratch).await.expect("snap");
+        let root_next = apply_lsu_to_storage(&env.store, &lsu_next)
+            .await
+            .expect("compute next root");
+        env.store.load_snapshot(scratch).await.expect("restore");
+        let _ = env.store.delete_snapshot(scratch).await;
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            BASE + 1,
+            &lsu_next.serialize().expect("ser"),
+            &hash_data(&lsu_next).expect("h"),
+            "",
+            &root_next,
+            "",
+            false,
+        )
+        .await;
+
+        let applied = try_apply_stored_lsu_at_cycle(&env.store, Some(&env.dfs), BASE + 1, false).await;
+        assert!(
+            !applied,
+            "background catch-up must not silently walk forward once reconcile has given up on this applied head"
+        );
+        assert_eq!(local_applied_cycle(&env.store).await, BASE);
+        assert_eq!(
+            get_balance_i64(&env.store, &pk0).await,
+            5,
+            "balance must not gain BASE+1's effect while the reconcile circuit is broken"
         );
     }
 
