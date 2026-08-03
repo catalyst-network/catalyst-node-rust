@@ -8145,6 +8145,7 @@ impl CatalystNode {
                             // Proof-driven sync (step 4): bundle old/new proofs for touched keys.
                             // These are best-effort; followers fall back to apply-then-check if unavailable.
                             let mut prev_state_root_for_msg: [u8; 32] = [0u8; 32];
+                            let mut new_state_root_for_msg: [u8; 32] = [0u8; 32];
                             let mut proof_cid_for_msg: String = String::new();
 
                             // Persist latest LSU and seed.
@@ -8174,6 +8175,25 @@ impl CatalystNode {
                                 // IMPORTANT: even if we skip proof bundles for EVM LSUs, we must still
                                 // gossip the correct previous state root so followers can validate
                                 // chain continuity and apply the LSU.
+                                //
+                                // CONSENSUS DETERMINISM / race fix (2026-08-03 network-wide reconcile-storm
+                                // incident): `current_root` must be captured atomically with the apply below,
+                                // under `lsu_apply_lock`. Previously this read happened *before* the lock was
+                                // acquired (the lock was only taken inside `apply_lsu_to_storage`), so a
+                                // concurrent apply of this exact cycle via gossip fast-path or the background
+                                // catch-up loop (`try_advance_applied_head_from_storage`) could complete in the
+                                // gap between this read and the apply call -- BFT construction for a cycle can
+                                // take many seconds while a faster peer's gossip/CID sync takes a few hundred ms.
+                                // When that happened, `current_root` here silently observed the *already-applied*
+                                // post-cycle root instead of the true prior-cycle root, and the apply below then
+                                // idempotently short-circuited (see `apply_lsu_to_storage_locked`'s
+                                // `lsu.cycle_number <= already` check) without mutating anything -- producing a
+                                // broadcast `LsuCidGossip` with `prev_state_root == state_root` for the same
+                                // cycle. Every peer's reconcile then correctly (but perpetually) rejects that
+                                // self-contradictory claim, since no real prior state ever equals a cycle's own
+                                // post state -- this was observed live, network-wide, as a "quorum fork reconcile
+                                // failed" storm hitting nearly every cycle and tripping `rpc`'s circuit breaker.
+                                let _produce_apply_guard = lsu_apply_lock().lock().await;
                                 let current_root = store.get_state_root().unwrap_or([0u8; 32]);
                                 let (prev_root, prev_proofs) = if lsu_contains_evm(&update) {
                                     (current_root, Vec::new())
@@ -8185,10 +8205,14 @@ impl CatalystNode {
                                 };
                                 prev_state_root_for_msg = prev_root;
 
-                                // Apply to state (leader path).
-                                let new_root = apply_lsu_to_storage(store.as_ref(), &update)
+                                // Apply to state (leader path). Already holding `lsu_apply_lock` from just
+                                // above, so call the `_locked` variant directly (the public wrapper would
+                                // deadlock re-acquiring the non-reentrant mutex).
+                                let new_root = apply_lsu_to_storage_locked(store.as_ref(), &update)
                                     .await
                                     .unwrap_or([0u8; 32]);
+                                new_state_root_for_msg = new_root;
+                                drop(_produce_apply_guard);
 
                                 let (post_root, post_proofs) = if lsu_contains_evm(&update) {
                                     ([0u8; 32], Vec::new())
@@ -8250,11 +8274,16 @@ impl CatalystNode {
                                     if let Ok(bytes) = update.serialize() {
                                         let cid_str = dfs.put(bytes).await.ok();
                                         if let Some(cid) = cid_str {
-                                            let state_root = if let Some(store) = &storage {
-                                                store.get_state_root().unwrap_or([0u8; 32])
-                                            } else {
-                                                [0u8; 32]
-                                            };
+                                            // Use the root captured atomically with the apply above
+                                            // (`new_state_root_for_msg`), not a fresh unlocked
+                                            // `get_state_root()` read here -- see the race fix note
+                                            // above `_produce_apply_guard`. A second independent read at
+                                            // this point could observe a *later* cycle's root if a
+                                            // concurrent apply advanced the head again in the meantime,
+                                            // corrupting both this broadcast and the
+                                            // `consensus:lsu_state_root:{cycle}` metadata written from it
+                                            // just below.
+                                            let state_root = new_state_root_for_msg;
                                             let finality_cid_for_gossip = if let Some(store) = &storage {
                                                 meta_string(
                                                     store.as_ref(),
