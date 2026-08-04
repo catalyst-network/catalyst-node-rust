@@ -1721,6 +1721,37 @@ async fn apply_lsu_to_storage_without_root_check(
 ) -> Result<bool> {
     let _apply_guard = lsu_apply_lock().lock().await;
 
+    // Same non-sequential-apply guard as `apply_lsu_to_storage_locked` -- see that function's
+    // 2026-08-04 comment for the full incident this closes. This path had no sequentiality check
+    // at all (not even the idempotence early-return the other apply function has), making it the
+    // most exposed of the two.
+    let already = store
+        .get_metadata("consensus:last_applied_cycle")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|b| {
+            if b.len() != 8 {
+                return None;
+            }
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&b);
+            Some(u64::from_le_bytes(arr))
+        })
+        .unwrap_or(0);
+    if lsu.cycle_number <= already {
+        return Ok(false);
+    }
+    if already != 0 && lsu.cycle_number != already.saturating_add(1) {
+        anyhow::bail!(
+            "refusing non-sequential apply: cycle {} is not immediately after applied head {} \
+             (would silently skip {} cycle(s) of compensation)",
+            lsu.cycle_number,
+            already,
+            lsu.cycle_number.saturating_sub(already).saturating_sub(1)
+        );
+    }
+
     let snap = format!("trusted_apply_verify_{}_{}", lsu.cycle_number, current_timestamp_ms());
     store
         .create_snapshot(&snap)
@@ -3475,6 +3506,31 @@ async fn apply_lsu_to_storage_locked(
         // Return current state root (best-effort).
         let root = store.get_state_root().unwrap_or([0u8; 32]);
         return Ok(root);
+    }
+
+    // CONSENSUS DETERMINISM (2026-08-04 root cause): this function trusts `lsu.cycle_number`
+    // to be exactly `already + 1` -- every legitimate caller (self-production, the reconcile
+    // replay loop, `try_apply_stored_lsu_at_cycle`, the L2 fast-path) is *supposed* to only ever
+    // hand it the immediate next cycle. Nothing enforced that here, though: a caller bug (e.g. the
+    // production depth-gate transiently seeing "not behind" while `applied_head` is still
+    // genuinely stuck, confirmed live via `asia` jumping straight from applied cycle 89290676 to
+    // 89290685 with zero intermediate applies) could apply a "future" cycle directly. Since this
+    // function only ever mutates balances by the deltas/compensation entries *of the LSU it is
+    // given* -- never replaying what a skipped cycle would have credited -- doing so permanently
+    // and silently orphans every intervening cycle's compensation, producing exactly the
+    // long-running "same recipe, different state_root, bal-only" divergence class this codebase
+    // has repeatedly chased. Fail closed here, at the lowest common apply primitive, instead of
+    // hunting down each individual caller: genesis bootstrap (`already == 0`, cycle numbers are
+    // wall-clock-derived so the true first cycle is unknown in advance) remains the one legitimate
+    // exception, matching the precedent in `try_apply_stored_lsu_at_cycle`.
+    if already != 0 && lsu.cycle_number != already.saturating_add(1) {
+        anyhow::bail!(
+            "refusing non-sequential apply: cycle {} is not immediately after applied head {} \
+             (would silently skip {} cycle(s) of compensation)",
+            lsu.cycle_number,
+            already,
+            lsu.cycle_number.saturating_sub(already).saturating_sub(1)
+        );
     }
 
     #[derive(Clone, Debug, Default)]
@@ -10575,6 +10631,87 @@ mod fork_choice_integration_tests {
         assert!(ok, "correctly-claimed root must be accepted");
         assert_eq!(get_balance_i64(&env.store, &pk0).await, 5 + 7);
         assert_eq!(local_applied_cycle(&env.store).await, 2);
+    }
+
+    /// Regression test for the 2026-08-04 root cause of the recurring "same recipe, different
+    /// state_root, bal-only" divergence class: `apply_lsu_to_storage_locked` had no check that
+    /// the LSU it was given was for the immediate next cycle. Any caller bug that handed it a
+    /// "future" cycle (confirmed live: `asia`'s applied head jumped from 89290676 straight to
+    /// 89290685 with zero intermediate applies) would silently skip every cycle in between,
+    /// permanently orphaning their compensation with no error anywhere. Applying cycle 3 directly
+    /// onto cycle 1 (skipping 2) must now be refused, not silently accepted.
+    #[tokio::test]
+    async fn apply_lsu_to_storage_refuses_non_sequential_cycle() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let pk0 = committee.keys[0].public_key().to_bytes();
+
+        let lsu_c1 = lsu_with_tx_seed(&committee, 1, 5);
+        apply_lsu_to_storage(&env.store, &lsu_c1)
+            .await
+            .expect("apply cycle 1");
+        assert_eq!(get_balance_i64(&env.store, &pk0).await, 5);
+        assert_eq!(local_applied_cycle(&env.store).await, 1);
+
+        // Cycle 3 directly onto applied head 1 -- skips cycle 2 entirely.
+        let lsu_c3 = lsu_with_tx_seed(&committee, 3, 11);
+        let err = apply_lsu_to_storage(&env.store, &lsu_c3)
+            .await
+            .expect_err("non-sequential apply must be rejected, not silently accepted");
+        assert!(
+            err.to_string().contains("non-sequential"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            get_balance_i64(&env.store, &pk0).await,
+            5,
+            "rejected skip-ahead apply must leave no partial mutation behind"
+        );
+        assert_eq!(
+            local_applied_cycle(&env.store).await,
+            1,
+            "rejected skip-ahead apply must not advance the applied head"
+        );
+
+        // The correct next cycle (2) still applies normally.
+        let lsu_c2 = lsu_with_tx_seed(&committee, 2, 7);
+        apply_lsu_to_storage(&env.store, &lsu_c2)
+            .await
+            .expect("sequential apply of cycle 2 must succeed");
+        assert_eq!(get_balance_i64(&env.store, &pk0).await, 5 + 7);
+        assert_eq!(local_applied_cycle(&env.store).await, 2);
+    }
+
+    /// Same invariant, for the other (less-guarded) apply primitive used by the proof-driven
+    /// fast-apply path -- see `apply_lsu_to_storage_refuses_non_sequential_cycle`.
+    #[tokio::test]
+    async fn apply_lsu_to_storage_without_root_check_refuses_non_sequential_cycle() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let pk0 = committee.keys[0].public_key().to_bytes();
+
+        let lsu_c1 = lsu_with_tx_seed(&committee, 1, 5);
+        apply_lsu_to_storage(&env.store, &lsu_c1)
+            .await
+            .expect("apply cycle 1");
+
+        // The sequentiality check runs before any root verification, so the claimed root's
+        // correctness is irrelevant here -- any value demonstrates the rejection.
+        let lsu_c3 = lsu_with_tx_seed(&committee, 3, 11);
+        let arbitrary_claimed_root = [7u8; 32];
+        let err = apply_lsu_to_storage_without_root_check(&env.store, &lsu_c3, arbitrary_claimed_root)
+            .await
+            .expect_err("non-sequential apply must be rejected before root verification even runs");
+        assert!(
+            err.to_string().contains("non-sequential"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            get_balance_i64(&env.store, &pk0).await,
+            5,
+            "rejected skip-ahead apply must leave no partial mutation behind"
+        );
+        assert_eq!(local_applied_cycle(&env.store).await, 1);
     }
 
     /// `StorageManager::load_snapshot` restores by writing back the snapshot's captured keys —
