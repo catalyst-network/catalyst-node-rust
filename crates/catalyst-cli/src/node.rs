@@ -1721,10 +1721,15 @@ async fn apply_lsu_to_storage_without_root_check(
 ) -> Result<bool> {
     let _apply_guard = lsu_apply_lock().lock().await;
 
-    // Same non-sequential-apply guard as `apply_lsu_to_storage_locked` -- see that function's
-    // 2026-08-04 comment for the full incident this closes. This path had no sequentiality check
-    // at all (not even the idempotence early-return the other apply function has), making it the
-    // most exposed of the two.
+    // Idempotence: this path previously had no protection at all against re-applying an
+    // already-applied (or even already-superseded) cycle on top of itself. A stricter
+    // cycle-number-sequentiality check was added and then reverted here 2026-08-05 -- see
+    // `apply_lsu_to_storage_locked`'s comment for why: cycle numbers are wall-clock-derived and
+    // legitimately have gaps whenever a slot's tx batch never reaches quorum, and the strict check
+    // froze the entire fleet on the very first such routine empty slot. This path's actual
+    // correctness comes from its caller already having verified `local_prev == info.prev_state_root`
+    // before ever reaching this call (see the `ConsensusSync`/proof-bundle gossip handler) -- a real
+    // prev-root check, not a cycle-number one.
     let already = store
         .get_metadata("consensus:last_applied_cycle")
         .await
@@ -1741,15 +1746,6 @@ async fn apply_lsu_to_storage_without_root_check(
         .unwrap_or(0);
     if lsu.cycle_number <= already {
         return Ok(false);
-    }
-    if already != 0 && lsu.cycle_number != already.saturating_add(1) {
-        anyhow::bail!(
-            "refusing non-sequential apply: cycle {} is not immediately after applied head {} \
-             (would silently skip {} cycle(s) of compensation)",
-            lsu.cycle_number,
-            already,
-            lsu.cycle_number.saturating_sub(already).saturating_sub(1)
-        );
     }
 
     let snap = format!("trusted_apply_verify_{}_{}", lsu.cycle_number, current_timestamp_ms());
@@ -3508,30 +3504,28 @@ async fn apply_lsu_to_storage_locked(
         return Ok(root);
     }
 
-    // CONSENSUS DETERMINISM (2026-08-04 root cause): this function trusts `lsu.cycle_number`
-    // to be exactly `already + 1` -- every legitimate caller (self-production, the reconcile
-    // replay loop, `try_apply_stored_lsu_at_cycle`, the L2 fast-path) is *supposed* to only ever
-    // hand it the immediate next cycle. Nothing enforced that here, though: a caller bug (e.g. the
-    // production depth-gate transiently seeing "not behind" while `applied_head` is still
-    // genuinely stuck, confirmed live via `asia` jumping straight from applied cycle 89290676 to
-    // 89290685 with zero intermediate applies) could apply a "future" cycle directly. Since this
-    // function only ever mutates balances by the deltas/compensation entries *of the LSU it is
-    // given* -- never replaying what a skipped cycle would have credited -- doing so permanently
-    // and silently orphans every intervening cycle's compensation, producing exactly the
-    // long-running "same recipe, different state_root, bal-only" divergence class this codebase
-    // has repeatedly chased. Fail closed here, at the lowest common apply primitive, instead of
-    // hunting down each individual caller: genesis bootstrap (`already == 0`, cycle numbers are
-    // wall-clock-derived so the true first cycle is unknown in advance) remains the one legitimate
-    // exception, matching the precedent in `try_apply_stored_lsu_at_cycle`.
-    if already != 0 && lsu.cycle_number != already.saturating_add(1) {
-        anyhow::bail!(
-            "refusing non-sequential apply: cycle {} is not immediately after applied head {} \
-             (would silently skip {} cycle(s) of compensation)",
-            lsu.cycle_number,
-            already,
-            lsu.cycle_number.saturating_sub(already).saturating_sub(1)
-        );
-    }
+    // REVERTED 2026-08-05 (caused a full-fleet liveness freeze, see below). A prior version of
+    // this function additionally required `lsu.cycle_number == already + 1`, reasoning that any
+    // larger jump must be silently orphaning real intervening history (the 2026-08-04 `asia`
+    // incident: applied cycle jumped from 89290676 straight to 89290685 with no intermediate
+    // applies). That check was wrong: cycle numbers are wall-clock-derived and *legitimately* have
+    // gaps whenever a slot's tx batch never reaches quorum (`TX_BATCH_MISS_FATAL` / "refuse
+    // ambiguous empty construction") -- explicitly documented as skip-safe in
+    // `should_defer_production_when_behind`'s doc comment ("cycle numbers may legitimately have
+    // gaps ... we compare against the observed head rather than doing wall-clock arithmetic").
+    // The very first such empty slot after deploying the strict check (cycle 89294601) made every
+    // one of the 3 validators reject their own next self-produced cycle (89294602) forever,
+    // freezing the whole fleet with no self-recovery path (confirmed live, all 4 hosts hit the
+    // identical rejection simultaneously). Every current caller of this function already
+    // establishes correctness the right way -- by verifying the incoming LSU's claimed
+    // `prev_state_root` against this node's actual current root before ever reaching this call
+    // (the L2 fast-path's `expected_prev == local_root`, the proof-driven path's
+    // `local_prev == info.prev_state_root`) -- or by walking cycles one at a time by construction
+    // (the reconcile replay loop, `try_apply_stored_lsu_at_cycle`). A cycle-number arithmetic check
+    // here was both redundant with those and wrong for the legitimate skip case. The 2026-08-04
+    // mechanism (some caller handing this function a future cycle without having verified
+    // prev-root continuity) is real and still worth closing, but needs a prev-root check, not a
+    // cycle-number one -- left for a follow-up rather than reintroducing a guaranteed freeze here.
 
     #[derive(Clone, Debug, Default)]
     struct ApplyOutcome {
@@ -10633,15 +10627,15 @@ mod fork_choice_integration_tests {
         assert_eq!(local_applied_cycle(&env.store).await, 2);
     }
 
-    /// Regression test for the 2026-08-04 root cause of the recurring "same recipe, different
-    /// state_root, bal-only" divergence class: `apply_lsu_to_storage_locked` had no check that
-    /// the LSU it was given was for the immediate next cycle. Any caller bug that handed it a
-    /// "future" cycle (confirmed live: `asia`'s applied head jumped from 89290676 straight to
-    /// 89290685 with zero intermediate applies) would silently skip every cycle in between,
-    /// permanently orphaning their compensation with no error anywhere. Applying cycle 3 directly
-    /// onto cycle 1 (skipping 2) must now be refused, not silently accepted.
+    /// Regression test for the 2026-08-05 outage: a prior version of `apply_lsu_to_storage_locked`
+    /// additionally required `cycle_number == already + 1`, which rejected the legitimate,
+    /// documented "skip-safe" case where a wall-clock cycle's tx batch never reached quorum
+    /// (`TX_BATCH_MISS_FATAL`) and production moves on to the next cycle with no LSU ever existing
+    /// for the skipped slot. That check froze the entire fleet on the first such routine empty
+    /// round. Applying cycle 3 directly onto cycle 1 (cycle 2 having no LSU at all, a legitimate
+    /// skip) must succeed.
     #[tokio::test]
-    async fn apply_lsu_to_storage_refuses_non_sequential_cycle() {
+    async fn apply_lsu_to_storage_allows_legitimate_wall_clock_gap() {
         let env = test_env().await;
         let committee = TestCommittee::three();
         let pk0 = committee.keys[0].public_key().to_bytes();
@@ -10653,39 +10647,20 @@ mod fork_choice_integration_tests {
         assert_eq!(get_balance_i64(&env.store, &pk0).await, 5);
         assert_eq!(local_applied_cycle(&env.store).await, 1);
 
-        // Cycle 3 directly onto applied head 1 -- skips cycle 2 entirely.
+        // Cycle 2 never happened anywhere on the network (no quorum on its tx batch) -- cycle 3
+        // chains directly onto cycle 1's state and must be accepted, not rejected as "skipping".
         let lsu_c3 = lsu_with_tx_seed(&committee, 3, 11);
-        let err = apply_lsu_to_storage(&env.store, &lsu_c3)
+        apply_lsu_to_storage(&env.store, &lsu_c3)
             .await
-            .expect_err("non-sequential apply must be rejected, not silently accepted");
-        assert!(
-            err.to_string().contains("non-sequential"),
-            "unexpected error: {err}"
-        );
-        assert_eq!(
-            get_balance_i64(&env.store, &pk0).await,
-            5,
-            "rejected skip-ahead apply must leave no partial mutation behind"
-        );
-        assert_eq!(
-            local_applied_cycle(&env.store).await,
-            1,
-            "rejected skip-ahead apply must not advance the applied head"
-        );
-
-        // The correct next cycle (2) still applies normally.
-        let lsu_c2 = lsu_with_tx_seed(&committee, 2, 7);
-        apply_lsu_to_storage(&env.store, &lsu_c2)
-            .await
-            .expect("sequential apply of cycle 2 must succeed");
-        assert_eq!(get_balance_i64(&env.store, &pk0).await, 5 + 7);
-        assert_eq!(local_applied_cycle(&env.store).await, 2);
+            .expect("a legitimate wall-clock gap (no LSU ever existed for the skipped cycle) must be allowed");
+        assert_eq!(get_balance_i64(&env.store, &pk0).await, 5 + 11);
+        assert_eq!(local_applied_cycle(&env.store).await, 3);
     }
 
-    /// Same invariant, for the other (less-guarded) apply primitive used by the proof-driven
-    /// fast-apply path -- see `apply_lsu_to_storage_refuses_non_sequential_cycle`.
+    /// Same, for the other (proof-driven fast-apply) primitive -- see
+    /// `apply_lsu_to_storage_allows_legitimate_wall_clock_gap`.
     #[tokio::test]
-    async fn apply_lsu_to_storage_without_root_check_refuses_non_sequential_cycle() {
+    async fn apply_lsu_to_storage_without_root_check_allows_legitimate_wall_clock_gap() {
         let env = test_env().await;
         let committee = TestCommittee::three();
         let pk0 = committee.keys[0].public_key().to_bytes();
@@ -10695,23 +10670,22 @@ mod fork_choice_integration_tests {
             .await
             .expect("apply cycle 1");
 
-        // The sequentiality check runs before any root verification, so the claimed root's
-        // correctness is irrelevant here -- any value demonstrates the rejection.
         let lsu_c3 = lsu_with_tx_seed(&committee, 3, 11);
-        let arbitrary_claimed_root = [7u8; 32];
-        let err = apply_lsu_to_storage_without_root_check(&env.store, &lsu_c3, arbitrary_claimed_root)
+        let scratch_snap = "scratch_true_root_c3";
+        env.store.create_snapshot(scratch_snap).await.expect("snap");
+        let root_c3 = apply_lsu_to_storage(&env.store, &lsu_c3)
             .await
-            .expect_err("non-sequential apply must be rejected before root verification even runs");
-        assert!(
-            err.to_string().contains("non-sequential"),
-            "unexpected error: {err}"
-        );
-        assert_eq!(
-            get_balance_i64(&env.store, &pk0).await,
-            5,
-            "rejected skip-ahead apply must leave no partial mutation behind"
-        );
+            .expect("compute the true root cycle 3 produces when chained directly onto cycle 1");
+        env.store.load_snapshot(scratch_snap).await.expect("restore");
+        let _ = env.store.delete_snapshot(scratch_snap).await;
         assert_eq!(local_applied_cycle(&env.store).await, 1);
+
+        let ok = apply_lsu_to_storage_without_root_check(&env.store, &lsu_c3, root_c3)
+            .await
+            .expect("a legitimate wall-clock gap must be allowed");
+        assert!(ok);
+        assert_eq!(get_balance_i64(&env.store, &pk0).await, 5 + 11);
+        assert_eq!(local_applied_cycle(&env.store).await, 3);
     }
 
     /// `StorageManager::load_snapshot` restores by writing back the snapshot's captured keys —
