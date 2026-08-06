@@ -1717,6 +1717,7 @@ async fn scan_for_self_produced_state_root_divergence(
 async fn apply_lsu_to_storage_without_root_check(
     store: &StorageManager,
     lsu: &catalyst_consensus::types::LedgerStateUpdate,
+    expected_prev: [u8; 32],
     new_root: [u8; 32],
 ) -> Result<bool> {
     let _apply_guard = lsu_apply_lock().lock().await;
@@ -1726,10 +1727,7 @@ async fn apply_lsu_to_storage_without_root_check(
     // cycle-number-sequentiality check was added and then reverted here 2026-08-05 -- see
     // `apply_lsu_to_storage_locked`'s comment for why: cycle numbers are wall-clock-derived and
     // legitimately have gaps whenever a slot's tx batch never reaches quorum, and the strict check
-    // froze the entire fleet on the very first such routine empty slot. This path's actual
-    // correctness comes from its caller already having verified `local_prev == info.prev_state_root`
-    // before ever reaching this call (see the `ConsensusSync`/proof-bundle gossip handler) -- a real
-    // prev-root check, not a cycle-number one.
+    // froze the entire fleet on the very first such routine empty slot.
     let already = store
         .get_metadata("consensus:last_applied_cycle")
         .await
@@ -1746,6 +1744,32 @@ async fn apply_lsu_to_storage_without_root_check(
         .unwrap_or(0);
     if lsu.cycle_number <= already {
         return Ok(false);
+    }
+
+    // CONSENSUS DETERMINISM (2026-08-06 root cause, see [[project-bal-divergence-root-cause]]
+    // memory): both current callers already read this node's applied state root and compare it to
+    // the incoming claim's prev_state_root *before* invoking this function -- but that read happens
+    // several `.await` points earlier (DFS proof-bundle fetch, finality verification), unlocked, and
+    // this function only acquires `lsu_apply_lock` once it actually runs. A concurrent apply
+    // (self-production, another gossip message, the background catch-up loop) completing in that
+    // window makes the caller's earlier check stale by the time this function mutates state -- the
+    // same class of TOCTOU race fixed on the *broadcast* side 2026-08-03 (commit `c5239fe`), just on
+    // the receive side instead. Re-verify atomically, under the lock, against the actual current
+    // root right before mutating: this is what actually closes the gap that let a node silently
+    // apply onto the wrong base and permanently orphan real intervening history (confirmed live,
+    // 2026-08-04: `asia` jumped from applied cycle 89290676 straight to 89290685 with no
+    // intermediate applies). Unlike the reverted cycle-number check, this does NOT reject legitimate
+    // wall-clock gaps -- a skipped empty slot's LSU still correctly chains onto the real current
+    // root, it just isn't cycle_number - 1's root numerically.
+    let current_root = store.get_state_root().unwrap_or([0u8; 32]);
+    if current_root != expected_prev {
+        anyhow::bail!(
+            "refusing apply for cycle {}: expected prev root {} does not match actual current root {} \
+             (stale caller-side check or genuine divergence -- would silently apply onto the wrong base)",
+            lsu.cycle_number,
+            hex_encode(&expected_prev),
+            hex_encode(&current_root)
+        );
     }
 
     let snap = format!("trusted_apply_verify_{}_{}", lsu.cycle_number, current_timestamp_ms());
@@ -1920,6 +1944,12 @@ async fn apply_lsu_to_storage_without_root_check(
         );
         catalyst_utils::increment_counter!("consensus_trusted_apply_root_mismatch_total", 1);
         let _ = store.load_snapshot(&snap).await;
+        // `load_snapshot` restores raw DB keys but does not refresh the cached root that
+        // `get_state_root()` reads (unlike `commit()`) -- without this, the cache would keep
+        // holding the just-rejected `recomputed` value, causing this function's own
+        // expected-prev check to spuriously fail on a legitimate subsequent call. Discovered
+        // while adding that check (2026-08-06); a real pre-existing gap, not new to this change.
+        let _ = store.refresh_cached_state_root().await;
         let _ = store.delete_snapshot(&snap).await;
         return Ok(false);
     }
@@ -6688,6 +6718,7 @@ impl CatalystNode {
                                                                             if apply_lsu_to_storage_without_root_check(
                                                                                 store.as_ref(),
                                                                                 &lsu,
+                                                                                ref_msg.prev_state_root,
                                                                                 bundle.new_state_root,
                                                                             )
                                                                             .await
@@ -7635,6 +7666,7 @@ impl CatalystNode {
                                                                     ok = apply_lsu_to_storage_without_root_check(
                                                                         store.as_ref(),
                                                                         &lsu,
+                                                                        info.prev_state_root,
                                                                         bundle.new_state_root,
                                                                     )
                                                                     .await
@@ -10582,7 +10614,7 @@ mod fork_choice_integration_tests {
         let pk0 = committee.keys[0].public_key().to_bytes();
 
         let lsu_c1 = lsu_with_tx_seed(&committee, 1, 5);
-        let _root_c1 = apply_lsu_to_storage(&env.store, &lsu_c1)
+        let root_c1 = apply_lsu_to_storage(&env.store, &lsu_c1)
             .await
             .expect("apply cycle 1");
         assert_eq!(get_balance_i64(&env.store, &pk0).await, 5);
@@ -10597,13 +10629,18 @@ mod fork_choice_integration_tests {
             .await
             .expect("compute true cycle 2 root");
         env.store.load_snapshot(scratch_snap).await.expect("restore");
+        // load_snapshot restores raw DB keys but does not refresh the cached root that
+        // get_state_root() reads -- real production restores (e.g.
+        // checkpoint::restore_reconcile_from_checkpoint) always follow with a cache refresh, so
+        // do the same here to accurately simulate what a real caller would see.
+        env.store.refresh_cached_state_root().await.expect("refresh cache");
         let _ = env.store.delete_snapshot(scratch_snap).await;
 
         // A deliberately wrong claimed root (flip the true root's first byte).
         let mut wrong_root = true_root_c2;
         wrong_root[0] ^= 0xFF;
 
-        let ok = apply_lsu_to_storage_without_root_check(&env.store, &lsu_c2, wrong_root)
+        let ok = apply_lsu_to_storage_without_root_check(&env.store, &lsu_c2, root_c1, wrong_root)
             .await
             .expect("no hard error, just a verified rejection");
         assert!(!ok, "mismatched claimed root must be rejected");
@@ -10619,7 +10656,7 @@ mod fork_choice_integration_tests {
         );
 
         // The correct claimed root is accepted and applied.
-        let ok = apply_lsu_to_storage_without_root_check(&env.store, &lsu_c2, true_root_c2)
+        let ok = apply_lsu_to_storage_without_root_check(&env.store, &lsu_c2, root_c1, true_root_c2)
             .await
             .expect("apply with correct root");
         assert!(ok, "correctly-claimed root must be accepted");
@@ -10666,7 +10703,7 @@ mod fork_choice_integration_tests {
         let pk0 = committee.keys[0].public_key().to_bytes();
 
         let lsu_c1 = lsu_with_tx_seed(&committee, 1, 5);
-        apply_lsu_to_storage(&env.store, &lsu_c1)
+        let root_c1 = apply_lsu_to_storage(&env.store, &lsu_c1)
             .await
             .expect("apply cycle 1");
 
@@ -10677,15 +10714,73 @@ mod fork_choice_integration_tests {
             .await
             .expect("compute the true root cycle 3 produces when chained directly onto cycle 1");
         env.store.load_snapshot(scratch_snap).await.expect("restore");
+        // load_snapshot restores raw DB keys but does not refresh the cached root that
+        // get_state_root() reads -- real production restores (e.g.
+        // checkpoint::restore_reconcile_from_checkpoint) always follow with a cache refresh, so
+        // do the same here to accurately simulate what a real caller would see.
+        env.store.refresh_cached_state_root().await.expect("refresh cache");
         let _ = env.store.delete_snapshot(scratch_snap).await;
         assert_eq!(local_applied_cycle(&env.store).await, 1);
 
-        let ok = apply_lsu_to_storage_without_root_check(&env.store, &lsu_c3, root_c3)
+        // Cycle 2 never happened (legitimate wall-clock gap) -- cycle 3 chains directly onto
+        // cycle 1's actual root, which is exactly what the atomic expected-prev check verifies.
+        let ok = apply_lsu_to_storage_without_root_check(&env.store, &lsu_c3, root_c1, root_c3)
             .await
             .expect("a legitimate wall-clock gap must be allowed");
         assert!(ok);
         assert_eq!(get_balance_i64(&env.store, &pk0).await, 5 + 11);
         assert_eq!(local_applied_cycle(&env.store).await, 3);
+    }
+
+    /// Regression test for the 2026-08-06 root cause: both callers of
+    /// `apply_lsu_to_storage_without_root_check` read this node's current root and compare it to
+    /// the incoming claim's `prev_state_root` *before* calling in -- several `.await` points
+    /// earlier (DFS fetch, finality verification), unlocked. If a concurrent apply (self-production,
+    /// another gossip message) advances the real applied head in that window, the caller's earlier
+    /// check is stale by the time this function actually mutates state -- it would silently apply
+    /// onto whatever the *current* state happens to be, using an `expected_prev` that no longer
+    /// describes it, permanently orphaning whatever the concurrent apply contributed (this is what
+    /// let `asia` jump from applied cycle 89290676 straight to 89290685 on 2026-08-04). The function
+    /// must re-verify atomically, under the lock, against the actual current root -- not just trust
+    /// the caller's `expected_prev` argument.
+    #[tokio::test]
+    async fn apply_lsu_to_storage_without_root_check_rejects_stale_expected_prev() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let pk0 = committee.keys[0].public_key().to_bytes();
+
+        let lsu_c1 = lsu_with_tx_seed(&committee, 1, 5);
+        let root_c1 = apply_lsu_to_storage(&env.store, &lsu_c1)
+            .await
+            .expect("apply cycle 1");
+
+        // Simulate a concurrent apply that raced ahead between the caller's prev-root read and this
+        // call: cycle 2 gets applied for real by someone else in between.
+        let lsu_c2 = lsu_with_tx_seed(&committee, 2, 7);
+        apply_lsu_to_storage(&env.store, &lsu_c2)
+            .await
+            .expect("concurrent apply of cycle 2");
+        assert_eq!(local_applied_cycle(&env.store).await, 2);
+
+        // The caller still believes cycle 1's root is current (its check ran before the race) and
+        // tries to apply cycle 3 directly onto it, skipping cycle 2's real, already-applied history.
+        let lsu_c3 = lsu_with_tx_seed(&committee, 3, 11);
+        let arbitrary_claimed_post_root = [9u8; 32];
+        let err = apply_lsu_to_storage_without_root_check(
+            &env.store,
+            &lsu_c3,
+            root_c1,
+            arbitrary_claimed_post_root,
+        )
+        .await
+        .expect_err("stale expected_prev must be rejected, not silently applied onto current state");
+        assert!(err.to_string().contains("does not match actual current root"), "unexpected error: {err}");
+        assert_eq!(
+            get_balance_i64(&env.store, &pk0).await,
+            5 + 7,
+            "rejected stale-prev apply must not skip the real cycle 2 history"
+        );
+        assert_eq!(local_applied_cycle(&env.store).await, 2);
     }
 
     /// `StorageManager::load_snapshot` restores by writing back the snapshot's captured keys —
@@ -10709,8 +10804,9 @@ mod fork_choice_integration_tests {
 
         let lsu_c1 = lsu_with_tx_seed(&committee, 1, 5);
         let bogus_root = [0xABu8; 32];
+        let genesis_root = env.store.get_state_root().unwrap_or([0u8; 32]);
 
-        let ok = apply_lsu_to_storage_without_root_check(&env.store, &lsu_c1, bogus_root)
+        let ok = apply_lsu_to_storage_without_root_check(&env.store, &lsu_c1, genesis_root, bogus_root)
             .await
             .expect("no hard error, just a verified rejection");
         assert!(!ok, "bogus claimed root must be rejected");
