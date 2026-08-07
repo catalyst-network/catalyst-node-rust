@@ -5186,6 +5186,17 @@ async fn try_reconcile_fork_from_quorum_lsu(
                     "reconcile failed ({e}) and snapshot restore failed ({e2})"
                 ));
             }
+            // Same gap as `apply_lsu_to_storage_without_root_check`'s revert path (see
+            // 2026-08-06, `5968afe`): `load_snapshot` restores raw DB keys but does not refresh
+            // the cached root that `get_state_root()` reads. `reconcile_inner` above may have
+            // called `apply_lsu_to_storage_locked` (which calls `commit()` and updates the
+            // cache) one or more times during replay before failing, so without this refresh the
+            // cache is left holding one of those now-discarded intermediate roots. Left unfixed
+            // here 2026-08-06 -- the missed sibling site behind the 2026-08-07 fleet-wide
+            // reconcile storm: `apply_lsu_to_storage_without_root_check`'s new atomic check
+            // trusts this same cache, so a stale value here made the very next trusted-path
+            // apply spuriously bail, cascading into repeated slow-path reconcile attempts.
+            let _ = store.refresh_cached_state_root().await;
             let _ = store.delete_snapshot(&snap).await;
             catalyst_utils::increment_counter!("consensus_fork_reconcile_aborted_total", 1);
             if record_reconcile_failure(local_cycle).await {
@@ -5260,6 +5271,16 @@ async fn apply_lsu_with_root_check_locked(
         .load_snapshot(&snap)
         .await
         .map_err(|e| anyhow::anyhow!("snapshot revert failed: {e}"))?;
+    // Same gap as `apply_lsu_to_storage_without_root_check`'s revert path (see 2026-08-06,
+    // `5968afe`): `load_snapshot` restores raw DB keys but does not refresh the cached root
+    // that `get_state_root()` reads. The `apply_lsu_to_storage_locked` call above already
+    // updated the cache (via its own `commit()`) to the just-rejected `got` value before this
+    // revert -- without this refresh, that wrong value stays cached. Left unfixed here
+    // 2026-08-06 -- the missed sibling site behind the 2026-08-07 fleet-wide reconcile storm:
+    // `apply_lsu_to_storage_without_root_check`'s new atomic check trusts this same cache, so a
+    // stale value here made the very next trusted-path apply spuriously bail, cascading into
+    // repeated slow-path reconcile attempts.
+    let _ = store.refresh_cached_state_root().await;
     let _ = store.delete_snapshot(&snap).await;
     Ok(false)
 }
@@ -9161,7 +9182,8 @@ mod storage_state_root_convergence_tests {
 #[cfg(test)]
 mod fork_choice_integration_tests {
     use super::{
-        apply_lsu_to_storage, apply_lsu_to_storage_without_root_check, ensure_chain_identity_and_genesis,
+        apply_lsu_to_storage, apply_lsu_to_storage_without_root_check, apply_lsu_with_root_check,
+        ensure_chain_identity_and_genesis,
         fork_choice_apply_gate, get_balance_i64, hex_encode, load_stored_certified_hash_at_cycle,
         local_applied_cycle, local_applied_lsu_hash, local_applied_state_root, lsu_apply_lock, meta_32,
         meta_string, persist_lsu_history, reconcile_failure_state_for_test, record_reconcile_failure,
@@ -10824,6 +10846,195 @@ mod fork_choice_integration_tests {
             env.store.get_metadata("consensus:lsu_hash:1").await.ok().flatten().is_none(),
             "rejected claim must not leave a stray consensus:lsu_hash:{{cycle}} record behind"
         );
+    }
+
+    /// Regression test for the 2026-08-07 fleet-wide reconcile storm: `5968afe` (2026-08-06)
+    /// fixed a stale-cache bug in `apply_lsu_to_storage_without_root_check`'s own revert path
+    /// (`load_snapshot` restores raw DB keys but never refreshes the in-memory cached root that
+    /// `get_state_root()` reads) but missed the identical gap in `apply_lsu_with_root_check_locked`'s
+    /// revert path. Once that same commit made `apply_lsu_to_storage_without_root_check` trust
+    /// `get_state_root()` as ground truth on every trusted-path apply, a single mismatched-root
+    /// rejection here left the cache poisoned, which then made the very next (fully legitimate)
+    /// trusted-path apply spuriously bail — observed live across all 4 testnet validators as a
+    /// self-sustaining, continuous reconcile-failure storm. Asserts that after a rejection here,
+    /// the cache reads back the correct (pre-attempt) root, and a subsequent legitimate call to
+    /// `apply_lsu_to_storage_without_root_check` succeeds rather than spuriously bailing.
+    #[tokio::test]
+    async fn verified_apply_revert_refreshes_cache_so_next_trusted_apply_does_not_spuriously_bail() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let pk0 = committee.keys[0].public_key().to_bytes();
+
+        let lsu_c1 = lsu_with_tx_seed(&committee, 1, 5);
+        let root_c1 = apply_lsu_to_storage(&env.store, &lsu_c1)
+            .await
+            .expect("apply cycle 1");
+        assert_eq!(env.store.get_state_root(), Some(root_c1));
+
+        // A deliberately wrong claimed root for cycle 2 forces apply_lsu_with_root_check_locked's
+        // internal recompute-and-compare to mismatch and revert.
+        let lsu_c2 = lsu_with_tx_seed(&committee, 2, 7);
+        let wrong_root_c2 = [0x42u8; 32];
+        let ok = apply_lsu_with_root_check(&env.store, &lsu_c2, wrong_root_c2)
+            .await
+            .expect("no hard error, just a verified rejection");
+        assert!(!ok, "mismatched claimed root must be rejected");
+        assert_eq!(
+            local_applied_cycle(&env.store).await,
+            1,
+            "rejected claim must not advance the applied head"
+        );
+
+        // The cache must read back the true pre-attempt root, not the just-rejected candidate's.
+        assert_eq!(
+            env.store.get_state_root(),
+            Some(root_c1),
+            "revert must refresh the cached state root, not leave the rejected candidate's root cached"
+        );
+
+        // A subsequent, entirely legitimate trusted-path apply for cycle 2 must succeed -- before
+        // the fix, this would spuriously bail with "expected prev root ... does not match actual
+        // current root" because the cache still held wrong_root_c2 (or the intermediate root
+        // apply_lsu_to_storage_locked computed before the mismatch was detected) instead of root_c1.
+        let scratch_snap = "scratch_true_root_c2_cache_test";
+        env.store.create_snapshot(scratch_snap).await.expect("snap");
+        let true_root_c2 = apply_lsu_to_storage(&env.store, &lsu_c2)
+            .await
+            .expect("compute true cycle 2 root");
+        env.store.load_snapshot(scratch_snap).await.expect("restore");
+        env.store.refresh_cached_state_root().await.expect("refresh cache");
+        let _ = env.store.delete_snapshot(scratch_snap).await;
+
+        let ok = apply_lsu_to_storage_without_root_check(&env.store, &lsu_c2, root_c1, true_root_c2)
+            .await
+            .expect("legitimate apply must not spuriously bail due to a stale cache");
+        assert!(ok, "legitimate trusted-path apply must succeed once the cache correctly reflects root_c1");
+        assert_eq!(get_balance_i64(&env.store, &pk0).await, 5 + 7);
+        assert_eq!(local_applied_cycle(&env.store).await, 2);
+    }
+
+    /// Same bug, same fix, for the sibling revert site in `try_reconcile_fork_from_quorum_lsu`'s
+    /// abort path (see `verified_apply_revert_refreshes_cache_so_next_trusted_apply_does_not_spuriously_bail`
+    /// for the full mechanism), but for the forward-replay ("Case A: behind") branch, which is
+    /// what actually dirties the cache in production: reconcile's replay loop calls
+    /// `apply_lsu_to_storage_locked` (which `commit()`s and updates the cache) for each stored
+    /// intermediate cycle *before* the final post-replay root check can fail. This reproduces the
+    /// live 2026-08-07 incident shape exactly: `eu` replayed 30 stored cycles forward
+    /// (89304065..89304095), then failed the final check against a peer's bad claim for cycle
+    /// 89304095 -- see `project_bal_divergence...` memory. A same-cycle "already applied, rebuild
+    /// from scratch" scenario (Case B) does not exercise this: with no replay iterations run
+    /// before the failure, the cache is never dirtied, so that shape does not actually prove this
+    /// fix does anything (confirmed by hand: it still passed with the fix reverted).
+    #[tokio::test]
+    async fn reconcile_abort_after_partial_replay_refreshes_cache_so_next_trusted_apply_does_not_spuriously_bail(
+    ) {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+        let pk0 = committee.keys[0].public_key().to_bytes();
+
+        // Use a distinctive, unlikely-to-collide base cycle: the reconcile-failure tracker this
+        // test exercises is keyed on a bare u64 in a process-global static, and cargo runs tests
+        // in the same process concurrently -- a small number like 1 collides with
+        // `reconcile_circuit_breaker_trips_after_threshold_and_skips_further_attempts`, which
+        // also forces a failure at local_cycle=1 (same flake pattern documented on
+        // `reconcile_circuit_breaker_trips_on_unbridgeable_gap_despite_increasing_target_cycle`).
+        const BASE: u64 = 900_901;
+
+        let lsu_base = lsu_with_tx_seed(&committee, BASE, 5);
+        let root_base = apply_lsu_to_storage(&env.store, &lsu_base)
+            .await
+            .expect("apply base cycle");
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            BASE,
+            &lsu_base.serialize().expect("ser"),
+            &hash_data(&lsu_base).expect("h base"),
+            "",
+            &root_base,
+            "",
+            false,
+        )
+        .await;
+        assert_eq!(env.store.get_state_root(), Some(root_base));
+
+        // BASE+1's LSU is already known/stored locally (e.g. from earlier gossip) but not yet
+        // applied as our own head -- we are one cycle behind, the common case reconcile's
+        // forward-replay branch handles.
+        let lsu_mid = lsu_with_tx_seed(&committee, BASE + 1, 7);
+        let hash_mid = hash_data(&lsu_mid).expect("h mid");
+        let scratch_snap = "scratch_root_mid_reconcile_abort_test";
+        env.store.create_snapshot(scratch_snap).await.expect("snap");
+        let root_mid = apply_lsu_to_storage(&env.store, &lsu_mid)
+            .await
+            .expect("compute mid root");
+        env.store.load_snapshot(scratch_snap).await.expect("restore");
+        env.store.refresh_cached_state_root().await.expect("refresh cache");
+        let _ = env.store.delete_snapshot(scratch_snap).await;
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            BASE + 1,
+            &lsu_mid.serialize().expect("ser"),
+            &hash_mid,
+            "",
+            &root_mid,
+            "",
+            false,
+        )
+        .await;
+        assert_eq!(
+            local_applied_cycle(&env.store).await,
+            BASE,
+            "sanity: still one cycle behind after the scratch restore"
+        );
+
+        // Reconcile target is BASE+2, with a deliberately wrong expected_prev that can never
+        // match root_mid -- guaranteed to fail reconcile's post-replay prev-root check only
+        // *after* the loop above has replayed (and committed) lsu_mid for real.
+        let lsu_target = lsu_with_tx_seed(&committee, BASE + 2, 11);
+        let hash_target = hash_data(&lsu_target).expect("h target");
+        let cid_target = install_finality_cert(&env, &lsu_target, &committee).await;
+
+        let reconciled = try_reconcile_fork_from_quorum_lsu(
+            &env.store,
+            &lsu_target,
+            BASE + 2,
+            [0xEEu8; 32],
+            [0u8; 32],
+            &hash_target,
+            None,
+            Some(&env.dfs),
+            &cid_target,
+            true,
+        )
+        .await
+        .expect("reconcile must fail cleanly, not hard-error");
+        assert!(!reconciled, "deliberately-wrong expected_prev must never succeed");
+        assert_eq!(
+            local_applied_cycle(&env.store).await,
+            BASE,
+            "failed reconcile must not advance the applied head"
+        );
+
+        // The cache must read back root_base, not root_mid -- the value the replay loop's
+        // intermediate `apply_lsu_to_storage_locked(lsu_mid)` call committed to the cache right
+        // before the final check failed and the DB content was reverted underneath it.
+        assert_eq!(
+            env.store.get_state_root(),
+            Some(root_base),
+            "reconcile abort after a partial replay must refresh the cached state root, not leave root_mid cached"
+        );
+
+        // A subsequent, entirely legitimate trusted-path apply of lsu_mid must succeed -- before
+        // the fix, this would spuriously bail with "expected prev root ... does not match actual
+        // current root" because the cache still held root_mid instead of root_base.
+        let ok = apply_lsu_to_storage_without_root_check(&env.store, &lsu_mid, root_base, root_mid)
+            .await
+            .expect("legitimate apply must not spuriously bail due to a stale cache");
+        assert!(ok, "legitimate trusted-path apply must succeed once the cache correctly reflects root_base");
+        assert_eq!(get_balance_i64(&env.store, &pk0).await, 5 + 7);
+        assert_eq!(local_applied_cycle(&env.store).await, BASE + 1);
     }
 
     /// ADR 0002 apply-path gate (`verify_state_root_finality_for_apply`): when
