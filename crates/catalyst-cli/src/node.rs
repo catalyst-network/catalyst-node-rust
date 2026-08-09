@@ -4140,6 +4140,75 @@ async fn verify_state_root_finality_for_apply(
     true
 }
 
+/// Build the `LsuCidGossip` refs to answer an `LsuRangeRequest` for `[start_cycle, start_cycle + count)`.
+///
+/// Cycles with no recorded history are legitimate wall-clock skips (`TX_BATCH_MISS_FATAL` /
+/// empty-slot -- see `apply_lsu_to_storage_locked`'s doc comment), not corruption, and are simply
+/// omitted from the result rather than aborting the whole response. Fixed 2026-08-09: a prior
+/// version `break`-ed the scan on the very first missing cycle, which meant a response was silent
+/// (zero refs sent) whenever the requester's first-needed cycle happened to be a skipped one --
+/// stranding a catching-up node forever, re-requesting the same unbridgeable `start_cycle` and
+/// getting silence back every time. Observed live across two separate fleet resets, each of which
+/// stranded one cohort validator this way (`asia`, then `us`), both stuck at their post-reset
+/// applied head with `stale_observed_head`'s `max_forgivable_gap` correctly refusing to paper over
+/// a gap this fetch pipeline should have bridged itself.
+///
+/// Also computes each ref's `prev_state_root` correctly across a skip: a blind `cycle - 1` lookup
+/// would silently default to all-zero (via `unwrap_or`) whenever the immediately preceding cycle
+/// was itself skipped, handing the requester a false "this chains from genesis" claim. Walks
+/// backward (bounded to 256 cycles, matching the forward scan's own cap) from `start_cycle - 1` to
+/// find the real prior root, then keeps it in sync with each found cycle's own `state_root` as the
+/// scan advances so later refs in the same batch chain correctly without repeating the walk.
+async fn build_lsu_range_refs(store: &StorageManager, start_cycle: u64, count: u32) -> Vec<LsuCidGossip> {
+    let max = count.min(256) as u64;
+    let mut refs: Vec<LsuCidGossip> = Vec::new();
+    let mut carry_prev_root = [0u8; 32];
+    if start_cycle > 0 {
+        let mut probe = start_cycle - 1;
+        for _ in 0..256 {
+            if let Some(root) = meta_32(store, &format!("consensus:lsu_state_root:{}", probe)).await {
+                carry_prev_root = root;
+                break;
+            }
+            if probe == 0 {
+                break;
+            }
+            probe -= 1;
+        }
+    }
+    for i in 0..max {
+        let cycle = start_cycle.saturating_add(i);
+        let Some(cid) = meta_string(store, &format!("consensus:lsu_cid:{}", cycle)).await else {
+            continue;
+        };
+        let Some(lsu_hash) = meta_32(store, &format!("consensus:lsu_hash:{}", cycle)).await else {
+            continue;
+        };
+        let Some(state_root) = meta_32(store, &format!("consensus:lsu_state_root:{}", cycle)).await else {
+            continue;
+        };
+        let prev_state_root = if cycle == 0 { [0u8; 32] } else { carry_prev_root };
+        let finality_cid = meta_string(store, &format!("consensus:lsu_finality_cid:{}", cycle))
+            .await
+            .unwrap_or_default();
+        let state_root_cid = meta_string(store, &format!("consensus:lsu_state_root_cid:{}", cycle))
+            .await
+            .unwrap_or_default();
+        refs.push(LsuCidGossip {
+            cycle,
+            lsu_hash,
+            cid,
+            prev_state_root,
+            state_root,
+            proof_cid: String::new(),
+            finality_cid,
+            state_root_cid,
+        });
+        carry_prev_root = state_root;
+    }
+    refs
+}
+
 /// Apply stored `consensus:lsu:{cycle}` when `cycle == local_applied + 1` (sequential follower catch-up).
 ///
 /// Holds `lsu_apply_lock` across its whole read-decide-apply sequence (not just the final write) so
@@ -7294,49 +7363,7 @@ impl CatalystNode {
                                 let Some(store) = &storage else {
                                     continue;
                                 };
-                                let max = req.count.min(256) as u64;
-                                let mut refs: Vec<LsuCidGossip> = Vec::new();
-                                for i in 0..max {
-                                    let cycle = req.start_cycle.saturating_add(i);
-                                    let Some(cid) = meta_string(store.as_ref(), &format!("consensus:lsu_cid:{}", cycle)).await else {
-                                        break;
-                                    };
-                                    let Some(lsu_hash) = meta_32(store.as_ref(), &format!("consensus:lsu_hash:{}", cycle)).await else {
-                                        break;
-                                    };
-                                    let Some(state_root) = meta_32(store.as_ref(), &format!("consensus:lsu_state_root:{}", cycle)).await else {
-                                        break;
-                                    };
-                                    let prev_state_root = if cycle == 0 {
-                                        [0u8; 32]
-                                    } else {
-                                        meta_32(store.as_ref(), &format!("consensus:lsu_state_root:{}", cycle.saturating_sub(1)))
-                                            .await
-                                            .unwrap_or([0u8; 32])
-                                    };
-                                    let finality_cid = meta_string(
-                                        store.as_ref(),
-                                        &format!("consensus:lsu_finality_cid:{}", cycle),
-                                    )
-                                    .await
-                                    .unwrap_or_default();
-                                    let state_root_cid = meta_string(
-                                        store.as_ref(),
-                                        &format!("consensus:lsu_state_root_cid:{}", cycle),
-                                    )
-                                    .await
-                                    .unwrap_or_default();
-                                    refs.push(LsuCidGossip {
-                                        cycle,
-                                        lsu_hash,
-                                        cid,
-                                        prev_state_root,
-                                        state_root,
-                                        proof_cid: String::new(),
-                                        finality_cid,
-                                        state_root_cid,
-                                    });
-                                }
+                                let refs = build_lsu_range_refs(store.as_ref(), req.start_cycle, req.count).await;
                                 if refs.is_empty() {
                                     continue;
                                 }
@@ -9183,7 +9210,7 @@ mod storage_state_root_convergence_tests {
 mod fork_choice_integration_tests {
     use super::{
         apply_lsu_to_storage, apply_lsu_to_storage_without_root_check, apply_lsu_with_root_check,
-        ensure_chain_identity_and_genesis,
+        build_lsu_range_refs, ensure_chain_identity_and_genesis,
         fork_choice_apply_gate, get_balance_i64, hex_encode, load_stored_certified_hash_at_cycle,
         local_applied_cycle, local_applied_lsu_hash, local_applied_state_root, lsu_apply_lock, meta_32,
         meta_string, persist_lsu_history, reconcile_failure_state_for_test, record_reconcile_failure,
@@ -11035,6 +11062,98 @@ mod fork_choice_integration_tests {
         assert!(ok, "legitimate trusted-path apply must succeed once the cache correctly reflects root_base");
         assert_eq!(get_balance_i64(&env.store, &pk0).await, 5 + 7);
         assert_eq!(local_applied_cycle(&env.store).await, BASE + 1);
+    }
+
+    /// Regression test for the 2026-08-08/09 stranded-catch-up incident: `build_lsu_range_refs`
+    /// (the `LsuRangeRequest` responder logic) must skip over a legitimately-missing cycle (a
+    /// wall-clock skip, e.g. `TX_BATCH_MISS_FATAL`) rather than aborting the whole response there,
+    /// and must resolve `prev_state_root` from the last cycle that actually has recorded history,
+    /// not blindly default to all-zero when the immediately preceding cycle is the gap. Live
+    /// impact: two separate fleet resets each stranded one cohort validator (`asia`, then `us`)
+    /// exactly at a post-reset bootstrap skip, because the old `break`-on-first-miss behavior sent
+    /// back zero refs whenever the requester's first-needed cycle was the skipped one -- the
+    /// requester re-requested the same unbridgeable `start_cycle` forever and got silence back
+    /// every time, with `stale_observed_head`'s `max_forgivable_gap` correctly refusing to
+    /// silently paper over the growing gap instead.
+    #[tokio::test]
+    async fn lsu_range_refs_skip_gap_and_resolve_correct_prev_root() {
+        let env = test_env().await;
+        let committee = TestCommittee::three();
+
+        let lsu_c1 = lsu_with_tx_seed(&committee, 1, 5);
+        let root_c1 = apply_lsu_to_storage(&env.store, &lsu_c1).await.expect("apply cycle 1");
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            1,
+            &lsu_c1.serialize().expect("ser"),
+            &hash_data(&lsu_c1).expect("h1"),
+            "cid1",
+            &root_c1,
+            "",
+            false,
+        )
+        .await;
+
+        let lsu_c2 = lsu_with_tx_seed(&committee, 2, 7);
+        let root_c2 = apply_lsu_to_storage(&env.store, &lsu_c2).await.expect("apply cycle 2");
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            2,
+            &lsu_c2.serialize().expect("ser"),
+            &hash_data(&lsu_c2).expect("h2"),
+            "cid2",
+            &root_c2,
+            "",
+            false,
+        )
+        .await;
+
+        // Cycle 3 is a legitimate wall-clock skip: no LSU was ever produced or recorded for it.
+
+        let lsu_c4 = lsu_with_tx_seed(&committee, 4, 11);
+        let root_c4 = apply_lsu_to_storage(&env.store, &lsu_c4)
+            .await
+            .expect("apply cycle 4 directly onto cycle 2's state (legitimate gap)");
+        persist_lsu_history(
+            &env.store,
+            Some(&env.dfs),
+            4,
+            &lsu_c4.serialize().expect("ser"),
+            &hash_data(&lsu_c4).expect("h4"),
+            "cid4",
+            &root_c4,
+            "",
+            false,
+        )
+        .await;
+
+        // A range request spanning the gap must return refs for the real cycles (1, 2, 4),
+        // skipping the missing 3 rather than stopping there.
+        let refs = build_lsu_range_refs(&env.store, 1, 10).await;
+        let cycles: Vec<u64> = refs.iter().map(|r| r.cycle).collect();
+        assert_eq!(cycles, vec![1, 2, 4], "must skip the gap at cycle 3, not abort there");
+
+        let ref4 = refs.iter().find(|r| r.cycle == 4).expect("ref for cycle 4 present");
+        assert_eq!(
+            ref4.prev_state_root, root_c2,
+            "cycle 4's prev_state_root must chain from cycle 2's real root, not default to zero across the cycle-3 gap"
+        );
+
+        // The exact live-incident shape: a requester stuck AT the skipped cycle (its first-needed
+        // cycle is the gap itself) must still get cycle 4's data back, not silence.
+        let refs_from_gap = build_lsu_range_refs(&env.store, 3, 10).await;
+        let cycles_from_gap: Vec<u64> = refs_from_gap.iter().map(|r| r.cycle).collect();
+        assert_eq!(
+            cycles_from_gap,
+            vec![4],
+            "requesting starting at the skipped cycle must still return later real cycles, not silence"
+        );
+        assert_eq!(
+            refs_from_gap[0].prev_state_root, root_c2,
+            "must still resolve the correct prev root when start_cycle itself is the gap"
+        );
     }
 
     /// ADR 0002 apply-path gate (`verify_state_root_finality_for_apply`): when
