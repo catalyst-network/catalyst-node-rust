@@ -3450,9 +3450,32 @@ async fn rehydrate_mempool_from_storage(store: &StorageManager, mempool: &tokio:
     }
 }
 
+/// Pure decision: should `rebroadcast_persisted_mempool` skip re-sending `txid` right now
+/// because it was already broadcast within `min_interval_ms`? Separated out from the async,
+/// I/O-heavy function below so the throttling logic is directly unit-testable without needing
+/// a live `P2pService`/storage, mirroring `should_defer_production_when_behind` elsewhere in
+/// this file.
+fn should_skip_mempool_rebroadcast(
+    last_broadcast: &std::collections::HashMap<[u8; 32], u64>,
+    txid: &[u8; 32],
+    now_ms: u64,
+    min_interval_ms: u64,
+) -> bool {
+    match last_broadcast.get(txid) {
+        Some(&last) => now_ms.saturating_sub(last) < min_interval_ms,
+        None => false,
+    }
+}
+
+/// `last_broadcast` tracks, per txid, the wall-clock ms this function last actually broadcast
+/// it -- callers own this map across repeated ticks (see the call site) so it persists between
+/// calls. See `consensus_limits::mempool_rebroadcast_min_interval_ms` for why this exists: an
+/// earlier version re-published every pending tx unconditionally on every 20s tick, flooding
+/// the shared gossipsub send queue and silently crowding out consensus-critical traffic.
 async fn rebroadcast_persisted_mempool(
     store: &StorageManager,
     network: &P2pService,
+    last_broadcast: &mut std::collections::HashMap<[u8; 32], u64>,
 ) {
     // Broadcast in deterministic txid order.
     let mut ids = load_mempool_txids(store).await;
@@ -3461,8 +3484,17 @@ async fn rebroadcast_persisted_mempool(
 
     let now_ms = current_timestamp_ms();
     let now_secs = now_ms / 1000;
+    let min_interval_ms = crate::consensus_limits::mempool_rebroadcast_min_interval_ms();
+
+    // Prune tracking entries for txids no longer pending (evicted/committed elsewhere) so this
+    // map stays bounded by current mempool size rather than growing across the process lifetime.
+    let id_set: std::collections::HashSet<[u8; 32]> = ids.iter().copied().collect();
+    last_broadcast.retain(|txid, _| id_set.contains(txid));
 
     for txid in ids {
+        if should_skip_mempool_rebroadcast(last_broadcast, &txid, now_ms, min_interval_ms) {
+            continue;
+        }
         let key = mempool_tx_key(&txid);
         let Some(bytes) = store.get_metadata(&key).await.ok().flatten() else {
             continue;
@@ -3486,6 +3518,7 @@ async fn rebroadcast_persisted_mempool(
         if let Ok(msg) = ProtocolTxGossip::new(tx, now_ms) {
             if let Ok(env) = MessageEnvelope::from_message(&msg, "rebroadcast".to_string(), None) {
                 let _ = network.broadcast_envelope(&env).await;
+                last_broadcast.insert(txid, now_ms);
             }
         }
     }
@@ -5902,11 +5935,12 @@ impl CatalystNode {
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 // initial burst shortly after startup
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let mut last_broadcast: std::collections::HashMap<[u8; 32], u64> = std::collections::HashMap::new();
                 loop {
                     if *shutdown_rx2.borrow() {
                         break;
                     }
-                    rebroadcast_persisted_mempool(store.as_ref(), net.as_ref()).await;
+                    rebroadcast_persisted_mempool(store.as_ref(), net.as_ref(), &mut last_broadcast).await;
                     tokio::select! {
                         _ = tick.tick() => {}
                         _ = shutdown_rx2.changed() => {}
@@ -8897,6 +8931,40 @@ mod bft_quorum_tests {
             vec!["a".into(), "b".into(), "x".into()]
         )));
         assert!(!lsu_has_bft_vote_quorum(&empty_lsu(1, p, vec!["a".into(), "a".into(), "a".into()])));
+    }
+
+    /// Regression test for the mempool-rebroadcast gossip-queue-flooding fix (2026-08): a prior
+    /// version re-published every pending tx unconditionally on every 20s tick, flooding the
+    /// shared per-peer gossipsub send queue and silently dropping consensus-critical traffic
+    /// (state-root attestations) alongside it. Throttling must skip a txid broadcast recently,
+    /// but still allow it once the minimum interval has elapsed, and must never block a txid
+    /// that was never broadcast before (fresh tx must go out immediately, not be starved).
+    #[test]
+    fn mempool_rebroadcast_throttle_skips_recent_and_allows_after_interval() {
+        use super::should_skip_mempool_rebroadcast;
+        use std::collections::HashMap;
+
+        let txid_a = [1u8; 32];
+        let txid_b = [2u8; 32];
+        let min_interval_ms = 60_000u64;
+
+        let mut last_broadcast: HashMap<[u8; 32], u64> = HashMap::new();
+
+        // Never broadcast before: must not be skipped (fresh tx goes out immediately).
+        assert!(!should_skip_mempool_rebroadcast(&last_broadcast, &txid_a, 1_000_000, min_interval_ms));
+
+        last_broadcast.insert(txid_a, 1_000_000);
+
+        // Just broadcast: must be skipped well within the interval.
+        assert!(should_skip_mempool_rebroadcast(&last_broadcast, &txid_a, 1_000_000, min_interval_ms));
+        assert!(should_skip_mempool_rebroadcast(&last_broadcast, &txid_a, 1_000_000 + 59_999, min_interval_ms));
+        // Exactly at the boundary: interval has elapsed, must allow.
+        assert!(!should_skip_mempool_rebroadcast(&last_broadcast, &txid_a, 1_000_000 + 60_000, min_interval_ms));
+        // Well past the interval: must allow.
+        assert!(!should_skip_mempool_rebroadcast(&last_broadcast, &txid_a, 1_000_000 + 120_000, min_interval_ms));
+
+        // A different, never-broadcast txid must never be throttled by another txid's history.
+        assert!(!should_skip_mempool_rebroadcast(&last_broadcast, &txid_b, 1_000_000, min_interval_ms));
     }
 }
 

@@ -315,6 +315,26 @@ pub fn reconcile_circuit_break_window_ms() -> u64 {
         .unwrap_or(DEFAULT)
 }
 
+/// Minimum interval (ms) between rebroadcasting the same pending mempool tx from
+/// `rebroadcast_persisted_mempool` (`CATALYST_MEMPOOL_REBROADCAST_MIN_MS`, default `60_000`,
+/// max `3_600_000`).
+///
+/// The rebroadcast ticker runs every 20s and previously re-published every pending tx
+/// unconditionally on every tick regardless of whether peers already had it -- on a busy
+/// mempool this flooded the shared per-peer gossipsub send queue with redundant traffic,
+/// competing with (and silently crowding out, via queue-full drops) latency-critical
+/// consensus messages like state-root attestations. This bounds how often the *same* tx gets
+/// re-sent while still guaranteeing it gets re-announced periodically in case a peer missed it.
+pub fn mempool_rebroadcast_min_interval_ms() -> u64 {
+    const MAX: u64 = 3_600_000;
+    const DEFAULT: u64 = 60_000;
+    std::env::var("CATALYST_MEMPOOL_REBROADCAST_MIN_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0 && v <= MAX)
+        .unwrap_or(DEFAULT)
+}
+
 /// On-disk / metadata encoding for `consensus:tx_batch_commit:{cycle}` (36 bytes).
 pub fn parse_tx_batch_commit_value(bytes: &[u8]) -> Option<([u8; 32], u32)> {
     if bytes.len() != 36 {

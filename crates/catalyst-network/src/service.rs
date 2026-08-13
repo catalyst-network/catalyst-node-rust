@@ -172,9 +172,20 @@ impl NetworkService {
             .boxed();
 
         // Gossipsub
+        //
+        // `connection_handler_queue_len` set explicitly (2x the libp2p default of 5000): live
+        // production logs showed ~40-50% of cycles never getting a state-root certificate
+        // published, traced to "Send Queue full" drops -- every message type (tx relay, LSU CID
+        // gossip, state-root attestations, range requests) shares one topic and one per-peer
+        // queue with no priority separation, so latency-critical consensus attestations were
+        // silently dropped alongside routine tx rebroadcast spam. This buys headroom while the
+        // rebroadcast volume itself is also being reduced (see `rebroadcast_persisted_mempool`
+        // in catalyst-cli); raising it further without evidence would just trade drops for
+        // unbounded queue growth instead of fixing the underlying contention.
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .validation_mode(gossipsub::ValidationMode::Permissive)
             .heartbeat_interval(config.gossip.heartbeat_interval)
+            .connection_handler_queue_len(10_000)
             .build()
             .map_err(|e| NetworkError::ConfigError(e.to_string()))?;
 
