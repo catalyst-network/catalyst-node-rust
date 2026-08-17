@@ -94,6 +94,14 @@ struct Behaviour {
     mdns: mdns::tokio::Behaviour,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
+    // Caps concurrent established connections per peer at 1 (regardless of direction). Without
+    // this, nothing in the swarm dedupes redial attempts against an already-connected peer, and
+    // ordinary reconnect churn (dial retries racing an in-flight connection, ping-timeout
+    // disconnects, etc.) silently stacks additional live connections instead of replacing the
+    // existing one -- observed live 2026-08-17 as 30-50k duplicate connections per peer pair
+    // accumulated over ~4 days, exhausting host memory/CPU and starving the gossipsub send
+    // queues this crate otherwise depends on for consensus-critical traffic.
+    connection_limits: libp2p::connection_limits::Behaviour,
 }
 
 #[derive(Debug)]
@@ -102,6 +110,7 @@ enum BehaviourEvent {
     Mdns(mdns::Event),
     Identify(identify::Event),
     Ping(ping::Event),
+    ConnectionLimits(std::convert::Infallible),
 }
 
 impl From<gossipsub::Event> for BehaviourEvent {
@@ -122,6 +131,11 @@ impl From<identify::Event> for BehaviourEvent {
 impl From<ping::Event> for BehaviourEvent {
     fn from(e: ping::Event) -> Self {
         BehaviourEvent::Ping(e)
+    }
+}
+impl From<std::convert::Infallible> for BehaviourEvent {
+    fn from(e: std::convert::Infallible) -> Self {
+        BehaviourEvent::ConnectionLimits(e)
     }
 }
 
@@ -211,11 +225,20 @@ impl NetworkService {
         ));
         let ping = ping::Behaviour::new(ping::Config::new());
 
+        // See the doc comment on `Behaviour::connection_limits` for why this exists: caps
+        // established connections per peer at 1 so reconnect churn can't silently accumulate
+        // duplicate connections.
+        let connection_limits = libp2p::connection_limits::Behaviour::new(
+            libp2p::connection_limits::ConnectionLimits::default()
+                .with_max_established_per_peer(Some(1)),
+        );
+
         let behaviour = Behaviour {
             gossipsub,
             mdns,
             identify,
             ping,
+            connection_limits,
         };
 
         let mut swarm = Swarm::new(
@@ -293,6 +316,14 @@ impl NetworkService {
                             if incompatible.contains(pid) {
                                 continue;
                             }
+                            // Already connected: skip. The connection_limits behaviour would
+                            // reject a redundant dial anyway, but checking here avoids wasting a
+                            // handshake attempt and resetting this peer's dial_backoff for no
+                            // reason (see ConnectionEstablished handler below).
+                            if swarm.is_connected(pid) {
+                                dial_backoff.remove(pid);
+                                continue;
+                            }
                             if let Some(st) = dial_backoff.get(pid) {
                                 if !st.can_attempt(now) {
                                     continue;
@@ -323,7 +354,9 @@ impl NetworkService {
                                     for (peer_id, addr) in list {
                                         // Discovery hint: dial and (optionally) add as explicit gossip peer.
                                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                                        let _ = swarm.dial(addr.clone());
+                                        if !swarm.is_connected(&peer_id) {
+                                            let _ = swarm.dial(addr.clone());
+                                        }
                                         let _ = emit(&event_tx, NetworkEvent::PeerConnected { peer_id, address: addr }).await;
                                     }
                                 }
