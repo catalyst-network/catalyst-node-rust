@@ -35,6 +35,13 @@ thiserror = "1.0"
 # Logging
 log = "0.4"
 env_logger = "0.10"
+# `catalyst_utils::logging::log_info!`/`log_warn!` route through a global CatalystLogger that
+# catalyst-cli never initializes (no `init_logger` call anywhere), so those macros are silent
+# no-ops in production -- confirmed live 2026-08-18 investigating a gossip-mesh stall, where even
+# pre-existing `log_warn!` calls in service.rs (e.g. "libp2p listening on ...") never reached
+# journald. `tracing` is what catalyst-cli's `init_logging` actually wires up process-wide, and any
+# crate calling `tracing::info!` directly gets captured regardless of which crate emits it.
+tracing = "0.1"
 
 # Metrics (optional)
 prometheus = { version = "0.14", optional = true }

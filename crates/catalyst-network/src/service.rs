@@ -322,8 +322,7 @@ impl NetworkService {
                         let all: Vec<(PeerId, usize)> = swarm.behaviour().gossipsub.all_peers()
                             .map(|(pid, topics)| (*pid, topics.len()))
                             .collect();
-                        log_info!(
-                            LogCategory::Network,
+                        tracing::info!(
                             "[gossip-mesh-diag] conns={:?} explicit={:?} mesh={:?} all_peers(topic_subs)={:?}",
                             conns, explicit_peers_diag, mesh, all
                         );
@@ -460,8 +459,7 @@ impl NetworkService {
                                     count
                                 };
                                 // TEMPORARY DIAGNOSTIC
-                                log_info!(
-                                    LogCategory::Network,
+                                tracing::info!(
                                     "[gossip-mesh-diag] ConnectionEstablished peer={} connection_id={:?} endpoint={:?} resulting_conn_count={}",
                                     peer_id, connection_id, endpoint, resulting_count
                                 );
@@ -491,8 +489,7 @@ impl NetworkService {
                                 // TEMPORARY DIAGNOSTIC: if resulting_conn_count > 0 here, we just
                                 // stripped explicit-peer status from a peer that's still connected
                                 // via another connection -- the suspected bug.
-                                log_info!(
-                                    LogCategory::Network,
+                                tracing::info!(
                                     "[gossip-mesh-diag] ConnectionClosed peer={} connection_id={:?} cause={:?} resulting_conn_count={}",
                                     peer_id, connection_id, cause, resulting_count
                                 );
@@ -505,15 +502,13 @@ impl NetworkService {
                             // duplicate/racing dial -- expected under max_established_per_peer(1)
                             // when both sides of a peer pair dial each other near-simultaneously.
                             SwarmEvent::OutgoingConnectionError { connection_id, peer_id, error } => {
-                                log_info!(
-                                    LogCategory::Network,
+                                tracing::info!(
                                     "[gossip-mesh-diag] OutgoingConnectionError connection_id={:?} peer={:?} error={:?}",
                                     connection_id, peer_id, error
                                 );
                             }
                             SwarmEvent::IncomingConnectionError { connection_id, peer_id, error, .. } => {
-                                log_info!(
-                                    LogCategory::Network,
+                                tracing::info!(
                                     "[gossip-mesh-diag] IncomingConnectionError connection_id={:?} peer={:?} error={:?}",
                                     connection_id, peer_id, error
                                 );
