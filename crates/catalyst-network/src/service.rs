@@ -301,11 +301,33 @@ impl NetworkService {
         let mut dial_backoff: HashMap<PeerId, DialBackoff> = HashMap::new();
         let mut incompatible: HashSet<PeerId> = HashSet::new();
 
+        // TEMPORARY DIAGNOSTIC (2026-08-18, gossip-mesh-stall investigation): mirrors exactly the
+        // peer_ids we've called gossipsub.add_explicit_peer/remove_explicit_peer with, since the
+        // gossipsub crate doesn't expose a public getter for its internal explicit_peers set.
+        // Logged alongside real mesh state (all_mesh_peers/all_peers) and every connection event
+        // to check whether a peer can go connected-but-not-explicit/not-meshed without any
+        // connection-layer signal of it. Remove once the stall is root-caused.
+        let mut explicit_peers_diag: HashSet<PeerId> = HashSet::new();
+        let mut mesh_diag_tick = tokio::time::interval(Duration::from_secs(15));
+        mesh_diag_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         let handle = tokio::spawn(async move {
             let start = Instant::now();
             let mut budgets: HashMap<PeerId, PeerBudget> = HashMap::new();
             loop {
                 tokio::select! {
+                    _ = mesh_diag_tick.tick() => {
+                        let conns = peer_conns.read().await.clone();
+                        let mesh: Vec<PeerId> = swarm.behaviour().gossipsub.all_mesh_peers().copied().collect();
+                        let all: Vec<(PeerId, usize)> = swarm.behaviour().gossipsub.all_peers()
+                            .map(|(pid, topics)| (*pid, topics.len()))
+                            .collect();
+                        log_info!(
+                            LogCategory::Network,
+                            "[gossip-mesh-diag] conns={:?} explicit={:?} mesh={:?} all_peers(topic_subs)={:?}",
+                            conns, explicit_peers_diag, mesh, all
+                        );
+                    }
                     _ = bootstrap_tick.tick() => {
                         let connected = peer_conns.read().await.len();
                         if connected >= min_peers {
@@ -424,36 +446,77 @@ impl NetworkService {
                                     }
                                 }
                             }
-                            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                            SwarmEvent::ConnectionEstablished { peer_id, endpoint, connection_id, .. } => {
                                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                                explicit_peers_diag.insert(peer_id); // TEMPORARY DIAGNOSTIC
                                 dial_backoff.remove(&peer_id);
-                                {
+                                let resulting_count = {
                                     let mut m = peer_conns.write().await;
-                                    *m.entry(peer_id).or_insert(0) += 1;
+                                    let c = m.entry(peer_id).or_insert(0);
+                                    *c += 1;
+                                    let count = *c;
                                     let mut st = stats.write().await;
                                     st.connected_peers = m.len();
-                                }
+                                    count
+                                };
+                                // TEMPORARY DIAGNOSTIC
+                                log_info!(
+                                    LogCategory::Network,
+                                    "[gossip-mesh-diag] ConnectionEstablished peer={} connection_id={:?} endpoint={:?} resulting_conn_count={}",
+                                    peer_id, connection_id, endpoint, resulting_count
+                                );
                                 let addr = endpoint.get_remote_address().clone();
                                 let _ = emit(&event_tx, NetworkEvent::PeerConnected { peer_id, address: addr }).await;
                             }
-                            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                            SwarmEvent::ConnectionClosed { peer_id, cause, connection_id, .. } => {
                                 swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                                explicit_peers_diag.remove(&peer_id); // TEMPORARY DIAGNOSTIC
                                 budgets.remove(&peer_id);
-                                {
+                                let resulting_count = {
                                     let mut m = peer_conns.write().await;
-                                    if let Some(c) = m.get_mut(&peer_id) {
+                                    let count = if let Some(c) = m.get_mut(&peer_id) {
                                         *c = c.saturating_sub(1);
+                                        let count = *c;
                                         if *c == 0 {
                                             m.remove(&peer_id);
                                         }
-                                    }
+                                        count
+                                    } else {
+                                        0
+                                    };
                                     let mut st = stats.write().await;
                                     st.connected_peers = m.len();
-                                }
+                                    count
+                                };
+                                // TEMPORARY DIAGNOSTIC: if resulting_conn_count > 0 here, we just
+                                // stripped explicit-peer status from a peer that's still connected
+                                // via another connection -- the suspected bug.
+                                log_info!(
+                                    LogCategory::Network,
+                                    "[gossip-mesh-diag] ConnectionClosed peer={} connection_id={:?} cause={:?} resulting_conn_count={}",
+                                    peer_id, connection_id, cause, resulting_count
+                                );
                                 let _ = emit(&event_tx, NetworkEvent::PeerDisconnected { peer_id, reason: format!("{:?}", cause) }).await;
                             }
                             SwarmEvent::NewListenAddr { address, .. } => {
                                 log_info!(LogCategory::Network, "libp2p listening on {} (uptime {:?})", address, start.elapsed());
+                            }
+                            // TEMPORARY DIAGNOSTIC: catches connection_limits rejecting a
+                            // duplicate/racing dial -- expected under max_established_per_peer(1)
+                            // when both sides of a peer pair dial each other near-simultaneously.
+                            SwarmEvent::OutgoingConnectionError { connection_id, peer_id, error } => {
+                                log_info!(
+                                    LogCategory::Network,
+                                    "[gossip-mesh-diag] OutgoingConnectionError connection_id={:?} peer={:?} error={:?}",
+                                    connection_id, peer_id, error
+                                );
+                            }
+                            SwarmEvent::IncomingConnectionError { connection_id, peer_id, error, .. } => {
+                                log_info!(
+                                    LogCategory::Network,
+                                    "[gossip-mesh-diag] IncomingConnectionError connection_id={:?} peer={:?} error={:?}",
+                                    connection_id, peer_id, error
+                                );
                             }
                             _ => {}
                         }
