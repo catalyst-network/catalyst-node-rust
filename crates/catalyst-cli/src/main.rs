@@ -674,8 +674,21 @@ async fn start_node(config: NodeConfig, generate_txs: bool, tx_interval_ms: u64)
 }
 
 fn init_logging(level: &str, json_logs: bool) -> Result<()> {
-    let level = level.parse::<tracing::Level>()
+    // Validate up front so an invalid CLI value still errors the same way it always has.
+    level.parse::<tracing::Level>()
         .map_err(|_| anyhow::anyhow!("Invalid log level: {}", level))?;
+
+    // libp2p-gossipsub's "Send Queue full" warning (behaviour.rs) logs the *entire* dropped
+    // RpcOut via `{:?}`, including raw message bytes and signature -- several KB per line. Under
+    // send-queue saturation this fires thousands of times/minute, and journald/rsyslog writing
+    // that volume both fills disk (49GB uncompressed syslog observed 2026-08-17/18) and steals
+    // CPU from the node itself on small hosts, turning a transient saturation blip into a
+    // self-reinforcing stall. Cap this crate's log level independently of `--log-level` so it
+    // can never do that again; the failed-message counters already surface the same information
+    // (`failed_messages` in gossipsub metrics) without the per-message payload dump.
+    let filter = tracing_subscriber::filter::EnvFilter::builder()
+        .parse(format!("{level},libp2p_gossipsub=error"))
+        .map_err(|e| anyhow::anyhow!("Invalid log filter: {}", e))?;
 
     if json_logs {
         // Keep the CLI buildable without enabling extra `tracing-subscriber` features.
@@ -683,7 +696,7 @@ fn init_logging(level: &str, json_logs: bool) -> Result<()> {
         // now fall back to the standard formatter.
         tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer().with_target(false))
-            .with(tracing_subscriber::filter::LevelFilter::from_level(level))
+            .with(filter)
             .init();
     } else {
         tracing_subscriber::registry()
@@ -692,9 +705,7 @@ fn init_logging(level: &str, json_logs: bool) -> Result<()> {
                     .with_target(false)
                 ,
             )
-            .with(
-                tracing_subscriber::filter::LevelFilter::from_level(level),
-            )
+            .with(filter)
             .init();
     }
 
