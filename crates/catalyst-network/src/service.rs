@@ -14,7 +14,7 @@ use crate::{
 };
 
 use catalyst_utils::logging::*;
-use catalyst_utils::network::{decode_envelope_wire, encode_envelope_wire, EnvelopeWireError, MessageEnvelope};
+use catalyst_utils::network::{decode_envelope_wire, encode_envelope_wire, EnvelopeWireError, MessageEnvelope, MessageType};
 
 use futures::StreamExt;
 use libp2p::{
@@ -139,9 +139,22 @@ impl From<std::convert::Infallible> for BehaviourEvent {
     }
 }
 
+/// Which gossipsub topic (and therefore which independent per-peer send queue) a message
+/// goes out on. Consensus messages get their own topic so routine high-volume traffic
+/// (tx relay/resync, state sync, etc.) can never head-of-line-block them behind a shared
+/// FIFO queue -- confirmed live 2026-08-18/19: a `ProducerQuantity` took 40+ seconds to
+/// arrive (well past each phase's ~4s collection window) despite `publish()` reporting
+/// success immediately, consistent with queuing behind a burst of routine traffic on the
+/// single shared queue this used to be. See `NetworkService::topic_for`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GossipChannel {
+    Default,
+    Consensus,
+}
+
 #[derive(Debug)]
 enum Cmd {
-    Publish(Vec<u8>),
+    Publish(Vec<u8>, GossipChannel),
     Dial(Multiaddr),
 }
 
@@ -149,6 +162,8 @@ enum Cmd {
 pub struct NetworkService {
     config: NetworkConfig,
     topic: gossipsub::IdentTopic,
+    /// Dedicated topic for consensus messages -- see `GossipChannel`.
+    topic_consensus: gossipsub::IdentTopic,
 
     event_tx: Arc<RwLock<Vec<mpsc::UnboundedSender<NetworkEvent>>>>,
     stats: Arc<RwLock<NetworkStats>>,
@@ -214,6 +229,12 @@ impl NetworkService {
             .subscribe(&topic)
             .map_err(|e| NetworkError::ConfigError(e.to_string()))?;
 
+        // Dedicated topic for consensus messages -- see `GossipChannel` doc comment for why.
+        let topic_consensus = gossipsub::IdentTopic::new(format!("{}-consensus", config.gossip.topic_name));
+        gossipsub
+            .subscribe(&topic_consensus)
+            .map_err(|e| NetworkError::ConfigError(e.to_string()))?;
+
         // mDNS (local discovery)
         let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
             .map_err(|e| NetworkError::ConfigError(e.to_string()))?;
@@ -260,6 +281,7 @@ impl NetworkService {
         Ok(Self {
             config,
             topic,
+            topic_consensus,
             event_tx: Arc::new(RwLock::new(Vec::new())),
             stats: Arc::new(RwLock::new(NetworkStats::default())),
             peer_conns: Arc::new(RwLock::new(HashMap::new())),
@@ -289,6 +311,7 @@ impl NetworkService {
         let stats = self.stats.clone();
         let peer_conns = self.peer_conns.clone();
         let topic = self.topic.clone();
+        let topic_consensus = self.topic_consensus.clone();
         let limits = self.config.safety_limits.clone();
 
         // Bootstrap dial manager (WAN-hardening): retry with backoff+jitter until we meet `min_peers`.
@@ -541,18 +564,23 @@ impl NetworkService {
                             _ => {}
                         }
 
-                        // Defensive: keep subscription present.
+                        // Defensive: keep subscriptions present.
                         let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
+                        let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic_consensus);
                     }
                     cmd = cmd_rx.recv() => {
                         match cmd {
-                            Some(Cmd::Publish(bytes)) => {
+                            Some(Cmd::Publish(bytes, channel)) => {
                                 // TEMPORARY DIAGNOSTIC: this Result was previously discarded
                                 // (`let _ = ...publish(...)`) -- any PublishError (e.g.
                                 // InsufficientPeers, NoPeersSubscribedToTopic, Duplicate) was
                                 // completely silent.
                                 let peek = decode_envelope_wire(&bytes).ok();
-                                let result = swarm.behaviour_mut().gossipsub.publish(topic.clone(), bytes);
+                                let dest_topic = match channel {
+                                    GossipChannel::Consensus => topic_consensus.clone(),
+                                    GossipChannel::Default => topic.clone(),
+                                };
+                                let result = swarm.behaviour_mut().gossipsub.publish(dest_topic, bytes);
                                 match &result {
                                     Ok(msg_id) => tracing::info!(
                                         "[gossip-mesh-diag] PUBLISH ok msg_id={:?} type={:?} sender={:?} conns={}",
@@ -611,7 +639,15 @@ impl NetworkService {
     pub async fn broadcast_envelope(&self, envelope: &MessageEnvelope) -> NetworkResult<()> {
         let bytes = encode_envelope_wire(envelope)
             .map_err(|e| NetworkError::SerializationFailed(e.to_string()))?;
-        let _ = self.cmd_tx.send(Cmd::Publish(bytes));
+        let channel = match envelope.message_type {
+            MessageType::ProducerQuantity
+            | MessageType::ProducerCandidate
+            | MessageType::ProducerVote
+            | MessageType::ProducerOutput
+            | MessageType::ConsensusSync => GossipChannel::Consensus,
+            _ => GossipChannel::Default,
+        };
+        let _ = self.cmd_tx.send(Cmd::Publish(bytes, channel));
         Ok(())
     }
 
