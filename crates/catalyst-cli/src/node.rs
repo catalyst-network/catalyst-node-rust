@@ -5553,6 +5553,12 @@ impl CatalystNode {
         // Dial bootstrap peers from CLI config + optional DNS seeds.
         let peers_static = self.config.network.bootstrap_peers.clone();
         let seeds = self.config.network.dns_seeds.clone();
+        // `bootstrap_peers` includes this node's own address (confirmed live in the deployed
+        // config: each validator's list has all 3 validator addresses, itself included), so
+        // `peers.len()` overcounts relative to the realistic max `connected_peers` -- use the
+        // same `min_peers` threshold service.rs's own bootstrap_tick guards on instead (see the
+        // fuller comment at the call site below).
+        let retry_loop_min_peers = self.config.network.min_peers as usize;
 
         let peers_from_dns: Vec<String> = resolve_dns_seeds_to_bootstrap_multiaddrs(&seeds, 30333)
             .await
@@ -5641,7 +5647,15 @@ impl CatalystNode {
                     // firing every 5-20s per node, i.e. roughly every peer's independent ~30s timer
                     // interleaved). Skip the whole pass with a coarse connected-peer-count check
                     // instead, mirroring bootstrap_tick's `if connected >= min_peers { continue }`.
-                    if net.get_stats().await.connected_peers >= peers.len() {
+                    //
+                    // FIRST ATTEMPT AT THIS FIX (`connected_peers >= peers.len()`) DID NOT WORK:
+                    // `peers` (built from `bootstrap_peers` config) includes this node's OWN
+                    // address -- confirmed live, every validator's deployed `bootstrap_peers` list
+                    // has all 3 validator addresses including itself -- so `peers.len()` (e.g. 3)
+                    // permanently overcounts the realistic max `connected_peers` (e.g. 2 real other
+                    // peers), and the guard never triggered. Use `min_peers` instead, matching
+                    // exactly what service.rs's own bootstrap_tick compares against.
+                    if net.get_stats().await.connected_peers >= retry_loop_min_peers {
                         continue;
                     }
 
