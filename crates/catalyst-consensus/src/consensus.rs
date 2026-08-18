@@ -544,12 +544,19 @@ impl CollaborativeConsensus {
 
         let deadline = Instant::now() + timeout_duration;
         let mut out: HashMap<ProducerId, ProducerQuantity> = HashMap::new();
+        // TEMPORARY DIAGNOSTIC (2026-08-18, gossip-mesh-stall investigation)
+        tracing::info!("[gossip-mesh-diag] collect_producer_quantities start cycle={}", self.current_cycle);
 
         // First, consume any previously buffered messages of this type.
         for env in self.drain_pending_by_type(MessageType::ProducerQuantity).await {
             if let Ok(q) = env.extract_message::<ProducerQuantity>() {
                 if phase_body_matches_current_cycle(q.cycle_number, self.current_cycle) {
                     out.insert(q.producer_id.clone(), q);
+                } else {
+                    tracing::info!(
+                        "[gossip-mesh-diag] collect_producer_quantities DROPPED buffered producer={} sender={} msg_cycle={} local_cycle={} (cycle mismatch)",
+                        q.producer_id, env.sender, q.cycle_number, self.current_cycle
+                    );
                 }
             }
         }
@@ -567,8 +574,19 @@ impl CollaborativeConsensus {
                     if env.message_type == MessageType::ProducerQuantity {
                         if let Ok(q) = env.extract_message::<ProducerQuantity>() {
                             if phase_body_matches_current_cycle(q.cycle_number, self.current_cycle) {
+                                tracing::info!(
+                                    "[gossip-mesh-diag] collect_producer_quantities ACCEPTED producer={} sender={} cycle={}",
+                                    q.producer_id, env.sender, q.cycle_number
+                                );
                                 out.insert(q.producer_id.clone(), q);
+                            } else {
+                                tracing::info!(
+                                    "[gossip-mesh-diag] collect_producer_quantities DROPPED live producer={} sender={} msg_cycle={} local_cycle={} (cycle mismatch)",
+                                    q.producer_id, env.sender, q.cycle_number, self.current_cycle
+                                );
                             }
+                        } else {
+                            tracing::info!("[gossip-mesh-diag] collect_producer_quantities extract_message FAILED sender={}", env.sender);
                         }
                     } else {
                         // Buffer for later phases instead of dropping it.
@@ -579,6 +597,12 @@ impl CollaborativeConsensus {
                 Err(_) => break,
             }
         }
+
+        // TEMPORARY DIAGNOSTIC
+        tracing::info!(
+            "[gossip-mesh-diag] collect_producer_quantities end cycle={} collected_producers={:?}",
+            self.current_cycle, out.keys().collect::<Vec<_>>()
+        );
 
         Ok(out.into_values().collect())
     }
@@ -595,11 +619,18 @@ impl CollaborativeConsensus {
 
         let deadline = Instant::now() + timeout_duration;
         let mut out: HashMap<ProducerId, ProducerCandidate> = HashMap::new();
+        // TEMPORARY DIAGNOSTIC (2026-08-18, gossip-mesh-stall investigation)
+        tracing::info!("[gossip-mesh-diag] collect_producer_candidates start cycle={}", self.current_cycle);
 
         for env in self.drain_pending_by_type(MessageType::ProducerCandidate).await {
             if let Ok(c) = env.extract_message::<ProducerCandidate>() {
                 if phase_body_matches_current_cycle(c.cycle_number, self.current_cycle) {
                     out.insert(c.producer_id.clone(), c);
+                } else {
+                    tracing::info!(
+                        "[gossip-mesh-diag] collect_producer_candidates DROPPED buffered producer={} sender={} msg_cycle={} local_cycle={} (cycle mismatch)",
+                        c.producer_id, env.sender, c.cycle_number, self.current_cycle
+                    );
                 }
             }
         }
@@ -617,8 +648,19 @@ impl CollaborativeConsensus {
                     if env.message_type == MessageType::ProducerCandidate {
                         if let Ok(c) = env.extract_message::<ProducerCandidate>() {
                             if phase_body_matches_current_cycle(c.cycle_number, self.current_cycle) {
+                                tracing::info!(
+                                    "[gossip-mesh-diag] collect_producer_candidates ACCEPTED producer={} sender={} cycle={}",
+                                    c.producer_id, env.sender, c.cycle_number
+                                );
                                 out.insert(c.producer_id.clone(), c);
+                            } else {
+                                tracing::info!(
+                                    "[gossip-mesh-diag] collect_producer_candidates DROPPED live producer={} sender={} msg_cycle={} local_cycle={} (cycle mismatch)",
+                                    c.producer_id, env.sender, c.cycle_number, self.current_cycle
+                                );
                             }
+                        } else {
+                            tracing::info!("[gossip-mesh-diag] collect_producer_candidates extract_message FAILED sender={}", env.sender);
                         }
                     } else {
                         self.push_pending_bounded(env).await;
@@ -628,6 +670,12 @@ impl CollaborativeConsensus {
                 Err(_) => break,
             }
         }
+
+        // TEMPORARY DIAGNOSTIC
+        tracing::info!(
+            "[gossip-mesh-diag] collect_producer_candidates end cycle={} collected_producers={:?}",
+            self.current_cycle, out.keys().collect::<Vec<_>>()
+        );
 
         Ok(out.into_values().collect())
     }
@@ -644,11 +692,18 @@ impl CollaborativeConsensus {
 
         let deadline = Instant::now() + timeout_duration;
         let mut out: HashMap<ProducerId, ProducerVote> = HashMap::new();
+        // TEMPORARY DIAGNOSTIC (2026-08-18, gossip-mesh-stall investigation)
+        tracing::info!("[gossip-mesh-diag] collect_producer_votes start cycle={}", self.current_cycle);
 
         for env in self.drain_pending_by_type(MessageType::ProducerVote).await {
             if let Ok(v) = env.extract_message::<ProducerVote>() {
                 if phase_body_matches_current_cycle(v.cycle_number, self.current_cycle) {
                     out.insert(v.producer_id.clone(), v);
+                } else {
+                    tracing::info!(
+                        "[gossip-mesh-diag] collect_producer_votes DROPPED buffered producer={} sender={} msg_cycle={} local_cycle={} (cycle mismatch)",
+                        v.producer_id, env.sender, v.cycle_number, self.current_cycle
+                    );
                 }
             }
         }
@@ -666,8 +721,19 @@ impl CollaborativeConsensus {
                     if env.message_type == MessageType::ProducerVote {
                         if let Ok(v) = env.extract_message::<ProducerVote>() {
                             if phase_body_matches_current_cycle(v.cycle_number, self.current_cycle) {
+                                tracing::info!(
+                                    "[gossip-mesh-diag] collect_producer_votes ACCEPTED producer={} sender={} cycle={}",
+                                    v.producer_id, env.sender, v.cycle_number
+                                );
                                 out.insert(v.producer_id.clone(), v);
+                            } else {
+                                tracing::info!(
+                                    "[gossip-mesh-diag] collect_producer_votes DROPPED live producer={} sender={} msg_cycle={} local_cycle={} (cycle mismatch)",
+                                    v.producer_id, env.sender, v.cycle_number, self.current_cycle
+                                );
                             }
+                        } else {
+                            tracing::info!("[gossip-mesh-diag] collect_producer_votes extract_message FAILED sender={}", env.sender);
                         }
                     } else {
                         self.push_pending_bounded(env).await;
@@ -677,6 +743,12 @@ impl CollaborativeConsensus {
                 Err(_) => break,
             }
         }
+
+        // TEMPORARY DIAGNOSTIC
+        tracing::info!(
+            "[gossip-mesh-diag] collect_producer_votes end cycle={} collected_producers={:?}",
+            self.current_cycle, out.keys().collect::<Vec<_>>()
+        );
 
         Ok(out.into_values().collect())
     }
@@ -693,11 +765,18 @@ impl CollaborativeConsensus {
 
         let deadline = Instant::now() + timeout_duration;
         let mut out: HashMap<ProducerId, ProducerOutput> = HashMap::new();
+        // TEMPORARY DIAGNOSTIC (2026-08-18, gossip-mesh-stall investigation)
+        tracing::info!("[gossip-mesh-diag] collect_producer_outputs start cycle={}", self.current_cycle);
 
         for env in self.drain_pending_by_type(MessageType::ProducerOutput).await {
             if let Ok(o) = env.extract_message::<ProducerOutput>() {
                 if phase_body_matches_current_cycle(o.cycle_number, self.current_cycle) {
                     out.insert(o.producer_id.clone(), o);
+                } else {
+                    tracing::info!(
+                        "[gossip-mesh-diag] collect_producer_outputs DROPPED buffered producer={} sender={} msg_cycle={} local_cycle={} (cycle mismatch)",
+                        o.producer_id, env.sender, o.cycle_number, self.current_cycle
+                    );
                 }
             }
         }
@@ -715,8 +794,19 @@ impl CollaborativeConsensus {
                     if env.message_type == MessageType::ProducerOutput {
                         if let Ok(o) = env.extract_message::<ProducerOutput>() {
                             if phase_body_matches_current_cycle(o.cycle_number, self.current_cycle) {
+                                tracing::info!(
+                                    "[gossip-mesh-diag] collect_producer_outputs ACCEPTED producer={} sender={} cycle={}",
+                                    o.producer_id, env.sender, o.cycle_number
+                                );
                                 out.insert(o.producer_id.clone(), o);
+                            } else {
+                                tracing::info!(
+                                    "[gossip-mesh-diag] collect_producer_outputs DROPPED live producer={} sender={} msg_cycle={} local_cycle={} (cycle mismatch)",
+                                    o.producer_id, env.sender, o.cycle_number, self.current_cycle
+                                );
                             }
+                        } else {
+                            tracing::info!("[gossip-mesh-diag] collect_producer_outputs extract_message FAILED sender={}", env.sender);
                         }
                     } else {
                         self.push_pending_bounded(env).await;
@@ -726,6 +816,12 @@ impl CollaborativeConsensus {
                 Err(_) => break,
             }
         }
+
+        // TEMPORARY DIAGNOSTIC
+        tracing::info!(
+            "[gossip-mesh-diag] collect_producer_outputs end cycle={} collected_producers={:?}",
+            self.current_cycle, out.keys().collect::<Vec<_>>()
+        );
 
         Ok(out.into_values().collect())
     }

@@ -391,6 +391,11 @@ impl NetworkService {
                             SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(e)) => {
                                 if let gossipsub::Event::Message { message, propagation_source, .. } = e {
                                     if message.data.len() > limits.max_gossip_message_bytes {
+                                        // TEMPORARY DIAGNOSTIC
+                                        tracing::info!(
+                                            "[gossip-mesh-diag] DROPPED (size limit) from={} len={} max={}",
+                                            propagation_source, message.data.len(), limits.max_gossip_message_bytes
+                                        );
                                         continue;
                                     }
                                     let now = Instant::now();
@@ -405,22 +410,42 @@ impl NetworkService {
                                         limits.per_peer_max_msgs_per_sec,
                                         limits.per_peer_max_bytes_per_sec,
                                     ) {
+                                        // TEMPORARY DIAGNOSTIC
+                                        tracing::info!(
+                                            "[gossip-mesh-diag] DROPPED (budget exceeded) from={} len={}",
+                                            propagation_source, message.data.len()
+                                        );
                                         continue;
                                     }
                                     let env: MessageEnvelope = match decode_envelope_wire(&message.data) {
                                         Ok(e) => e,
                                         Err(EnvelopeWireError::UnsupportedVersion { got, local }) => {
-                                            log_warn!(
-                                                LogCategory::Network,
-                                                "Dropping message from {} due to unsupported envelope version (got={} local={})",
+                                            // TEMPORARY DIAGNOSTIC: was log_warn! (dead logger, see
+                                            // 7d08036) -- switched to tracing::info! so this is
+                                            // actually visible while investigating.
+                                            tracing::info!(
+                                                "[gossip-mesh-diag] DROPPED (unsupported envelope version) from={} got={} local={}",
                                                 propagation_source,
                                                 got,
                                                 local
                                             );
                                             continue;
                                         }
-                                        Err(_) => continue,
+                                        Err(err) => {
+                                            // TEMPORARY DIAGNOSTIC: this decode-failure path had zero
+                                            // logging before (silent `continue`).
+                                            tracing::info!(
+                                                "[gossip-mesh-diag] DROPPED (decode error) from={} len={} err={:?}",
+                                                propagation_source, message.data.len(), err
+                                            );
+                                            continue;
+                                        }
                                     };
+                                    // TEMPORARY DIAGNOSTIC
+                                    tracing::info!(
+                                        "[gossip-mesh-diag] RECEIVED type={:?} id={} sender={} from={} len={}",
+                                        env.message_type, env.id, env.sender, propagation_source, message.data.len()
+                                    );
                                     {
                                         let mut st = stats.write().await;
                                         st.messages_received += 1;
@@ -522,7 +547,28 @@ impl NetworkService {
                     cmd = cmd_rx.recv() => {
                         match cmd {
                             Some(Cmd::Publish(bytes)) => {
-                                let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), bytes);
+                                // TEMPORARY DIAGNOSTIC: this Result was previously discarded
+                                // (`let _ = ...publish(...)`) -- any PublishError (e.g.
+                                // InsufficientPeers, NoPeersSubscribedToTopic, Duplicate) was
+                                // completely silent.
+                                let peek = decode_envelope_wire(&bytes).ok();
+                                let result = swarm.behaviour_mut().gossipsub.publish(topic.clone(), bytes);
+                                match &result {
+                                    Ok(msg_id) => tracing::info!(
+                                        "[gossip-mesh-diag] PUBLISH ok msg_id={:?} type={:?} sender={:?} conns={}",
+                                        msg_id,
+                                        peek.as_ref().map(|e| e.message_type),
+                                        peek.as_ref().map(|e| e.sender.clone()),
+                                        peer_conns.read().await.len()
+                                    ),
+                                    Err(err) => tracing::info!(
+                                        "[gossip-mesh-diag] PUBLISH FAILED err={:?} type={:?} sender={:?} conns={}",
+                                        err,
+                                        peek.as_ref().map(|e| e.message_type),
+                                        peek.as_ref().map(|e| e.sender.clone()),
+                                        peer_conns.read().await.len()
+                                    ),
+                                }
                                 let mut st = stats.write().await;
                                 st.messages_sent += 1;
                                 st.connected_peers = peer_conns.read().await.len();
