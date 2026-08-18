@@ -5627,6 +5627,24 @@ impl CatalystNode {
                     peers.sort();
                     peers.dedup();
 
+                    // TEMPORARY DIAGNOSTIC (2026-08-18, gossip-mesh-stall investigation) turned
+                    // permanent fix: this loop is a second, independent dial-retry mechanism from
+                    // `NetworkService::start`'s own internal `bootstrap_tick` (service.rs) -- and
+                    // unlike that one, it has no connectivity check at all, so it re-dials every
+                    // peer on its own ~30s-per-peer cycle regardless of whether we're already
+                    // connected. `Cmd::Dial` only carries a bare `Multiaddr` (no `PeerId`), so it
+                    // can't use the same per-peer `is_connected()` guard service.rs's bootstrap_tick
+                    // uses -- but a redundant dial to an already-established peer still pays the
+                    // full TCP+Noise handshake cost before `connection_limits` rejects it at the
+                    // "established" checkpoint (confirmed live: `OutgoingConnectionError`/
+                    // `IncomingConnectionError ... Exceeded { limit: 1, kind: EstablishedPerPeer }`
+                    // firing every 5-20s per node, i.e. roughly every peer's independent ~30s timer
+                    // interleaved). Skip the whole pass with a coarse connected-peer-count check
+                    // instead, mirroring bootstrap_tick's `if connected >= min_peers { continue }`.
+                    if net.get_stats().await.connected_peers >= peers.len() {
+                        continue;
+                    }
+
                     let now = Instant::now();
 
                     // Ensure dial state exists for all peers.
