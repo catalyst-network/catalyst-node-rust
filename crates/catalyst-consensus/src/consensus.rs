@@ -190,7 +190,7 @@ impl CollaborativeConsensus {
         let remaining_ms = self.config.construction_phase_ms
             .saturating_sub(phase_start.elapsed().as_millis() as u64);
         let mut quantities = self
-            .collect_producer_quantities(Duration::from_millis(remaining_ms))
+            .collect_producer_quantities(Duration::from_millis(remaining_ms), &quantity)
             .await?;
         quantities.push(quantity.clone());
         dedup_by_producer_id_quantity(&mut quantities);
@@ -208,7 +208,7 @@ impl CollaborativeConsensus {
         let remaining_ms = self.config.campaigning_phase_ms
             .saturating_sub(phase_start.elapsed().as_millis() as u64);
         let mut candidates = self
-            .collect_producer_candidates(Duration::from_millis(remaining_ms))
+            .collect_producer_candidates(Duration::from_millis(remaining_ms), &candidate)
             .await?;
         candidates.push(candidate.clone());
         dedup_by_producer_id_candidate(&mut candidates);
@@ -225,7 +225,7 @@ impl CollaborativeConsensus {
         let remaining_ms = self.config.voting_phase_ms
             .saturating_sub(phase_start.elapsed().as_millis() as u64);
         let mut votes = self
-            .collect_producer_votes(Duration::from_millis(remaining_ms))
+            .collect_producer_votes(Duration::from_millis(remaining_ms), &vote)
             .await?;
         votes.push(vote.clone());
         dedup_by_producer_id_vote(&mut votes);
@@ -536,6 +536,7 @@ impl CollaborativeConsensus {
     async fn collect_producer_quantities(
         &self,
         timeout_duration: Duration,
+        local: &ProducerQuantity,
     ) -> CatalystResult<Vec<ProducerQuantity>> {
         let Some(rx) = &self.network_receiver else {
             sleep(timeout_duration).await;
@@ -561,6 +562,18 @@ impl CollaborativeConsensus {
             }
         }
 
+        // Single-shot consensus broadcasts have been observed live to land far less
+        // reliably than messages using a retry pattern (e.g. node.rs's tx_batch_resync,
+        // which resends every 600ms) in this network's current gossipsub mesh regime
+        // (`all_mesh_peers()` persistently empty -- delivery relies solely on the
+        // explicit-peer `flood_publish` path, which is evidently lossy on any single
+        // attempt). Re-send our own value periodically through the collection window
+        // instead of relying on the one publish() call `run_construction_phase` already
+        // made to land.
+        let mut rebroadcast_tick = tokio::time::interval(Duration::from_millis(700));
+        rebroadcast_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        rebroadcast_tick.tick().await; // consume the immediate first tick
+
         loop {
             let now = Instant::now();
             if now >= deadline {
@@ -568,33 +581,42 @@ impl CollaborativeConsensus {
             }
             let remaining = deadline - now;
 
-            let mut guard = rx.lock().await;
-            match timeout(remaining, guard.recv()).await {
-                Ok(Some(env)) => {
-                    if env.message_type == MessageType::ProducerQuantity {
-                        if let Ok(q) = env.extract_message::<ProducerQuantity>() {
-                            if phase_body_matches_current_cycle(q.cycle_number, self.current_cycle) {
-                                tracing::info!(
-                                    "[gossip-mesh-diag] collect_producer_quantities ACCEPTED producer={} sender={} cycle={}",
-                                    q.producer_id, env.sender, q.cycle_number
-                                );
-                                out.insert(q.producer_id.clone(), q);
+            tokio::select! {
+                recv_result = async {
+                    let mut guard = rx.lock().await;
+                    timeout(remaining, guard.recv()).await
+                } => {
+                    match recv_result {
+                        Ok(Some(env)) => {
+                            if env.message_type == MessageType::ProducerQuantity {
+                                if let Ok(q) = env.extract_message::<ProducerQuantity>() {
+                                    if phase_body_matches_current_cycle(q.cycle_number, self.current_cycle) {
+                                        tracing::info!(
+                                            "[gossip-mesh-diag] collect_producer_quantities ACCEPTED producer={} sender={} cycle={}",
+                                            q.producer_id, env.sender, q.cycle_number
+                                        );
+                                        out.insert(q.producer_id.clone(), q);
+                                    } else {
+                                        tracing::info!(
+                                            "[gossip-mesh-diag] collect_producer_quantities DROPPED live producer={} sender={} msg_cycle={} local_cycle={} (cycle mismatch)",
+                                            q.producer_id, env.sender, q.cycle_number, self.current_cycle
+                                        );
+                                    }
+                                } else {
+                                    tracing::info!("[gossip-mesh-diag] collect_producer_quantities extract_message FAILED sender={}", env.sender);
+                                }
                             } else {
-                                tracing::info!(
-                                    "[gossip-mesh-diag] collect_producer_quantities DROPPED live producer={} sender={} msg_cycle={} local_cycle={} (cycle mismatch)",
-                                    q.producer_id, env.sender, q.cycle_number, self.current_cycle
-                                );
+                                // Buffer for later phases instead of dropping it.
+                                self.push_pending_bounded(env).await;
                             }
-                        } else {
-                            tracing::info!("[gossip-mesh-diag] collect_producer_quantities extract_message FAILED sender={}", env.sender);
                         }
-                    } else {
-                        // Buffer for later phases instead of dropping it.
-                        self.push_pending_bounded(env).await;
+                        Ok(None) => break,
+                        Err(_) => break,
                     }
                 }
-                Ok(None) => break,
-                Err(_) => break,
+                _ = rebroadcast_tick.tick() => {
+                    let _ = self.broadcast_message(local).await;
+                }
             }
         }
 
@@ -611,6 +633,7 @@ impl CollaborativeConsensus {
     async fn collect_producer_candidates(
         &self,
         timeout_duration: Duration,
+        local: &ProducerCandidate,
     ) -> CatalystResult<Vec<ProducerCandidate>> {
         let Some(rx) = &self.network_receiver else {
             sleep(timeout_duration).await;
@@ -635,6 +658,12 @@ impl CollaborativeConsensus {
             }
         }
 
+        // See the comment in collect_producer_quantities: re-send periodically instead of
+        // relying on run_campaigning_phase's single publish() call to land.
+        let mut rebroadcast_tick = tokio::time::interval(Duration::from_millis(700));
+        rebroadcast_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        rebroadcast_tick.tick().await; // consume the immediate first tick
+
         loop {
             let now = Instant::now();
             if now >= deadline {
@@ -642,32 +671,41 @@ impl CollaborativeConsensus {
             }
             let remaining = deadline - now;
 
-            let mut guard = rx.lock().await;
-            match timeout(remaining, guard.recv()).await {
-                Ok(Some(env)) => {
-                    if env.message_type == MessageType::ProducerCandidate {
-                        if let Ok(c) = env.extract_message::<ProducerCandidate>() {
-                            if phase_body_matches_current_cycle(c.cycle_number, self.current_cycle) {
-                                tracing::info!(
-                                    "[gossip-mesh-diag] collect_producer_candidates ACCEPTED producer={} sender={} cycle={}",
-                                    c.producer_id, env.sender, c.cycle_number
-                                );
-                                out.insert(c.producer_id.clone(), c);
+            tokio::select! {
+                recv_result = async {
+                    let mut guard = rx.lock().await;
+                    timeout(remaining, guard.recv()).await
+                } => {
+                    match recv_result {
+                        Ok(Some(env)) => {
+                            if env.message_type == MessageType::ProducerCandidate {
+                                if let Ok(c) = env.extract_message::<ProducerCandidate>() {
+                                    if phase_body_matches_current_cycle(c.cycle_number, self.current_cycle) {
+                                        tracing::info!(
+                                            "[gossip-mesh-diag] collect_producer_candidates ACCEPTED producer={} sender={} cycle={}",
+                                            c.producer_id, env.sender, c.cycle_number
+                                        );
+                                        out.insert(c.producer_id.clone(), c);
+                                    } else {
+                                        tracing::info!(
+                                            "[gossip-mesh-diag] collect_producer_candidates DROPPED live producer={} sender={} msg_cycle={} local_cycle={} (cycle mismatch)",
+                                            c.producer_id, env.sender, c.cycle_number, self.current_cycle
+                                        );
+                                    }
+                                } else {
+                                    tracing::info!("[gossip-mesh-diag] collect_producer_candidates extract_message FAILED sender={}", env.sender);
+                                }
                             } else {
-                                tracing::info!(
-                                    "[gossip-mesh-diag] collect_producer_candidates DROPPED live producer={} sender={} msg_cycle={} local_cycle={} (cycle mismatch)",
-                                    c.producer_id, env.sender, c.cycle_number, self.current_cycle
-                                );
+                                self.push_pending_bounded(env).await;
                             }
-                        } else {
-                            tracing::info!("[gossip-mesh-diag] collect_producer_candidates extract_message FAILED sender={}", env.sender);
                         }
-                    } else {
-                        self.push_pending_bounded(env).await;
+                        Ok(None) => break,
+                        Err(_) => break,
                     }
                 }
-                Ok(None) => break,
-                Err(_) => break,
+                _ = rebroadcast_tick.tick() => {
+                    let _ = self.broadcast_message(local).await;
+                }
             }
         }
 
@@ -684,6 +722,7 @@ impl CollaborativeConsensus {
     async fn collect_producer_votes(
         &self,
         timeout_duration: Duration,
+        local: &ProducerVote,
     ) -> CatalystResult<Vec<ProducerVote>> {
         let Some(rx) = &self.network_receiver else {
             sleep(timeout_duration).await;
@@ -708,6 +747,12 @@ impl CollaborativeConsensus {
             }
         }
 
+        // See the comment in collect_producer_quantities: re-send periodically instead of
+        // relying on run_voting_phase's single publish() call to land.
+        let mut rebroadcast_tick = tokio::time::interval(Duration::from_millis(700));
+        rebroadcast_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        rebroadcast_tick.tick().await; // consume the immediate first tick
+
         loop {
             let now = Instant::now();
             if now >= deadline {
@@ -715,32 +760,41 @@ impl CollaborativeConsensus {
             }
             let remaining = deadline - now;
 
-            let mut guard = rx.lock().await;
-            match timeout(remaining, guard.recv()).await {
-                Ok(Some(env)) => {
-                    if env.message_type == MessageType::ProducerVote {
-                        if let Ok(v) = env.extract_message::<ProducerVote>() {
-                            if phase_body_matches_current_cycle(v.cycle_number, self.current_cycle) {
-                                tracing::info!(
-                                    "[gossip-mesh-diag] collect_producer_votes ACCEPTED producer={} sender={} cycle={}",
-                                    v.producer_id, env.sender, v.cycle_number
-                                );
-                                out.insert(v.producer_id.clone(), v);
+            tokio::select! {
+                recv_result = async {
+                    let mut guard = rx.lock().await;
+                    timeout(remaining, guard.recv()).await
+                } => {
+                    match recv_result {
+                        Ok(Some(env)) => {
+                            if env.message_type == MessageType::ProducerVote {
+                                if let Ok(v) = env.extract_message::<ProducerVote>() {
+                                    if phase_body_matches_current_cycle(v.cycle_number, self.current_cycle) {
+                                        tracing::info!(
+                                            "[gossip-mesh-diag] collect_producer_votes ACCEPTED producer={} sender={} cycle={}",
+                                            v.producer_id, env.sender, v.cycle_number
+                                        );
+                                        out.insert(v.producer_id.clone(), v);
+                                    } else {
+                                        tracing::info!(
+                                            "[gossip-mesh-diag] collect_producer_votes DROPPED live producer={} sender={} msg_cycle={} local_cycle={} (cycle mismatch)",
+                                            v.producer_id, env.sender, v.cycle_number, self.current_cycle
+                                        );
+                                    }
+                                } else {
+                                    tracing::info!("[gossip-mesh-diag] collect_producer_votes extract_message FAILED sender={}", env.sender);
+                                }
                             } else {
-                                tracing::info!(
-                                    "[gossip-mesh-diag] collect_producer_votes DROPPED live producer={} sender={} msg_cycle={} local_cycle={} (cycle mismatch)",
-                                    v.producer_id, env.sender, v.cycle_number, self.current_cycle
-                                );
+                                self.push_pending_bounded(env).await;
                             }
-                        } else {
-                            tracing::info!("[gossip-mesh-diag] collect_producer_votes extract_message FAILED sender={}", env.sender);
                         }
-                    } else {
-                        self.push_pending_bounded(env).await;
+                        Ok(None) => break,
+                        Err(_) => break,
                     }
                 }
-                Ok(None) => break,
-                Err(_) => break,
+                _ = rebroadcast_tick.tick() => {
+                    let _ = self.broadcast_message(local).await;
+                }
             }
         }
 
