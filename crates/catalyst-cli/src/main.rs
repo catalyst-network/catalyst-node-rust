@@ -686,8 +686,16 @@ fn init_logging(level: &str, json_logs: bool) -> Result<()> {
     // self-reinforcing stall. Cap this crate's log level independently of `--log-level` so it
     // can never do that again; the failed-message counters already surface the same information
     // (`failed_messages` in gossipsub metrics) without the per-message payload dump.
+    //
+    // TEMPORARY DIAGNOSTIC (2026-08-18, gossip-mesh-stall investigation): overridable via
+    // CATALYST_GOSSIPSUB_LOG_LEVEL so we can briefly re-enable "Send Queue full" warnings on a
+    // live host to check whether queue-saturation drops (not visible at `error`) explain
+    // ProducerQuantity/Candidate/Vote messages going unreceived, without hardcoding a change to
+    // the safe default. Unset/invalid falls back to "error".
+    let gossipsub_level = std::env::var("CATALYST_GOSSIPSUB_LOG_LEVEL")
+        .unwrap_or_else(|_| "error".to_string());
     let filter = tracing_subscriber::filter::EnvFilter::builder()
-        .parse(format!("{level},libp2p_gossipsub=error"))
+        .parse(format!("{level},libp2p_gossipsub={gossipsub_level}"))
         .map_err(|e| anyhow::anyhow!("Invalid log filter: {}", e))?;
 
     if json_logs {
