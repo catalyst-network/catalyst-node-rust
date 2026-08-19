@@ -211,10 +211,25 @@ impl NetworkService {
         // rebroadcast volume itself is also being reduced (see `rebroadcast_persisted_mempool`
         // in catalyst-cli); raising it further without evidence would just trade drops for
         // unbounded queue growth instead of fixing the underlying contention.
+        // `publish_queue_duration`/`forward_queue_duration` raised from the crate defaults
+        // (5s/1s): live 2026-08-19 diagnostics (Event::SlowPeer, newly surfaced -- see
+        // 362b495) showed the connection handler's own per-message send timeout firing
+        // continuously and almost exclusively (`FailedMessages.timeout` accounting for ~100%
+        // of failures, hundreds of SlowPeer events/minute, on every peer, immediately after a
+        // fresh restart with healthy TCP-level connections) -- i.e. messages were being
+        // queued successfully but the outbound substream wasn't managing to actually write
+        // them out to an already-established, low-RTT connection within the default budget.
+        // Raising this is a diagnostic experiment as much as a fix: if it materially improves
+        // delivery, the mechanism really was "not enough time" (worth continuing to
+        // understand why sends are this slow, but immediately mitigated); if delivery is
+        // still broken with a generous budget, the substream itself is stuck regardless of
+        // timeout length, which would rule out timing entirely and point elsewhere.
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .validation_mode(gossipsub::ValidationMode::Permissive)
             .heartbeat_interval(config.gossip.heartbeat_interval)
             .connection_handler_queue_len(10_000)
+            .publish_queue_duration(Duration::from_secs(30))
+            .forward_queue_duration(Duration::from_secs(15))
             .build()
             .map_err(|e| NetworkError::ConfigError(e.to_string()))?;
 
