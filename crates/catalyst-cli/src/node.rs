@@ -8258,10 +8258,26 @@ impl CatalystNode {
                                 MessageEnvelope::from_message(&batch, "txbatch".to_string(), None)
                             {
                                 // Gossipsub is best-effort; rebroadcast to improve WAN delivery.
-                                for _ in 0..8 {
-                                    let _ = network.broadcast_envelope(&env).await;
-                                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                                }
+                                // Spawned as a background task instead of awaited inline: this
+                                // loop used to block the leader's own thread for 1.6s (8*200ms)
+                                // every cycle it leads, before it could even enter the 4-phase
+                                // consensus pipeline (consensus.start_cycle below) -- confirmed
+                                // live 2026-08-19 that this left the leader's own
+                                // collect_producer_quantities starting ~1.5s later in wall-clock
+                                // time than followers each cycle, while the leader's inbound
+                                // quantities/candidates from peers came back empty despite its
+                                // own broadcasts reliably reaching them (asymmetric, leader-only
+                                // pattern). First send still happens immediately below; only the
+                                // 7 remaining retries move to the background.
+                                let _ = network.broadcast_envelope(&env).await;
+                                let net_for_resend = network.clone();
+                                let env_for_resend = env.clone();
+                                tokio::spawn(async move {
+                                    for _ in 0..7 {
+                                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                        let _ = net_for_resend.broadcast_envelope(&env_for_resend).await;
+                                    }
+                                });
                             }
                         }
                         entries
