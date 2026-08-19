@@ -83,3 +83,13 @@ overflow-checks = true
 [profile.bench]
 debug = true
 opt-level = 3
+
+# TEMPORARY (2026-08-19, quorum-stall investigation): local patched copy of libp2p-gossipsub
+# 0.49.3 with diagnostic tracing added to the outbound send path (vendor/libp2p-gossipsub-0.49.3).
+# Every non-invasive diagnostic avenue (public API events, tcpdump, config experiments) has been
+# exhausted trying to explain why the outbound gossipsub substream stops writing queued messages
+# on an otherwise-healthy connection. This patch adds read-only tracing only -- no behavior
+# change -- to see exactly where the outbound substream state machine stalls. Revert this
+# [patch.crates-io] block and delete vendor/libp2p-gossipsub-0.49.3 once root-caused.
+[patch.crates-io]
+libp2p-gossipsub = { path = "vendor/libp2p-gossipsub-0.49.3" }
