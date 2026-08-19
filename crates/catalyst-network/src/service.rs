@@ -94,13 +94,36 @@ struct Behaviour {
     mdns: mdns::tokio::Behaviour,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
-    // Caps concurrent established connections per peer at 1 (regardless of direction). Without
-    // this, nothing in the swarm dedupes redial attempts against an already-connected peer, and
-    // ordinary reconnect churn (dial retries racing an in-flight connection, ping-timeout
-    // disconnects, etc.) silently stacks additional live connections instead of replacing the
-    // existing one -- observed live 2026-08-17 as 30-50k duplicate connections per peer pair
-    // accumulated over ~4 days, exhausting host memory/CPU and starving the gossipsub send
-    // queues this crate otherwise depends on for consensus-critical traffic.
+    // Caps concurrent established connections per peer at 2 (was 1 -- see 2026-08-19 note
+    // below). Without SOME cap, nothing in the swarm dedupes redial attempts against an
+    // already-connected peer, and ordinary reconnect churn (dial retries racing an in-flight
+    // connection, ping-timeout disconnects, etc.) silently stacks additional live connections
+    // instead of replacing the existing one -- observed live 2026-08-17 as 30-50k duplicate
+    // connections per peer pair accumulated over ~4 days, exhausting host memory/CPU and
+    // starving the gossipsub send queues this crate otherwise depends on for
+    // consensus-critical traffic.
+    //
+    // 2026-08-19: raised from 1 to 2. A cap of exactly 1 turned out to actively cause the
+    // fleet-wide quorum stall this session spent hours root-causing: tcpdump confirmed both
+    // sides of an ordinary simultaneous-dial race (both peers dial each other at once, a
+    // normal occurrence with mutual bootstrap_peers lists, not the runaway growth this
+    // behaviour exists to prevent) independently RST a "duplicate" connection in a tight burst
+    // across every peer pair -- and at least once, live, that RST landed on a connection that
+    // was actively mid-handshake/mid-data, not an idle leftover. This is the likely cause of
+    // gossipsub's own Event::SlowPeer firing continuously with FailedMessages.timeout
+    // accounting for ~100% of failures (see the publish/forward_queue_duration change a few
+    // lines below in NetworkService::new, and the investigation notes there) -- a connection
+    // getting reset mid-flight would strand whatever gossipsub had queued on that specific
+    // connection handler. The *original* justification for a cap here (unbounded accumulation
+    // from redialing without checking is_connected first) was separately, fully fixed the same
+    // session (see node.rs's bootstrap retry loop and this file's own bootstrap_tick, both of
+    // which now always check per-peer connection state before dialing) -- so a strict cap of 1
+    // is no longer needed to prevent runaway growth, and was actively harmful. 2 gives
+    // ordinary simultaneous-dial races room to resolve without an in-use connection being torn
+    // down; growth beyond that is still bounded by the now-fixed dial guards, not by this cap.
+    // A more complete fix would resolve simultaneous-connect races deterministically (e.g. a
+    // PeerId-comparison tie-break so only one side's dial wins) instead of tolerating a small
+    // duplicate window -- not done this session, flagged as a follow-up.
     connection_limits: libp2p::connection_limits::Behaviour,
 }
 
@@ -261,12 +284,12 @@ impl NetworkService {
         ));
         let ping = ping::Behaviour::new(ping::Config::new());
 
-        // See the doc comment on `Behaviour::connection_limits` for why this exists: caps
-        // established connections per peer at 1 so reconnect churn can't silently accumulate
-        // duplicate connections.
+        // See the doc comment on `Behaviour::connection_limits` for why this is 2, not 1 (as
+        // of 2026-08-19): bounds reconnect-churn accumulation while giving ordinary
+        // simultaneous-dial races room to resolve without RST-ing an in-use connection.
         let connection_limits = libp2p::connection_limits::Behaviour::new(
             libp2p::connection_limits::ConnectionLimits::default()
-                .with_max_established_per_peer(Some(1)),
+                .with_max_established_per_peer(Some(2)),
         );
 
         let behaviour = Behaviour {
