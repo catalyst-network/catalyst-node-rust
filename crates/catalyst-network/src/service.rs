@@ -483,6 +483,45 @@ impl NetworkService {
                                         st.connected_peers = peer_conns.read().await.len();
                                     }
                                     let _ = emit(&event_tx, NetworkEvent::MessageReceived { envelope: env, from: propagation_source }).await;
+                                } else {
+                                    // TEMPORARY DIAGNOSTIC (2026-08-19): these gossipsub::Event
+                                    // variants were previously silently discarded entirely (the
+                                    // `if let Event::Message = e` above has no else branch in the
+                                    // original code) -- mesh has been persistently empty all
+                                    // session despite flood_publish=true and no peer scoring
+                                    // configured (confirmed both structurally shouldn't require
+                                    // mesh for delivery), so this is the highest-value remaining
+                                    // non-invasive signal: GossipsubNotSupported would directly
+                                    // explain healthy TCP/ping/identify alongside near-total
+                                    // pubsub delivery failure (a per-substream protocol
+                                    // negotiation failure, not a transport-level one).
+                                    match e {
+                                        gossipsub::Event::GossipsubNotSupported { peer_id } => {
+                                            tracing::info!(
+                                                "[gossip-mesh-diag] GossipsubNotSupported peer={}",
+                                                peer_id
+                                            );
+                                        }
+                                        gossipsub::Event::SlowPeer { peer_id, failed_messages } => {
+                                            tracing::info!(
+                                                "[gossip-mesh-diag] SlowPeer peer={} failed_messages={:?}",
+                                                peer_id, failed_messages
+                                            );
+                                        }
+                                        gossipsub::Event::Subscribed { peer_id, topic } => {
+                                            tracing::info!(
+                                                "[gossip-mesh-diag] Subscribed peer={} topic={}",
+                                                peer_id, topic
+                                            );
+                                        }
+                                        gossipsub::Event::Unsubscribed { peer_id, topic } => {
+                                            tracing::info!(
+                                                "[gossip-mesh-diag] Unsubscribed peer={} topic={}",
+                                                peer_id, topic
+                                            );
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
                             SwarmEvent::Behaviour(BehaviourEvent::Identify(e)) => {
