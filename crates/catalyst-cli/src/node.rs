@@ -5940,8 +5940,39 @@ impl CatalystNode {
         {
             let net = network.clone();
             let handle = tokio::spawn(async move {
-                while let Some(env) = out_rx.recv().await {
-                    let _ = net.broadcast_envelope(&env).await;
+                // TEMPORARY DIAGNOSTIC (2026-08-19, quorum-stall recurrence investigation):
+                // pinpoint exactly where the consensus-engine -> network handoff breaks if
+                // publishing stops entirely again (confirmed live: zero PUBLISH ok of any
+                // message type on all 3 validators simultaneously, while the network layer's
+                // own periodic diagnostics kept firing -- so the swarm task wasn't dead, but
+                // something between here and there was).
+                let mut forwarded: u64 = 0;
+                loop {
+                    match out_rx.recv().await {
+                        Some(env) => {
+                            forwarded += 1;
+                            if forwarded <= 5 || forwarded % 50 == 0 {
+                                tracing::info!(
+                                    "[gossip-mesh-diag] out_rx forwarding #{} type={:?} sender={}",
+                                    forwarded, env.message_type, env.sender
+                                );
+                            }
+                            let result = net.broadcast_envelope(&env).await;
+                            if let Err(e) = result {
+                                tracing::info!(
+                                    "[gossip-mesh-diag] out_rx broadcast_envelope FAILED #{}: {:?}",
+                                    forwarded, e
+                                );
+                            }
+                        }
+                        None => {
+                            tracing::info!(
+                                "[gossip-mesh-diag] out_rx CLOSED after forwarding {} envelopes -- consensus engine's network_sender was dropped",
+                                forwarded
+                            );
+                            break;
+                        }
+                    }
                 }
             });
             self.network_tasks.push(handle);

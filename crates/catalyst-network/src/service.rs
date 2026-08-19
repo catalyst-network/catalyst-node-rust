@@ -655,7 +655,16 @@ impl NetworkService {
             | MessageType::ConsensusSync => GossipChannel::Consensus,
             _ => GossipChannel::Default,
         };
-        let _ = self.cmd_tx.send(Cmd::Publish(bytes, channel));
+        // TEMPORARY DIAGNOSTIC (2026-08-19, quorum-stall recurrence investigation): this send
+        // Result was discarded (`let _ = ...`) -- if the swarm task's cmd_rx were ever dropped
+        // (task panicked/ended), every subsequent broadcast_envelope call would silently no-op
+        // forever with Ok(()) still returned to the caller, masking a total publish outage.
+        if let Err(e) = self.cmd_tx.send(Cmd::Publish(bytes, channel)) {
+            tracing::info!(
+                "[gossip-mesh-diag] broadcast_envelope: cmd_tx.send FAILED (swarm task's cmd_rx dropped?) type={:?} err={:?}",
+                envelope.message_type, e
+            );
+        }
         Ok(())
     }
 
