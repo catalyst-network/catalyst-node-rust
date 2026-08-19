@@ -5553,12 +5553,6 @@ impl CatalystNode {
         // Dial bootstrap peers from CLI config + optional DNS seeds.
         let peers_static = self.config.network.bootstrap_peers.clone();
         let seeds = self.config.network.dns_seeds.clone();
-        // `bootstrap_peers` includes this node's own address (confirmed live in the deployed
-        // config: each validator's list has all 3 validator addresses, itself included), so
-        // `peers.len()` overcounts relative to the realistic max `connected_peers` -- use the
-        // same `min_peers` threshold service.rs's own bootstrap_tick guards on instead (see the
-        // fuller comment at the call site below).
-        let retry_loop_min_peers = self.config.network.min_peers as usize;
 
         let peers_from_dns: Vec<String> = resolve_dns_seeds_to_bootstrap_multiaddrs(&seeds, 30333)
             .await
@@ -5633,32 +5627,30 @@ impl CatalystNode {
                     peers.sort();
                     peers.dedup();
 
-                    // TEMPORARY DIAGNOSTIC (2026-08-18, gossip-mesh-stall investigation) turned
-                    // permanent fix: this loop is a second, independent dial-retry mechanism from
-                    // `NetworkService::start`'s own internal `bootstrap_tick` (service.rs) -- and
-                    // unlike that one, it has no connectivity check at all, so it re-dials every
-                    // peer on its own ~30s-per-peer cycle regardless of whether we're already
-                    // connected. `Cmd::Dial` only carries a bare `Multiaddr` (no `PeerId`), so it
-                    // can't use the same per-peer `is_connected()` guard service.rs's bootstrap_tick
-                    // uses -- but a redundant dial to an already-established peer still pays the
-                    // full TCP+Noise handshake cost before `connection_limits` rejects it at the
-                    // "established" checkpoint (confirmed live: `OutgoingConnectionError`/
-                    // `IncomingConnectionError ... Exceeded { limit: 1, kind: EstablishedPerPeer }`
-                    // firing every 5-20s per node, i.e. roughly every peer's independent ~30s timer
-                    // interleaved). Skip the whole pass with a coarse connected-peer-count check
-                    // instead, mirroring bootstrap_tick's `if connected >= min_peers { continue }`.
+                    // History of this dial-retry loop (a second, independent mechanism from
+                    // `NetworkService::start`'s own internal `bootstrap_tick` in service.rs):
                     //
-                    // FIRST ATTEMPT AT THIS FIX (`connected_peers >= peers.len()`) DID NOT WORK:
-                    // `peers` (built from `bootstrap_peers` config) includes this node's OWN
-                    // address -- confirmed live, every validator's deployed `bootstrap_peers` list
-                    // has all 3 validator addresses including itself -- so `peers.len()` (e.g. 3)
-                    // permanently overcounts the realistic max `connected_peers` (e.g. 2 real other
-                    // peers), and the guard never triggered. Use `min_peers` instead, matching
-                    // exactly what service.rs's own bootstrap_tick compares against.
-                    if net.get_stats().await.connected_peers >= retry_loop_min_peers {
-                        continue;
-                    }
-
+                    // 1. Originally had no connectivity check at all -- redialed every peer on
+                    //    its own ~30s-per-peer cycle regardless of connection state, paying a
+                    //    full TCP+Noise handshake cost each time before `connection_limits`
+                    //    rejected the redundant dial.
+                    // 2. First fix attempt (`connected_peers >= peers.len()`) never triggered:
+                    //    `peers` includes this node's own address (every validator's
+                    //    `bootstrap_peers` list has all 3 addresses, itself included), so
+                    //    `peers.len()` permanently overcounted the realistic max
+                    //    `connected_peers`.
+                    // 3. Second fix attempt (`connected_peers >= min_peers`) had a different bug,
+                    //    shared with service.rs's `bootstrap_tick` before its own 2026-08-19 fix:
+                    //    with 3 possible peers and min_peers=2, a node sitting at exactly 2/3
+                    //    connections (having lost one, e.g. mid-restart of that peer) would
+                    //    treat itself as "enough" and never attempt to redial the missing third
+                    //    peer -- confirmed live, `us` got stuck at 2 connections (missing `eu`
+                    //    during its restart) and stayed that way.
+                    //
+                    // No coarse gate at all now -- rely purely on the per-peer `next_at` backoff
+                    // below (already resets to a lazy ~30s cadence on a "successful" send, so a
+                    // steady-state fully-connected node still isn't hammering anything; the
+                    // `attempts_left` cap below also bounds worst-case per-tick dial volume).
                     let now = Instant::now();
 
                     // Ensure dial state exists for all peers.

@@ -314,9 +314,10 @@ impl NetworkService {
         let topic_consensus = self.topic_consensus.clone();
         let limits = self.config.safety_limits.clone();
 
-        // Bootstrap dial manager (WAN-hardening): retry with backoff+jitter until we meet `min_peers`.
+        // Bootstrap dial manager (WAN-hardening): retry with backoff+jitter, per-peer, every
+        // tick -- see the fix note at the bootstrap_tick match arm for why this no longer
+        // short-circuits on a `min_peers` threshold.
         let bootstrap: Vec<(PeerId, Multiaddr)> = self.config.peer.bootstrap_peers.clone();
-        let min_peers = self.config.peer.min_peers;
         let max_attempts = self.config.peer.max_retry_attempts;
         let base_backoff = self.config.peer.retry_backoff;
         let mut bootstrap_tick = tokio::time::interval(self.config.discovery.bootstrap_interval);
@@ -351,10 +352,17 @@ impl NetworkService {
                         );
                     }
                     _ = bootstrap_tick.tick() => {
-                        let connected = peer_conns.read().await.len();
-                        if connected >= min_peers {
-                            continue;
-                        }
+                        // BUG FIXED 2026-08-19: this used to bail out of the whole per-peer
+                        // reconciliation loop below whenever `connected >= min_peers`. With
+                        // only 3 possible peers and min_peers=2, that let a node permanently
+                        // stop trying to reconnect to exactly one missing peer as long as its
+                        // other two connections stayed up -- confirmed live: `us` sat at 2/3
+                        // connections (missing `eu`, mid-restart) and never attempted to
+                        // redial it because 2 >= min_peers(2) kept short-circuiting this tick.
+                        // The per-peer loop below is already a no-op for peers that are
+                        // already connected (`is_connected` check) or still backing off, so
+                        // there's no cost to always running the full reconciliation instead of
+                        // gating it on a coarse threshold.
                         let now = Instant::now();
                         for (pid, addr) in &bootstrap {
                             if incompatible.contains(pid) {
