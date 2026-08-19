@@ -421,6 +421,8 @@ async fn main() -> Result<()> {
 
     info!("Starting Catalyst CLI v{}", env!("CARGO_PKG_VERSION"));
 
+    spawn_tokio_scheduler_diag();
+
     // Execute command
     match cli.command {
         Commands::Start {
@@ -718,4 +720,58 @@ fn init_logging(level: &str, json_logs: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+// TEMPORARY DIAGNOSTIC (2026-08-19, gossip-mesh-stall investigation): the stall has been traced
+// down through gossipsub, yamux's protocol logic, and the noise/TCP layer -- all measurably fast
+// whenever actually polled. The remaining hypothesis is that the per-connection task driving
+// libp2p's yamux StreamMuxer simply isn't being scheduled by tokio during a stall (CPU stays
+// idle throughout, ruling out a synchronous CPU-bound or iowait-bound block). This periodically
+// logs tokio's own RuntimeMetrics (requires `--cfg tokio_unstable`, set only for this diagnostic
+// build) so we can directly see whether the scheduler itself keeps making progress (worker
+// poll/park/steal counts advancing normally) during a live stall, or whether something more
+// fundamental is wrong. Remove this call and the cfg flag once root-caused.
+fn spawn_tokio_scheduler_diag() {
+    #[cfg(tokio_unstable)]
+    {
+        tokio::spawn(async move {
+            let handle = tokio::runtime::Handle::current();
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            let mut last_poll_counts: Vec<u64> = Vec::new();
+            loop {
+                interval.tick().await;
+                let metrics = handle.metrics();
+                let workers = metrics.num_workers();
+                let mut poll_counts = Vec::with_capacity(workers);
+                let mut park_counts = Vec::with_capacity(workers);
+                let mut steal_counts = Vec::with_capacity(workers);
+                let mut local_queue_depths = Vec::with_capacity(workers);
+                for w in 0..workers {
+                    poll_counts.push(metrics.worker_poll_count(w));
+                    park_counts.push(metrics.worker_park_count(w));
+                    steal_counts.push(metrics.worker_steal_count(w));
+                    local_queue_depths.push(metrics.worker_local_queue_depth(w));
+                }
+                let stalled_workers: Vec<usize> = if last_poll_counts.len() == poll_counts.len() {
+                    (0..workers)
+                        .filter(|&w| poll_counts[w] == last_poll_counts[w])
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                tracing::info!(
+                    "[gossip-mesh-diag/tokio-rt] alive_tasks={} global_queue_depth={} workers={} poll_counts={:?} park_counts={:?} steal_counts={:?} local_queue_depths={:?} STALLED_WORKERS(no new polls in 5s)={:?}",
+                    metrics.num_alive_tasks(),
+                    metrics.global_queue_depth(),
+                    workers,
+                    poll_counts,
+                    park_counts,
+                    steal_counts,
+                    local_queue_depths,
+                    stalled_workers,
+                );
+                last_poll_counts = poll_counts;
+            }
+        });
+    }
 }
