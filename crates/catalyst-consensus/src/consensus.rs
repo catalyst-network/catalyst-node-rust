@@ -183,12 +183,33 @@ impl CollaborativeConsensus {
         manager: &ProducerManager,
         transactions: Vec<TransactionEntry>,
     ) -> CatalystResult<Option<LedgerStateUpdate>> {
-        // Phase 1: Construction — track elapsed so collection gets only the remaining budget,
-        // preventing the double-count that caused cycles to overrun cycle_duration_ms.
-        let phase_start = Instant::now();
+        // Anchor every phase's collection deadline to this single fixed point instead of
+        // measuring each phase's remaining budget relative to when THAT phase itself
+        // started (the old `phase_start = Instant::now()` reset before each phase).
+        //
+        // Why: confirmed live 2026-08-19 that the old relative-timing scheme causes
+        // cascading cross-node misalignment. A phase's actual success time (when the
+        // pivotal peer message happens to arrive) is essentially random within its
+        // window; under the old scheme, a node whose quantities phase succeeded early
+        // (say at pipeline+0.5s) would start ITS campaigning phase's 4s window at 0.5s
+        // and finish by 4.5s, while a peer whose quantities took the full 4s wouldn't
+        // even START broadcasting its own candidate until pipeline+4.0s -- leaving only
+        // a sliver of overlap (or none) between the two nodes' campaigning windows, even
+        // though both are nominally "the same phase of the same cycle". This compounds
+        // with each subsequent phase. Observed effect: quantities succeeded on a
+        // meaningful fraction of cycles, but candidates then succeeded on almost none of
+        // *those*, and votes was never reached at all in an extended live sample.
+        //
+        // Fixed-anchor deadlines mean a node that finishes a phase early gets a
+        // *longer* listening window for the next phase (extending to the fixed
+        // cumulative deadline) instead of a fresh-but-early one -- maximizing overlap
+        // with peers regardless of how quickly any single phase happened to resolve.
+        let pipeline_start = Instant::now();
+
+        // Phase 1: Construction
         let quantity = self.run_construction_phase(manager, transactions).await?;
-        let remaining_ms = self.config.construction_phase_ms
-            .saturating_sub(phase_start.elapsed().as_millis() as u64);
+        let quantities_deadline = pipeline_start + Duration::from_millis(self.config.construction_phase_ms);
+        let remaining_ms = quantities_deadline.saturating_duration_since(Instant::now()).as_millis() as u64;
         let mut quantities = self
             .collect_producer_quantities(Duration::from_millis(remaining_ms), &quantity)
             .await?;
@@ -203,10 +224,10 @@ impl CollaborativeConsensus {
 
         // Phase 2: Campaigning — merge peer `ProducerCandidate` messages collected during the
         // phase window with our own candidate (see `collect_producer_candidates`).
-        let phase_start = Instant::now();
         let candidate = self.run_campaigning_phase(manager, quantities).await?;
-        let remaining_ms = self.config.campaigning_phase_ms
-            .saturating_sub(phase_start.elapsed().as_millis() as u64);
+        let candidates_deadline = pipeline_start
+            + Duration::from_millis(self.config.construction_phase_ms + self.config.campaigning_phase_ms);
+        let remaining_ms = candidates_deadline.saturating_duration_since(Instant::now()).as_millis() as u64;
         let mut candidates = self
             .collect_producer_candidates(Duration::from_millis(remaining_ms), &candidate)
             .await?;
@@ -220,10 +241,14 @@ impl CollaborativeConsensus {
         );
 
         // Phase 3: Voting
-        let phase_start = Instant::now();
         let vote = self.run_voting_phase(manager, candidates).await?;
-        let remaining_ms = self.config.voting_phase_ms
-            .saturating_sub(phase_start.elapsed().as_millis() as u64);
+        let votes_deadline = pipeline_start
+            + Duration::from_millis(
+                self.config.construction_phase_ms
+                    + self.config.campaigning_phase_ms
+                    + self.config.voting_phase_ms,
+            );
+        let remaining_ms = votes_deadline.saturating_duration_since(Instant::now()).as_millis() as u64;
         let mut votes = self
             .collect_producer_votes(Duration::from_millis(remaining_ms), &vote)
             .await?;
