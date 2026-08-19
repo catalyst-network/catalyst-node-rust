@@ -32,11 +32,116 @@ use libp2p::{
 };
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     path::Path,
-    sync::Arc,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, OnceLock,
+    },
+    task::{Context as TaskContext, Poll},
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, Mutex, RwLock};
+
+// TEMPORARY DIAGNOSTIC (2026-08-19, gossip-mesh-stall investigation): the process-wide tokio
+// RuntimeMetrics (see catalyst-cli/src/main.rs) show the scheduler as a whole is healthy
+// (workers polling thousands of times per 5s, zero stalled workers) even during a live
+// PendingFlush stall -- but the vendored noise::Output::poll_flush tracing shows near-zero calls
+// during that same window, meaning it's not that tokio is starved overall, it's that ONE
+// specific connection's background task has apparently stopped being polled while everything
+// else keeps running. libp2p's `Config::with_tokio_executor()` spawns one task per connection
+// via its own internal glue that we can't directly observe. This replaces it with a custom
+// `Executor` that wraps every spawned future with a last-polled timestamp, so a periodic checker
+// can directly see which specific per-connection task (if any) has gone quiet -- the same
+// information tokio-console's task view would give, without adding that dependency.
+struct ConnTaskDiag {
+    label: String,
+    last_poll_ms: Arc<AtomicU64>,
+    spawned_ms: u64,
+    completed: Arc<AtomicBool>,
+}
+
+fn conn_task_registry() -> &'static std::sync::Mutex<Vec<ConnTaskDiag>> {
+    static REG: OnceLock<std::sync::Mutex<Vec<ConnTaskDiag>>> = OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+struct PollTrackedFuture {
+    inner: Pin<Box<dyn Future<Output = ()> + Send>>,
+    last_poll_ms: Arc<AtomicU64>,
+    completed: Arc<AtomicBool>,
+}
+
+impl Future for PollTrackedFuture {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        this.last_poll_ms.store(now_ms(), Ordering::Relaxed);
+        let res = this.inner.as_mut().poll(cx);
+        if res.is_ready() {
+            this.completed.store(true, Ordering::Relaxed);
+        }
+        res
+    }
+}
+
+fn tracked_libp2p_executor(
+    fut: Pin<Box<dyn Future<Output = ()> + Send>>,
+) {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let spawned_ms = now_ms();
+    let last_poll_ms = Arc::new(AtomicU64::new(spawned_ms));
+    let completed = Arc::new(AtomicBool::new(false));
+    conn_task_registry().lock().unwrap().push(ConnTaskDiag {
+        label: format!("libp2p-conn-task-{id}"),
+        last_poll_ms: last_poll_ms.clone(),
+        spawned_ms,
+        completed: completed.clone(),
+    });
+    tokio::spawn(PollTrackedFuture {
+        inner: fut,
+        last_poll_ms,
+        completed,
+    });
+}
+
+fn spawn_conn_task_diag() {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let now = now_ms();
+            let reg = conn_task_registry().lock().unwrap();
+            let mut summary: Vec<(String, u64, bool)> = Vec::new();
+            let mut stalled: Vec<(String, u64)> = Vec::new();
+            for entry in reg.iter() {
+                let done = entry.completed.load(Ordering::Relaxed);
+                let last = entry.last_poll_ms.load(Ordering::Relaxed);
+                let age_ms = now.saturating_sub(last);
+                summary.push((entry.label.clone(), age_ms, done));
+                if !done && age_ms >= 3000 {
+                    stalled.push((entry.label.clone(), age_ms));
+                }
+            }
+            let alive = summary.iter().filter(|(_, _, done)| !done).count();
+            tracing::info!(
+                "[gossip-mesh-diag/conn-task] alive_conn_tasks={} total_ever_spawned={} STALLED_CONN_TASKS(no poll in >=3s)={:?}",
+                alive,
+                summary.len(),
+                stalled,
+            );
+        }
+    });
+}
 
 #[derive(Debug, Clone)]
 struct DialBackoff {
@@ -300,11 +405,12 @@ impl NetworkService {
             connection_limits,
         };
 
+        spawn_conn_task_diag();
         let mut swarm = Swarm::new(
             transport,
             behaviour,
             peer_id,
-            libp2p::swarm::Config::with_tokio_executor(),
+            libp2p::swarm::Config::with_executor(tracked_libp2p_executor),
         );
 
         // Listen
