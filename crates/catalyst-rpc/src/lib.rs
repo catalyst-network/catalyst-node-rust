@@ -713,15 +713,24 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn block_number(&self) -> RpcResult<u64> {
-        let n = self
+        // On an already-running node, this metadata key is written every cycle, so a miss here
+        // is a rare, transient storage-read hiccup, not a real "cycle 0". Returning `0` in that
+        // case is ambiguous with a genuine value and gets silently recorded as real data by
+        // callers (confirmed live: corrupted the block explorer's "Head cycle rate" chart, whose
+        // min-max-normalized sparkline rendered as a flat line once a stray `0` sample entered
+        // its rolling window). Return a proper RPC error instead so callers can distinguish and
+        // skip/retry rather than treat it as a real cycle number.
+        match self
             .storage
             .get_metadata("consensus:last_applied_cycle")
             .await
-            .ok()
-            .flatten()
-            .map(|b| decode_u64_le(&b))
-            .unwrap_or(0);
-        Ok(n)
+        {
+            Ok(Some(b)) => Ok(decode_u64_le(&b)),
+            Ok(None) => Err(ErrorObjectOwned::from(RpcServerError::Server(
+                "consensus:last_applied_cycle metadata not found".to_string(),
+            ))),
+            Err(e) => Err(ErrorObjectOwned::from(RpcServerError::Server(e.to_string()))),
+        }
     }
 
     async fn get_block_by_hash(&self, _hash: String, _full_transactions: bool) -> RpcResult<Option<RpcBlock>> {
