@@ -568,6 +568,7 @@ pub struct CatalystRpcImpl {
     limiter: Arc<RpcLimiters>,
     _global_rps: u32,
     sender_rps: u32,
+    cycle_duration_ms: u64,
 }
 
 struct RpcLimiters {
@@ -617,6 +618,7 @@ impl CatalystRpcImpl {
         tx_submit: Option<mpsc::UnboundedSender<catalyst_core::protocol::Transaction>>,
         global_rps: u32,
         sender_rps: u32,
+        cycle_duration_ms: u64,
     ) -> Self {
         Self {
             storage,
@@ -625,6 +627,7 @@ impl CatalystRpcImpl {
             limiter: Arc::new(RpcLimiters::new(global_rps, sender_rps)),
             _global_rps: global_rps,
             sender_rps,
+            cycle_duration_ms,
         }
     }
 }
@@ -737,7 +740,7 @@ impl CatalystRpcServer for CatalystRpcImpl {
     }
 
     async fn get_block_by_number(&self, _number: u64, _full_transactions: bool) -> RpcResult<Option<RpcBlock>> {
-        build_block(self.storage.as_ref(), _number, _full_transactions)
+        build_block(self.storage.as_ref(), _number, _full_transactions, self.cycle_duration_ms)
             .await
             .map_err(ErrorObjectOwned::from)
             .map(Some)
@@ -763,7 +766,7 @@ impl CatalystRpcServer for CatalystRpcImpl {
         let count = count.min(10_000); // hard cap to protect node
         for i in 0..count {
             let n = start.saturating_add(i);
-            if let Ok(b) = build_block(self.storage.as_ref(), n, full_transactions).await {
+            if let Ok(b) = build_block(self.storage.as_ref(), n, full_transactions, self.cycle_duration_ms).await {
                 out.push(b);
             } else {
                 // Stop at first missing to keep semantics simple for indexers.
@@ -1331,6 +1334,7 @@ async fn build_block(
     store: &catalyst_storage::StorageManager,
     cycle: u64,
     full_transactions: bool,
+    cycle_duration_ms: u64,
 ) -> Result<RpcBlock, RpcServerError> {
     let lsu_key = format!("consensus:lsu:{}", cycle);
     let lsu_hash_key = format!("consensus:lsu_hash:{}", cycle);
@@ -1397,7 +1401,13 @@ async fn build_block(
         hash: format!("0x{}", hex::encode(lsu_hash)),
         number: cycle,
         parent_hash: format!("0x{}", hex::encode(parent_hash)),
-        timestamp: lsu.partial_update.timestamp,
+        // `lsu.partial_update.timestamp` is deliberately the raw cycle number, not wall-clock
+        // time -- it feeds a hash multiple producers must compute identically to converge on a
+        // majority (see catalyst-consensus/src/phases.rs). Derive a real epoch-seconds value
+        // here instead, purely for API/display consumers (e.g. the block explorer): cycles are
+        // wall-clock-paced (`cycle = now_ms / cycle_duration_ms`), so this reconstructs the
+        // approximate real time without touching anything consensus-critical.
+        timestamp: cycle.saturating_mul(cycle_duration_ms) / 1000,
         transactions: txs,
         transactions_full,
         transaction_count: txids.len(),
@@ -1660,13 +1670,14 @@ pub async fn start_rpc_http(
     tx_submit: Option<mpsc::UnboundedSender<catalyst_core::protocol::Transaction>>,
     global_rps: u32,
     sender_rps: u32,
+    cycle_duration_ms: u64,
 ) -> Result<ServerHandle, RpcServerError> {
     let server = jsonrpsee::server::ServerBuilder::default()
         .build(bind_address)
         .await
         .map_err(|e| RpcServerError::Server(e.to_string()))?;
 
-    let rpc = CatalystRpcImpl::new(storage, network, tx_submit, global_rps, sender_rps).into_rpc();
+    let rpc = CatalystRpcImpl::new(storage, network, tx_submit, global_rps, sender_rps, cycle_duration_ms).into_rpc();
     let handle = server.start(rpc);
 
     Ok(handle)

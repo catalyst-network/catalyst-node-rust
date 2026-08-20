@@ -5857,6 +5857,7 @@ impl CatalystNode {
                     Some(rpc_tx),
                     self.config.rpc.rate_limit,
                     self.config.rpc.rate_limit,
+                    (self.config.consensus.cycle_duration_seconds as u64) * 1000,
                 )
                     .await
                     .map_err(|e| anyhow::anyhow!("rpc start failed: {e}"))?;
