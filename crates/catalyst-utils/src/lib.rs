@@ -26,6 +26,10 @@ pub type Signature = [u8; 64];
 // Re-export async_trait since many of our traits use it
 pub use async_trait::async_trait;
 
+// Re-export tracing so `log_info!`/`log_warn!`/etc (see `logging` module) can forward to it via
+// `$crate::tracing::...` without requiring every downstream crate to add its own `tracing` dep.
+pub use tracing;
+
 /// System information utilities
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemInfo {
