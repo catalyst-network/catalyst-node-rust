@@ -474,70 +474,78 @@ pub fn set_node_id(node_id: String) {
     }
 }
 
-/// Convenience macros for logging
+// Convenience macros for logging.
+//
+// These used to route through `get_logger()`/the `CatalystLogger`/`GLOBAL_LOGGER` machinery
+// above, but `get_logger()` was hardcoded to always return `None` (see its doc comment history)
+// -- every call through these macros across the whole codebase was a silent no-op in production,
+// regardless of whether `init_logger()` had been called. `tracing::info!`/etc are what's actually
+// wired up process-wide (via `catalyst-cli`'s `init_logging`/`tracing_subscriber` registry), and
+// that wiring is global -- any crate emitting through `tracing` directly gets captured regardless
+// of which crate it's called from. So these macros now forward straight to `tracing`, carrying
+// `category` along as a structured field, instead of going through the dead custom logger.
 #[macro_export]
 macro_rules! log_trace {
     ($category:expr, $($arg:tt)*) => {
-        if let Some(logger) = $crate::logging::get_logger() {
-            let _ = logger.trace($category, &format!($($arg)*));
-        }
+        $crate::tracing::trace!(category = %$category, $($arg)*)
     };
 }
 
 #[macro_export]
 macro_rules! log_debug {
     ($category:expr, $($arg:tt)*) => {
-        if let Some(logger) = $crate::logging::get_logger() {
-            let _ = logger.debug($category, &format!($($arg)*));
-        }
+        $crate::tracing::debug!(category = %$category, $($arg)*)
     };
 }
 
 #[macro_export]
 macro_rules! log_info {
     ($category:expr, $($arg:tt)*) => {
-        if let Some(logger) = $crate::logging::get_logger() {
-            let _ = logger.info($category, &format!($($arg)*));
-        }
+        $crate::tracing::info!(category = %$category, $($arg)*)
     };
 }
 
 #[macro_export]
 macro_rules! log_warn {
     ($category:expr, $($arg:tt)*) => {
-        if let Some(logger) = $crate::logging::get_logger() {
-            let _ = logger.warn($category, &format!($($arg)*));
-        }
+        $crate::tracing::warn!(category = %$category, $($arg)*)
     };
 }
 
 #[macro_export]
 macro_rules! log_error {
     ($category:expr, $($arg:tt)*) => {
-        if let Some(logger) = $crate::logging::get_logger() {
-            let _ = logger.error($category, &format!($($arg)*));
-        }
+        $crate::tracing::error!(category = %$category, $($arg)*)
     };
 }
 
 #[macro_export]
 macro_rules! log_critical {
+    // tracing has no level above ERROR; tag critical events so they're still distinguishable.
     ($category:expr, $($arg:tt)*) => {
-        if let Some(logger) = $crate::logging::get_logger() {
-            let _ = logger.critical($category, &format!($($arg)*));
-        }
+        $crate::tracing::error!(category = %$category, critical = true, $($arg)*)
     };
 }
 
 /// Macro for logging with structured fields
 #[macro_export]
 macro_rules! log_with_fields {
-    ($level:expr, $category:expr, $message:expr, $($key:expr => $value:expr),*) => {
-        if let Some(logger) = $crate::logging::get_logger() {
-            let fields = vec![$(($key, $value.into())),*];
-            let _ = logger.log_with_fields($level, $category, $message, &fields);
+    ($level:expr, $category:expr, $message:expr, $($key:expr => $value:expr),* $(,)?) => {{
+        // Field names must be static for `tracing`'s macros, but these come in as runtime
+        // expressions, so fold them into the formatted message instead of separate fields.
+        let mut __catalyst_log_fields = String::new();
+        $(
+            __catalyst_log_fields.push_str(&format!(" {}={:?}", $key, $value));
+        )*
+        match $level {
+            $crate::logging::LogLevel::Trace => $crate::tracing::trace!(category = %$category, "{}{}", $message, __catalyst_log_fields),
+            $crate::logging::LogLevel::Debug => $crate::tracing::debug!(category = %$category, "{}{}", $message, __catalyst_log_fields),
+            $crate::logging::LogLevel::Info => $crate::tracing::info!(category = %$category, "{}{}", $message, __catalyst_log_fields),
+            $crate::logging::LogLevel::Warn => $crate::tracing::warn!(category = %$category, "{}{}", $message, __catalyst_log_fields),
+            $crate::logging::LogLevel::Error => $crate::tracing::error!(category = %$category, "{}{}", $message, __catalyst_log_fields),
+            $crate::logging::LogLevel::Critical => $crate::tracing::error!(category = %$category, critical = true, "{}{}", $message, __catalyst_log_fields),
         }
-    };
+    }};
 }
 
 // Allow calling logging macros via `catalyst_utils::logging::log_info!` etc.
