@@ -21,7 +21,7 @@
 
 //! Async functions driving pending and established connections in the form of a task.
 
-use std::{convert::Infallible, pin::Pin};
+use std::{convert::Infallible, pin::Pin, task::Poll};
 
 use futures::{
     channel::{mpsc, oneshot},
@@ -177,13 +177,35 @@ pub(crate) async fn new_for_established_connection<THandler>(
     THandler: ConnectionHandler,
 {
     loop {
-        match futures::future::select(
-            command_receiver.next(),
-            poll_fn(|cx| Pin::new(&mut connection).poll(cx)),
-        )
+        // FLUSH-STALL FIX (2026-08-22, see project_flush_stall_fix_2026-08-22.md): the previous
+        // `futures::future::select(command_receiver.next(), poll_fn(connection.poll))` let a
+        // continuously-ready `command_receiver` (e.g. a burst of outbound NotifyHandler commands,
+        // which is exactly what heavy publish/relay traffic produces) win this race on *every*
+        // poll, forever -- `future::select` returns as soon as either side is Ready, so
+        // `connection.poll(cx)` was never even called during such a burst, not just starved
+        // internally. Since `connection.poll()`'s side effect (via `muxing.poll_unpin`, see the
+        // separate fix in `connection.rs`) is the only thing that flushes queued yamux writes,
+        // this fully explains the observed `PendingFlush STUCK` symptom persisting even after that
+        // first fix landed (confirmed live: 765s+ stuck, same build). Poll both unconditionally on
+        // every call instead, so the connection is always driven forward regardless of how much
+        // command traffic is arriving; command handling still gets priority when both are ready
+        // (this loop's the same as before otherwise), but it can no longer starve the connection
+        // poll's call itself.
+        match poll_fn(|cx| {
+            let conn_poll = Pin::new(&mut connection).poll(cx);
+            let cmd_poll = command_receiver.poll_next_unpin(cx);
+
+            if let Poll::Ready(command) = cmd_poll {
+                return Poll::Ready(Either::Left(command));
+            }
+            if let Poll::Ready(event) = conn_poll {
+                return Poll::Ready(Either::Right(event));
+            }
+            Poll::Pending
+        })
         .await
         {
-            Either::Left((Some(command), _)) => match command {
+            Either::Left(Some(command)) => match command {
                 Command::NotifyHandler(event) => connection.on_behaviour_event(event),
                 Command::Close => {
                     command_receiver.close();
@@ -213,9 +235,9 @@ pub(crate) async fn new_for_established_connection<THandler>(
             },
 
             // The manager has disappeared; abort.
-            Either::Left((None, _)) => return,
+            Either::Left(None) => return,
 
-            Either::Right((event, _)) => {
+            Either::Right(event) => {
                 match event {
                     Ok(connection::Event::Handler(event)) => {
                         // TEMPORARY DIAGNOSTIC (2026-08-20, flush-stall investigation): confirm
