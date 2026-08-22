@@ -272,6 +272,31 @@ where
         } = self.get_mut();
 
         loop {
+            // FLUSH-STALL FIX (2026-08-22, see project_flush_stall_live_capture_2026-08-22.md):
+            // this must run before `handler.poll(cx)` below, on every iteration of this loop --
+            // including iterations re-entered immediately after returning a NotifyBehaviour event
+            // to the caller. `muxing.poll_unpin` is the *only* thing that drives the underlying
+            // yamux `Connection::poll_next_inbound`, which is in turn the only mechanism that
+            // flushes queued outbound writes for every stream on this connection (see
+            // libp2p-yamux's `Muxer` doc comment). The `NotifyBehaviour` arm further down
+            // `return`s (not `continue`s) so the caller can relay the event to the behaviour --
+            // but under a burst of inbound messages (exactly what catch-up/resync traffic
+            // produces), the handler branch wins on every single re-entry into this function and
+            // the muxer poll below it was never reached for as long as the burst lasted, starving
+            // every outbound flush on the connection (observed live as gossipsub's
+            // `PendingFlush STUCK for Ns` diagnostic, up to 68s+ in production). Polling the muxer
+            // first guarantees it gets a turn once per handler event delivered, regardless of how
+            // busy the handler is.
+            match muxing.poll_unpin(cx)? {
+                Poll::Pending => {}
+                Poll::Ready(StreamMuxerEvent::AddressChange(address)) => {
+                    handler.on_connection_event(ConnectionEvent::AddressChange(AddressChange {
+                        new_address: &address,
+                    }));
+                    return Poll::Ready(Ok(Event::AddressChange(address)));
+                }
+            }
+
             match requested_substreams.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(()))) => continue,
                 Poll::Ready(Some(Err(info))) => {
@@ -401,15 +426,8 @@ where
                 *shutdown = Shutdown::None;
             }
 
-            match muxing.poll_unpin(cx)? {
-                Poll::Pending => {}
-                Poll::Ready(StreamMuxerEvent::AddressChange(address)) => {
-                    handler.on_connection_event(ConnectionEvent::AddressChange(AddressChange {
-                        new_address: &address,
-                    }));
-                    return Poll::Ready(Ok(Event::AddressChange(address)));
-                }
-            }
+            // (muxing.poll_unpin now happens at the top of the loop -- see the FLUSH-STALL FIX
+            // comment there.)
 
             if let Some(requested_substream) = requested_substreams.iter_mut().next() {
                 match muxing.poll_outbound_unpin(cx)? {
